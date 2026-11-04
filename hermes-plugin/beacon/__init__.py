@@ -13,7 +13,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools')
+_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools','email_drafts')
 # Only purge the siblings loaded here; dashboard-only modules may still serve live routes.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -25,7 +25,7 @@ for name in _MODULE_NAMES:
         sys.modules[key]=module;spec.loader.exec_module(module)
 mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];observers=sys.modules['beacon_observers']
 proactive=sys.modules['beacon_proactive'];phone_delivery=sys.modules['beacon_phone_delivery']
-live_context=sys.modules['beacon_live_context'];phone_tools=sys.modules['beacon_phone_tools']
+live_context=sys.modules['beacon_live_context'];phone_tools=sys.modules['beacon_phone_tools'];email_drafts=sys.modules['beacon_email_drafts']
 
 def _cron_fallback_allowed(cfg,row):
     if row.get('source')!='cron' or cfg.get('scheduled_callbacks_enabled') is not True: return False
@@ -710,5 +710,6 @@ def register(ctx):
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
     phone_tools.register(ctx)
+    email_drafts.register(ctx)
     _record_gateway_plugin_version()
     _restart_stale_dashboard()

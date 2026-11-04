@@ -14,6 +14,8 @@ import java.time.temporal.ChronoUnit
 import java.time.format.TextStyle
 import java.util.Locale
 
+private const val CALL = "phone_call"
+
 /**
  * The rules of phone access, free of Android: which tool may run for whom, argument checks and bounds, approval, rate limits, the
  * activity log and the bounded result. The phone's providers sit behind [CalendarBackend], [ContactsBackend] and [ActionsBackend].
@@ -48,8 +50,17 @@ internal class PhoneEngine(
         return false
     }
 
-    /** A write always needs the owner's tap; so does a Hermes read while "Ask before Hermes reads" is on. */
-    fun needsApproval(name: String, origin: PhoneOrigin): Boolean = PhoneSpecs.isWrite(name) || (origin == PhoneOrigin.Hermes && settings.askBeforeHermesReads())
+    /**
+     * The one rule for the owner's tap. A phone call always waits (for the tap or the countdown, see [PhoneCountdown.forHermes]).
+     * Any other write needs it unless Hermes may use phone access and "Ask before Hermes acts" is off, in a chat, a call or the
+     * assistant alike: they are one Hermes. A Hermes read needs it while "Ask before Hermes reads" is on; calls and the assistant read freely.
+     */
+    fun needsApproval(name: String, origin: PhoneOrigin): Boolean = when {
+        name == CALL -> true
+        PhoneSpecs.isWrite(name) -> !settings.hermesAllowed() || settings.askBeforeHermesActs()
+        origin != PhoneOrigin.Hermes -> false
+        else -> settings.askBeforeHermesReads()
+    }
 
     /** Why [name] cannot run for [origin] right now, or null when it can. */
     fun unavailable(name: String, origin: PhoneOrigin): PhoneFailure? {
@@ -120,11 +131,20 @@ internal class PhoneEngine(
             if (!limiter.wouldAllow(origin, spec.write)) throw busy()
             // A change without the owner's tap is refused before anything on the phone is read: the reply then says nothing about
             // whether that event or contact exists. The log line comes from the arguments alone.
-            if (spec.write && decision?.approved != true) {
+            val tapNeeded = needsApproval(name, origin)
+            if (spec.write && tapNeeded && decision?.approved != true) {
                 line = runCatching { build(name, args, live = false).card.lines.first() }.getOrDefault(line)
                 throw refused(decision, origin, write = true)
             }
-            val prepared = withContext(io) { build(name, args, live = true) }
+            val prepared = withContext(io) {
+                if (!spec.write || tapNeeded) build(name, args, live = true)
+                else {
+                    // The owner chose not to be asked: a change that cannot be made still gets the one neutral answer, so a request
+                    // cannot find out what is on the phone by trying.
+                    line = build(name, args, live = false).card.lines.first()
+                    try { build(name, args, live = true) } catch (failure: PhoneFailure) { throw PhoneFailure("not_found", "That isn't available on this phone.") }
+                }
+            }
             line = prepared.card.lines.first()
             execute(prepared, origin, decision)
         } catch (failure: PhoneFailure) {
@@ -165,6 +185,9 @@ internal class PhoneEngine(
         if (needsApproval(name, origin)) {
             if (decision?.approved != true) throw refused(decision, origin, PhoneSpecs.isWrite(name))
             if (locked()) throw PhoneFailure("denied", "The phone is locked. Unlock it, then approve again.")
+        } else if (PhoneSpecs.isWrite(name) && locked()) {
+            // Nothing is changed on a locked phone, with or without a tap.
+            throw PhoneFailure("unavailable", "The phone is locked. Unlock it, then ask again.", logged = "locked")
         }
         if (!limiter.tryAcquire(origin, PhoneSpecs.isWrite(name))) throw busy()
         // Once the action starts it finishes and is logged as done, even if the conversation that asked is cancelled meanwhile.

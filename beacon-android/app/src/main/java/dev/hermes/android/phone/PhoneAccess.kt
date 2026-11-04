@@ -19,6 +19,8 @@ internal interface PhoneSettings {
     fun hermesAllowed(): Boolean
     /** "Ask before Hermes reads". */
     fun askBeforeHermesReads(): Boolean
+    /** "Ask before Hermes acts": a Hermes change, alarm, timer or message draft waits for the owner's tap. A call keeps its own card either way. */
+    fun askBeforeHermesActs(): Boolean
 }
 
 /**
@@ -29,6 +31,7 @@ object PhoneAccess {
     private const val FILE = "beacon_phone_access"
     private const val HERMES = "hermes_allowed"
     private const val HERMES_ASK = "hermes_ask_reads"
+    private const val HERMES_ASK_ACTS = "hermes_ask_acts"
 
     private fun prefs(context: Context) = context.applicationContext.getSharedPreferences(FILE, Context.MODE_PRIVATE)
 
@@ -57,6 +60,10 @@ object PhoneAccess {
     fun askBeforeHermesReads(context: Context): Boolean = prefs(context).getBoolean(HERMES_ASK, true)
     fun setAskBeforeHermesReads(context: Context, on: Boolean) { prefs(context).edit().putBoolean(HERMES_ASK, on).apply() }
 
+    /** "Ask before Hermes acts": on until the owner turns it off. */
+    fun askBeforeHermesActs(context: Context): Boolean = prefs(context).getBoolean(HERMES_ASK_ACTS, true)
+    fun setAskBeforeHermesActs(context: Context, on: Boolean) { prefs(context).edit().putBoolean(HERMES_ASK_ACTS, on).apply() }
+
     internal fun settings(context: Context): PhoneSettings {
         val app = context.applicationContext
         return object : PhoneSettings {
@@ -65,6 +72,7 @@ object PhoneAccess {
             override fun switchOff(capability: PhoneCapability) = setSwitchedOn(app, capability, false)
             override fun hermesAllowed() = PhoneAccess.hermesAllowed(app)
             override fun askBeforeHermesReads() = PhoneAccess.askBeforeHermesReads(app)
+            override fun askBeforeHermesActs() = PhoneAccess.askBeforeHermesActs(app)
         }
     }
 }

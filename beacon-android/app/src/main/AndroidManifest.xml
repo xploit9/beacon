@@ -70,6 +70,22 @@
                 <data android:scheme="${applicationId}" android:host="auth" android:path="/complete" />
             </intent-filter>
         </activity>
+        <!-- Beacon in Android's share sheet for text, links and images. It draws a small chooser over the sharing app and opens BeaconActivity with the choice;
+             any app may send to it, so everything it receives is treated as untrusted data and nothing is sent without the owner's tap. -->
+        <activity android:name=".share.ShareActivity" android:exported="true" android:excludeFromRecents="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
         <!-- The phone's assist gesture. An exported ASSIST activity is what lists Beacon under Settings > Default digital assistant app; it draws nothing and hands off to BeaconActivity. -->
         <activity android:name=".assist.AssistEntryActivity" android:exported="true" android:excludeFromRecents="true" android:noHistory="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
@@ -115,6 +131,9 @@
         <receiver android:name=".push.NativeActivityReceiver" android:exported="false" />
         <service android:name=".push.NativeActivityActionJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
         <service android:name=".push.NotificationPreviewJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
+        <!-- Reply typed in a reply notification: the system fills the typed text into a PendingIntent that names this receiver; nothing else can reach it. -->
+        <receiver android:name=".push.NotificationReplyReceiver" android:exported="false" />
+        <service android:name=".push.NotificationReplyJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
         <service android:name=".push.PushRegistrationJob" android:exported="false" android:permission="android.permission.BIND_JOB_SERVICE" />
         <service android:name=".push.BeaconMessagingService" android:exported="false">
             <intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT" /></intent-filter>

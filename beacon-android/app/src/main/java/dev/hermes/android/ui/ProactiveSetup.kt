@@ -128,6 +128,59 @@ internal fun proactiveSources(proactive: JSONObject): List<String> {
     }.distinct()
 }
 
+/** One connected source and whether the watch reads it. */
+internal data class ProactiveSource(val name: String, val watched: Boolean)
+
+/** What the Sources sheet shows: every connected source, and whether "All sources" (the default, new sources included) is on. */
+internal data class ProactiveSourcesView(val sources: List<ProactiveSource>, val all: Boolean)
+
+/** The sources Hermes lets the owner choose from, or null when its plugin is older and sends only plain labels. */
+internal fun proactiveSourceChoices(proactive: JSONObject): List<ProactiveSource>? {
+    val rows = proactive.optJSONArray("source_choices") ?: return null
+    return (0 until rows.length()).mapNotNull { index ->
+        val row = rows.optJSONObject(index) ?: return@mapNotNull null
+        val name = (row.opt("name") as? String)?.trim()?.takeIf(String::isNotBlank) ?: return@mapNotNull null
+        // A source nobody turned off is watched.
+        ProactiveSource(name, row.optBoolean("watched", true))
+    }.distinctBy { it.name }
+}
+
+/** The sheet's state: what Hermes sent, with the owner's latest tap over it until the save answers. [pick] is the chosen names; empty means all. */
+internal fun proactiveSourcesView(proactive: JSONObject, pick: List<String>? = null): ProactiveSourcesView? {
+    val sources = proactiveSourceChoices(proactive) ?: return null
+    if (pick == null) return ProactiveSourcesView(sources, all = proactive.optBoolean("sources_all", true))
+    return ProactiveSourcesView(sources.map { it.copy(watched = pick.isEmpty() || it.name in pick) }, all = pick.isEmpty())
+}
+
+internal fun proactiveSourceName(name: String): String = ruleSourceWords(name) ?: name
+
+/** The row's value: "All sources", or the first two chosen names and a count of the rest. */
+internal fun proactiveWatchSummary(view: ProactiveSourcesView, allLabel: String): String =
+    if (view.all) allLabel else proactiveSourcesSummary(view.sources.filter { it.watched }.map { proactiveSourceName(it.name) })
+
+/** The names to save after "All sources" is switched; an empty list is all of them, and switching it off names every source to start from. */
+internal fun proactiveSourcesAfterAll(view: ProactiveSourcesView, on: Boolean): List<String> = if (on) emptyList() else view.sources.map { it.name }
+
+/**
+ * The names to save after one source is switched, or null when the tap changes nothing. With All sources on every source shows on,
+ * and switching one off keeps all the others; switching one on changes nothing then. The last one watched stays on.
+ */
+internal fun proactiveSourcesAfterToggle(view: ProactiveSourcesView, name: String, on: Boolean): List<String>? {
+    if (view.sources.none { it.name == name }) return null
+    if (view.all) return if (on) null else view.sources.filter { it.name != name }.map { it.name }.takeIf { it.isNotEmpty() }
+    return view.sources.filter { if (it.name == name) on else it.watched }.map { it.name }.takeIf { it.isNotEmpty() }
+}
+
+internal fun proactiveSourcesBody(names: List<String>): JSONObject = json("sources" to org.json.JSONArray(names))
+
+internal suspend fun saveProactiveSources(vm: BeaconViewModel, profile: String, names: List<String>): JSONObject {
+    val source = vm.client ?: throw IllegalStateException("Connect to Hermes to manage Proactive.")
+    val client = source.forAuthorizedProfile(profile)
+    return try {
+        client.call(PROACTIVE_SETTINGS_PATH, mapOf("profile" to profile), method = "PUT", data = proactiveSourcesBody(names))
+    } finally { client.closeNative() }
+}
+
 internal suspend fun saveProactiveSettings(vm: BeaconViewModel, profile: String, body: JSONObject): JSONObject {
     require(proactiveSettingsValid(body)) { "Choose a valid delivery, check interval, and quiet-hours time." }
     val source = vm.client ?: throw IllegalStateException("Connect to Hermes to manage Proactive.")

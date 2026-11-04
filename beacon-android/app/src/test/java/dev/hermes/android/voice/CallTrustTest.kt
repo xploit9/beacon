@@ -116,6 +116,86 @@ class CallTrustTest {
         assertEquals("locked", refused.getString("error_code"))
         assertTrue(refused.getString("message").startsWith("Unlock your phone first."))
         assertTrue(refused.getString("message").contains("ask the owner to unlock"))
+        // Plainly what to say, and that the conversation goes on after it.
+        assertTrue(refused.getString("message").contains("as soon as they have"))
+        assertTrue(refused.getString("message").contains("Unlock button"))
         assertFalse(refused.has("result") || refused.has("tools") || refused.has("summary"))
+        assertEquals(LOCKED_TOOL_MESSAGE, refused.getString("message"))
+    }
+
+    // ---- Lane LS: a locked conversation talks, says to unlock for what is private, and carries on trusted after the unlock ----
+
+    @Test fun theBriefOfAnUntrustedConversationTellsTheModelThePhoneIsLockedAndToAskForTheUnlock() {
+        val locked = liveInstruction(withholdPersonal(pluginContext()))
+        assertTrue(locked.contains(LOCKED_BRIEF))
+        assertTrue(LOCKED_BRIEF.contains("unlock their phone first"))
+        // It tries the tool anyway: the refusal is what puts the Unlock button on the screen, and nothing is read for it.
+        assertTrue(LOCKED_BRIEF.contains("call the tool you would normally use"))
+        assertTrue(LOCKED_BRIEF.contains("Unlock button"))
+        assertTrue("and in the owner's language", LOCKED_BRIEF.contains("in the language they speak"))
+        // Control: the whole brief of a trusted conversation does not say the phone is locked.
+        assertFalse(liveInstruction(pluginContext()).contains(LOCKED_BRIEF))
+        assertFalse(callBrief(pluginContext(), trusted = true).toString().contains("phone is locked"))
+        assertTrue(callBrief(pluginContext(), trusted = false).toString().contains(LOCKED_BRIEF))
+        // The persona slot carries only the note: nothing of the owner's own persona.
+        assertEquals(LOCKED_BRIEF, withholdPersonal(pluginContext()).getString("system_instruction"))
+    }
+
+    @Test fun anUnlockTellsTheConversationOnceWhicheverWayItIsSeen() {
+        locked = true
+        val signalled = trust()
+        var told = 0
+        signalled.whenTrusted { told++ }
+        assertFalse(signalled.trusted())
+        assertEquals(0, told)
+        signalled.unlocked(); signalled.unlocked()
+        assertEquals("once, however often it is seen", 1, told)
+        // Seen by a read when a tool runs, instead of a broadcast.
+        val read = trust()
+        read.whenTrusted { told++ }
+        locked = false
+        assertTrue(read.trusted())
+        assertTrue(read.trusted())
+        read.unlocked()
+        assertEquals(2, told)
+    }
+
+    @Test fun aConversationThatStartedTrustedNeverTellsAnyone() {
+        locked = false
+        val open = trust()
+        var told = 0
+        open.whenTrusted { told++ }
+        open.unlocked(); open.trusted()
+        assertEquals(0, told)
+    }
+
+    @Test fun aRefusalIsCountedForTheOverlayAndRememberedByItsConversation() {
+        locked = true
+        val first = trust()
+        val second = trust()
+        val before = CallTrust.lockedAsks.value
+        assertFalse(first.wasRefused())
+        first.refused()
+        assertTrue(first.wasRefused())
+        assertFalse("another conversation was not turned away", second.wasRefused())
+        assertEquals(before + 1, CallTrust.lockedAsks.value)
+        second.refused()
+        assertEquals(before + 2, CallTrust.lockedAsks.value)
+    }
+
+    @Test fun theCueAfterTheUnlockCarriesOutTheRefusedRequestOrAsksForItAgainWithoutGreeting() {
+        assertTrue(TRUSTED_CUE.contains("unlocked the phone"))
+        assertTrue(TRUSTED_CUE.contains("do it now"))
+        assertTrue(TRUSTED_CUE.contains("say it again"))
+        assertTrue(TRUSTED_CUE.contains("Do not greet again"))
+        assertTrue("a note from the app, never the owner's words", TRUSTED_CUE.startsWith("[Note from the app, not the owner"))
+    }
+
+    // Owner, 4 Nov: "anything personal can be a setting ... so a user can decide for the assistant to have control even in lock screen".
+    @Test fun theOwnersLockScreenChoiceDecidesWhetherALockedPhoneHoldsPersonalThingsBack() {
+        assertTrue("off by default: a locked phone holds them back", heldBackWhileLocked(locked = true, allowedWhileLocked = false))
+        assertFalse("on: memory and tools work while locked", heldBackWhileLocked(locked = true, allowedWhileLocked = true))
+        assertFalse(heldBackWhileLocked(locked = false, allowedWhileLocked = false))
+        assertFalse(heldBackWhileLocked(locked = false, allowedWhileLocked = true))
     }
 }

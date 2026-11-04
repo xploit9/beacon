@@ -92,7 +92,7 @@ internal fun assistantConversationToSelect(openScope: Scope?, openSessionId: Str
 data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L, val displayKind: String = "") {
     companion object {
         fun from(o: JSONObject, index: Int, sessionId: String = ""): Message {
-            val content = when { o.has("display_content") && !o.isNull("display_content") -> o.opt("display_content"); o.has("display_text") && !o.isNull("display_text") -> o.opt("display_text"); o.has("text") && !o.isNull("text") -> o.opt("text"); else -> o.opt("content") }
+            val content = historyRowContent(o)
             val parts = (content as? JSONArray)?.objects().orEmpty()
             val text = messageContentText(o.string("role", "assistant"), content)
             val snapshots = o.optJSONObject("_media_snapshots")?.let { values -> values.keys().asSequence().take(256).mapNotNull { path -> values.optString(path).takeIf(::validMediaSnapshot)?.takeIf { path.length in 1..8192 && path.none { it.code < 32 || it.code == 127 } }?.let { path to it.lowercase() } }.toMap() }.orEmpty()
@@ -202,7 +202,7 @@ internal fun unsavedOpenChatRead(error: Throwable, id: String, clientCreated: Bo
 internal fun pendingPrompt(event: JSONObject): JSONObject? = event.optJSONObject("pending") ?: event.takeUnless { it.has("pending") }
 // Hermes stores model-switch steering as user rows, so the reserved prefix identifies it.
 internal fun visibleTranscriptMessages(messages: List<Message>): List<Message> =
-    messages.filterNot { it.text.trimStart().startsWith("[System:") }
+    messages.filterNot { isSteeringText(it.text) }
 
 /** How many of the newest rows a chat-list preview reads, at most how many bytes, and for how many of the top chats. */
 internal const val PREVIEW_READ_WINDOW = 8
@@ -237,6 +237,48 @@ internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed
     if (chat.streamId != stream) return chat
     return if (replyConfirmed) chat.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), status = terminalStatus)
     else chat.copy(streamId = "", liveTools = emptyList())
+}
+
+/** The chat without the live segment and tool cards the saved [rows] already hold; the turn itself is not ended here. */
+internal fun withoutSavedLive(chat: ChatState, rows: List<JSONObject>, boundary: LiveAssistantBoundary): ChatState {
+    val turn = runningTurnMessages(rows)
+    val owned = historyToolIdentities(turn)
+    val wordsSaved = historyOwnsTextSegment(turn, chat.liveText, boundary.closed)
+    return chat.copy(liveText = if (wordsSaved) "" else chat.liveText, liveReasoning = if (wordsSaved) "" else chat.liveReasoning,
+        liveTools = chat.liveTools.filterNot { toolIdentity(it).isNotBlank() && toolIdentity(it) in owned })
+}
+
+/** What the live view keeps once the saved [rows] are known: the segment they hold is dropped, and the turn is over when they hold its end. */
+internal data class LiveSettlement(val streamEnded: Boolean, val text: String, val reasoning: String, val tools: List<JSONObject>)
+internal fun settleLive(old: ChatState, rows: List<JSONObject>, active: String?, boundary: LiveAssistantBoundary, finalRow: String): LiveSettlement {
+    val turn = runningTurnMessages(rows)
+    val historyOwnsLive = (finalRow.isNotBlank() && rows.any { it.string("row_id", it.string("_row_id")) == finalRow }) ||
+        historyOwnsLiveBoundary(turn, old.liveTools, boundary.closed, boundary.toolIds)
+    val streamEnded = historyOwnsLive || (!active.isNullOrBlank() && active != old.streamId)
+    val kept = withoutSavedLive(old, rows, boundary)
+    return LiveSettlement(streamEnded,
+        text = if (streamEnded) "" else kept.liveText,
+        reasoning = if (streamEnded) "" else kept.liveReasoning,
+        tools = if (streamEnded) emptyList() else kept.liveTools)
+}
+
+/** The chat after one stream event that moves the live bubble, reasoning or tool cards; null for every other event. [previousClosed] is the boundary before the event, [next] the one it leaves. */
+internal fun liveAfterEvent(s: ChatState, type: String, o: JSONObject, previousClosed: Boolean, next: LiveAssistantBoundary): ChatState? = when (type) {
+    "token" -> s.copy(liveText = (if (previousClosed) "" else s.liveText) + o.string("text"), liveReasoning = if (previousClosed) "" else s.liveReasoning, status = "Responding")
+    "reasoning" -> s.copy(liveText = if (previousClosed) "" else s.liveText, liveReasoning = (if (previousClosed) "" else s.liveReasoning) + o.string("text"), status = "Thinking")
+    "tool", "tool_complete" -> {
+        val turn = runningTurnMessages(s.raw.rows("messages"))
+        val ownsBody = historyOwnsLiveBoundary(turn, emptyList(), next.closed, next.toolIds) || historyOwnsTextSegment(turn, s.liveText, next.closed)
+        s.copy(liveText = if (ownsBody) "" else s.liveText, liveReasoning = if (ownsBody) "" else s.liveReasoning,
+            liveTools = if (toolIdentity(o).isNotBlank() && toolIdentity(o) in historyToolIdentities(turn)) s.liveTools else mergeLiveTool(s.liveTools, o),
+            status = if (type == "tool") "Using ${dev.hermes.android.ui.toolDisplayName(o)}" else "Working")
+    }
+    "interim_assistant" -> interimAssistantBody(s.liveText, s.liveReasoning, o).let { body ->
+        val turn = runningTurnMessages(s.raw.rows("messages"))
+        val owned = historyOwnsLiveBoundary(turn, emptyList(), next.closed, next.toolIds) || historyOwnsTextSegment(turn, body.text, next.closed)
+        s.copy(liveText = if (owned) "" else body.text, liveReasoning = if (owned) "" else body.reasoning)
+    }
+    else -> null
 }
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
@@ -311,6 +353,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, screens = screens,
         globalClient = { client }, authorizeProfile = ::authorizeSettingsProfile, profileFailure = ::profileSettingsFailure) { settingsProfileClient() }
     val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat, screens = screens) { client }
+    /** The email draft cards of the open chats: each keeps its state while it is scrolled out of view. */
+    internal val emailDrafts = dev.hermes.android.ui.EmailDraftStore(viewModelScope)
     /** Makes, describes and deletes profiles for Settings › Profiles and Bot Mode. */
     val profileAdmin = dev.hermes.android.data.NativeProfileAdmin(viewModelScope, { client }, ::profilesChanged)
     /** Beacon's own plugin install from the app; [pluginInstalled] runs when Beacon is ready on this Hermes. */
@@ -557,6 +601,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             app.push.emailAlerts.collect { scope -> if (scope == sourceScope) client?.let { refreshChatAlerts(scope, it) } }
         }
         viewModelScope.launch { app.push.conversationPosts.collect(::refreshPostedConversation) }
+        // Something shared into Beacon from Android's share sheet: the chat the owner chose opens with it in the composer.
+        viewModelScope.launch { dev.hermes.android.share.SharedIntake.pending.collect { share -> if (share != null) dev.hermes.android.share.openShared(this@BeaconViewModel, share) } }
         viewModelScope.launch {
             var previousFinals = emptyList<CallTranscript>()
             var wasActive = false
@@ -1355,7 +1401,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             client?.let { prepareStartup(); recoverForeground() }
         }
     }
-    fun finishSetupWizard(keepConnected: Boolean = true) {
+    /** [openSettings] names a settings page to open once setup is done (the wizard's last screen links Phone access and Proactive). */
+    fun finishSetupWizard(keepConnected: Boolean = true, openSettings: String? = null) {
         if (!_ui.value.authenticated) return
         clearPendingVoiceKeyRequests()
         setKeepConnectedEnabled(keepConnected)
@@ -1363,6 +1410,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         saveSetupProgress("done", complete = true, active = false)
         tab("Chat")
         openInitialChat()
+        openSettings?.let { tab("More"); more(it) }
     }
     private suspend fun persistAuthIfCurrent(auth: AuthContext, version: Long?, snapshot: Boolean, selectProfileIf: (() -> Boolean)? = null): Boolean {
         if (app.auth.persistIfUnchanged(auth, version, snapshot, selectProfileIf)) return true
@@ -2848,6 +2896,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (!ready) notice(if (_ui.value.tab == "Beacon") "Open ${dev.hermes.android.data.currentAssistantName}'s conversation before sending or changing it. Your scoped draft is retained." else "Open a conversation before continuing.")
         return ready
     }
+    /** Returns once the chat just selected has finished loading (its saved draft restored); the share hand-off adds to it only then. */
+    internal suspend fun awaitSelection() { selectionJob?.join() }
     fun selectSession(id: String, editorDraft: String? = null, preserveInitialDraft: Boolean = false, initialResponse: JSONObject? = null, closeMenu: Boolean = true, onCachedReady: (() -> Unit)? = null, titleHint: String = "") {
         selectionJob?.cancel()
         val navigation = ++navigationGeneration
@@ -3075,24 +3125,17 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         _chat.update { old ->
             val rows = o.rows("messages")
             val active = (o.opt("active_stream_id") as? String)?.takeIf { it.matches(streamIdPattern) }
-            val turn = currentTurnMessages(rows)
-            val owned = historyToolIdentities(turn)
             val boundary = liveBoundaries["${scope.key}:${old.streamId}"] ?: LiveAssistantBoundary()
             val proof = persistedTurns["${scope.key}:${old.streamId}"]
-            val finalRow = proof?.string("final_assistant_row_id").orEmpty()
-            val historyOwnsLive = (finalRow.isNotBlank() && rows.any { it.string("row_id", it.string("_row_id")) == finalRow }) ||
-                historyOwnsLiveBoundary(turn, old.liveTools, boundary.closed, boundary.toolIds)
-            val streamEnded = historyOwnsLive || (!active.isNullOrBlank() && active != old.streamId)
+            val live = settleLive(old, rows, active, boundary, proof?.string("final_assistant_row_id").orEmpty())
             old.copy(projectionReady = true,
                 sessionReasoningEffort = o.string("reasoning_effort").ifBlank { if (o.has("model_config")) "" else old.sessionReasoningEffort },
                 approval = if (o.has("pending_approval")) o.optJSONObject("pending_approval") else old.approval,
                 clarification = if (o.has("pending_clarification")) o.optJSONObject("pending_clarification") else old.clarification,
                 sessionId = scope.session, title = shownTitle.ifBlank { old.title.takeIf { old.sessionId == scope.session } ?: "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) }, raw = o,
-                status = renderedChatStatus(old, active, streamEnded),
-                streamId = active?.takeIf { it.isNotBlank() } ?: if (streamEnded) "" else old.streamId,
-                liveText = if (streamEnded) "" else old.liveText,
-                liveReasoning = if (streamEnded) "" else old.liveReasoning,
-                liveTools = if (streamEnded) emptyList() else old.liveTools.filterNot { toolIdentity(it).isNotBlank() && toolIdentity(it) in owned })
+                status = renderedChatStatus(old, active, live.streamEnded),
+                streamId = active?.takeIf { it.isNotBlank() } ?: if (live.streamEnded) "" else old.streamId,
+                liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools)
         }
         projectCallTranscripts()
     }
@@ -3168,6 +3211,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val excerpt = dev.hermes.android.ui.quoteExcerpt(text).takeIf(String::isNotBlank) ?: return
         val quoted = dev.hermes.android.ui.quotedDraft(excerpt, _composer.value.text)
         composer(TextFieldValue(quoted, TextRange(quoted.length)))
+    }
+    /** A draft card's Send, when Hermes has to send the email itself, says so in the chat as the owner's own message: possible while the composer is free. */
+    fun canSendAsOwner() = _composer.value.text.isBlank() && _attachments.value.isEmpty()
+    fun sendAsOwner(text: String) {
+        if (!canSendAsOwner()) { notice("Send or clear your message first."); return }
+        composer(TextFieldValue(text, TextRange(text.length)))
+        send()
     }
     fun composer(value: TextFieldValue, fromEditor: Boolean = false) {
         if (value.text.length > 50_000) { notice("Draft is limited to 50,000 characters"); return }
@@ -3837,7 +3887,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val frame = liveFrames[frameKey] ?: app.cache.read(scope, "live:$stream")?.let(::JSONObject)
             val last = frame?.string("cursor").orEmpty()
             if (frame != null) liveBoundaries[frameKey] = LiveAssistantBoundary.from(frame)
-            if (frame != null && sourceScope == scope) _chat.update { it.copy(liveText = frame.string("text"), liveReasoning = frame.string("reasoning"), liveTools = frame.rows("tools"), streamId = stream) }
+            // A checkpoint can be older than the history read since: what that history holds does not come back.
+            if (frame != null && sourceScope == scope) _chat.update { chat ->
+                val restored = chat.copy(liveText = frame.string("text"), liveReasoning = frame.string("reasoning"), liveTools = frame.rows("tools"), streamId = stream)
+                if (restored.raw.has("messages")) withoutSavedLive(restored, restored.raw.rows("messages"), LiveAssistantBoundary.from(frame)) else restored
+            }
             if (frame != null && sourceScope == scope && _chat.value.raw.has("messages") && _chat.value.raw.string("active_stream_id") == stream) renderSession(_chat.value.raw, scope)
             val cursor = ReplayCursor(stream, last)
             var lastCheckpoint = 0L
@@ -3982,20 +4036,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         liveBoundaries[boundaryKey] = nextBoundary
         if (event.type in setOf("done", "state_saved") && o.optJSONObject("session")?.has("messages") == true) ++chatHistoryRevision
         if (event.type in setOf("apperror", "error")) _ui.update { it.copy(error = turnErrorText(o)) }
-        _chat.update { s -> when (event.type) {
-            "token" -> s.copy(liveText = (if (previousClosed) "" else s.liveText) + o.string("text"), liveReasoning = if (previousClosed) "" else s.liveReasoning, status = "Responding")
-            "reasoning" -> s.copy(liveText = if (previousClosed) "" else s.liveText, liveReasoning = (if (previousClosed) "" else s.liveReasoning) + o.string("text"), status = "Thinking")
-            "tool", "tool_complete" -> {
-                val turn = currentTurnMessages(s.raw.rows("messages"))
-                val ownsBody = historyOwnsLiveBoundary(turn, emptyList(), nextBoundary.closed, nextBoundary.toolIds)
-                s.copy(liveText = if (ownsBody) "" else s.liveText, liveReasoning = if (ownsBody) "" else s.liveReasoning,
-                    liveTools = if (toolIdentity(o).isNotBlank() && toolIdentity(o) in historyToolIdentities(turn)) s.liveTools else mergeLiveTool(s.liveTools, o),
-                    status = if (event.type == "tool") "Using ${dev.hermes.android.ui.toolDisplayName(o)}" else "Working")
-            }
-            "interim_assistant" -> interimAssistantBody(s.liveText, s.liveReasoning, o).let { body ->
-                val owned = historyOwnsLiveBoundary(currentTurnMessages(s.raw.rows("messages")), emptyList(), nextBoundary.closed, nextBoundary.toolIds)
-                s.copy(liveText = if (owned) "" else body.text, liveReasoning = if (owned) "" else body.reasoning)
-            }
+        _chat.update { s -> liveAfterEvent(s, event.type, o, previousClosed, nextBoundary) ?: when (event.type) {
             "title" -> s.copy(title = o.string("title").ifBlank { s.title })
             "approval" -> s.copy(approval = pendingPrompt(o))
             "clarify" -> s.copy(clarification = pendingPrompt(o))

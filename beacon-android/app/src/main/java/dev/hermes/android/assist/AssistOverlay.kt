@@ -229,7 +229,7 @@ private val OnGold = Color(0xFF2E1C00)
     // controller's flag follows the broadcasts and the lock screen is read now as well, so a lock that came up between two broadcasts is not missed.
     val keyguardLocked = rememberKeyguardLocked()
     val phoneLocked = overlayLocked(c.locked, keyguardLocked())
-    // Locked with no conversation running, the text box is inert: nothing to type, send or dictate, and its orb only asks for the unlock.
+    // Locked with no conversation running, the text box is inert: nothing to type, send or dictate (a written question goes into the private chat); its orb talks.
     val pillLocked = pillInert(phoneLocked, live)
     // The chips start rising a frame after the overlay shows (they are clear for their first 200 ms), so the first frame after
     // the gesture composes as little as it can.
@@ -374,7 +374,7 @@ internal val ContentDirection = androidx.compose.ui.text.TextStyle(textDirection
  * What the text box shows and does, apart from the controller: the overlay passes its controller's, a Compose test its own. [face] is
  * the orb's (a tap to talk, or the conversation's state), [status] the words for it, [voice] the conversation's voice level (read
  * while drawing) and [onOrb] a tap on it: talk, or, live, end the conversation. [onSend] gets the question an attached screen asks.
- * [locked] is the locked phone's text box (see [pillInert]): nothing to type, send or dictate, no hint, and the orb only asks for the unlock.
+ * [locked] is the locked phone's text box (see [pillInert]): nothing to type, send or dictate, and no hint; the orb still talks.
  */
 internal class PillInput(
     val state: AssistOverlayState,
@@ -716,7 +716,7 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
 
 @Composable private fun LineRow(c: AssistOverlayController, line: OverlayLine, callFailure: CallReason?) {
     val onAction: () -> Unit = when (lineAction(line, callFailure)) {
-        // Asks Android for the unlock again; the overlay stays, and the unlock brings it back as a fresh start.
+        // Asks Android for the unlock again; the overlay stays, and after the unlock it comes back with the same conversation.
         LineAction.Unlock -> c::unlock
         LineAction.Allow -> c::openPermissions
         // Both open Beacon; locked, the phone unlocks first (needsUnlock). SignIn lands on the sign-in the app shows.

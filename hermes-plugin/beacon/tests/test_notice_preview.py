@@ -53,6 +53,19 @@ def test_completion_notice_detail_carries_the_reply(harness, monkeypatch):
     assert detail["preview"] == {"title": "Weekend in Lisbon", "body": "Here is a two-day plan."}
 
 
+def test_a_reply_in_the_beacon_chat_says_so_so_the_phone_titles_it_with_the_assistants_name(harness, monkeypatch):
+    # Owner, 4 Nov: a reply notice from the Beacon chat showed the chat's auto title ("hi"); the phone names it after the assistant.
+    api, client, cfg, _, _ = harness
+    monkeypatch.setattr(api.native, "conversation_snapshot", lambda *args: {"title": "hi", "messages": [{"role": "assistant", "text": "Alarm set."}]})
+    import time
+    for event, conversation in (("a" * 32, cfg["scheduled_callback_conversation_id"]), ("b" * 32, "native-stored")):
+        with api.mobile.connect() as conn:
+            conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)",
+                         (event, "owner", "default", "completion", conversation, time.time(), time.time() + 300))
+    assert client.get(f"/api/plugins/beacon/mobile/notifications/events/{'a' * 32}").json()["assistant_chat"] is True
+    assert client.get(f"/api/plugins/beacon/mobile/notifications/events/{'b' * 32}").json()["assistant_chat"] is False
+
+
 def test_legacy_alert_notice_detail_uses_generic_title_and_keeps_feedback_marker(harness):
     import time
     api, client, _, _, _ = harness

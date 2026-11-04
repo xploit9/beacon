@@ -19,7 +19,7 @@ import java.io.File
  * Lane AO: the side-button assistant talks at once, in one surface. The overlay's reducer and pure rules, without Android: a fresh
  * show goes live (or asks for the microphone), a re-show keeps what was on screen, closing ends the conversation, the text box stays
  * with the orb showing the conversation, the captions are the last two lines, and phone approvals show inside the overlay. All of it
- * is the unlocked phone's: on a locked one the show asks for the unlock first and starts nothing (AssistUnlockFirstTest, Lane LK).
+ * holds locked too: the show starts the conversation, which is untrusted until the unlock (AssistLockedTalkTest, Lane LS).
  */
 class AssistLiveModelTest {
     private fun shown(fresh: Boolean = true, callActive: Boolean = false) = reduce(AssistOverlayState(), OverlayEvent.Show(fresh = fresh, callActive = callActive))
@@ -50,8 +50,9 @@ class AssistLiveModelTest {
         assertEquals("Never a dead end: the pill stays, with its one-tap line", OverlaySurface.Pill, line.surface)
         assertEquals(OverlayLine.Microphone, line.line)
         assertEquals(LineAction.Allow, lineAction(OverlayLine.Microphone))
-        // Unlocked, starting needs nothing but the microphone; locked it waits for the unlock first (AssistUnlockFirstTest).
+        // Starting needs nothing but the microphone, locked or not (AssistLockedTalkTest).
         assertFalse(needsUnlock(OverlayAction.Live, locked = false))
+        assertFalse(needsUnlock(OverlayAction.Live, locked = true))
         // The orb is the talk button again, ready for a tap once the microphone is allowed.
         assertEquals(OrbFace.Talk, orbFace(live = false, call = CallState()))
     }

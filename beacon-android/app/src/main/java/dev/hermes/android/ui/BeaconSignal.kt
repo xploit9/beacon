@@ -416,13 +416,14 @@ internal class DustField(seed: Long) {
                 }
                 !motion || !placed -> { x[i] = tx; y[i] = ty }
                 else -> {
-                    val rate = if (own == BeaconDustMood.Listening) 9f else 3.2f
+                    // After a reply the swarm comes home from above the crown at the resting pace; the magnet's quick pull and its
+                    // streaks build up as it arrives, so ending a reply never flashes a burst of long lines (owner, 4 Nov).
+                    val rate = if (own == BeaconDustMood.Listening) listeningPull(ageMillis) else 3.2f
                     val k = 1f - exp(-rate * ppace[i] * dt)
                     val ox = x[i]; val oy = y[i]
                     x[i] += (tx - x[i]) * k; y[i] += (ty - y[i]) * k
                     if (own == BeaconDustMood.Listening && streaks < DUST_PILL) {
-                        val s = streaks * 4
-                        lines[s] = ox - (x[i] - ox) * 3f; lines[s + 1] = oy - (y[i] - oy) * 3f; lines[s + 2] = x[i]; lines[s + 3] = y[i]
+                        listeningStreak(ox, oy, x[i], y[i], STREAK_MAX_DP * density, smoothstep(0f, LISTEN_SETTLE_MILLIS, ageMillis), lines, streaks * 4)
                         streaks++
                     }
                 }
@@ -573,6 +574,25 @@ private fun easeOut(q: Float) = 1f - (1f - q) * (1f - q) * (1f - q)
 
 /** Rises past 1 and settles back: the aurora's bloom on summon. */
 private fun easeOutBack(q: Float): Float { val s = 1.6f; val p = q - 1f; return 1f + (s + 1f) * p * p * p + s * p * p }
+
+/** How long after the swarm starts listening its magnet reaches full pull: the glide home after a reply. */
+internal const val LISTEN_SETTLE_MILLIS = 700f
+private const val STREAK_MAX_DP = 7f
+
+/** The listening pull: the resting pace right after the mood changes, the magnet's full pull once [ageMillis] passes the glide home. */
+internal fun listeningPull(ageMillis: Float): Float = 3.2f + 5.8f * smoothstep(0f, LISTEN_SETTLE_MILLIS, ageMillis)
+
+/**
+ * One listening streak into [out] at [at]: the speck's step this frame drawn back three times its length, but never longer than [cap],
+ * and scaled by [settle] (0 while the swarm is still gliding home, 1 once it is there).
+ */
+internal fun listeningStreak(ox: Float, oy: Float, nx: Float, ny: Float, cap: Float, settle: Float, out: FloatArray, at: Int) {
+    var dx = (nx - ox) * 3f; var dy = (ny - oy) * 3f
+    val length = kotlin.math.hypot(dx, dy)
+    val scale = settle.coerceIn(0f, 1f) * if (length > cap && length > 0f) cap / length else 1f
+    dx *= scale; dy *= scale
+    out[at] = nx - dx; out[at + 1] = ny - dy; out[at + 2] = nx; out[at + 3] = ny
+}
 
 private fun smoothstep(from: Float, to: Float, v: Float): Float { val q = ((v - from) / (to - from)).coerceIn(0f, 1f); return q * q * (3f - 2f * q) }
 

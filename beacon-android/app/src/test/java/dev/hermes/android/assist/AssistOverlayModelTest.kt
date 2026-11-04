@@ -310,17 +310,18 @@ class AssistOverlayModelTest {
         assertEquals(question, answered.ask?.question)
         assertEquals("", answerQuestion(locked = true, ask = answered.ask!!))
         // Hide, lock, show again: the card returns with its question held, and it is drawn only once the phone is unlocked.
-        val reshown = reduce(reduce(answered, OverlayEvent.Hidden), OverlayEvent.Show(fresh = false, callActive = false, locked = true))
+        val reshown = reduce(reduce(answered, OverlayEvent.Hidden), OverlayEvent.Show(fresh = false, callActive = false))
         assertEquals(OverlaySurface.Answer, reshown.surface)
         assertEquals("", answerQuestion(locked = true, ask = reshown.ask!!))
         assertEquals(question, answerQuestion(locked = false, ask = reshown.ask))
     }
 
-    @Test fun lockedNothingIsAskedHeardOrStartedAndOpeningAnythingUnlocksFirst() {
-        // On a locked phone the side button asks for the unlock first (Lane LK): asking, dictating and starting wait for it, as does
-        // everything that opens the app or a settings screen. Ending a conversation, closing and dismissing never do.
-        val free = listOf(OverlayAction.EndCall, OverlayAction.Type, OverlayAction.CloseCard, OverlayAction.Dismiss, OverlayAction.AttachScreen)
-        val gated = listOf(OverlayAction.Ask, OverlayAction.Dictate, OverlayAction.Live,
+    @Test fun lockedNothingIsWrittenOrDictatedAndOpeningAnythingUnlocksFirstButTalkingNever() {
+        // On a locked phone the side button talks at once (Lane LS): only what ends in the assistant's chat (a written question, a
+        // dictation) waits for the unlock, as does everything that opens the app or a settings screen. Talking, ending a conversation,
+        // closing and dismissing never do.
+        val free = listOf(OverlayAction.Live, OverlayAction.EndCall, OverlayAction.Type, OverlayAction.CloseCard, OverlayAction.Dismiss, OverlayAction.AttachScreen)
+        val gated = listOf(OverlayAction.Ask, OverlayAction.Dictate,
             OverlayAction.OpenInBeacon, OverlayAction.ContinueChat, OverlayAction.OpenWaiting, OverlayAction.Reveal, OverlayAction.Settings)
         assertEquals(OverlayAction.entries.toSet(), (free + gated).toSet())
         free.forEach { assertFalse("$it must work locked", needsUnlock(it, locked = true)) }

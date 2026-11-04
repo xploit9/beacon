@@ -33,7 +33,10 @@ import androidx.lifecycle.repeatOnLifecycle
 import dev.hermes.android.assist.ContentDirection
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.phone.HermesPhoneRequests
+import dev.hermes.android.phone.PhoneCountdown
 import dev.hermes.android.phone.PhoneOutcome
+import dev.hermes.android.voice.CallToolApproval
+import dev.hermes.android.voice.PhoneApprovalText
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -42,7 +45,9 @@ internal const val PHONE_REQUEST_POLL_MILLIS = 5_000L
 
 /**
  * Shows the card for the oldest phone request Hermes is waiting on, and keeps Hermes told what this phone allows while Beacon is open.
- * Pushes bring requests when Beacon is closed; this is the way in when the owner taps that notification.
+ * Pushes bring requests when Beacon is closed; this is the way in when the owner taps that notification. While it is in front, a
+ * request that opens another app's screen may run without a card once "Ask before Hermes acts" is off; a call to a saved contact then
+ * shows the call countdown (Cancel, Call now) instead of Allow and Deny.
  */
 @Composable
 internal fun HermesPhoneApprovalHost(client: BeaconClient?) {
@@ -52,10 +57,13 @@ internal fun HermesPhoneApprovalHost(client: BeaconClient?) {
     LaunchedEffect(client, lifecycle) {
         if (client == null) return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
-            while (true) {
-                HermesPhoneRequests.keepCurrent(context, client)
-                delay(PHONE_REQUEST_POLL_MILLIS)
-            }
+            HermesPhoneRequests.setFront(true)
+            try {
+                while (true) {
+                    HermesPhoneRequests.keepCurrent(context, client)
+                    delay(PHONE_REQUEST_POLL_MILLIS)
+                }
+            } finally { HermesPhoneRequests.setFront(false) }
         }
     }
     // Only the signed-in account's requests are shown; another account's wait for its own sign-in.
@@ -75,38 +83,60 @@ internal fun HermesPhoneApprovalHost(client: BeaconClient?) {
         }
     }
     val scope = rememberCoroutineScope()
+    // A call that counts down does so once, at the first draw, and only while the card is fresh and the phone unlocked; after the
+    // countdown's answer leaves the card on screen (locked, no answer from Hermes, ended) the ordinary Allow and Deny take over.
+    var countdownOver by remember(card.request.id) { mutableStateOf(false) }
+    val counting = remember(card.request.id) {
+        PhoneCountdown.startsAtFirstDraw(card.held.countdown, card.held.askedAt, SystemClock.elapsedRealtime(), HermesPhoneRequests.locked(context))
+    } && !countdownOver
     // The card a live call shows for the same request: the headline, who or where, the details and the notes or message, whole.
     val shown = card.card
+    val headline = phoneLineText(shown.headline)
+    val details = shown.details().map { phoneLineText(it) }
+    val onAllow = {
+        busy = true
+        retry = false
+        scope.launch {
+            val outcome = HermesPhoneRequests.approve(context, card)
+            busy = false
+            if (outcome == PhoneOutcome.Locked) locked = true
+            if (outcome == PhoneOutcome.Retry) retry = true
+            if (outcome == PhoneOutcome.Expired || outcome == PhoneOutcome.Gone) ended = true
+            if (outcome in setOf(PhoneOutcome.Locked, PhoneOutcome.Retry, PhoneOutcome.Expired, PhoneOutcome.Gone)) countdownOver = true
+        }
+        Unit
+    }
+    val onDeny = {
+        busy = true
+        retry = false
+        scope.launch {
+            val outcome = HermesPhoneRequests.deny(context, card)
+            busy = false
+            if (outcome == PhoneOutcome.Retry) retry = true
+            if (outcome == PhoneOutcome.Expired || outcome == PhoneOutcome.Gone) ended = true
+            if (outcome in setOf(PhoneOutcome.Retry, PhoneOutcome.Expired, PhoneOutcome.Gone)) countdownOver = true
+        }
+        Unit
+    }
+    if (counting && !ended && card.request.deadline > now) {
+        PhoneCallCountdownDialog(
+            CallToolApproval(card.request.id, card.request.id, card.request.tool, "", busy = busy,
+                phone = PhoneApprovalText(headline, shown.target, details.joinToString("\n"), shown.preview, card.held.countdown, card.held.askedAt)),
+            onDecision = { choice -> if (choice == "deny") onDeny() else onAllow() },
+        )
+        return
+    }
     PhoneApprovalCard(
-        headline = phoneLineText(shown.headline),
+        headline = headline,
         expired = ended || card.request.deadline <= now,
         locked = locked,
         busy = busy,
-        onAllow = {
-            busy = true
-            retry = false
-            scope.launch {
-                val outcome = HermesPhoneRequests.approve(context, card)
-                busy = false
-                if (outcome == PhoneOutcome.Locked) locked = true
-                if (outcome == PhoneOutcome.Retry) retry = true
-                if (outcome == PhoneOutcome.Expired || outcome == PhoneOutcome.Gone) ended = true
-            }
-        },
-        onDeny = {
-            busy = true
-            retry = false
-            scope.launch {
-                val outcome = HermesPhoneRequests.deny(context, card)
-                busy = false
-                if (outcome == PhoneOutcome.Retry) retry = true
-                if (outcome == PhoneOutcome.Expired || outcome == PhoneOutcome.Gone) ended = true
-            }
-        },
+        onAllow = onAllow,
+        onDeny = onDeny,
         onClose = { HermesPhoneRequests.dismiss(context, card) },
         onLater = { later = later + card.request.id },
         target = shown.target,
-        details = shown.details().map { phoneLineText(it) },
+        details = details,
         preview = shown.preview,
         retry = retry,
     )

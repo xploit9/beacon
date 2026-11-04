@@ -32,9 +32,10 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * Lane LK: the side button on a locked phone asks for the unlock first. The overlay's own composables run without a voice session:
- * the one line "Unlock your phone first." with its Unlock action (asking again each tap, with no close), a text box with nothing to
- * type, send or dictate, and an unlocked or running conversation's text box exactly as before.
+ * Lanes LK and LS: on a locked phone the side button talks at once, and what is private asks for the unlock. The overlay's own
+ * composables run without a voice session: the line "Unlock your phone first." with its Unlock action (asking again each tap, with no
+ * close) over an inert text box, or over the live text box of a conversation that turned something private away, a text box with
+ * nothing to type, send or dictate while no conversation runs, and an unlocked or running conversation's text box exactly as before.
  */
 class AssistUnlockFirstUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
@@ -99,8 +100,23 @@ class AssistUnlockFirstUiTest {
         compose.onNodeWithTag("assist-send").assertDoesNotExist()
         assertEquals(emptyList<String>(), sent)
         assertEquals(0, dictations)
-        // The orb stays: a tap on it is the owner asking to talk, which on a locked phone asks for the unlock.
+        // The orb stays: a tap on it is the owner asking to talk, which starts a (locked) conversation.
         compose.onNodeWithTag("assist-live").assertIsDisplayed().performClick()
+        assertEquals(1, orbTaps)
+    }
+
+    /** The locked conversation turned something private away: the line is above its live text box, which carries on. */
+    @Test fun aLockedConversationThatTurnedSomethingPrivateAwayShowsTheUnlockLineAboveItsLiveTextBox() {
+        show(phoneLocked = true, line = OverlayLine.Unlock, live = true)
+        compose.onNodeWithTag("assist-line").assertIsDisplayed()
+        compose.onNodeWithText("Unlock your phone first.").assertIsDisplayed()
+        compose.onNodeWithTag("assist-line-action").performClick()
+        assertEquals("the line's one action asks Android for the unlock", 1, unlockTaps)
+        // The conversation is still live under it: its text box takes typed turns, and its orb ends it.
+        compose.onNodeWithTag("assist-field").assertIsEnabled()
+        compose.onNodeWithText("Listening").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Close").assertDoesNotExist()
+        compose.onNodeWithTag("assist-live").performClick()
         assertEquals(1, orbTaps)
     }
 

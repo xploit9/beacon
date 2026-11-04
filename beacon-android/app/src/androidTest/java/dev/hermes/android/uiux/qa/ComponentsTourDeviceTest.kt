@@ -207,7 +207,7 @@ class ComponentsTourDeviceTest {
             }
         }
         screen("Overlay live conversation", overlay = true) { OverlayStage(remember { busyCall() }, locked = false) }
-        // Lane LK: the side button on a locked phone asks for the unlock first; this one line is all the overlay shows until then.
+        // The line a locked conversation shows when it turns something personal away, with its Unlock action.
         screen("Overlay locked", overlay = true) { OverlayUnlockStage() }
         screen("Overlay approval with a 500 character note", overlay = true) { OverlayStage(remember { busyCall() }, locked = false, approval = eventApproval(), show = ApprovalShow.Card) }
         screen("Overlay call countdown", overlay = true) { OverlayStage(remember { busyCall() }, locked = false, approval = callApproval(), show = ApprovalShow.Card) }

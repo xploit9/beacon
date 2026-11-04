@@ -10,11 +10,13 @@ internal class FakeSettings : PhoneSettings {
     val allowed = mutableSetOf<PhoneCapability>()
     var hermes = false
     var askReads = true
+    var askActs = true
     override fun enabled(capability: PhoneCapability) = capability in on
     override fun granted(capability: PhoneCapability) = capability in allowed
     override fun switchOff(capability: PhoneCapability) { on -= capability }
     override fun hermesAllowed() = hermes
     override fun askBeforeHermesReads() = askReads
+    override fun askBeforeHermesActs() = askActs
     fun everything() { on += PhoneCapability.entries; allowed += PhoneCapability.entries }
 }
 

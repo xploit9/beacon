@@ -334,7 +334,8 @@ def test_proactive_status_and_source_labels_are_fetched_together(harness, monkey
     elapsed = time.monotonic() - started
 
     assert response.status_code == 200, response.text
-    assert response.json() == {'enabled': False, 'sources': ['mail', 'news']}
+    assert response.json() == {'enabled': False, 'sources': ['mail', 'news'], 'sources_all': True,
+                               'source_choices': [{'name': 'mail', 'watched': True}, {'name': 'news', 'watched': True}]}
     assert elapsed < 0.7  # one after the other would take 0.8 s
 
 

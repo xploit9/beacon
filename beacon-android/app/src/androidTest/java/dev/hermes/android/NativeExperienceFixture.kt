@@ -93,6 +93,9 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     @Volatile var proactiveRouteMissing = false
     @Volatile var proactiveStatusCode = 200
     @Volatile var proactiveSaveStatusCode = 200
+    // The sources this Hermes lets the watch read (null: an older plugin, which sends plain labels only) and the ones each profile chose (none: all).
+    @Volatile var proactiveSourceNames: List<String>? = null
+    val proactiveChosenSources = ConcurrentHashMap<String, List<String>>()
     val workspaceFiles = ConcurrentHashMap<String, String>()
     val downloads = ConcurrentHashMap<String, ByteArray>()
     val fileRequests = CopyOnWriteArrayList<String>()
@@ -498,7 +501,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         "learned" to JSONArray(proactiveLearned[profile]?.toList() ?: emptyList<String>()),
         "learned_proposal" to JSONArray(proactiveProposal[profile]?.map { it.copy() } ?: emptyList<JSONObject>()),
         "jobs" to JSONArray(),
-    )
+    ).apply {
+        proactiveSourceNames?.let { names ->
+            val chosen = proactiveChosenSources[profile].orEmpty().filter { it in names }
+            put("sources", JSONArray(names))
+            put("sources_all", chosen.isEmpty())
+            put("source_choices", JSONArray(names.map { json("name" to it, "watched" to (chosen.isEmpty() || it in chosen)) }))
+        }
+    }
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
         if (path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         if (path in setOf("/api/sessions", "/api/sessions/search") && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
@@ -532,6 +542,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 if (body.has("check_minutes")) proactiveCheckMinutes[profile] = body.getInt("check_minutes")
                 if (body.has("quiet_start")) proactiveQuietStart[profile] = body.getString("quiet_start")
                 if (body.has("quiet_end")) proactiveQuietEnd[profile] = body.getString("quiet_end")
+                if (body.has("sources")) body.getJSONArray("sources").let { names -> proactiveChosenSources[profile] = List(names.length()) { names.getString(it) } }
             }
             200 to proactiveResponse(profile)
         }

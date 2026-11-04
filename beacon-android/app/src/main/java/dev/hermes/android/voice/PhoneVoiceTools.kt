@@ -87,7 +87,8 @@ internal class PhoneVoiceBridge(private val context: Context, private val origin
         // A conversation that started on a locked phone and has not been unlocked since is told nothing about the calendar or the contacts,
         // and shows no card; the activity list says why. Once trusted it keeps its tools when the screen locks again (see CallTrust).
         if (!trust.trusted()) {
-            val locked = PhoneFailure("unavailable", "Unlock your phone first.", logged = "locked")
+            trust.refused()
+            val locked = PhoneFailure("unavailable", LOCKED_TOOL_MESSAGE, logged = "locked")
             PhoneTools.record(context, name, PhoneTools.plainLine(name), origin, locked.logged)
             return locked.toJson()
         }

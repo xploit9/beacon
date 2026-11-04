@@ -1,7 +1,6 @@
 package dev.hermes.android.phone
 
 import android.Manifest
-import android.app.KeyguardManager
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
@@ -45,9 +44,11 @@ import java.util.concurrent.ConcurrentHashMap
 
 /*
  * Hermes asks this phone to use phone access (calendar, alarms, contacts, calls, messages). The plugin queues each request and the
- * phone decides: a write or action always waits for the owner's tap on a card that shows what it will do, a read waits too unless
- * "Ask before Hermes reads" is off, and nothing runs while Hermes access or that capability is switched off. A request runs at most
- * once and never after its two minutes; the result goes back only to the plugin that asked.
+ * phone decides: a write or action waits for the owner's tap on a card that shows what it will do unless "Ask before Hermes acts" is
+ * off, a read waits too unless "Ask before Hermes reads" is off, and nothing runs while Hermes access or that capability is switched
+ * off. With asking off a change still waits for the tap while the phone is locked, and one that opens another app's screen while Beacon
+ * is not in front; a call to a saved contact counts down on a card the owner can cancel. A request runs at most once and never after
+ * its two minutes; the result goes back only to the plugin that asked.
  */
 
 internal const val PHONE_REQUEST_SECONDS = 120L
@@ -90,6 +91,12 @@ internal interface PhoneToolPort {
     fun enabled(): Set<String>
     fun hermesAccess(): Boolean
     fun askBeforeReads(): Boolean
+    /** Whether the request must wait for the owner's tap: the engine's one rule, from the owner's settings. */
+    fun needsApproval(name: String): Boolean
+    /** Running [name] opens another app's screen, so it can only run while Beacon is in front. */
+    fun launchesApp(name: String): Boolean
+    /** Seconds the card of [name] counts down before it runs by itself (a call to a saved contact once asking is off), else 0. */
+    fun countdownSeconds(name: String, savedContact: Boolean): Int
     /** The card for a request, with its names looked up, exactly as a live call builds it; throws [PhoneFailure] when the phone would refuse the request. */
     suspend fun prepare(name: String, args: JSONObject): PhonePrepared
     suspend fun run(name: String, args: JSONObject, decision: PhoneDecision?): JSONObject
@@ -107,6 +114,9 @@ internal class RealPhoneTools(private val context: Context) : PhoneToolPort {
     override fun enabled() = PhoneTools.enabledTools(context)
     override fun hermesAccess() = PhoneTools.hermesAccess(context)
     override fun askBeforeReads() = PhoneTools.askBeforeHermesReads(context)
+    override fun needsApproval(name: String) = PhoneTools.needsApproval(context, name, PhoneOrigin.Hermes)
+    override fun launchesApp(name: String) = PhoneTools.launchesApp(name)
+    override fun countdownSeconds(name: String, savedContact: Boolean) = PhoneTools.hermesCountdownSeconds(context, name, savedContact)
     override suspend fun prepare(name: String, args: JSONObject) = PhoneTools.prepare(context, name, args, PhoneOrigin.Hermes)
     override suspend fun run(name: String, args: JSONObject, decision: PhoneDecision?) =
         PhoneTools.run(context, name, args, PhoneOrigin.Hermes, decision)
@@ -179,12 +189,15 @@ internal class HermesPhoneEngine(
     private val unlocked: () -> Boolean,
     private val pause: suspend (Long) -> Unit = { delay(it) },
     private val io: CoroutineDispatcher = Dispatchers.IO,
+    /** Beacon is on screen, in front. */
+    private val inFront: () -> Boolean = { false },
 ) {
     /**
      * A request waiting for the owner's tap, with what it will do ([prepared], the card a live call shows for the same request). The
-     * tap runs exactly [prepared], never the request's raw arguments again.
+     * tap runs exactly [prepared], never the request's raw arguments again. [countdown] seconds, counted from [askedAt] on the phone's
+     * elapsed clock, run the call by themselves unless the owner cancels; 0 means the owner must tap.
      */
-    data class Card(val request: HermesPhoneRequest, val prepared: PhonePrepared) {
+    data class Card(val request: HermesPhoneRequest, val prepared: PhonePrepared, val countdown: Int = 0, val askedAt: Long = 0) {
         val card: PhoneCard get() = prepared.card
     }
 
@@ -194,8 +207,9 @@ internal class HermesPhoneEngine(
 
     /**
      * Reads what Hermes is waiting on. A request for something switched off is answered "off"; a request the phone would refuse is
-     * answered with that error and gets no card; a read runs at once only when "Ask before Hermes reads" is off; everything else comes
-     * back as a card for the owner to allow or deny. [have] gives the card already made for a request, so it is looked up once.
+     * answered with that error and gets no card; a request the owner's settings let run without a tap runs at once ([runsWithoutTap]);
+     * everything else comes back as a card for the owner to allow or deny. [have] gives the card already made for a request, so it is
+     * looked up once.
      */
     suspend fun refresh(have: (String) -> PhonePrepared? = { null }): List<Card> = withContext(io) {
         val cards = mutableListOf<Card>()
@@ -203,17 +217,27 @@ internal class HermesPhoneEngine(
             try {
                 when {
                     !tools.hermesAccess() || request.tool !in tools.enabled() -> answerOff(request)
-                    !tools.isWrite(request.tool) && !tools.askBeforeReads() -> execute(request, null)
+                    runsWithoutTap(request.tool) -> execute(request, null)
                     handled.has(request.id) -> Unit
                     else -> (have(request.id) ?: prepare(request))?.let { prepared ->
                         lines[request.id] = prepared.card.lines.first()
-                        cards += Card(request, prepared)
+                        cards += Card(request, prepared, tools.countdownSeconds(request.tool, prepared.card.savedContact), now())
                     }
                 }
             } catch (e: CancellationException) { throw e }
             catch (_: Exception) { /* One request that cannot be read or answered must not hide the others; it expires on its own. */ }
         }
         cards
+    }
+
+    /**
+     * The owner's settings let [tool] run now with no tap. A read follows its switch. A change also needs an unlocked phone and, when
+     * it opens another app's screen (an alarm, a timer, a message draft), Beacon in front, as the tap itself would: otherwise it waits
+     * for the tap like any other request.
+     */
+    private fun runsWithoutTap(tool: String): Boolean {
+        if (tools.needsApproval(tool)) return false
+        return !tools.isWrite(tool) || (unlocked() && (!tools.launchesApp(tool) || inFront()))
     }
 
     /** What [request] will do, or null after answering it with the error the phone gave. */
@@ -321,7 +345,12 @@ object HermesPhoneRequests {
     private var handledRequests: HandledRequests? = null
 
     private fun elapsed() = SystemClock.elapsedRealtime()
-    private fun isLocked(context: Context) = context.getSystemService(KeyguardManager::class.java)?.isDeviceLocked != false
+    /** Beacon is on screen, in front; the approval card's screen says so. */
+    @Volatile private var front = false
+    internal fun setFront(on: Boolean) { front = on }
+
+    // The phone's one lock source, the same the engine checks before it runs a change.
+    private fun isLocked(context: Context) = deviceLockedNow(context)
     internal fun locked(context: Context) = isLocked(context)
 
     @Synchronized private fun handled(context: Context): HandledRequests = handledRequests ?: run {
@@ -338,7 +367,7 @@ object HermesPhoneRequests {
     private fun stateStore(context: Context) = context.applicationContext.getSharedPreferences("hermes-phone-requests-state", Context.MODE_PRIVATE)
 
     private fun engine(context: Context, client: BeaconClient) = HermesPhoneEngine(
-        RealPhoneTools(context.applicationContext), ClientLink(client), handled(context), ::elapsed, { !isLocked(context) },
+        RealPhoneTools(context.applicationContext), ClientLink(client), handled(context), ::elapsed, { !isLocked(context) }, inFront = { front },
     )
 
     /** A push said Hermes has a phone request: read what is waiting and show it. */

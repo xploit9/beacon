@@ -32,12 +32,6 @@ class BeaconVoiceInteractionService : VoiceInteractionService() {
         /** Brings the overlay back with what it held, after an unlock. False when Beacon is no longer the assistant. */
         fun reshow(): Boolean = showWith(Bundle().apply { putBoolean(EXTRA_RESHOW, true) })
 
-        /**
-         * Opens the overlay as a fresh start, the same as the gesture on an unlocked phone: after the unlock it asked for on a locked one,
-         * it clears the last question and talks at once. False when Beacon is no longer the assistant.
-         */
-        fun show(): Boolean = showWith(Bundle())
-
         private fun showWith(args: Bundle): Boolean {
             val service = running?.get() ?: return false
             return runCatching { service.showSession(args, 0) }.isSuccess

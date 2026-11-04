@@ -1642,7 +1642,8 @@ def test_v4_routes_are_topic_free_fast_and_strict(harness, monkeypatch):
     assert result.status_code == 200, result.text
     body = result.json()
     assert set(body) == {"enabled", "setup_complete", "timezone", "delivery", "check_minutes",
-                         "quiet_start", "quiet_end", "health", "rules", "learned", "learned_proposal", "jobs", "sources"}
+                         "quiet_start", "quiet_end", "health", "rules", "learned", "learned_proposal", "jobs", "sources",
+                         "source_choices", "sources_all"}
     assert body["timezone"] == "America/Los_Angeles" and body["learned"] == ['Important: "A client review"']
     assert body["health"]["state"] == "unknown"
 

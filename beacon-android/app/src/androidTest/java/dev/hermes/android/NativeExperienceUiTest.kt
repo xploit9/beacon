@@ -4643,6 +4643,40 @@ class NativeExperienceUiTest {
         receipts += "A quiet turn Hermes still runs is asked about less and less often, picked up again each time, and never sent twice."
     }
 
+    @Test fun aSavedTextOnlyMessageIsNotShownAgainLiveWhileTheTurnGoesOnWithToolSteps() = withFixture { vm, fixture ->
+        val words = "I'll set that alarm for you now."
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("Set an alarm for 10 am")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == "runtime-chat-a" }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        fixture.emitNativeEvent("message.delta", json("text" to words))
+        fixture.emitNativeEvent("message.interim", json("text" to words, "already_streamed" to true))
+        await { vm.chat.value.liveText == words }
+
+        // Hermes saves the message, which names no tool call, and its hidden steering row; the history is read while the turn goes on.
+        val saved = fixture.sessions.getValue("chat-a").getJSONArray("messages")
+        saved.put(json("role" to "assistant", "text" to words, "row_id" to "saved-prelude"))
+        saved.put(json("role" to "user", "text" to "[System: Continue now. Execute the required tool calls and only send your final answer after completing the task.]", "row_id" to "steering"))
+        val subscriptionsBeforeReconnect = fixture.streamSubscriptions.get()
+        fixture.interruptActiveNativeStream()
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeReconnect }
+        await { vm.chat.value.messages.any { it.id == "saved-prelude" } }
+
+        repeat(3) { fixture.emitNativeEvent("tool.start", json("tool_call_id" to "describe-$it", "name" to "describe", "context" to "")) }
+        await { vm.chat.value.liveTools.size == 3 }
+        assertEquals("The saved message is not also the live bubble", "", vm.chat.value.liveText)
+        assertEquals("The turn goes on", "runtime-chat-a", vm.chat.value.streamId)
+        compose.waitForIdle()
+        compose.onAllNodes(hasText(words) and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(1)
+
+        fixture.emitNativeEvent("message.complete", json("text" to "The alarm is set."))
+        await { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == "The alarm is set." } }
+        compose.waitForIdle()
+        compose.onAllNodes(hasText(words) and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(1)
+        receipts += "A text-only message Hermes saved mid-turn is shown once while the turn goes on with tool steps."
+    }
+
     @Test fun theBeaconChatNamedOnlyByTheCacheIsRestoredWhenTheAssistantProfileDiffersFromTheChats() = withFixture { vm, fixture ->
         val coder = fixture.scope.copy(profile = "coder")
         fun handle(): String? = BeaconViewModel::class.java.getDeclaredMethod("readBeaconSessionHandle", Scope::class.java).apply { isAccessible = true }.invoke(vm, coder) as String?

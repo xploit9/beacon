@@ -1307,7 +1307,7 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them).
     assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_create_proactive_request',
                                             'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked',
-                                            *plugin.phone_tools.NAMES}
+                                            *plugin.phone_tools.NAMES,*plugin.email_drafts.NAMES}
     assert all(callable(handler) for name,handler in hooks)
 
 

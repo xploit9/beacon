@@ -65,9 +65,9 @@ data class PhoneCard(val lines: List<PhoneLine>, val target: String = "", val pr
 
 /**
  * The owner's countdown for a call placed from a live call or the assistant overlay: the card shows who and which number for
- * [SECONDS] seconds, and the call is placed when it ends unless the owner cancels. Hermes requests never use it; they need a tap.
- * Only a number saved in the owner's contacts counts down: a number the model brought from anywhere else (an event note, a
- * message, a web page) could be an attacker's, so it waits for the tap.
+ * [SECONDS] seconds, and the call is placed when it ends unless the owner cancels. Only a number saved in the owner's contacts counts
+ * down: a number the model brought from anywhere else (an event note, a message, a web page) could be an attacker's, so it waits for
+ * the tap. A Hermes call gets the same countdown only once the owner turned "Ask before Hermes acts" off; otherwise it needs the tap.
  */
 internal object PhoneCountdown {
     const val SECONDS = 3
@@ -78,6 +78,9 @@ internal object PhoneCountdown {
     fun secondsFor(name: String, origin: PhoneOrigin, savedContact: Boolean): Int =
         if (name == "phone_call" && origin != PhoneOrigin.Hermes && savedContact) SECONDS else 0
 
+    /** The countdown a call from Hermes gets: [SECONDS] for a saved contact once "Ask before Hermes acts" is off, else 0 (the owner taps). */
+    fun forHermes(name: String, savedContact: Boolean, asking: Boolean): Int = if (name == "phone_call" && savedContact && !asking) SECONDS else 0
+
     /** A card that waited longer than this before it was drawn (a screen that was off) no longer counts down: it needs the tap. */
     const val STALE_MS = 15_000L
     /**
@@ -85,6 +88,9 @@ internal object PhoneCountdown {
      * when the card is old, was never stamped or carries a time in the future.
      */
     fun secondsAt(seconds: Int, askedAt: Long, now: Long): Int = if (askedAt <= 0 || now < askedAt || now - askedAt > STALE_MS) 0 else seconds
+
+    /** Whether a card counts down when it is first drawn: it asked for a countdown, the phone is unlocked and the card is still fresh. */
+    fun startsAtFirstDraw(seconds: Int, askedAt: Long, now: Long, locked: Boolean): Boolean = !locked && secondsAt(seconds, askedAt, now) > 0
 }
 
 /** The arguments exactly as they will run, with the card that shows them. A card is built from these, never from the model's raw words. */

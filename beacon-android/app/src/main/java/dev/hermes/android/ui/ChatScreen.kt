@@ -273,6 +273,13 @@ internal fun mergeToolOnlyRuns(messages: List<IndexedValue<Message>>): List<Inde
 
 internal fun toolCallResultId(tool: JSONObject): String = tool.string("tool_call_id").ifBlank { toolIdentity(tool) }
 
+/** The email draft a `beacon_email_draft` step made: its id comes from the step's result, its fields from the call itself. Null for any other step, and for a draft Hermes refused. */
+internal fun emailDraftOf(tool: JSONObject, foldedResult: FoldedToolResult?): EmailDraft? {
+    if (tool.rawToolName() != EMAIL_DRAFT_TOOL) return null
+    val id = emailDraftId(foldedResult?.content ?: tool.recordedValue("result", "output")?.detailText()) ?: return null
+    return EmailDraft.seed(id, tool.argumentsValue())
+}
+
 /** Hermes stores the tool that produced a result row as `tool_name`; title the row after it. */
 internal fun toolResultTitles(messages: List<JSONObject>): Map<String, String> = messages.asSequence()
     .filter { (it.string("role") == "tool" || it.string("role") == "function") && it.string("id").isNotBlank() }
@@ -1975,15 +1982,18 @@ private fun decodePendingAttachmentThumbnail(encoded: String): Bitmap? {
 /** Live work stays compact; recorded steps can be opened from the same summary row. */
 @Composable internal fun MessageActivity(reasoning: String, tools: List<JSONObject>, status: String = "", streaming: Boolean = false, messageTime: Long = 0L, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), onToolExpanded: (Boolean) -> Unit = {}, onCopyResult: (String) -> Unit = {}, vm: BeaconViewModel? = null, scope: Scope? = null) {
     if (reasoning.isBlank() && tools.isEmpty() && status.isBlank()) return
-    val live = streaming && tools.isNotEmpty()
-    val grouped = tools.size >= 3 && !streaming
+    // An email Hermes drafted is a card of its own, not one more step folded into the activity (an older app shows the step).
+    val drafts = if (vm != null && scope != null) tools.mapNotNull { tool -> emailDraftOf(tool, toolResultsByCallId[toolCallResultId(tool)])?.let { tool to it } } else emptyList()
+    val steps = if (drafts.isEmpty()) tools else tools - drafts.map { it.first }.toSet()
+    val live = streaming && steps.isNotEmpty()
+    val grouped = steps.size >= 3 && !streaming
     val motionEnabled = rememberNativeMotionEnabled()
-    var showSteps by rememberSaveable(tools.firstOrNull()?.toolKey(0)) { mutableStateOf(false) }
+    var showSteps by rememberSaveable(steps.firstOrNull()?.toolKey(0)) { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().testTag("message-activity"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         if (status.isNotBlank()) Text(status, Modifier.testTag("message-activity-status"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (reasoning.isNotBlank()) Disclosure("Reasoning", reasoning, renderContent = if (vm == null) null else ({ Markdown(reasoning, vm, scope, interactive = false) }))
         if (live || grouped) {
-            ToolStepsHeader(tools, live, showSteps, motionEnabled) {
+            ToolStepsHeader(steps, live, showSteps, motionEnabled) {
                 showSteps = !showSteps
                 onToolExpanded(showSteps)
             }
@@ -1993,14 +2003,15 @@ private fun decodePendingAttachmentThumbnail(encoded: String): Bitmap? {
                 exit = if (motionEnabled) shrinkVertically() + fadeOut(tween(120)) else ExitTransition.None,
             ) {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    tools.forEachIndexed { index, tool ->
+                    steps.forEachIndexed { index, tool ->
                         key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) }
                     }
                 }
             }
         } else {
-            tools.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) } }
+            steps.forEachIndexed { index, tool -> key(tool.toolKey(index)) { ToolCard(tool, streaming, messageTime, onToolExpanded, toolResultsByCallId[toolCallResultId(tool)], onCopyResult) } }
         }
+        drafts.forEach { (_, draft) -> key(draft.id) { EmailDraftInChat(draft, vm!!, scope!!, onCopyResult) } }
     }
 }
 
@@ -2069,6 +2080,7 @@ internal val friendlyToolNames = linkedMapOf(
     "browser_navigate" to "Open web page", "session_search" to "Search past chats", "delegate_task" to "Hand off a task",
     "clarify" to "Ask you", "vision_analyze" to "Look at image", "image_generate" to "Create image", "text_to_speech" to "Speak",
     "todo" to "To-do list", "patch" to "Edit file",
+    "beacon_email_draft" to "Email draft", "beacon_email_draft_send" to "Get the email to send", "beacon_email_draft_result" to "Report the send",
 )
 
 /** The name a tool card and the steps row show: the plain name when there is one (passed through [translate]), else [toolDisplayName]. */

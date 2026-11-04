@@ -25,6 +25,7 @@ import dev.hermes.android.BeaconApplication
 import dev.hermes.android.loginLiveTest
 import dev.hermes.android.preferences
 import dev.hermes.android.ui.presenceState
+import dev.hermes.android.voice.CallTrust
 import dev.hermes.android.ui.sphere.SphereState
 import dev.hermes.android.ui.normalized
 import kotlinx.coroutines.runBlocking
@@ -43,8 +44,8 @@ import java.io.File
  * Lanes assist-overlay, ux-overlay and ux2-overlay: Beacon's own assistant overlay on the emulator, end to end. It makes Beacon the phone's
  * assistant for the run (cmd role, test only), opens the overlay over the home screen, over another app and over the lock screen,
  * asks in writing, listens, starts the live conversation at once (the side button talks, with no tap and no other window: the text box stays and the captions sit above it),
- * ends it with the orb and by closing, checks that over the lock screen the side button asks for the unlock first (one line, nothing started,
- * nothing sent, then the unlock brings the conversation) and that the chips fit whole, that a failed send
+ * ends it with the orb and by closing, checks that over the lock screen the side button talks at once (nothing of it drawn, then a private ask
+ * shows the unlock line and the unlock carries the same conversation on) and that the chips fit whole, that a failed send
  * goes back to the pill and a failed call shows its short reason, and takes the
  * review screenshots in four looks (dark, light, Arabic right to left in dark, 1.3x text in light). Everything it changes on the phone (assistant, recognizer, lock screen, dark mode, text size, app language)
  * is put back in `finally`.
@@ -162,8 +163,17 @@ class AssistOverlayDeviceTest {
         AssistOverlayController::class.java.getDeclaredMethod("setState", AssistOverlayState::class.java).apply { isAccessible = true }.invoke(c, change(c.state))
     }
 
+    /**
+     * Waits for the main thread to go quiet, but never for good: with a live conversation up the dust animates and the instrumentation's
+     * idle wait can go on forever (it stopped a whole run twice), so a screenshot takes the screen as it is after [millis].
+     */
+    private fun waitIdle(millis: Long = 3_000) {
+        val waiter = Thread { runCatching { instrumentation.waitForIdleSync() } }.apply { isDaemon = true; start() }
+        waiter.join(millis)
+    }
+
     private fun capture(name: String, settle: Long = 700) {
-        instrumentation.waitForIdleSync()
+        waitIdle()
         Thread.sleep(settle)
         val image = requireNotNull(automation.takeScreenshot()) { "No screenshot" }
         File(shots, "$name.png").outputStream().use { image.compress(Bitmap.CompressFormat.PNG, 100, it) }
@@ -206,6 +216,15 @@ class AssistOverlayDeviceTest {
         waitFor("the overlay to close", 6_000) { controller().state.phase == OverlayPhase.Hidden }
     }
 
+    /** [waitFor] whose failure message carries what [detail] says when the wait ends, not when it began. */
+    private fun waitForDetail(what: String, timeoutMillis: Long, detail: () -> String, condition: () -> Boolean) {
+        try { waitFor(what, timeoutMillis, condition) } catch (error: IllegalStateException) { throw IllegalStateException("${error.message}: ${detail()}", error) }
+    }
+
+    /** The app's own recent warnings and errors, for a failure message: what Android and the app logged while the overlay waited. */
+    private fun logTail(): String = shell("logcat -d -t 3000 -v brief *:W").lines()
+        .filter { line -> listOf("dev.hermes", "Beacon", "ForegroundService", "AndroidRuntime", "VoiceInteraction").any { line.contains(it) } }.takeLast(14).joinToString(" | ") { it.take(220) }
+
     /** What the overlay and the assistant chat hold, for a failure message. */
     private fun overlayState(): String {
         val c = session()?.controller ?: return "no session"
@@ -213,7 +232,8 @@ class AssistOverlayDeviceTest {
         val ui = vm?.ui?.value
         val chat = vm?.chat?.value
         return "overlay=${c.state.copy(ask = c.state.ask?.copy(answer = c.state.ask?.answer?.take(80).orEmpty()))} " +
-            "ui=[auth=${ui?.authenticated} connected=${ui?.connected} tab=${ui?.tab} opening=${ui?.beaconOpening} beaconError=${ui?.beaconError} notice=${ui?.notice} error=${ui?.error}] " +
+            "ui=[auth=${ui?.authenticated} restoring=${ui?.restoringSession} loading=${ui?.loading} connected=${ui?.connected} tab=${ui?.tab} opening=${ui?.beaconOpening} beaconError=${ui?.beaconError} notice=${ui?.notice} error=${ui?.error}] " +
+            "call=[active=${app.calls.state.value.active} state=${app.calls.state.value.state} error=${app.calls.state.value.error.take(80)} reason=${app.calls.state.value.failureReason.take(80)}] " +
             "chat=[session=${chat?.sessionId?.take(8)} stream=${chat?.streamId?.take(8)} uncertain=${chat?.uncertain?.take(8)} status=${chat?.status} messages=${chat?.messages?.size} " +
             "last=${chat?.messages?.takeLast(3)?.map { it.role + ":" + it.text.take(30) }} live=${chat?.liveText?.take(40)} tools=${chat?.liveTools?.size} approval=${chat?.approval != null} clarification=${chat?.clarification != null} queued=${chat?.queued?.size}]"
     }
@@ -297,6 +317,96 @@ class AssistOverlayDeviceTest {
         main { controller().endCall() }
         waitFor("the conversation to end", 45_000) { controller().state.surface != OverlaySurface.Live && !app.calls.state.value.active }
     }
+    /**
+     * Section 6 of the full run, and the whole of [theSideButtonTalksOnTheLockScreenAndTheUnlockCarriesOn]: the overlay over the lock screen
+     * in every look, then a private ask and the unlock. Leaves the phone unlocked (the caller restores the lock setting).
+     */
+    private fun overTheLockScreen() {
+    // 6. Over the lock screen in every look: the side button talks at once (owner decision, 4 Nov, "talk now, unlock for private").
+    // The conversation starts by itself, untrusted: no unlock line until something private is asked for, and nothing of it is drawn
+    // over the lock screen (no words, no chip, no mic, no send); the lock-screen look of the overlay is otherwise the same.
+    shell("locksettings set-disabled false")
+    shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_500); shell("input keyevent KEYCODE_WAKEUP")
+    val keyguard = requireNotNull(app.getSystemService(KeyguardManager::class.java))
+    waitFor("the lock screen", 10_000) { keyguard.isKeyguardLocked }
+    val power = requireNotNull(app.getSystemService(android.os.PowerManager::class.java))
+    for (look in looks) {
+        wear(look)
+        // The lock screen sleeps ten seconds after it wakes, and the system hides the overlay with the screen. The open overlay
+        // holds the screen for half a minute after the last interaction, so each look wakes the phone afresh.
+        shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_000)
+        shell("input keyevent KEYCODE_WAKEUP"); Thread.sleep(500)
+        summon()
+        assertTrue("The overlay knows it is over the lock screen", controller().locked)
+        assertTrue(keyguard.isKeyguardLocked)
+        val summoned = SystemClock.uptimeMillis()
+        waitFor("the conversation to start at once over the lock screen in ${look.name}: ${overlayState()} log=${logTail()}", 60_000) {
+            (app.calls.state.value.active && controller().state.surface == OverlaySurface.Live) || controller().state.line == OverlayLine.CallFailed
+        }
+        assertTrue("The locked start failed in ${look.name}: ${overlayState()} log=${logTail()}", app.calls.state.value.active && controller().state.surface == OverlaySurface.Live)
+        timings.put("locked_start_ms_${look.name}", SystemClock.uptimeMillis() - summoned)
+        assertNull("No unlock line before anything private is asked for in ${look.name}: ${overlayState()}", controller().state.line)
+        assertTrue("The phone is still locked while it talks", keyguard.isKeyguardLocked)
+        assertFalse("No chip over the lock screen", hasTag("assist-chip-0"))
+        assertFalse("No mic over the lock screen", hasTag("assist-mic"))
+        assertFalse("No send over the lock screen", hasTag("assist-send"))
+        assertFalse("The conversation's words are not drawn over the lock screen", hasTag("assist-captions"))
+        assertNull(controller().state.ask)
+        assertTrue("The screen stays on over the lock screen while it talks", power.isInteractive && controller().state.phase == OverlayPhase.Open)
+        capture("lock-talk-${look.name}")
+        if (look.name == "dark") frames("locked")
+        dismissWithBack()
+        waitFor("the locked conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
+    }
+    // Something private asked for over the lock screen: the model tries its tool, which is refused, and the overlay says to unlock.
+    // Unlock asks Android (no PIN here, so it succeeds at once) and the same conversation carries on, trusted.
+    wear(looks[0])
+    shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_000)
+    shell("input keyevent KEYCODE_WAKEUP"); Thread.sleep(500)
+    summon()
+    // The call has its id once Hermes' admission lands, a moment after it turns active: the id is what says it is the same call later.
+    waitFor("the locked conversation: ${overlayState()}", 45_000) { app.calls.state.value.active && controller().state.surface == OverlaySurface.Live && app.calls.state.value.callId.isNotBlank() }
+    val lockedCall = app.calls.state.value.callId
+    var asked = 0
+    val fromTheModel = runCatching {
+        waitFor("the unlock line after a private ask", 45_000) {
+            if (controller().state.line == OverlayLine.Unlock) true
+            else {
+                // A typed turn into the conversation: the model's own words decide whether it tries a tool, so ask again now and then.
+                if (asked == 0 || SystemClock.uptimeMillis() % 15_000 < 600) {
+                    asked++
+                    main { controller().draft = TextFieldValue("Please check what you remember about me with your memory tool, and tell me one thing."); controller().ask() }
+                    Thread.sleep(700)
+                }
+                false
+            }
+        }
+    }.isSuccess
+    if (!fromTheModel) {
+        // The model answered without trying its tool this time. The refusal is what puts the line up (the count the overlay watches is
+        // process-wide), so one stands in for it; the model's half is pinned by LockedStartCallTest.
+        CallTrust { true }.refused()
+        waitForDetail("the unlock line after a refusal", 10_000, { overlayState() }) { controller().state.line == OverlayLine.Unlock }
+    }
+    timings.put("private_asks_before_unlock_line", asked)
+    timings.put("unlock_line_from_the_model", fromTheModel)
+    waitFor("its Unlock action", 8_000) { hasTag("assist-line-action") }
+    waitForText("the unlock line", shownIn(looks[0], "Unlock your phone first."))
+    assertTrue("The conversation is still up under the line", app.calls.state.value.active && controller().state.surface == OverlaySurface.Live)
+    capture("lock-private-asks-unlock")
+    assertTrue("Unlock asks Android for the unlock", clickTag("assist-line-action"))
+    waitFor("the phone to unlock", 20_000) { !keyguard.isKeyguardLocked }
+    waitForDetail("the overlay back with its conversation after the unlock", 30_000, { "${overlayState()} locked=${controller().locked} keyguard=${keyguard.isKeyguardLocked} interactive=${power.isInteractive} log=${logTail()}" }) {
+        controller().state.surface == OverlaySurface.Live && controller().state.line == null && !controller().locked
+    }
+    assertEquals("The same conversation carries on after the unlock", lockedCall, app.calls.state.value.callId)
+    waitForDetail("the conversation to listen again, trusted", 60_000, { "${overlayState()} log=${logTail()}" }) { app.calls.state.value.active && app.calls.state.value.state == "listening" }
+    assertEquals(lockedCall, app.calls.state.value.callId)
+    capture("unlock-carries-on")
+    dismissWithBack()
+    waitFor("the conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
+    }
+
     /** Non-intrusive, always runs: Android can find the assistant service, its session and the pass-through recognizer. */
     @Test fun androidSeesBeaconAsAnAssistantWithARecognizer() {
         val pm = app.packageManager
@@ -310,6 +420,61 @@ class AssistOverlayDeviceTest {
         assertTrue(recognizer.exported)
         // The fallback for phones without a voice interaction service is still the assist activity.
         assertEquals(AssistEntryActivity::class.java.name, pm.queryIntentActivities(Intent(Intent.ACTION_ASSIST).setPackage(pkg), PackageManager.MATCH_DEFAULT_ONLY).single().activityInfo.name)
+    }
+
+    /**
+     * Lane LS on its own: over the lock screen the side button starts the conversation at once (untrusted: nothing of it drawn), a private
+     * ask shows the unlock line, and the unlock carries the same conversation on. The same opt-in and the same demo Hermes as the full run;
+     * everything it changes on the phone is put back.
+     */
+    @Test(timeout = 900_000) fun theSideButtonTalksOnTheLockScreenAndTheUnlockCarriesOn() {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Opt-in: --arg assistOverlay=1 with --isolated", args.getString("assistOverlay") == "1")
+        val auth = File(app.filesDir, "live-auth.json")
+        assumeTrue("Needs the isolated demo sign-in (device-test.py --isolated)", auth.isFile)
+        val credentials = JSONObject(auth.readText(Charsets.UTF_8).removePrefix("\uFEFF"))
+        val origin = credentials.getString("origin")
+        require(android.net.Uri.parse(origin).let { it.scheme == "https" && it.port == 8446 }) { "The overlay test only runs against the demo Hermes" }
+        runBlocking {
+            loginLiveTest(app, origin, credentials)
+            app.preferences.edit { it[stringPreferencesKey("origin")] = origin; it[booleanPreferencesKey("setup_complete")] = true; it[booleanPreferencesKey("setup_active")] = false }
+        }
+        val holders = shell("cmd role get-role-holders android.app.role.ASSISTANT").lines().map { it.trim() }.filter { it.isNotEmpty() }
+        val recognizer = shell("settings get secure voice_recognition_service")
+        val lockDisabled = shell("locksettings get-disabled")
+        val night = shell("cmd uimode night")
+        val fontScale = shell("settings get system font_scale")
+        appLocales = Regex("""\[(.*)]""").find(shell("cmd locale get-app-locales $pkg"))?.groupValues?.get(1).orEmpty().trim()
+        try {
+            shell("cmd role add-role-holder android.app.role.ASSISTANT $pkg")
+            waitFor("Beacon to become the assistant", 20_000) { shell("settings get secure voice_interaction_service") == assistant }
+            wear(looks[0])
+            // The first show on a cold process restores the sign-in and opens the assistant chat, which takes a while on this emulator
+            // (the full run waits as long): warm the overlay up unlocked first, as that run's section 1 does, then go to the lock screen.
+            shell("input keyevent KEYCODE_HOME")
+            Thread.sleep(1_500)
+            summon()
+            endAutoLive()
+            waitFor("the assistant chat to open in the overlay: ${overlayState()}", 150_000) {
+                val vm = controller().vm
+                vm != null && vm.ui.value.authenticated && vm.chat.value.sessionId.isNotBlank() && vm.isBeaconConversation()
+            }
+            dismissWithBack()
+            overTheLockScreen()
+            shell("wm dismiss-keyguard")
+        } finally {
+            runCatching { app.calls.hangup() }
+            runCatching { session()?.let { s -> main { s.hide() } } }
+            shell("settings put system font_scale $fontScale")
+            restoreAppLocale()
+            shell(if (night.contains("yes")) "cmd uimode night yes" else if (night.contains("no")) "cmd uimode night no" else "cmd uimode night auto")
+            if (lockDisabled == "true") { shell("wm dismiss-keyguard"); shell("locksettings set-disabled true") }
+            if (holders.isEmpty()) shell("cmd role clear-role-holders android.app.role.ASSISTANT")
+            else shell("cmd role add-role-holder android.app.role.ASSISTANT ${holders.first()}")
+            if (recognizer.isNotBlank() && recognizer != "null" && shell("settings get secure voice_recognition_service") != recognizer) shell("settings put secure voice_recognition_service $recognizer")
+            File(shots, "timings.json").writeText(timings.toString(2))
+        }
+        assertEquals(holders, shell("cmd role get-role-holders android.app.role.ASSISTANT").lines().map { it.trim() }.filter { it.isNotEmpty() })
     }
 
     @Test(timeout = 1_500_000) fun theOverlayOpensOverAppsAndTheLockScreenWithoutTheApp() {
@@ -480,62 +645,7 @@ class AssistOverlayDeviceTest {
             waitFor("the conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
             assertFalse("Nothing holds the app's call window once the overlay is closed", app.calls.uiVisible)
             wear(looks[0])
-            // 6. Over the lock screen in every look: the side button asks for the unlock first (owner decision, 3 Nov). The one line
-            // "Unlock your phone first." with Unlock is all the overlay shows; nothing is heard or said, no conversation starts, no
-            // microphone opens, no chip, no mic, no send, and a question typed anyway goes nowhere.
-            shell("locksettings set-disabled false")
-            shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_500); shell("input keyevent KEYCODE_WAKEUP")
-            val keyguard = requireNotNull(app.getSystemService(KeyguardManager::class.java))
-            waitFor("the lock screen", 10_000) { keyguard.isKeyguardLocked }
-            val power = requireNotNull(app.getSystemService(android.os.PowerManager::class.java))
-            for (look in looks) {
-                wear(look)
-                // The lock screen sleeps ten seconds after it wakes, and the system hides the overlay with the screen. The open overlay
-                // holds the screen for half a minute after the last interaction, so each look wakes the phone afresh.
-                shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_000)
-                shell("input keyevent KEYCODE_WAKEUP"); Thread.sleep(500)
-                summon()
-                assertTrue("The overlay knows it is over the lock screen", controller().locked)
-                assertTrue(keyguard.isKeyguardLocked)
-                waitFor("the unlock line in ${look.name}: ${overlayState()}", 8_000) { controller().state.line == OverlayLine.Unlock && hasTag("assist-line") }
-                waitForText("the unlock line", shownIn(look, "Unlock your phone first."))
-                waitForText("its Unlock action", shownIn(look, "Unlock"))
-                // Nothing starts by itself, however long it waits: no conversation, no call, no microphone, no written answer.
-                Thread.sleep(4_000)
-                assertEquals("Still the unlock line in ${look.name}: ${overlayState()}", OverlayLine.Unlock, controller().state.line)
-                assertEquals(OverlaySurface.Pill, controller().state.surface)
-                assertFalse("No conversation starts on a locked phone in ${look.name}", app.calls.state.value.active)
-                assertFalse(controller().state.dictating)
-                assertNull(controller().state.ask)
-                assertFalse("No chip over the lock screen", hasTag("assist-chip-0"))
-                assertFalse("No mic over the lock screen", hasTag("assist-mic"))
-                assertFalse("No send over the lock screen", hasTag("assist-send"))
-                // A question typed anyway goes nowhere.
-                main { controller().draft = TextFieldValue("Hello"); controller().ask() }
-                Thread.sleep(700)
-                assertNull("A typed question is not sent locked in ${look.name}", controller().state.ask)
-                assertEquals(OverlaySurface.Pill, controller().state.surface)
-                main { controller().draft = TextFieldValue() }
-                assertTrue("The screen stays on over the lock screen while the line waits", power.isInteractive && controller().state.phase == OverlayPhase.Open)
-                capture("lock-unlock-first-${look.name}")
-                if (look.name == "dark") frames("locked")
-                dismissWithBack()
-            }
-            // The unlock brings the conversation: Unlock asks Android (no PIN here, so it succeeds at once), the overlay comes back as a
-            // fresh start and the conversation starts on its own, as it does on an unlocked phone.
-            wear(looks[0])
-            shell("input keyevent KEYCODE_SLEEP"); Thread.sleep(1_000)
-            shell("input keyevent KEYCODE_WAKEUP"); Thread.sleep(500)
-            summon()
-            waitFor("the unlock line before the unlock", 8_000) { controller().state.line == OverlayLine.Unlock && hasTag("assist-line-action") }
-            assertTrue("Unlock asks Android for the unlock", clickTag("assist-line-action"))
-            waitFor("the phone to unlock", 20_000) { !keyguard.isKeyguardLocked }
-            waitFor("the conversation after the unlock: ${overlayState()}", 60_000) { app.calls.state.value.active && controller().state.surface == OverlaySurface.Live }
-            assertNull("The line is gone once the phone is unlocked", controller().state.line)
-            assertFalse("Unlocked, the overlay no longer reads as locked", controller().locked)
-            capture("unlock-then-talk")
-            dismissWithBack()
-            waitFor("the conversation to end with the overlay", 45_000) { !app.calls.state.value.active }
+            overTheLockScreen()
             shell("wm dismiss-keyguard")
         } finally {
             runCatching { app.calls.hangup() }

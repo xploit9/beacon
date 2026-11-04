@@ -29,7 +29,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -940,6 +940,8 @@ async def notice_detail(event_id:str,request:Request):
         if not found: raise HTTPException(404,'Owned notification unavailable')
         return found,notice_wire(dict(found),owner)
     row,result=await asyncio.to_thread(load)
+    # The Beacon chat's own replies are titled with the assistant's name on the phone, not with the chat's title.
+    result['assistant_chat']=bool(row['conversation']) and row['conversation']==cfg.get('scheduled_callback_conversation_id')
     if row['kind']=='completion' and row['conversation']:
         # The notification shows what the reply says; Android's lock-screen setting still hides it when locked. The chat is read
         # under the profile the notice was stored for (the query above already requires it to be the selected one).
@@ -1415,18 +1417,48 @@ async def _proactive_source_labels(profile):
     except (HTTPException,TimeoutError): return []
     return list(dict.fromkeys(line.partition(':')[0].strip() for line in catalogue.splitlines() if ':' in line))
 
+async def _proactive_source_rows(profile):
+    # The call catalogue's own tool rows, which say what toolsets carry each source, and whether nothing is left to scan (a source
+    # missing from a catalogue that is still filling is starting up, not gone). Read after the labels, whose lookup stores the list.
+    def read():
+        module=sys.modules['beacon_gateway_tools']
+        gateway=module.Gateway(mobile,voice_context.scoped)
+        rows=gateway.catalog(profile,discover=False)
+        return rows,gateway._catalog_key(profile) in module.CATALOG_SETTLED
+    try: return await feature(read,timeout=8)
+    except Exception: return [],False
+
+async def _proactive_sources(owner,profile,sync):
+    # The sources the watch can read, each with whether it is chosen. A settled catalogue also drops chosen sources that are gone.
+    labels=await _proactive_source_labels(profile)
+    rows,settled=await _proactive_source_rows(profile) if labels else ([],False)
+    if sync and settled and rows:
+        try: await feature(proactive.sync_watch_sources,mobile,owner,profile,proactive.watch_source_options(rows),timeout=30)
+        except Exception: pass  # the next look tries again; a failed tidy-up never hides the sources
+    return {'sources':labels,**await asyncio.to_thread(proactive.watch_source_state,mobile,owner,profile,labels)}
+
 @router.get('/mobile/proactive')
 async def proactive_status(request:Request):
     owner,_,profile,_=await identity_async(request)
     # The saved status and the connected sources are independent lookups; they wait together, not one after the other.
-    result,labels=await asyncio.gather(feature(proactive.status,mobile,owner,profile,timeout=8,lookup_message='This item is no longer available.'),
-                                       _proactive_source_labels(profile))
-    result['sources']=labels
+    result,sources=await asyncio.gather(feature(proactive.status,mobile,owner,profile,timeout=8,lookup_message='This item is no longer available.'),
+                                        _proactive_sources(owner,profile,True))
+    result.update(sources)
     return result
 
 @router.put('/mobile/proactive')
 async def proactive_enabled(request:Request):
     value=await body(request,4096)
+    if set(value)=={'sources'}:
+        # Which sources the watch reads; none (or null) is every source. It travels alone, so an older plugin refuses it as an unknown field.
+        names=[] if value['sources'] is None else value['sources']
+        if not isinstance(names,list) or len(names)>proactive.WATCH_SOURCE_LIMIT: raise HTTPException(400,'Choose up to %d sources'%proactive.WATCH_SOURCE_LIMIT)
+        owner,_,profile,_=await identity_async(request)
+        labels=await _proactive_source_labels(profile)
+        rows,_=await _proactive_source_rows(profile) if names and labels else ([],False)
+        result=await feature(proactive.set_watch_sources,mobile,owner,profile,names,labels,proactive.watch_source_options(rows),timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
+        result.update(await asyncio.to_thread(proactive.watch_source_state,mobile,owner,profile,labels),sources=labels)
+        return result
     toggle=set(value)=={'enabled'}
     if toggle:
         if type(value['enabled']) is not bool: raise HTTPException(400,'enabled must be a boolean')
@@ -1450,7 +1482,7 @@ async def proactive_enabled(request:Request):
     function=proactive.set_enabled if toggle else proactive.configure
     args=(mobile,owner,profile,value['enabled']) if toggle else (mobile,owner,profile,value)
     result=await feature(function,*args,timeout=30,value_error_status=400,lookup_message='This item is no longer available.')
-    result['sources']=await _proactive_source_labels(profile)
+    result.update(await _proactive_sources(owner,profile,False))
     return result
 
 @router.post('/mobile/proactive/feedback')
@@ -1523,4 +1555,5 @@ async def proactive_request_delete(request_id:str,request:Request):
 router.include_router(sys.modules['beacon_callback_api'].build_router(call,body,feature,mobile,native,sys.modules['beacon_callbacks']))
 router.include_router(sys.modules['beacon_call_history_api'].build_router(identity,mobile))
 router.include_router(sys.modules['beacon_health_api'].build_router(identity))
+router.include_router(sys.modules['beacon_email_drafts_api'].build_router(identity,body,sys.modules['beacon_email_drafts']))
 

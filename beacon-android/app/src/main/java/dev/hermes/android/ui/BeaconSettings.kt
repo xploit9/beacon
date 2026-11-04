@@ -11,6 +11,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.PhoneCallback
 import androidx.compose.material.icons.automirrored.rounded.Rule
+import androidx.compose.material.icons.rounded.Lock
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Badge
 import androidx.compose.material.icons.rounded.Bedtime
@@ -183,6 +184,11 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     var earlierSheet by remember(profile) { mutableStateOf(false) }
     var earlierError by remember(profile) { mutableStateOf("") }
     var confirmClear by remember(profile) { mutableStateOf(false) }
+    var sourcesSheet by remember(profile) { mutableStateOf(false) }
+    // The owner's latest tap in the Sources sheet (empty is All sources) shows until Hermes answers; a failed save drops it and the switches go back.
+    var sourcePick by remember(profile) { mutableStateOf<List<String>?>(null) }
+    var savingSources by remember(profile) { mutableStateOf(false) }
+    var queuedSources by remember(profile) { mutableStateOf<List<String>?>(null) }
     // Words the callbacks below show are translated here, where uiText can run.
     val loadFailed = uiText("Couldn't load Proactive settings. Try again.")
     val updateFailed = uiText("Couldn't update Proactive settings. Try again.")
@@ -254,6 +260,29 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 proactiveDelivery = wasDelivery; proactiveCheckMinutes = wasCheckMinutes; proactiveQuietStart = wasQuietStart; proactiveQuietEnd = wasQuietEnd
                 reportProactiveError(error, updateFailed)
             } finally { savingProactive = false }
+        }
+    }
+    /** A switch in the Sources sheet is saved at once; taps made while a save is out wait, and the last one goes after it. */
+    fun saveProactiveSourceChoice(names: List<String>) {
+        if (vm.client == null || !ui.connected || pluginStatus == "absent") return
+        sourcePick = names
+        queuedSources = names
+        if (savingSources) return
+        savingSources = true
+        scope.launch {
+            try {
+                while (true) {
+                    val next = queuedSources ?: break
+                    queuedSources = null
+                    val response = saveProactiveSources(vm, profile, next)
+                    if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
+                        vm.storeData(proactiveKey, response)
+                }
+            } catch (error: Throwable) {
+                if (error is CancellationException) throw error
+                queuedSources = null
+                reportProactiveError(error, updateFailed)
+            } finally { sourcePick = null; savingSources = false }
         }
     }
     fun updateProactiveRule(id: String, method: String, body: JSONObject? = null) {
@@ -357,7 +386,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
         }
     }
     val connected = ui.connected && vm.client != null
-    val controlsEnabled = connected && !savingProactive
+    val controlsEnabled = connected && !savingProactive && !savingSources
     val pluginMissing = pluginStatus == "absent" || proactive?.optBoolean("_pluginUpdateRequired") == true
     val checkupRefreshing = checkupKey != null && checkupKey in refreshing && checkupCapabilitiesKnown(checkupCapabilities)
     val phoneAssistant = dev.hermes.android.assist.rememberPhoneAssistantState()
@@ -385,7 +414,17 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
         }
         if (phoneAssistant != dev.hermes.android.assist.PhoneAssistantState.Unavailable) item {
             val context = LocalContext.current
-            dev.hermes.android.assist.PhoneAssistantSection(phoneAssistant) { if (!dev.hermes.android.assist.openAssistantSettings(context)) vm.notice("Open Beacon’s app settings in Android") }
+            // On a locked phone the assistant always talks; this decides whether the owner's memory and tools work there too
+            // (changes still need the unlock: see voice/CallTrust.kt).
+            var personalWhileLocked by remember { mutableStateOf(dev.hermes.android.voice.LockScreenAccess.allowed(context)) }
+            dev.hermes.android.assist.PhoneAssistantSection(phoneAssistant, more = {
+                SettingsDivider()
+                SettingsSwitchRow(uiText("Personal info when locked"), personalWhileLocked,
+                    { on -> dev.hermes.android.voice.LockScreenAccess.set(context, on); personalWhileLocked = on },
+                    icon = Icons.Rounded.Lock,
+                    summary = if (personalWhileLocked) uiText("Memory and tools work while locked") else uiText("Asks you to unlock first"),
+                    testTag = "lock-screen-access")
+            }) { if (!dev.hermes.android.assist.openAssistantSettings(context)) vm.notice("Open Beacon’s app settings in Android") }
         }
         item {
             SettingsSection(uiText("What needs you"), trailing = { SettingsBadge(profileLabel, Modifier.padding(end = 4.dp)) }) {
@@ -415,8 +454,12 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                     }
                     if (proactiveLoaded) {
                         val sources = proactiveSources(proactive)
+                        // An older plugin sends plain labels only: the row then stays a list the owner reads.
+                        val sourcesView = proactiveSourcesView(proactive, sourcePick)?.takeIf { it.sources.isNotEmpty() }
                         SettingsDivider()
-                        SettingsValueRow(uiText("Sources"), icon = Icons.Rounded.Sensors, value = if (sources.isEmpty()) uiText("Not yet") else proactiveSourcesSummary(sources), testTag = "proactive-sources")
+                        if (sourcesView != null) SettingsNavRow(uiText("Sources"), { sourcesSheet = true }, icon = Icons.Rounded.Sensors,
+                            value = proactiveWatchSummary(sourcesView, uiText("All sources")), enabled = controlsEnabled, testTag = "proactive-sources")
+                        else SettingsValueRow(uiText("Sources"), icon = Icons.Rounded.Sensors, value = if (sources.isEmpty()) uiText("Not yet") else proactiveSourcesSummary(sources), testTag = "proactive-sources")
                     }
                 }
             }
@@ -473,6 +516,15 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     if (earlierSheet) {
         val proposal = proactive?.let(::proactiveLearnedProposal).orEmpty()
         if (proposal.isNotEmpty()) EarlierRulesSheet(proposal, busy = savingProactive, error = earlierError, onSave = { convertEarlierRatings(it) }, onDismiss = { earlierSheet = false })
+    }
+    if (sourcesSheet) {
+        // The sheet opens on the saved list and the sources are read again behind it.
+        LaunchedEffect(Unit) { proactiveRefresh++ }
+        val view = proactive?.let { proactiveSourcesView(it, sourcePick) }?.takeIf { it.sources.isNotEmpty() }
+        if (view != null) ProactiveSourcesSheet(view, enabled = connected,
+            onAll = { saveProactiveSourceChoice(proactiveSourcesAfterAll(view, it)) },
+            onToggle = { name, on -> proactiveSourcesAfterToggle(view, name, on)?.let(::saveProactiveSourceChoice) },
+            onDismiss = { sourcesSheet = false })
     }
 }
 

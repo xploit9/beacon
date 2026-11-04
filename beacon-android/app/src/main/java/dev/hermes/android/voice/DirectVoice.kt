@@ -253,6 +253,13 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     @Volatile internal var greetingArrivedMs=-1L; private set
     @Volatile private var warmUsed=false
     @Volatile private var running=false
+    // Whether the brief the current session was set up with held the owner's memory. It starts true: nothing is withheld until a setup is sent locked.
+    @Volatile private var briefedTrusted=true
+    // The unlock replaced a session set up without the owner's memory: the new one is told a turned-away request is owed (see TRUSTED_CUE).
+    @Volatile private var rebrief=false
+    // Ends the session this loop turn runs, so the next turn sets up a new one; null between sessions.
+    @Volatile private var replaceSession:(()->Unit)?=null
+    private fun briefTrust():Boolean=trust.trusted().also { briefedTrusted=it }
     private fun admissionBudget(maximum:Long):Long {
         if(greeted) return maximum
         val left=20000-(System.nanoTime()-connectingSince)/1000000
@@ -576,6 +583,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             if(!connected&&!stopped&&callOwned()) { run?.cancel();fail(java.net.SocketTimeoutException("Call did not connect")) }
         }
         running=true
+        // A conversation set up locked carries on trusted once the phone is unlocked: its session is replaced by one with the whole brief.
+        trust.whenTrusted(::upgrade)
         if(admitted) startPolling()
         run=scope.launch {
         try {
@@ -685,11 +694,12 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 if(adopted?.cueRequested==true) beginGreeting()
                 val ws=adopted?.attach(listener)?:newProviderSocket(providerRequest(),listener)
                 socket=ws
+                replaceSession={ if(!ended.isCompleted&&voiceProviderCurrent(generation,epoch.get(),stopped,false)) ended.complete(Unit) }
                 // The setup carries this conversation's verified context, so it waits for that read; the socket's handshake does not.
                 val setupSender=if(adopted!=null) null else launch {
                     opened.await()
                     if(load.result.await()!=null) return@launch
-                    if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)&&!sendFrames(ws,liveSetup(credentials,callBrief(context,trust.trusted()),resumption,recentSpeech()).toString())) { ended.complete(Unit);ws.cancel() }
+                    if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)&&!sendFrames(ws,liveSetup(credentials,callBrief(context,briefTrust()),resumption,recentSpeech()).toString())) { ended.complete(Unit);ws.cancel() }
                 }
                 var fatal=false
                 fun admit():Boolean = synchronized(socketFence) {
@@ -703,6 +713,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                     // The microphone is live from here on; the call reads as connected once it streams and Hermes admitted it.
                     if(!greeted) { greeted=true;openGreeting(ws,adopted) { socket,json -> sendFrames(socket,json) } }
                     else if(connected) event(JSONObject().put("type","state").put("state","listening"))
+                    // A session replaced after the unlock goes on where the conversation was; a turned-away request is carried out or asked for again.
+                    if(rebrief&&briefedTrusted) { rebrief=false;if(trust.wasRefused()) controls.trySend(Outbound(cueTurn(TRUSTED_CUE),{ callOwned() },control=true)) }
                     true
                 }
                 try {
@@ -735,6 +747,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                     } }
                     val watchdog=launch { while(isActive) {
                         delay(stallPoll)
+                        // A conversation set up locked looks for the unlock itself, so its upgrade never depends on a broadcast reaching it.
+                        if(!briefedTrusted) trust.trusted()
                         // End this session before re-queuing what it was owed, so its writer cannot send that into the dead socket.
                         if(ready&&stall.stalled()) { ended.complete(Unit);stalledSession();break }
                     } }
@@ -744,7 +758,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 catch(e:CallAdmissionFailed) { fatal=true;throw e }
                 catch(e:Exception) { /* Reconnect with the same phone-held key and refreshed Hermes context. */ }
                 // A fatal context failure ends the call next (the call ends next), so it shows no interim state.
-                finally { setupSender?.cancel();epoch.compareAndSet(generation,generation+1);ready=false;if(!fatal) { playUntil=0;event(JSONObject().put("type","interrupted")) };endGreeting(cut=true);ws.cancel();if(!stopped&&!fatal) event(JSONObject().put("type","state").put("state","reconnecting")) }
+                finally { replaceSession=null;setupSender?.cancel();epoch.compareAndSet(generation,generation+1);ready=false;if(!fatal) { playUntil=0;event(JSONObject().put("type","interrupted")) };endGreeting(cut=true);ws.cancel();if(!stopped&&!fatal) event(JSONObject().put("type","state").put("state","reconnecting")) }
                 reconnects.failed()
             }
         } catch(e:CallAdmissionFailed) { /* The service ends the call with Hermes' own reason for refusing it. */ }
@@ -759,6 +773,24 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         job.start()
     }
     private fun callOwned() = !stopped&&ownerActive()&&client.scope==callScope
+    /** One user turn in the live session's own wire shape, for the notes the app gives the model. */
+    private fun cueTurn(text:String):String=JSONObject().put("clientContent",JSONObject().put("turns",org.json.JSONArray().put(JSONObject().put("role","user")
+        .put("parts",org.json.JSONArray().put(JSONObject().put("text",text))))).put("turnComplete",true)).toString()
+    /**
+     * The phone was unlocked in a conversation whose session was set up without the owner's memory, history, persona or tools: that session
+     * is replaced by one set up with all of it, from what was said so far (the same replacement a stalled session gets), and the
+     * conversation goes on. A reply that is being said is finished first, so the swap comes between two turns.
+     */
+    private fun upgrade() {
+        if(stopped) return
+        scope.launch {
+            val limit=clock()+8_000
+            while(!stopped&&clock()<playUntil&&clock()<limit) delay(100)
+            if(stopped||briefedTrusted) return@launch
+            rebrief=true;resume=null
+            replaceSession?.invoke()
+        }
+    }
     /** Replace the session at once: resume it once, then start fresh from the call transcript; tool results are re-said as text, never re-run. */
     private fun stalledSession() {
         val stalls=stall.stalledAgain()
@@ -892,7 +924,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         }
         // A conversation that started on a locked phone and has not been unlocked since may talk, but nothing private is read or done:
         // every Hermes tool answers at once, before admission or any request (the phone's own tools are held back in PhoneVoiceBridge).
-        if(!trust.trusted()&&name in DIRECT_CALL_TOOLS) { toolResponse(id,name,lockedToolResult());return }
+        if(!trust.trusted()&&name in DIRECT_CALL_TOOLS) { if(name!="get_visual_state") trust.refused();toolResponse(id,name,lockedToolResult());return }
         // Every Hermes action belongs to the admitted call; none runs before Hermes admitted it.
         // Phone tools run on this phone and never reach Hermes, so they do not wait for its admission.
         if(name!="get_visual_state"&&!phoneTool) try { admittedCall() } catch(_:CallAdmissionFailed) {

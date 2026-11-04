@@ -173,10 +173,22 @@ class VoiceMemoryLiveTest {
     /** Sends [text] through the chat composer's send path and waits for Hermes' finished reply. */
     private suspend fun chatTurn(run: MemoryRun, text: String): String {
         val vm = run.vm
-        withContext(Dispatchers.Main.immediate) { vm.composer(TextFieldValue(text)); vm.send() }.join()
-        eventually({ "Hermes' reply to the chat message \"$text\" (status: ${vm.chat.value.status})" }, 180_000) {
-            vm.chat.value.streamId.isBlank() && replyTo(vm.chat.value.messages, text).isNotBlank()
+        // Every change of the open chat while the turn runs, so a reply that never shows says where it went.
+        val seen = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val sampler = kotlinx.coroutines.CoroutineScope(Dispatchers.Default).launch {
+            while (true) {
+                val c = vm.chat.value
+                val line = "${c.sessionId.takeLast(6)} m=${c.messages.size} s=${c.streamId.isNotBlank()} live=${c.liveText.length} st=${c.status} ready=${c.projectionReady} raw=${c.raw.optInt("message_count", -1)}"
+                if (seen.lastOrNull()?.substringAfter("] ") != line) seen += "[${SystemClock.elapsedRealtime() % 1_000_000}] $line"
+                delay(50)
+            }
         }
+        try {
+            withContext(Dispatchers.Main.immediate) { vm.composer(TextFieldValue(text)); vm.send() }.join()
+            eventually({ "Hermes' reply to the chat message \"$text\" (opened: ${run.chats.lastOrNull()?.takeLast(6)}, tab: ${vm.ui.value.tab}; states: ${seen.takeLast(25).joinToString(" || ")})" }, 180_000) {
+                vm.chat.value.streamId.isBlank() && replyTo(vm.chat.value.messages, text).isNotBlank()
+            }
+        } finally { sampler.cancel() }
         return replyTo(vm.chat.value.messages, text)
     }
 

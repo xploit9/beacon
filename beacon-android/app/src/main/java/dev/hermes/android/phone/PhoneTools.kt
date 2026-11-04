@@ -59,11 +59,20 @@ object PhoneTools {
     /** "Ask before Hermes reads": on until the owner turns it off. */
     fun askBeforeHermesReads(context: Context): Boolean = PhoneAccess.askBeforeHermesReads(context)
 
+    /** "Ask before Hermes acts": on until the owner turns it off. */
+    fun askBeforeHermesActs(context: Context): Boolean = PhoneAccess.askBeforeHermesActs(context)
+
+    /** Seconds of on-screen countdown before a call Hermes asked for is placed without a tap: 3 for a saved contact while "Ask before Hermes acts" is off, else 0. */
+    fun hermesCountdownSeconds(context: Context, name: String, savedContact: Boolean): Int = PhoneCountdown.forHermes(name, savedContact, askBeforeHermesActs(context))
+
     /** Seconds of on-screen countdown before [name] from [origin] is placed without a tap: 3 for a call to a saved contact from a live
      *  call or the overlay, else 0 (the owner taps). */
     fun countdownSeconds(name: String, origin: PhoneOrigin, savedContact: Boolean): Int = PhoneCountdown.secondsFor(name, origin, savedContact)
 
-    /** Whether [name] from [origin] must wait for the owner's tap: every write, and a Hermes read while "Ask before Hermes reads" is on. */
+    /**
+     * Whether [name] from [origin] must wait for the owner's tap: every write (a Hermes one unless "Ask before Hermes acts" is off, and
+     * a Hermes call still waits for its tap or countdown), and a Hermes read while "Ask before Hermes reads" is on.
+     */
     fun needsApproval(context: Context, name: String, origin: PhoneOrigin): Boolean = engine(context).needsApproval(name, origin)
 
     /**

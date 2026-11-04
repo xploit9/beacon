@@ -733,6 +733,8 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
             val alert = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText(content.second).setStyle(NotificationCompat.BigTextStyle().bigText(content.second)).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public)
                 .setWhen(alertMillis).setShowWhen(true).setSilent(quiet || silentPushNotification(nativeKind, app.calls.uiVisible)).setContentIntent(pending).setAutoCancel(true)
             if (quiet) alert.setGroup(ALERT_GROUP).addExtras(android.os.Bundle().apply { putBoolean(QUIET_ALERT_EXTRA, true) })
+            // A reply the owner sent from the shade is answered here: its "Sent" notice gives way to this one.
+            runCatching { retireSentReplies(manager, data["conversation_ref"].orEmpty(), routeKey) }
             try { manager.notify(routeKey, 1, alert.build()) } catch (_: SecurityException) { return null }
             if (quiet) postQuietSummary(context, manager, routeKey) else AlertBurst.note(now)
             DeliveryLog.recordArrival(context, nativeKind, event, now)

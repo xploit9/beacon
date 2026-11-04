@@ -193,11 +193,14 @@ class CallAdmissionFailureTest {
         var rejectNextForeground = false
         var foregroundRejections = 0
         private val prefs = memoryPreferences()
+        private val lockScreen = defaultsOnly()
         private val context = object : ContextWrapper(target) {
             override fun getApplicationContext(): Context = app
-            override fun getSharedPreferences(name: String, mode: Int): SharedPreferences {
-                check(name == "auth-private") { "Unexpected persistent storage access: $name" }
-                return prefs
+            override fun getSharedPreferences(name: String, mode: Int): SharedPreferences = when (name) {
+                "auth-private" -> prefs
+                // The owner's "Personal info when locked" choice (voice/CallTrust.kt), read as a call starts: in memory, so it stays off.
+                "beacon_lock_screen" -> lockScreen
+                else -> error("Unexpected persistent storage access: $name")
             }
             override fun checkPermission(permission: String, pid: Int, uid: Int): Int =
                 if (permission == Manifest.permission.RECORD_AUDIO) {
@@ -336,5 +339,14 @@ class CallAdmissionFailureTest {
                 }
             } as SharedPreferences
         }
+
+        /** Preferences nothing was ever saved in: a switch reads as its default, and nothing may be written. */
+        private fun defaultsOnly(): SharedPreferences =
+            Proxy.newProxyInstance(SharedPreferences::class.java.classLoader, arrayOf(SharedPreferences::class.java)) { _, method, args ->
+                when (method.name) {
+                    "getBoolean" -> args!![1]
+                    else -> error("Unexpected preference access: ${method.name}")
+                }
+            } as SharedPreferences
     }
 }

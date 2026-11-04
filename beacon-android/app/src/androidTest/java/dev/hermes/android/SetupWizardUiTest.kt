@@ -997,6 +997,30 @@ class SetupWizardUiTest {
         compose.onNodeWithTag("setup-finish").assertIsDisplayed()
     }
 
+    // Owner, 4 Nov: the wizard reflects what Beacon does now. Its last screen links the side button, Phone access and the proactive
+    // watch, and those two open their settings page once setup is done; the notification step names replies too.
+    @Test fun theLastStepLinksTheRestOfBeaconAndOpensItsPageOnceSetupIsDone() {
+        val opened = mutableListOf<String>()
+        val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false)
+        compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
+            SetupWizardScreen(state, onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = { opened += "chat" }, onReopen = {}, onCancel = {},
+                onFinishThenOpen = { _, page -> opened += page })
+        } } }
+        compose.onNodeWithTag("setup-phone-access").performScrollTo().performClick()
+        compose.onNodeWithTag("setup-proactive").performScrollTo().performClick()
+        assertEquals(listOf("Phone access", "Assistant"), opened)
+        compose.onNodeWithText("Calendar, alarms, calls and more").assertExists()
+        compose.onNodeWithText("Alerts when something needs you").assertExists()
+    }
+
+    @Test fun theNotificationStepSaysRepliesArriveThere() {
+        val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "permission-notifications", restoringSession = false)
+        compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
+            SetupWizardScreen(state, onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
+        } } }
+        compose.onNodeWithText("Allow notifications so replies, calls and updates can reach you.").assertExists()
+    }
+
     @Test fun anInterruptedSetupResumesAtItsIncompletePermissionStep() {
         val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "permission-notifications", restoringSession = false)
         compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {

@@ -4,6 +4,7 @@ import android.app.role.RoleManager
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.runtime.Composable
@@ -60,14 +61,16 @@ internal fun openAssistantSettings(context: Context): Boolean {
  * Android's picker. The gesture itself differs between phones, so the row never names one. Android's picker lists the app as
  * Beacon whatever the assistant is called, so that is the name the row asks the owner to choose.
  */
-@Composable internal fun PhoneAssistantSection(state: PhoneAssistantState, onOpen: () -> Unit) {
+/** [more] adds rows under the side button's own, in the same card (Settings › Assistant puts the lock-screen choice there). */
+@Composable internal fun PhoneAssistantSection(state: PhoneAssistantState, more: @Composable ColumnScope.() -> Unit = {}, onOpen: () -> Unit) {
     val active = state == PhoneAssistantState.Active
     SettingsSection(testTag = "phone-assistant-section") {
         SettingsNavRow(uiText("Phone assistant"), onOpen,
-            icon = Icons.Rounded.AutoAwesome, value = if (active) uiText("Opens over any app") else uiText("Choose Beacon to open it over any app"),
+            icon = Icons.Rounded.AutoAwesome, value = if (active) uiText("Opens over any app, even locked") else uiText("Choose Beacon to open it over any app"),
             // Not set, the line already says what to do: a "Not set" pill beside it only squeezed it ("to open it over …").
             valueMaxLines = 2, status = if (active) SettingsStatus.Ok else null,
             statusLabel = if (active) uiText("Active") else "", external = true, valueTestTag = "phone-assistant-value", testTag = "phone-assistant")
+        more()
     }
 }
 

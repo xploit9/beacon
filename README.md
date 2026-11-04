@@ -75,13 +75,20 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
 - **Projects.** Add a chat to a project from its menu. It works in the project's folder and shows the project at the top.
 - **Tools at hand.** Tools, under More in a chat's menu, opens your tools and MCP servers, the same controls as Settings.
 - **Approvals per chat.** Each chat follows your profile's approval mode, or skips approvals for that chat only.
+- **Email drafts you can shape.** Ask for an email and it appears as a draft card. Say what to change and it is
+  redrafted in place, without adding to the chat; step back to an earlier version, then tap Send.
+- **Reply and share.** Answer a reply straight from its notification, and share text, links or photos from any app
+  into a Beacon chat.
 - **Voice calls.** Talk with Gemini Live or Grok, in any language; switch languages mid-call and Beacon follows (OpenAI Realtime is
   coming soon). Calls use the tools and memory of your Hermes profile,
   and can save new memories like a chat ([how calls use tools and memory](docs/voice-calls.md)). A ball of drifting
   dust shows the call: blue while Beacon listens, amber while it thinks, green while it speaks, and it swirls and
   scatters while someone talks. Call text is saved; audio is not kept.
 - **What needs you.** Beacon watches what your Hermes can reach and tells you, or calls you, when something matters.
-  Write rules like "Call me if a client moves a meeting" and teach it with Important / Not important.
+  Pick which sources it watches, write rules like "Call me if a client moves a meeting" and teach it with
+  Important / Not important.
+- **The side button, even locked.** Hold it and the assistant talks at once over any app or the lock screen. Personal
+  things wait for the unlock, unless you allow them in Settings > Assistant ([phone access](docs/phone-access.md)).
 - **All of Hermes.** Profiles, skills, memory, schedules, files, Kanban and Bot Mode, with screens that open ready.
   Editing a profile in Settings keeps the active chat profile; switch chats' profiles from the top drawer selector.
   Check-up calls are in Settings > Assistant.

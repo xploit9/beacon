@@ -15,6 +15,7 @@ import androidx.compose.ui.test.assertIsOn
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
@@ -36,6 +37,7 @@ class PhoneAccessUiTest {
     private val context: Context = InstrumentationRegistry.getInstrumentation().targetContext
     private val before = PhoneCapability.entries.associateWith { PhoneAccess.switchedOn(context, it) }
     private val hermesBefore = PhoneAccess.hermesAllowed(context) to PhoneAccess.askBeforeHermesReads(context)
+    private val actsBefore = PhoneAccess.askBeforeHermesActs(context)
     private val log = PhoneActivityLog.of(context)
     private val logBefore = log.recent().reversed()
 
@@ -43,6 +45,7 @@ class PhoneAccessUiTest {
         PhoneCapability.entries.forEach { PhoneAccess.setSwitchedOn(context, it, false) }
         PhoneAccess.setHermesAllowed(context, false)
         PhoneAccess.setAskBeforeHermesReads(context, true)
+        PhoneAccess.setAskBeforeHermesActs(context, true)
         log.clear()
     }
 
@@ -50,6 +53,7 @@ class PhoneAccessUiTest {
         before.forEach { (capability, on) -> PhoneAccess.setSwitchedOn(context, capability, on) }
         PhoneAccess.setHermesAllowed(context, hermesBefore.first)
         PhoneAccess.setAskBeforeHermesReads(context, hermesBefore.second)
+        PhoneAccess.setAskBeforeHermesActs(context, actsBefore)
         log.clear()
         logBefore.forEach(log::add)
     }
@@ -135,6 +139,48 @@ class PhoneAccessUiTest {
         compose.waitForIdle()
         assertFalse(PhoneAccess.hermesAllowed(context))
         compose.onAllNodesWithTag("phone-access-hermes-ask").assertCountEquals(0)
+    }
+
+    @Test fun askBeforeHermesActsIsOnByDefaultShowsOnlyWhileHermesAccessIsOnAndKeepsTheFooterTrue() {
+        // Nothing is stored yet: asking is the default, so every Hermes change keeps its card.
+        assertTrue(PhoneAccess.askBeforeHermesActs(context))
+        show()
+        compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
+        compose.onNodeWithTag("phone-access-hermes-switch").performScrollTo().performClick()
+        compose.waitForIdle()
+        val acts = compose.onNodeWithTag("phone-access-hermes-ask-acts").performScrollTo()
+        acts.assertIsOn()
+        compose.onNodeWithText("Ask before Hermes acts").assertExists()
+        compose.onNodeWithText("Changes need your tap").assertExists()
+        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
+        // Reads and changes are separate choices: turning one off leaves the other alone.
+        acts.performClick()
+        compose.waitForIdle()
+        assertFalse(PhoneAccess.askBeforeHermesActs(context))
+        assertTrue(PhoneAccess.askBeforeHermesReads(context))
+        acts.assertIsOff()
+        compose.onNodeWithTag("phone-access-hermes-ask").assertIsOn()
+        compose.onNodeWithText("Hermes can add events, set alarms and more without asking").assertExists()
+        // The footer under the switches no longer claims Beacon asks before everything.
+        compose.onNodeWithText("Phone calls still ask first").performScrollTo().assertExists()
+        compose.onAllNodesWithText("Beacon asks before it changes anything").assertCountEquals(0)
+        // The engine reads the same stored choice: a change needs no tap in a chat or from the assistant, a phone call still does.
+        assertFalse(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Hermes))
+        assertTrue(PhoneTools.needsApproval(context, "phone_call", PhoneOrigin.Hermes))
+        assertFalse(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Overlay))
+        acts.performScrollTo().performClick()
+        compose.waitForIdle()
+        assertTrue(PhoneAccess.askBeforeHermesActs(context))
+        assertTrue(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Hermes))
+        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
+    }
+
+    @Test fun theFooterKeepsSayingBeaconAsksWhenHermesAccessIsOffEvenIfActingWasFreed() {
+        // With Hermes locked out the switch is hidden and Hermes cannot act at all, so nothing changes without asking.
+        PhoneAccess.setAskBeforeHermesActs(context, false)
+        show()
+        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
+        compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
     }
 
     @Test fun withNotificationsOffAndHermesAccessOnThePageSaysRequestsShowOnlyInTheOpenApp() {

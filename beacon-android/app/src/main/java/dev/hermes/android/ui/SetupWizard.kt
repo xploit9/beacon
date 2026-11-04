@@ -191,6 +191,7 @@ fun SetupWizard(vm: BeaconViewModel, modifier: Modifier = Modifier, externalLink
         ownerName = prefs.ownerName,
         onOwnerNameChange = { vm.setOwnerName(it) },
         onFinish = { vm.finishSetupWizard(it); onExternalLinkCleared() },
+        onFinishThenOpen = { keep, page -> vm.finishSetupWizard(keep, openSettings = page); onExternalLinkCleared() },
         onReopen = vm::reopenSetupWizard,
         onCancel = { vm.cancelSetupWizard(); onExternalLinkCleared() },
         onOpenBackgroundSettings = { if (!requestBackgroundUse(context)) vm.notice(backgroundHint) },
@@ -206,6 +207,8 @@ internal fun SetupWizardScreen(
     onSignIn: (Context) -> Unit,
     onAdvancePermission: () -> Unit,
     onFinish: (Boolean) -> Unit,
+    /** Finish, then open a settings page by name; screens shown without a view model only finish. */
+    onFinishThenOpen: (Boolean, String) -> Unit = { keep, _ -> onFinish(keep) },
     onReopen: (String) -> Unit,
     onCancel: () -> Unit,
     onVoiceKeySaved: () -> Unit = {},
@@ -416,7 +419,7 @@ internal fun SetupWizardScreen(
                 val permission = current
                 val (title, reason) = when (permission) {
                     "permission-microphone" -> Pair(microphoneLabel, uiText("Allow the microphone when you start a call."))
-                    "permission-notifications" -> Pair(notificationsLabel, uiText("Allow notifications so calls and updates can reach you."))
+                    "permission-notifications" -> Pair(notificationsLabel, uiText("Allow notifications so replies, calls and updates can reach you."))
                     else -> Pair(fullScreenLabel, uiText("Allow full-screen alerts so an incoming call can get your attention."))
                 }
                 val allowed = permissionAllowed(permission)
@@ -473,6 +476,22 @@ internal fun SetupWizardScreen(
                             autoLaunchVisible = !setupNeedsBackgroundExemption(ignoringBatteryOptimizations) && thisPhoneStrictMaker() != null,
                             onOpenAutoLaunch = onOpenAutoLaunch,
                         )
+                    }
+                    // The rest of Beacon, one tap each: the side button (Android's own picker; it works on a locked phone too),
+                    // Phone access and the proactive watch (both open once setup is done).
+                    val context = androidx.compose.ui.platform.LocalContext.current
+                    val assistant = dev.hermes.android.assist.rememberPhoneAssistantState()
+                    val assistantActive = assistant == dev.hermes.android.assist.PhoneAssistantState.Active
+                    SetupContainer {
+                        if (assistant != dev.hermes.android.assist.PhoneAssistantState.Unavailable)
+                            SettingsNavRow(uiText("Phone assistant"), { dev.hermes.android.assist.openAssistantSettings(context) },
+                                value = if (assistantActive) uiText("Opens over any app, even locked") else uiText("Choose Beacon to open it over any app"), valueMaxLines = 2,
+                                status = if (assistantActive) SettingsStatus.Ok else null, statusLabel = if (assistantActive) uiText("Active") else "",
+                                external = true, testTag = "setup-phone-assistant")
+                        SettingsNavRow(uiText("Phone access"), { onFinishThenOpen(keepConnected, "Phone access") },
+                            value = uiText("Calendar, alarms, calls and more"), enabled = state.authenticated, testTag = "setup-phone-access")
+                        SettingsNavRow(uiText("What needs you"), { onFinishThenOpen(keepConnected, "Assistant") },
+                            value = uiText("Alerts when something needs you"), enabled = state.authenticated, testTag = "setup-proactive")
                     }
                 },
                 actions = { SetupPrimaryButton(uiText("Open chat"), { onFinish(keepConnected) }, Modifier.testTag("setup-finish"), enabled = state.authenticated) },

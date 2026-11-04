@@ -51,9 +51,10 @@ class VisualFixesV2bTest {
 
     // Item 4: one relative-time format.
 
-    @Test fun phoneAccessActivityUsesTheSameAgoWordsAsNotifications() {
+    // 4 Nov 2026: Activity rows sit under a heading for their day, so each says its clock time ("3:00 PM") instead of how long ago.
+    @Test fun phoneAccessActivitySaysTheClockTimeUnderItsDay() {
         val phone = source("PhoneAccessSettings.kt")
-        assertTrue(phone.contains("agoText(System.currentTimeMillis(), entry.at)"))
+        assertTrue(phone.contains("PhoneTime.clock(entry.at"))
         assertFalse("The phone's own abbreviation (\"2 hr. ago\") is gone", phone.contains("getRelativeTimeSpanString"))
         assertEquals(Ago.Hours to 2L, deliveryAgo(2 * 3_600_000L + 5, 5))
         assertEquals(Ago.Minutes to 5L, deliveryAgo(5 * 60_000L + 7, 7))

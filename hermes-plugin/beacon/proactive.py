@@ -27,6 +27,10 @@ EMAIL_RULE_PREFIX = "proactive-email-rule:"
 IMPORTANCE_ACTIONS = ("important", "not_important")
 RULE_LIMIT = 20
 PROPOSAL_LIMIT = 5
+WATCH_SOURCE_LIMIT = 40
+# What the watch needs whichever sources the owner picks: Hermes memory and the plugin's own notice tools.
+WATCH_TOOLSETS = ("memory", "beacon-mailbox")
+HERMES_SOURCE = "Hermes"  # the call catalogue's name for Hermes' own tools, as source_lines() writes it
 ENABLE_UNSETTLED = "Proactive setup cleanup is incomplete. Managed jobs may still run; check them in Hermes before retrying."
 PROFILE_PROMPT = (
     "Use this profile's Hermes memory and the owner's rules to learn what the owner considers important per source. "
@@ -452,7 +456,12 @@ def _sync_request_jobs(mobile, owner, profile, rows, undo=None):
 
 
 def _save_requests(mobile, owner, profile, rows):
-    key = _key(owner, profile, "requests")
+    return _save_setting(mobile, owner, profile, "requests", json.dumps(rows, separators=(",", ":")) if rows else None, rows)
+
+
+def _save_setting(mobile, owner, profile, suffix, value, rows):
+    """Saves one setting that shapes the managed jobs (the rules, the watched sources) and brings the jobs to match, all or nothing."""
+    key = _key(owner, profile, suffix)
     previous = _meta_get(mobile, key)
     error_key = _key(owner, profile, "enable-error")
     previous_error = _meta_get(mobile, error_key)
@@ -461,7 +470,7 @@ def _save_requests(mobile, owner, profile, rows):
     undo = []
     _meta_set(mobile, error_key, "1")
     try:
-        _meta_set(mobile, key, json.dumps(rows, separators=(",", ":")) if rows else None)
+        _meta_set(mobile, key, value)
         _sync_request_jobs(mobile, owner, profile, rows, undo)
     except Exception:
         failed = _rollback_enable_jobs(mobile, owner, profile, undo, previous_ids)
@@ -479,6 +488,111 @@ def _save_requests(mobile, owner, profile, rows):
                               _specs(_setup(mobile, owner, profile), rows))
     _meta_set(mobile, error_key, None if active else previous_error)
     return rows
+
+
+def watch_source_options(rows):
+    """The sources a profile's call tool rows make up, by canonical name: the label the app shows and the Hermes toolsets that
+    carry each. An MCP server is a toolset under the name Hermes has it by; Hermes' own tools come by their toolset names."""
+    label_of = sys.modules["beacon_gateway_tools"].source_label
+    options = {}
+    for row in rows if isinstance(rows, (list, tuple)) else ():
+        if not isinstance(row, dict):
+            continue
+        server, toolset = row.get("_server"), row.get("_toolset")
+        if server:
+            label, field, item = label_of(str(server)) or HERMES_SOURCE, "servers", str(server)
+        elif isinstance(toolset, str) and toolset:
+            label, field, item = HERMES_SOURCE, "native", toolset
+        else:
+            continue
+        key = _label_key(label)
+        if key is None:
+            continue
+        option = options.setdefault(key, {"name": label, "native": [], "servers": []})
+        if item not in option[field]:
+            option[field].append(item)
+    for option in options.values():
+        option["native"].sort()
+        option["servers"].sort()
+    return options
+
+
+def _label_key(label):
+    try:
+        return source_name(label)
+    except ValueError:
+        return None
+
+
+def _stored_watch_sources(mobile, owner, profile):
+    """The sources the owner chose, each as {key, native, servers}; nothing stored (or anything unreadable) is no choice."""
+    try:
+        rows = json.loads(_meta_get(mobile, _key(owner, profile, "watch-sources")) or "[]")
+    except ValueError:
+        return []
+    return [row for row in rows if isinstance(row, dict) and isinstance(row.get("key"), str)
+            and isinstance(row.get("native"), list) and isinstance(row.get("servers"), list)] if isinstance(rows, list) else []
+
+
+def watch_toolsets(mobile, owner, profile):
+    """The toolsets the watch job is limited to, or None when the owner chose no sources and the watch reads every one."""
+    chosen = _stored_watch_sources(mobile, owner, profile)
+    if not chosen:
+        return None
+    servers = {name for row in chosen for name in row["servers"] if isinstance(name, str)}
+    native = {name for row in chosen for name in row["native"] if isinstance(name, str)}
+    # A job that names no MCP server gets every enabled one from Hermes, so "none" has to be said.
+    return sorted(servers | native | set(WATCH_TOOLSETS) | (set() if servers else {"no_mcp"}))
+
+
+def _save_watch_sources(mobile, owner, profile, chosen):
+    _save_setting(mobile, owner, profile, "watch-sources", json.dumps(chosen, separators=(",", ":")) if chosen else None,
+                  list_requests(mobile, owner, profile))
+
+
+def set_watch_sources(mobile, owner, profile, names, labels, options):
+    """Saves the sources the owner wants watched, named as the app shows them. None is the watch's default: it reads every
+    source, including one connected later. A list, even of every source today, names exactly those."""
+    if not isinstance(names, list) or len(names) > WATCH_SOURCE_LIMIT:
+        raise ValueError(f"Choose up to {WATCH_SOURCE_LIMIT} sources")
+    keys = list(dict.fromkeys(source_name(name) for name in names))
+    connected = {key for key in map(_label_key, labels) if key}
+    chosen = []
+    if keys:
+        if not connected or not options:
+            raise RuntimeError("The connected sources could not be read")
+        if any(key not in connected for key in keys):
+            raise ValueError("Choose from the connected sources")
+        if any(key not in options for key in keys):
+            raise RuntimeError("The connected sources could not be read")
+        chosen = [{"key": key, "native": options[key]["native"], "servers": options[key]["servers"]} for key in keys]
+    with _SET_ENABLED_LOCK:
+        _save_watch_sources(mobile, owner, profile, chosen)
+    return status(mobile, owner, profile)
+
+
+def sync_watch_sources(mobile, owner, profile, options):
+    """Drops chosen sources the profile no longer has and refreshes the toolsets of the rest. [options] must come from a catalogue
+    with nothing left to scan: a server that is only starting up is not a server that is gone."""
+    if not options:
+        return False
+    with _SET_ENABLED_LOCK:
+        chosen = _stored_watch_sources(mobile, owner, profile)
+        kept = [{"key": row["key"], "native": options[row["key"]]["native"], "servers": options[row["key"]]["servers"]}
+                for row in chosen if row["key"] in options]
+        if kept == chosen:
+            return False
+        _save_watch_sources(mobile, owner, profile, kept)
+    return True
+
+
+def watch_source_state(mobile, owner, profile, labels):
+    """Every connected source with whether the watch reads it, for the app's Sources sheet."""
+    chosen = {row["key"] for row in _stored_watch_sources(mobile, owner, profile)}
+    keyed = [(label, _label_key(label)) for label in labels]
+    # A chosen source that is not connected is no choice; with none left, the watch reads every source.
+    live = chosen & {key for _, key in keyed} if labels else chosen
+    return {"source_choices": [{"name": label, "watched": not live or key in live} for label, key in keyed], "sources_all": not live}
 
 
 def create_request(mobile, owner, profile, text, action, signal=None, night=False):
@@ -668,10 +782,13 @@ def _watch_schedule(setup, requests):
     return f"*/{interval} {_cron_field(hours)} * * *"
 
 
-def _specs(setup, requests=()):
+def _specs(setup, requests=(), toolsets=None):
     watch = {"id": "watch_email", "name": "Beacon: what needs you",
              "schedule": _watch_schedule(setup, requests), "cadence": "watch", "deliver": "local",
              "quiet_hours": (setup["quiet_start"], setup["quiet_end"])}
+    # The owner's chosen sources (watch_toolsets); without a choice the job has no list and Hermes gives it every tool.
+    if toolsets:
+        watch["enabled_toolsets"] = list(toolsets)
     watch["prompt"] = _job_prompt(watch, requests=requests)
     memory = {"id": "nightly_memory", "name": "Beacon proactive: Nightly memory upkeep",
               "schedule": "0 2 * * *", "cadence": "nightly", "task":
@@ -748,7 +865,8 @@ def _retire_obsolete_jobs(mobile, owner, profile, jobs, specs, undo=None):
 def _reconcile_jobs(mobile, owner, profile, setup, requests=None, undo=None):
     call, create, mutate, model = _cron_helpers()
     jobs = call(profile, "list_jobs", True)
-    specs = _specs(setup, list_requests(mobile, owner, profile) if requests is None else requests)
+    specs = _specs(setup, list_requests(mobile, owner, profile) if requests is None else requests,
+                   watch_toolsets(mobile, owner, profile))
     jobs = _retire_obsolete_jobs(mobile, owner, profile, jobs, specs, undo)
     for spec in specs:
         owned = _owned_jobs(mobile, owner, profile, spec, jobs)

@@ -368,7 +368,11 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
         // A summary may take a second line rather than be cut ("Calls while Beacon is cl…" at large text).
         SettingsRowText(label, if (status != null && statusLabel.isNotBlank()) "" else summary, status, statusLabel, MaterialTheme.colorScheme.onSurface, valueMaxLines = 2)
         if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
-        Switch(checked, onCheckedChange = null, enabled = active)
+        // A switch that is on but locked ("All sources" covers it, say) stays visibly on, dimmed; Material's own disabled look reads as off.
+        Switch(checked, onCheckedChange = null, enabled = active, colors = SwitchDefaults.colors(
+            disabledCheckedTrackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f),
+            disabledCheckedThumbColor = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.8f),
+            disabledCheckedBorderColor = Color.Transparent))
     }
 }
 

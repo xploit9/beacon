@@ -26,12 +26,16 @@ internal class AssistLiveBook {
     private var cancelled = false
     /** When the start in flight began (the phone's clock, as a call's own start is stamped), or [NO_START]. */
     private var launchedAt = NO_START
+    /** This ask already had its one automatic second try. */
+    private var retried = false
+    /** The conversation running here got going (it listened or spoke); a failure after that is a dropped call, not a failed start. */
+    private var reachedLive = false
 
     /** A fresh show clears what an earlier one left. */
     fun shown() { cancelled = false }
 
-    /** A conversation is asked for. */
-    fun requested() { wanted = true; cancelled = false }
+    /** A conversation is asked for: by the owner, or as the automatic second try ([retry]), which keeps this ask's one try spent. */
+    fun requested(retry: Boolean = false) { wanted = true; cancelled = false; if (!retry) retried = false }
 
     /** The ask ended without a call (no sign-in, no key, it failed to start): nothing is left to cancel. Returns whether it was still wanted. */
     fun gaveUp(): Boolean { if (!wanted) return false; wanted = false; return true }
@@ -64,8 +68,22 @@ internal class AssistLiveBook {
     /** A call turned active, started at [startedAt]. */
     fun callActive(startedAt: Long): LiveActive {
         if (cancelled && startedAt >= launchedAt) { cancelled = false; launchedAt = NO_START; wanted = false; here = false; return LiveActive.HangUp }
-        if (wanted) { wanted = false; here = true; return LiveActive.Adopted }
+        if (wanted) { wanted = false; here = true; reachedLive = false; return LiveActive.Adopted }
         return LiveActive.Other
+    }
+
+    /** The conversation running here listened or spoke. */
+    fun heard() { if (here) reachedLive = true }
+
+    /**
+     * A start that failed before it got going (Android or the network turning it away for a moment): true once per ask, when it is
+     * worth one more try before the owner sees it fail. [running] says the failure ended a call started here, else the start itself failed.
+     */
+    fun retryOnce(running: Boolean): Boolean {
+        val failedStart = if (running) here && !wanted && !reachedLive else wanted
+        if (!failedStart || retried) return false
+        retried = true
+        return true
     }
 
     /** A call ended while nothing was being asked for: the overlay no longer runs one. */

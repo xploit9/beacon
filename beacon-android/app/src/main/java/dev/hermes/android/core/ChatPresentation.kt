@@ -97,3 +97,32 @@ fun historyOwnsLiveBoundary(messages: List<JSONObject>, tools: List<JSONObject>,
 }
 
 fun currentTurnMessages(messages: List<JSONObject>): List<JSONObject> = messages.drop(messages.indexOfLast { it.string("role") == "user" }.coerceAtLeast(0))
+
+/** Hermes stores its own steering notes (a model switch, "continue now" after a message that named no action) as user rows. */
+fun isSteeringText(text: String): Boolean = text.trimStart().startsWith("[System:")
+
+/** The saved content of a row, as the transcript reads it. */
+fun historyRowContent(row: JSONObject): Any? = when {
+    row.has("display_content") && !row.isNull("display_content") -> row.opt("display_content")
+    row.has("display_text") && !row.isNull("display_text") -> row.opt("display_text")
+    row.has("text") && !row.isNull("text") -> row.opt("text")
+    else -> row.opt("content")
+}
+
+/** The rows of the turn the owner started: a steering note continues that turn instead of beginning another, so the messages before it still belong to it. */
+fun runningTurnMessages(messages: List<JSONObject>): List<JSONObject> = messages.drop(messages.indexOfLast { row ->
+    row.string("role") == "user" && !isSteeringText(messageContentText("user", historyRowContent(row)))
+}.coerceAtLeast(0))
+
+private val runsOfSpace = Regex("\\s+")
+
+/**
+ * Words that name no tool call (Hermes saves such a message when it makes the model go on, and its turn continues) have only their text to be told by.
+ * A closed live segment is held once a saved assistant message without tool calls, in the running turn, says the same words; a message with tool calls is still told by them.
+ */
+fun historyOwnsTextSegment(messages: List<JSONObject>, liveText: String, boundaryClosed: Boolean): Boolean {
+    val live = liveText.trim().replace(runsOfSpace, " ")
+    return boundaryClosed && live.isNotEmpty() && messages.any { row ->
+        row.string("role") == "assistant" && row.rows("tool_calls").isEmpty() && messageContentText("assistant", historyRowContent(row)).trim().replace(runsOfSpace, " ") == live
+    }
+}

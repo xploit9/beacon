@@ -12,12 +12,13 @@ Hermes can use your phone, and you approve what it does on the phone.
 ## What you control
 
 - Settings › Phone access has one switch per capability: Calendar & reminders, Alarms & timers, Contacts, Phone calls, Messages. Everything is off until you turn it on, and Android asks for its permission then.
-- "Let Hermes use phone access" is separate and off by default. Voice calls and the assistant overlay do not depend on it. "Ask before Hermes reads" is on by default.
+- "Let Hermes use phone access" is separate and off by default. Voice calls and the assistant overlay do not depend on it. "Ask before Hermes reads" and "Ask before Hermes acts" are both on by default.
 - Every change or action waits for your tap on a card that shows what it will do, with the notes or message text whole. Reads also wait unless you turn "Ask before Hermes reads" off. Your phone must be unlocked to allow.
-- A call you ask for in a live call or the assistant overlay to a contact saved on your phone starts after a 3-second countdown on the screen (Cancel or Call now). A call to any other number, and every call Hermes asks for, waits for your tap. A saved contact means the same number is saved exactly; a similar number does not count. A card that waited more than a few seconds before you saw it never counts down.
+- With "Ask before Hermes acts" off, what Hermes asks for in a chat, a scheduled job, a live call or the assistant overlay runs without the card (events, reminders, alarms, timers, drafts; a phone call still asks first) and is still listed in Activity. It still never runs while the phone is locked (the card waits for you instead), and an alarm, timer or message draft runs on its own only while Beacon is on screen, because it opens another app.
+- A call you ask for in a live call or the assistant overlay to a contact saved on your phone starts after a 3-second countdown on the screen (Cancel or Call now). A call to any other number waits for your tap. A call Hermes asks for waits for your tap too, unless "Ask before Hermes acts" is off and the number is a saved contact: then it gets the same 3-second countdown. A saved contact means the same number is saved exactly; a similar number does not count. A card that waited more than a few seconds before you saw it never counts down.
 - If you take a permission away in Android, its switch goes off and stays off until you turn it on again.
 - A request lasts two minutes. If you do not answer, nothing happens, and it is never run later.
-- On a locked phone the side button asks you to unlock first; the assistant hears and says nothing until you do. A call you started while unlocked keeps its tools when the screen turns off.
+- On a locked phone the side button still starts the assistant at once and it talks, but anything personal (your memory, mail, calendar, contacts, chats) waits: it asks you to unlock, and the same conversation carries on once you do. Turn on Settings > Assistant > "Personal info when locked" to let it use your memory and tools on the lock screen too. Changes still need the unlock. A call you started while unlocked keeps its tools when the screen turns off.
 - The countdown stops (and nothing is dialled) if you press power, lock the phone, leave the screen or end the call. After you cancel or deny a call, further calls in that conversation need your tap for five minutes.
 - While the card is on your screen there is no notification for it; if you leave the screen with a request waiting, the notification appears. With notifications off, Phone access shows a line saying Hermes requests need Beacon open.
 
@@ -46,4 +47,4 @@ Hermes can use your phone, and you approve what it does on the phone.
 
 - What a live call or the assistant overlay reads (event titles, notes, contact names and numbers) goes to the voice provider you chose for that call, as part of the conversation. A call can read at most 30 contacts in all.
 - With "Ask before Hermes reads" off, any Hermes chat or scheduled job can read the calendars and contacts you switched on without asking you each time. Leave it on to approve every read.
-- Every request, including the ones you denied, that expired or that were switched off, appears in Settings › Phone access › Activity.
+- Every request, including the ones you denied, that expired or that were switched off, appears in Settings › Phone access › Activity: grouped by day, newest first, with search and filters for the type, the result and who asked, 20 at a time.

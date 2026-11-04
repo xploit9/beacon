@@ -74,12 +74,11 @@ class AssistLockGateTest {
 
     @Test fun theRuleIsWrittenInTheOverlaysCommentBlock() {
         val model = source("assist/AssistOverlayModel.kt")
-        // Lane LK: the overlay never starts one locked; the trust rule stays below it as defense in depth.
-        assertTrue(model.contains("The overlay never starts a conversation on a locked phone."))
+        // Lane LS: the side button always starts the conversation; a locked one is untrusted and asks for the unlock for what is private.
+        assertTrue(model.contains("The side button always starts the conversation, locked or not"))
         assertTrue(model.contains("A conversation is TRUSTED when it started on an unlocked phone"))
-        assertTrue(model.contains("That stays as defense in depth"))
         assertTrue(model.contains("Unlock your phone first."))
         assertTrue(model.contains("Once trusted it stays trusted for that conversation"))
-        assertFalse("the old rule, a locked start that talks, is gone", model.contains("talks at once, but until it is trusted"))
+        assertFalse("the Lane LK rule, a locked show that only asks to unlock, is gone", model.contains("The overlay never starts a conversation on a locked phone."))
     }
 }

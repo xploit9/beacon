@@ -89,10 +89,12 @@ class LockedStartCallTest {
         socket
     }
 
-    private class Call(val voice: DirectVoice, val scope: CoroutineScope, val client: BeaconClient, val socket: WebSocket, val listener: WebSocketListener,
+    /** The call and the provider session it runs now: an unlock replaces the session (Lane LS), and tool calls go to the newest one. */
+    private class Call(val voice: DirectVoice, val scope: CoroutineScope, val client: BeaconClient, val latest: java.util.concurrent.atomic.AtomicReference<Pair<WebSocket, WebSocketListener>>,
         val frames: CopyOnWriteArrayList<JSONObject>, val paths: CopyOnWriteArrayList<String>, val tickets: AtomicInteger) {
-        fun call(id: String, name: String, args: JSONObject = json()) =
+        fun call(id: String, name: String, args: JSONObject = json()) = latest.get().let { (socket, listener) ->
             listener.onMessage(socket, json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to id, "name" to name, "args" to args)))).toString())
+        }
         fun responses() = frames.filter { it.has("toolResponse") }.map { it.getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0) }
         fun response(id: String) = responses().first { it.getString("id") == id }.getJSONObject("response")
         fun close() { voice.close(); scope.cancel(); client.closeNative() }
@@ -101,17 +103,18 @@ class LockedStartCallTest {
     private fun openCall(trust: CallTrust): Call = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val started = CompletableDeferred<Pair<WebSocket, WebSocketListener>>()
+        val latest = java.util.concurrent.atomic.AtomicReference<Pair<WebSocket, WebSocketListener>>()
         val events = CopyOnWriteArrayList<JSONObject>()
         val frames = CopyOnWriteArrayList<JSONObject>()
         val paths = CopyOnWriteArrayList<String>()
         val tickets = AtomicInteger()
         val client = client(paths, tickets)
         val voice = DirectVoice(client, "call", "stored", scope, {}, { events += it }, {}, credentials = credentials(),
-            providerSocketFactory = providerFactory({ frames += it }, { socket, listener -> started.complete(socket to listener) }), trust = trust)
+            providerSocketFactory = providerFactory({ frames += it }, { socket, listener -> latest.set(socket to listener); started.complete(socket to listener) }), trust = trust)
         voice.start()
-        val (socket, listener) = withTimeout(3000) { started.await() }
+        withTimeout(3000) { started.await() }
         withTimeout(3000) { while (events.none { it.optString("state") == "listening" }) delay(5) }
-        Call(voice, scope, client, socket, listener, frames, paths, tickets)
+        Call(voice, scope, client, latest, frames, paths, tickets)
     }
 
     private fun instruction(frames: List<JSONObject>) =
@@ -160,6 +163,8 @@ class LockedStartCallTest {
             assertEquals("locked", call.response("before").getString("error_code"))
             assertTrue(call.paths.none { it.endsWith("/tools") })
             trust.unlocked()
+            // The unlock replaces the session with one set up with the whole brief (see the Lane LS tests below); its tools work at once.
+            waitFor("the session after the unlock") { call.frames.count { it.has("setup") } >= 2 }
             call.call("after", "discover_tools", json("query" to "weather"))
             runBlocking { withTimeout(5000) { while (call.responses().none { it.getString("id") == "after" }) delay(5) } }
             assertEquals("get_weather", call.response("after").getJSONArray("tools").getJSONObject(0).getString("name"))
@@ -190,9 +195,10 @@ class LockedStartCallTest {
         val bridge = bridge(CallTrust { true })
         val read = bridge.call("l1", "phone_calendars", JSONObject(), events::add)
         assertEquals("unavailable", read.getString("error"))
-        assertEquals("Unlock your phone first.", read.getString("message"))
+        assertEquals(LOCKED_TOOL_MESSAGE, read.getString("message"))
+        assertTrue(read.getString("message").startsWith("Unlock your phone first."))
         val write = bridge.call("l2", "phone_timer_set", obj("seconds" to 60), events::add)
-        assertEquals("Unlock your phone first.", write.getString("message"))
+        assertEquals(LOCKED_TOOL_MESSAGE, write.getString("message"))
         assertTrue("no card for a locked start", events.isEmpty())
         assertEquals(listOf("locked", "locked"), rig.log.entries.map { it.outcome })
         assertEquals("no calendar or contact was read", 0, rig.calendar.listQueries)
@@ -247,11 +253,86 @@ class LockedStartCallTest {
 
     @Test fun theDispatchRefusesBeforeAnythingRunsAndTheBriefIsWithheldWhereItIsApplied() {
         val direct = source("voice/DirectVoice.kt")
-        assertTrue(direct.contains("if(!trust.trusted()&&name in DIRECT_CALL_TOOLS) { toolResponse(id,name,lockedToolResult());return }"))
-        assertTrue(direct.contains("liveSetup(credentials,callBrief(context,trust.trusted()),resumption,recentSpeech())"))
+        assertTrue(direct.contains("if(!trust.trusted()&&name in DIRECT_CALL_TOOLS) { if(name!=\"get_visual_state\") trust.refused();toolResponse(id,name,lockedToolResult());return }"))
+        // The setup remembers whether its brief was whole, so the unlock knows whether the session has to be replaced.
+        assertTrue(direct.contains("liveSetup(credentials,callBrief(context,briefTrust()),resumption,recentSpeech())"))
+        assertTrue(direct.contains("private fun briefTrust():Boolean=trust.trusted().also { briefedTrusted=it }"))
+        assertTrue(direct.contains("trust.whenTrusted(::upgrade)"))
         assertTrue(direct.contains("warm?.takeIf { !warmUsed&&!greeted&&!it.dead&&trust.trusted() }"))
         val bridge = source("voice/PhoneVoiceTools.kt")
         assertTrue(bridge.contains("if (!trust.trusted()) {"))
+        assertTrue("a refused phone tool is counted too, so the overlay says to unlock", bridge.substringAfter("if (!trust.trusted()) {").substringBefore("return locked.toJson()").contains("trust.refused()"))
+    }
+
+    // ---- Lane LS: the unlock carries a locked conversation on, trusted ----
+
+    private fun instructionOf(setup: JSONObject) = setup.getJSONObject("setup").getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
+    private fun setups(call: Call) = call.frames.filter { it.has("setup") }
+    private fun cues(call: Call) = call.frames.filter { it.has("clientContent") && it.toString().contains("owner unlocked the phone") }
+    private fun waitFor(what: String, millis: Long = 8_000, condition: () -> Boolean) = runBlocking { withTimeout(millis) { while (!condition()) delay(10) } }
+
+    @Test(timeout = 25000) fun theUnlockReplacesALockedSessionWithOneThatHasTheWholeBriefAndAsksForTheRefusedRequestAgain() {
+        var locked = true
+        val trust = CallTrust { locked }
+        val call = openCall(trust)
+        try {
+            // Locked, the first session holds nothing private and says why; a private request is turned away.
+            call.call("ask", "hermes_memory", json("query" to "what is my name"))
+            waitFor("the refusal") { call.responses().any { it.getString("id") == "ask" } }
+            assertEquals("locked", call.response("ask").getString("error_code"))
+            assertTrue(trust.wasRefused())
+            assertEquals(1, setups(call).size)
+            assertFalse(instructionOf(setups(call)[0]).contains("MEMORY-SECRET"))
+            assertTrue(instructionOf(setups(call)[0]).contains(LOCKED_BRIEF))
+            // The unlock: the conversation goes on in a new session set up with the owner's memory and persona, from what was said so far.
+            locked = false
+            trust.unlocked()
+            waitFor("the second session's setup") { setups(call).size >= 2 }
+            val whole = instructionOf(setups(call)[1])
+            for (secret in listOf("MEMORY-SECRET", "PERSONA-SECRET", "NAME-SECRET", "CATALOGUE-SECRET")) assertTrue("$secret in the trusted brief", whole.contains(secret))
+            assertFalse("it no longer says the phone is locked", whole.contains(LOCKED_BRIEF))
+            // Told, as a note and never as the owner's words, that the request turned away is theirs to carry out now.
+            waitFor("the note about the request") { cues(call).isNotEmpty() }
+            assertEquals("once", 1, cues(call).size)
+            assertEquals("no greeting is asked for again", 0, call.frames.count { it.toString().contains("Greet the owner now") } - 1)
+        } finally { call.close() }
+    }
+
+    @Test(timeout = 25000) fun aCallThatSeesTheUnlockItselfIsReplacedWithoutAnyBroadcast() {
+        var locked = true
+        val trust = CallTrust { locked }
+        val call = openCall(trust)
+        try {
+            // No unlock signal and no tool: the call's own once-a-second look at the lock screen finds the unlock.
+            locked = false
+            waitFor("the second session's setup", 10_000) { setups(call).size >= 2 }
+            assertTrue(instructionOf(setups(call)[1]).contains("MEMORY-SECRET"))
+        } finally { call.close() }
+    }
+
+    @Test(timeout = 25000) fun anUnlockWithNothingTurnedAwayReplacesTheSessionQuietly() {
+        var locked = true
+        val trust = CallTrust { locked }
+        val call = openCall(trust)
+        try {
+            locked = false
+            trust.unlocked()
+            waitFor("the second session's setup") { setups(call).size >= 2 }
+            assertTrue(instructionOf(setups(call)[1]).contains("MEMORY-SECRET"))
+            // Nothing was owed: no note about a request, and the model is not made to speak.
+            runBlocking { delay(1_500) }
+            assertEquals(0, cues(call).size)
+        } finally { call.close() }
+    }
+
+    @Test(timeout = 25000) fun aConversationThatStartedUnlockedIsNeverReplacedByAnUnlock() {
+        val trust = CallTrust { false }
+        val call = openCall(trust)
+        try {
+            trust.unlocked()
+            runBlocking { delay(1_800) }
+            assertEquals("its first session already had the whole brief", 1, setups(call).size)
+        } finally { call.close() }
     }
 
     @Test fun theBriefIsWholeOnceTheConversationIsTrusted() {

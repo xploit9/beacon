@@ -7,18 +7,34 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Alarm
+import androidx.compose.material.icons.rounded.ArrowDropDown
 import androidx.compose.material.icons.rounded.CalendarMonth
 import androidx.compose.material.icons.rounded.Call
 import androidx.compose.material.icons.rounded.ContactPage
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.NotificationsOff
+import androidx.compose.material.icons.rounded.SearchOff
 import androidx.compose.material.icons.rounded.Sms
 import androidx.compose.material.icons.rounded.SmartToy
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -39,18 +55,31 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.phone.PhoneAccess
+import dev.hermes.android.phone.PhoneActivityDay
 import dev.hermes.android.phone.PhoneActivityEntry
+import dev.hermes.android.phone.PhoneActivityFilter
 import dev.hermes.android.phone.PhoneActivityLog
 import dev.hermes.android.phone.PhoneCapability
+import dev.hermes.android.phone.PhoneDayName
 import dev.hermes.android.phone.PhoneLine
 import dev.hermes.android.phone.PhoneOrigin
+import dev.hermes.android.phone.PhoneResult
+import dev.hermes.android.phone.activityPage
+import dev.hermes.android.phone.filterActivity
+import dev.hermes.android.phone.groupActivityByDay
+import dev.hermes.android.phone.phoneDayName
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
+import java.text.SimpleDateFormat
+import java.time.LocalDate
+import java.time.ZoneId
+import java.util.Date
+import java.util.Locale
 
 /** The words of the activity list that reach uiText through a variable; the translation test checks each one. */
 internal val PhoneAccessStrings = listOf(
     "Done", "Said no", "Expired", "Turned off", "Needs permission", "Busy", "Not found", "Not available", "Invalid", "Cancelled",
-    "Unlock your phone first.", "Voice call", "Assistant", "Hermes",
+    "Unlock your phone first.", "Voice call", "Assistant", "Hermes", "Didn't run",
 )
 
 private fun outcomeText(outcome: String) = when (outcome) {
@@ -65,6 +94,12 @@ private fun outcomeText(outcome: String) = when (outcome) {
     "locked" -> "Unlock your phone first."
     "cancelled" -> "Cancelled"
     else -> "Invalid"
+}
+
+private fun resultText(result: PhoneResult) = when (result) {
+    PhoneResult.Done -> "Done"
+    PhoneResult.SaidNo -> "Said no"
+    PhoneResult.DidntRun -> "Didn't run"
 }
 
 private fun originText(origin: PhoneOrigin) = when (origin) {
@@ -91,8 +126,6 @@ private fun capabilityIcon(capability: PhoneCapability) = when (capability) {
     PhoneCapability.Calls -> Icons.Rounded.Call
     PhoneCapability.Messages -> Icons.Rounded.Sms
 }
-
-private const val ACTIVITY_SHOWN = 50
 
 /** Settings > Phone access, as its own page. */
 @Composable internal fun PhoneAccessSettings(vm: BeaconViewModel) {
@@ -146,12 +179,29 @@ private const val ACTIVITY_SHOWN = 50
     val entries = remember(version) { log.recent() }
     val hermes = remember(version) { PhoneAccess.hermesAllowed(context) }
     val ask = remember(version) { PhoneAccess.askBeforeHermesReads(context) }
+    val askActs = remember(version) { PhoneAccess.askBeforeHermesActs(context) }
+    // The Activity list's search, its three choices and how many pages it shows; a change of any of them starts again at the first page.
+    var query by rememberSaveable { mutableStateOf("") }
+    var typeKey by rememberSaveable { mutableStateOf("") }
+    var resultKey by rememberSaveable { mutableStateOf("") }
+    var originKey by rememberSaveable { mutableStateOf("") }
+    var pages by rememberSaveable { mutableIntStateOf(1) }
+    val filter = PhoneActivityFilter(query, PhoneCapability.entries.firstOrNull { it.key == typeKey }, PhoneResult.entries.firstOrNull { it.name == resultKey },
+        PhoneOrigin.entries.firstOrNull { it.name == originKey })
+    // The search reads each action as the owner sees it, in the phone's language.
+    val shown = entries.map { it.line.template }.distinct().associateWith { uiText(it) }
+    val matching = remember(entries, filter, shown) { filterActivity(entries, filter) { PhoneLine(shown.getValue(it.template), it.args).text() } }
+    val visible = activityPage(matching, pages)
+    val zone = remember { ZoneId.systemDefault() }
+    val days = remember(visible, zone) { groupActivityByDay(visible, zone) }
+    val today = remember(entries) { LocalDate.now(zone) }
     // A request from Hermes reaches the owner as a notification when Beacon is closed; with notifications off it waits for the app to open.
     val notificationsOff = remember(version) { hermes && !(notificationsOn?.invoke() ?: NotificationManagerCompat.from(context).areNotificationsEnabled()) }
 
     SettingsList(modifier, testTag = "phone-access") {
         item {
-            SettingsSection(uiText("Beacon can use"), footer = uiText("Beacon asks before it changes anything"), testTag = "phone-access-capabilities") {
+            SettingsSection(uiText("Beacon can use"), footer = uiText(if (hermes && !askActs) "Phone calls still ask first" else "Beacon asks before it changes anything"),
+                testTag = "phone-access-capabilities") {
                 PhoneCapability.entries.forEachIndexed { index, capability ->
                     if (index > 0) SettingsDivider()
                     val stored = remember(version) { PhoneAccess.switchedOn(context, capability) }
@@ -199,6 +249,12 @@ private const val ACTIVITY_SHOWN = 50
                         onCheckedChange = { PhoneAccess.setAskBeforeHermesReads(context, it); version++ },
                         summary = uiText(if (ask) "Reads need your tap too" else "Hermes can read your calendar and contacts without asking"), testTag = "phone-access-hermes-ask",
                     )
+                    SettingsDivider()
+                    SettingsSwitchRow(
+                        label = uiText("Ask before Hermes acts"), checked = askActs,
+                        onCheckedChange = { PhoneAccess.setAskBeforeHermesActs(context, it); version++ },
+                        summary = uiText(if (askActs) "Changes need your tap" else "Hermes can add events, set alarms and more without asking"), testTag = "phone-access-hermes-ask-acts",
+                    )
                 }
                 if (notificationsOff) {
                     SettingsDivider()
@@ -211,20 +267,82 @@ private const val ACTIVITY_SHOWN = 50
         }
         item {
             SettingsSection(uiText("Activity"), testTag = "phone-access-activity", trailing = {
-                if (entries.isNotEmpty()) TextButton(onClick = { confirmClear = true }, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-access-clear")) { androidx.compose.material3.Text(uiText("Clear")) }
+                if (entries.isNotEmpty()) TextButton(onClick = { confirmClear = true }, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-access-clear")) { Text(uiText("Clear")) }
             }) {
                 if (entries.isEmpty()) SettingsEmpty(uiText("Nothing yet"), Icons.Rounded.History)
-                entries.take(ACTIVITY_SHOWN).forEachIndexed { index, entry ->
+                else Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SettingsSearchField(query, { query = it; pages = 1 }, uiText("Search activity"), testTag = "phone-access-search")
+                    Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterMenuChip(uiText("Type"), filter.capability, PhoneCapability.entries, { uiText(capabilityLabel(it)) }, { it.key }, "phone-access-filter-type") {
+                            typeKey = it?.key.orEmpty(); pages = 1
+                        }
+                        FilterMenuChip(uiText("Result"), filter.result, PhoneResult.entries, { uiText(resultText(it)) }, { it.name.lowercase() }, "phone-access-filter-result") {
+                            resultKey = it?.name.orEmpty(); pages = 1
+                        }
+                        FilterMenuChip(uiText("Asked by"), filter.origin, PhoneOrigin.entries, { uiText(originText(it)) }, { it.name.lowercase() }, "phone-access-filter-origin") {
+                            originKey = it?.name.orEmpty(); pages = 1
+                        }
+                    }
+                }
+            }
+        }
+        if (entries.isNotEmpty() && matching.isEmpty()) item {
+            SettingsSection(testTag = "phone-access-no-matches") {
+                SettingsEmpty(uiText("No matches"), Icons.Rounded.SearchOff, action = SettingsAction(uiText("Reset filters"), onClick = {
+                    query = ""; typeKey = ""; resultKey = ""; originKey = ""; pages = 1
+                }, testTag = "phone-access-clear-filters"))
+            }
+        }
+        // One titled card for each day, newest first; a day's rows are compact: what was done, then who asked, how long ago and how it ended.
+        items(days, key = { it.day.toString() }) { group ->
+            SettingsSection(dayLabel(group, today), testTag = "phone-access-day") {
+                group.entries.forEachIndexed { index, entry ->
                     if (index > 0) SettingsDivider()
                     ActivityRow(entry)
                 }
             }
         }
+        if (matching.size > visible.size) item {
+            SettingsSection(testTag = "phone-access-more-section") {
+                SettingsActionRow(uiText("Show more"), onClick = { pages++ }, testTag = "phone-access-more")
+            }
+        }
     }
     if (confirmClear) SettingsConfirmDialog(
         title = uiText("Clear activity?"), text = "", confirmLabel = uiText("Clear"),
-        onConfirm = { log.clear(); confirmClear = false; version++ }, onDismiss = { confirmClear = false }, confirmTestTag = "phone-access-clear-confirm",
+        onConfirm = { log.clear(); confirmClear = false; query = ""; typeKey = ""; resultKey = ""; originKey = ""; pages = 1; version++ },
+        onDismiss = { confirmClear = false }, confirmTestTag = "phone-access-clear-confirm",
     )
+}
+
+/** A filter that opens a menu: [label] while it lets everything through, the chosen option once one is picked. [onPick] gets null for All. */
+@Composable private fun <T : Any> FilterMenuChip(
+    label: String, value: T?, options: List<T>, text: @Composable (T) -> String, optionTag: (T) -> String, tag: String, onPick: (T?) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        FilterChip(
+            selected = value != null, onClick = { open = true }, label = { Text(if (value != null) text(value) else label, maxLines = 1) },
+            trailingIcon = { Icon(Icons.Rounded.ArrowDropDown, null, Modifier.size(FilterChipDefaults.IconSize)) }, modifier = Modifier.testTag(tag),
+        )
+        DropdownMenu(open, { open = false }) {
+            DropdownMenuItem(text = { Text(uiText("All")) }, onClick = { open = false; onPick(null) }, modifier = Modifier.testTag("$tag:all"))
+            options.forEach { option ->
+                DropdownMenuItem(text = { Text(text(option)) }, onClick = { open = false; onPick(option) }, modifier = Modifier.testTag("$tag:${optionTag(option)}"))
+            }
+        }
+    }
+}
+
+/** A day's heading: Today, Yesterday, else the date in the phone's own order (with the weekday this year, the year before). */
+@Composable private fun dayLabel(group: PhoneActivityDay, today: LocalDate): String = when (phoneDayName(group.day, today)) {
+    PhoneDayName.Today -> uiText("Today")
+    PhoneDayName.Yesterday -> uiText("Yesterday")
+    PhoneDayName.Date -> {
+        val locale = Locale.getDefault()
+        val sameYear = group.day.year == today.year
+        SimpleDateFormat(nativeDayPattern(locale, withYear = !sameYear, withWeekday = sameYear), locale).format(Date(group.entries.first().at))
+    }
 }
 
 /** Bumped whenever this page changes a choice, so the Settings list beside it (wide screens) shows the new state at once. */
@@ -256,10 +374,12 @@ internal val PhoneAccessLabels = listOf(
 )
 
 @Composable private fun ActivityRow(entry: PhoneActivityEntry) {
-    val ago = agoText(System.currentTimeMillis(), entry.at)
+    // Under its day's heading a row says the time it happened ("3:00 PM"), so rows of one day read in order.
+    val locale = androidx.compose.ui.platform.LocalConfiguration.current.locales[0]
+    val time = dev.hermes.android.phone.PhoneTime.clock(entry.at, java.time.ZoneId.systemDefault(), locale)
     SettingsValueRow(
         label = phoneLineText(entry.line), valueMaxLines = 2,
-        value = listOf(uiText(originText(entry.origin)), ago, uiText(outcomeText(entry.outcome))).joinToString(" · "),
+        value = listOf(uiText(originText(entry.origin)), time, uiText(outcomeText(entry.outcome))).joinToString(" · "),
         testTag = "phone-access-entry",
     )
 }

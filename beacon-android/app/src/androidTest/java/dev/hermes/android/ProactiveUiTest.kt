@@ -43,6 +43,27 @@ class ProactiveUiTest {
     private val app get() = ApplicationProvider.getApplicationContext<BeaconApplication>()
     private fun proactiveKey(fixture: NativeExperienceFixture) = proactiveSettingsKey(fixture.scope.copy(profile = "coder"))
 
+    // Owner, 4 Nov 2026: whether the assistant may use personal things on the lock screen is the owner's choice, in Settings › Assistant.
+    @Test fun thePhoneAssistantCardHoldsTheLockScreenChoiceOffByDefault() = withFixture { vm, _ ->
+        val context = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        dev.hermes.android.voice.LockScreenAccess.set(context, false)
+        try {
+            compose.runOnIdle { vm.more("Assistant") }
+            if (dev.hermes.android.assist.phoneAssistantState(context) == dev.hermes.android.assist.PhoneAssistantState.Unavailable) return@withFixture
+            val row = compose.onNodeWithTag("lock-screen-access")
+            row.performScrollTo().assertIsOff().assertTextContains("Personal info when locked").assertTextContains("Asks you to unlock first")
+            // It sits in the side button's own card, not in a card of its own.
+            compose.onNode(hasTestTag("lock-screen-access") and hasAnyAncestor(hasTestTag("phone-assistant-section"))).assertExists()
+            row.performClick()
+            compose.waitForIdle()
+            row.assertIsOn().assertTextContains("Memory and tools work while locked")
+            assertTrue(dev.hermes.android.voice.LockScreenAccess.allowed(context))
+            row.performClick()
+            compose.waitForIdle()
+            assertFalse(dev.hermes.android.voice.LockScreenAccess.allowed(context))
+        } finally { dev.hermes.android.voice.LockScreenAccess.set(context, false) }
+    }
+
     @Test fun proactiveToggleEnablesImmediatelyWithTheExistingDefaults() = withFixture { vm, fixture ->
         fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true); vm.more("Assistant") }
@@ -326,6 +347,71 @@ class ProactiveUiTest {
         "expires_at" to System.currentTimeMillis() / 1000 + expiresInSeconds, "verdict" to verdict,
     )
     private fun saveAlerts(scope: Scope, vararg alerts: JSONObject) = runBlocking { app.cache.write(scope, "alerts", JSONArray(alerts.toList()).toString(), protected = true) }
+    private fun sourcesBody(fixture: NativeExperienceFixture) = fixture.requests.last { it.string("path") == PROACTIVE_SETTINGS_PATH && it.string("method") == "PUT" }.getJSONObject("body")
+    private fun savedSources(fixture: NativeExperienceFixture) = sourcesBody(fixture).getJSONArray("sources").let { names -> List(names.length()) { names.getString(it) } }
+
+    @Test fun theSourcesRowOpensASheetWhoseSwitchesSaveAtOnce() = withFixture { vm, fixture ->
+        fixture.proactiveSourceNames = listOf("Hermes", "github", "gmail")
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.has("source_choices") == true }
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-sources"))
+        // All sources is the default, and the row is a button now.
+        compose.onNodeWithTag("proactive-sources").assertIsEnabled().assertTextContains("All sources").performClick()
+        compose.onNodeWithTag("proactive-sources-sheet").assertExists()
+        compose.onNodeWithTag("proactive-source-all").assertIsOn()
+        // The sources are listed, every one on while All sources is on, and each can still be switched off.
+        for (name in listOf("Hermes", "github", "gmail")) compose.onNodeWithTag("proactive-source-$name").assertIsOn().assertIsEnabled()
+
+        compose.onNodeWithTag("proactive-source-all").performClick()
+        await { fixture.proactiveChosenSources["coder"] == listOf("Hermes", "github", "gmail") }
+        assertEquals("coder", fixture.requests.last { it.string("path") == PROACTIVE_SETTINGS_PATH && it.string("method") == "PUT" }.string("profile"))
+        assertEquals(setOf("sources"), sourcesBody(fixture).keys().asSequence().toSet())
+        await { runCatching { compose.onNodeWithTag("proactive-source-all").assertIsOff(); compose.onNodeWithTag("proactive-source-github").assertIsEnabled() }.isSuccess }
+
+        compose.onNodeWithTag("proactive-source-Hermes").performClick()
+        await { fixture.proactiveChosenSources["coder"] == listOf("github", "gmail") }
+        await { runCatching { compose.onNodeWithTag("proactive-source-Hermes").assertIsOff() }.isSuccess }
+        compose.onNodeWithTag("proactive-source-github").performClick()
+        await { fixture.proactiveChosenSources["coder"] == listOf("gmail") }
+        // The last source stays on: none chosen would mean every source.
+        await { runCatching { compose.onNodeWithTag("proactive-source-gmail").assertIsOn().assertIsNotEnabled() }.isSuccess }
+        compose.onNodeWithTag("proactive-sources-done").performClick()
+        compose.onNodeWithTag("proactive-sources-sheet").assertDoesNotExist()
+        compose.onNodeWithTag("proactive-sources").assertTextContains("Gmail")
+
+        // Back to All sources: nothing chosen is saved.
+        compose.onNodeWithTag("proactive-sources").performClick()
+        compose.onNodeWithTag("proactive-source-all").performClick()
+        await { fixture.proactiveChosenSources["coder"] == emptyList<String>() }
+        assertEquals(emptyList<String>(), savedSources(fixture))
+        await { runCatching { compose.onNodeWithTag("proactive-source-all").assertIsOn() }.isSuccess }
+        compose.onNodeWithTag("proactive-sources-done").performClick()
+        compose.onNodeWithTag("proactive-sources").assertTextContains("All sources")
+    }
+
+    @Test fun aFailedSourcesSaveGivesTheSwitchesBack() = withFixture { vm, fixture ->
+        fixture.proactiveSourceNames = listOf("github", "gmail")
+        fixture.proactiveChosenSources["coder"] = listOf("github", "gmail")
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.has("source_choices") == true }
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-sources"))
+        compose.onNodeWithTag("proactive-sources").assertTextContains("Github, Gmail").performClick()
+        fixture.proactiveSaveStatusCode = 500
+        compose.onNodeWithTag("proactive-source-github").assertIsOn().performClick()
+        // Hermes refused, so the switch is back on what Hermes has.
+        await { runCatching { compose.onNodeWithTag("proactive-source-github").assertIsOn() }.isSuccess && fixture.requests.any { it.string("method") == "PUT" && it.getJSONObject("body").has("sources") } }
+        assertEquals(listOf("github", "gmail"), fixture.proactiveChosenSources["coder"])
+        fixture.proactiveSaveStatusCode = 200
+        compose.onNodeWithTag("proactive-sources-done").performClick()
+    }
+
+    @Test fun anOlderPluginThatSendsNoChoicesKeepsAPlainRow() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.has("enabled") == true }
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-sources"))
+        compose.onNodeWithTag("proactive-sources").assertTextContains("Not yet").assertHasNoClickAction()
+    }
+
     private fun emailAlertRoute(fixture: NativeExperienceFixture, source: String, noticeId: String, reason: String) = json(
         "seq" to 1,
         "event_id" to noticeId,

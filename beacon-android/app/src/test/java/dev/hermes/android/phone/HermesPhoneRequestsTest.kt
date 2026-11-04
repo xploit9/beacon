@@ -24,6 +24,9 @@ class HermesPhoneRequestsTest {
     private class FakeTools(val all: Set<String>, val reads: Set<String>) : PhoneToolPort {
         var access = true
         var ask = true
+        var askActs = true
+        /** The tools whose card is for a number saved in the owner's contacts. */
+        val savedContact = mutableSetOf<String>()
         var enabledNow: Set<String> = all
         var failRun = false
         var failPrepareFor: String? = null
@@ -44,12 +47,15 @@ class HermesPhoneRequestsTest {
         override fun enabled() = enabledNow
         override fun hermesAccess() = access
         override fun askBeforeReads() = ask
+        override fun needsApproval(name: String) = if (name in reads) ask else askActs || name == "phone_call"
+        override fun launchesApp(name: String) = name in setOf("phone_alarm_set", "phone_timer_set", "phone_call", "phone_message_draft")
+        override fun countdownSeconds(name: String, savedContact: Boolean) = PhoneCountdown.forHermes(name, savedContact, askActs)
         override suspend fun prepare(name: String, args: JSONObject): PhonePrepared {
             guard("prepare")
             if (name == failPrepareFor) error("cannot describe")
             refused[name]?.let { throw it }
             prepared += name
-            return PhonePrepared(name, args, PhoneCard(listOf(PhoneLine("{0}", listOf("$name ${args.optString("title")}".trim())))))
+            return PhonePrepared(name, args, PhoneCard(listOf(PhoneLine("{0}", listOf("$name ${args.optString("title")}".trim()))), savedContact = name in savedContact))
         }
         override suspend fun run(name: String, args: JSONObject, decision: PhoneDecision?): JSONObject {
             runs += Triple(name, args, decision)
@@ -90,12 +96,14 @@ class HermesPhoneRequestsTest {
 
     private class Rig(val tools: FakeTools, val link: FakeLink, val seen: MutableMap<String, Long>, val clockValue: LongArray, val saved: IntArray) {
         var unlocked = true
+        /** Beacon is on screen, in front. */
+        var front = true
         var canSave = true
         /** The threads that saved a handled id. */
         val savedOn = mutableListOf<String>()
         var io: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.Unconfined
         fun handled() = HandledRequests(seen, { saved[0]++; savedOn += Thread.currentThread().name; canSave }, { clockValue[0] })
-        fun engine(handled: HandledRequests = handled()) = HermesPhoneEngine(tools, link, handled, { clockValue[0] }, { unlocked }, pause = {}, io = io)
+        fun engine(handled: HandledRequests = handled()) = HermesPhoneEngine(tools, link, handled, { clockValue[0] }, { unlocked }, pause = {}, io = io, inFront = { front })
     }
 
     private fun rig(): Rig {
@@ -409,6 +417,9 @@ class HermesPhoneRequestsTest {
         override fun enabled() = phone.engine.enabledTools(PhoneOrigin.Hermes)
         override fun hermesAccess() = phone.settings.hermes
         override fun askBeforeReads() = phone.settings.askReads
+        override fun needsApproval(name: String) = phone.engine.needsApproval(name, PhoneOrigin.Hermes)
+        override fun launchesApp(name: String) = PhoneTools.launchesApp(name)
+        override fun countdownSeconds(name: String, savedContact: Boolean) = PhoneCountdown.forHermes(name, savedContact, phone.settings.askActs)
         override suspend fun prepare(name: String, args: JSONObject) = phone.engine.prepare(name, args, PhoneOrigin.Hermes)
         override suspend fun run(name: String, args: JSONObject, decision: PhoneDecision?) = phone.engine.run(name, args, PhoneOrigin.Hermes, decision)
         override suspend fun runPrepared(prepared: PhonePrepared, decision: PhoneDecision?) = phone.engine.runPrepared(prepared, PhoneOrigin.Hermes, decision)
@@ -552,5 +563,129 @@ class HermesPhoneRequestsTest {
         off.link.page = page(row(4, "phone_calendar_list"))
         off.engine().refresh()
         assertEquals(listOf("off"), off.tools.records.map { it.third })
+    }
+
+    // ---- "Ask before Hermes acts" ------------------------------------------------------------------------------------------------
+
+    @Test fun withAskingOffAChangeRunsAtOnceWithNoCardAndOnlyOnce() = runBlocking {
+        val rig = rig(); rig.tools.askActs = false
+        rig.link.page = page(row(1, "phone_calendar_create"), row(2, "phone_reminder_create"), row(3, "phone_calendar_delete", args = JSONObject().put("id", "5")))
+        val engine = rig.engine()
+        assertTrue("no dialog for a change the owner stopped being asked about", engine.refresh().isEmpty())
+        assertEquals(listOf("phone_calendar_create", "phone_reminder_create", "phone_calendar_delete"), rig.tools.runs.map { it.first })
+        assertTrue("no tap, so no approval is passed", rig.tools.runs.all { it.third == null })
+        assertEquals(listOf("decide:true", "result", "decide:true", "result", "decide:true", "result"), rig.events)
+        assertEquals(listOf(id(1), id(2), id(3)), rig.link.results.map { it.first })
+        // The plugin keeps listing it until it settles; the phone does not run it again.
+        engine.refresh()
+        assertEquals(3, rig.tools.runs.size)
+        assertEquals(3, rig.link.results.size)
+    }
+
+    @Test fun askingStaysTheDefaultSoEveryChangeIsACard() = runBlocking {
+        val rig = rig()
+        rig.link.page = page(row(1, "phone_calendar_create"), row(2, "phone_alarm_set"), row(3, "phone_timer_set"), row(4, "phone_message_draft"), row(5, "phone_call"))
+        assertEquals(5, rig.engine().refresh().size)
+        assertTrue(rig.tools.runs.isEmpty() && rig.link.decisions.isEmpty())
+    }
+
+    @Test fun theTwoSwitchesAreIndependent() = runBlocking {
+        val readsFree = rig(); readsFree.tools.ask = false
+        readsFree.link.page = page(row(1, "phone_calendar_list"), row(2, "phone_calendar_create"))
+        assertEquals("a read runs, the change still asks", listOf(id(2)), readsFree.engine().refresh().map { it.request.id })
+        assertEquals(listOf("phone_calendar_list"), readsFree.tools.runs.map { it.first })
+        val actsFree = rig(); actsFree.tools.askActs = false
+        actsFree.link.page = page(row(1, "phone_calendar_list"), row(2, "phone_calendar_create"))
+        assertEquals("the change runs, the read still asks", listOf(id(1)), actsFree.engine().refresh().map { it.request.id })
+        assertEquals(listOf("phone_calendar_create"), actsFree.tools.runs.map { it.first })
+    }
+
+    @Test fun aLockedPhoneKeepsTheChangeACardUntilItIsUnlocked() = runBlocking {
+        val rig = rig(); rig.tools.askActs = false; rig.unlocked = false
+        rig.link.page = page(row(1, "phone_calendar_create"))
+        val engine = rig.engine()
+        assertEquals("a locked phone runs nothing by itself", listOf(id(1)), engine.refresh().map { it.request.id })
+        assertTrue(rig.tools.runs.isEmpty() && rig.link.decisions.isEmpty())
+        rig.unlocked = true
+        assertTrue(engine.refresh().isEmpty())
+        assertEquals(listOf("phone_calendar_create"), rig.tools.runs.map { it.first })
+    }
+
+    @Test fun aChangeThatOpensAnotherAppsScreenRunsOnlyWhileBeaconIsInFront() = runBlocking {
+        val rig = rig(); rig.tools.askActs = false; rig.front = false
+        rig.link.page = page(row(1, "phone_alarm_set"), row(2, "phone_timer_set"), row(3, "phone_message_draft"), row(4, "phone_calendar_create"))
+        val engine = rig.engine()
+        // Out of sight an app screen cannot be opened, so those three wait for the owner's tap; the calendar needs no screen.
+        assertEquals(listOf(id(1), id(2), id(3)), engine.refresh().map { it.request.id })
+        assertEquals(listOf("phone_calendar_create"), rig.tools.runs.map { it.first })
+        rig.front = true
+        assertTrue(engine.refresh().isEmpty())
+        assertEquals(listOf("phone_calendar_create", "phone_alarm_set", "phone_timer_set", "phone_message_draft"), rig.tools.runs.map { it.first })
+    }
+
+    @Test fun aCallNeverRunsWithoutTheTapOrTheCountdownAndOnlyASavedContactCountsDown() = runBlocking {
+        val rig = rig(); rig.tools.askActs = false; rig.tools.savedContact += "phone_call"
+        rig.link.page = page(row(1, "phone_call", args = JSONObject().put("contact_id", "7")))
+        val saved = rig.engine().refresh().single()
+        assertTrue(rig.tools.runs.isEmpty())
+        assertEquals(PhoneCountdown.SECONDS, saved.countdown)
+        assertEquals("stamped when the card was made, on the phone's elapsed clock", rig.clockValue[0], saved.askedAt)
+        // Not a saved contact: the number could have come from anywhere, so it waits for the tap.
+        val other = rig(); other.tools.askActs = false
+        other.link.page = page(row(1, "phone_call", args = JSONObject().put("number", "+15550100")))
+        assertEquals(0, other.engine().refresh().single().countdown)
+        // While asking is on, a call needs the tap whoever it is for.
+        val asking = rig(); asking.tools.savedContact += "phone_call"
+        asking.link.page = page(row(1, "phone_call", args = JSONObject().put("contact_id", "7")))
+        assertEquals(0, asking.engine().refresh().single().countdown)
+        // Only a call counts down.
+        val alarm = rig(); alarm.tools.savedContact += "phone_alarm_set"
+        alarm.link.page = page(row(1, "phone_alarm_set"))
+        assertEquals(0, alarm.engine().refresh().single().countdown)
+    }
+
+    @Test fun theCountdownEndingRunsTheCallThroughTheOrdinaryApprovalAndALockedPhoneStopsIt() = runBlocking {
+        val rig = rig(); rig.tools.askActs = false; rig.tools.savedContact += "phone_call"
+        rig.link.page = page(row(1, "phone_call", args = JSONObject().put("contact_id", "7")))
+        val engine = rig.engine()
+        val card = engine.refresh().single()
+        rig.unlocked = false
+        assertEquals(PhoneOutcome.Locked, engine.approve(card))
+        assertTrue(rig.tools.runs.isEmpty())
+        rig.unlocked = true
+        assertEquals(PhoneOutcome.Ran, engine.approve(card))
+        assertEquals(1, rig.tools.ranPrepared.size)
+        assertEquals(Approved, rig.tools.runs.single().third)
+        // Cancel is the ordinary deny.
+        val cancelled = rig()
+        cancelled.tools.askActs = false; cancelled.tools.savedContact += "phone_call"
+        cancelled.link.page = page(row(2, "phone_call", args = JSONObject().put("contact_id", "7")))
+        val cancelEngine = cancelled.engine()
+        val second = cancelEngine.refresh().single()
+        assertEquals(PhoneOutcome.Denied, cancelEngine.deny(second.request))
+        assertTrue(cancelled.tools.runs.isEmpty())
+    }
+
+    @Test fun theRealEngineRunsAChangeAtOnceWhenAskingIsOffAndStillRefusesWhatIsSwitchedOffOrLocked() = runBlocking<Unit> {
+        val phone = Rig2().also { it.settings.everything(); it.settings.hermes = true; it.settings.askActs = false }
+        val base = rig()
+        fun engine() = HermesPhoneEngine(EnginePort(phone), base.link, base.handled(), { base.clockValue[0] }, { !phone.locked }, pause = {}, inFront = { true })
+        base.link.page = page(row(1, "phone_calendar_create", args = JSONObject().put("title", "Dentist").put("start", "2025-11-04T15:00:00Z")))
+        assertTrue(engine().refresh().isEmpty())
+        assertEquals("Dentist", phone.calendar.inserted.single().title)
+        assertEquals(listOf("done"), phone.log.entries.map { it.outcome })
+        assertEquals("the line the card would have shown", "Add '{0}' {1} to {2}", phone.log.entries.single().line.template)
+        assertEquals(listOf(true), base.link.results.map { !it.second.has("error") })
+        // Locked: the engine itself would refuse, and the request path keeps it as a card instead of running it.
+        phone.locked = true
+        base.link.page = page(row(2, "phone_calendar_create", args = JSONObject().put("title", "Pills").put("start", "2025-11-04T16:00:00Z")))
+        assertEquals(listOf(id(2)), engine().refresh().map { it.request.id })
+        assertEquals(1, phone.calendar.inserted.size)
+        phone.locked = false
+        // The calendar switched off: answered off, nothing written.
+        phone.settings.on -= PhoneCapability.Calendar
+        assertTrue(engine().refresh().isEmpty())
+        assertEquals(1, phone.calendar.inserted.size)
+        assertEquals("off", base.link.results.last().second.getString("error"))
     }
 }

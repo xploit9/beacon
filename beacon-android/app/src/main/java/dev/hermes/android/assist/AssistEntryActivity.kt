@@ -10,7 +10,8 @@ import dev.hermes.android.phone.deviceLockedNow
 /**
  * The phone's assist gesture (hold power, corner swipe, assistant button) lands here when Beacon is the default assistant.
  * It draws nothing, shows nothing over the lock screen and leaves at once; BeaconActivity opens in front and starts the call.
- * On a locked phone it asks for the unlock first, the same as the overlay: nothing is heard or said until then.
+ * On a locked phone it asks for the unlock first, because the full app cannot show over the lock screen (the overlay talks at once instead):
+ * nothing is heard or said until then.
  */
 class AssistEntryActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
