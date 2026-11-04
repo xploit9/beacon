@@ -289,9 +289,10 @@ internal fun scheduleFailureReason(job: JSONObject): String {
 }
 
 /** One labeled Run now: it opens the same confirmation the lightning-bolt icon did. */
-@Composable internal fun ScheduleRunNow(id: String, enabled: Boolean, onClick: () -> Unit) {
-    TextButton(onClick, Modifier.heightIn(min = 48.dp).testTag("schedule-run:$id"), enabled = enabled) {
-        Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp)); Text(uiText("Run now"), Modifier.padding(start = 6.dp))
+/** Run now, or, while [running], the same place saying so (the card's progress bar shows it too). */
+@Composable internal fun ScheduleRunNow(id: String, enabled: Boolean, running: Boolean = false, onClick: () -> Unit) {
+    TextButton(onClick, Modifier.heightIn(min = 48.dp).testTag("schedule-run:$id"), enabled = enabled && !running) {
+        Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp)); Text(uiText(if (running) "Running..." else "Run now"), Modifier.padding(start = 6.dp))
     }
 }
 
@@ -382,7 +383,7 @@ internal fun scheduleFailureReason(job: JSONObject): String {
                     scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { ScheduleDeliveryError(it) }
                     if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
                 }
-                ScheduleRunNow(id, idle) { runSchedule(vm, job, refresh) }
+                ScheduleRunNow(id, idle, running = pending == id) { pending = id; actionScope.launch { runSchedule(vm, job, refresh).join(); pending = "" } }
                 if (selected == id) Column(Modifier.padding(end = 12.dp, bottom = 8.dp)) { RunHistory(vm, job, data["cron-history:$id"]) }
             } }
         }
@@ -433,7 +434,9 @@ internal fun scheduleFailureReason(job: JSONObject): String {
 }
 internal fun pauseSchedule(vm: BeaconViewModel, job: JSONObject, refresh: () -> Unit): Job =
     vm.action(if (schedulePaused(job)) "/api/crons/resume" else "/api/crons/pause", json("job_id" to job.string("id")), refresh = false) { _, _ -> refresh() }
-internal fun runSchedule(vm: BeaconViewModel, job: JSONObject, refresh: () -> Unit) = vm.openForm(ActionForm("Run this schedule", "/api/crons/run", emptyList(), json("job_id" to job.string("id")), explanation = if (job.optBoolean("no_agent")) "Run this script once now." else "Run this schedule now with its saved tools and delivery.", actionLabel = "Run", onResult = { refresh() }))
+/** Runs [job] at once: no window to wait in; the caller shows the run on the card until Hermes answers. */
+internal fun runSchedule(vm: BeaconViewModel, job: JSONObject, refresh: () -> Unit): Job =
+    vm.action("/api/crons/run", json("job_id" to job.string("id")), refresh = false, successNotice = "") { _, _ -> refresh() }
 /** `deliver` is where a new task's result goes; the thread sheet starts it on its own thread. [format] is the phone's clock and language, for the hour and date choices. */
 internal fun cronForm(vm: BeaconViewModel, job: JSONObject?, targets: List<JSONObject>, timezone: String, refresh: () -> Unit, deliver: String = "local", format: ScheduleFormat = ScheduleFormat()) {
     val seed = job?.let(::schedulePayload) ?: json("deliver" to deliver)

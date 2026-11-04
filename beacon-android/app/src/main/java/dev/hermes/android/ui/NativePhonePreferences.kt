@@ -103,6 +103,8 @@ import dev.hermes.android.BeaconViewModel
     val admin by vm.profileAdmin.state.collectAsStateWithLifecycle()
     var creating by rememberSaveable { mutableStateOf(false) }
     var deleting by rememberSaveable { mutableStateOf("") }
+    var describing by rememberSaveable { mutableStateOf(false) }
+    var instructing by rememberSaveable { mutableStateOf(false) }
     var discard by remember { mutableStateOf<(() -> Unit)?>(null) }
     fun leave(action: () -> Unit) {
         if (!state.saving) {
@@ -130,10 +132,16 @@ import dev.hermes.android.BeaconViewModel
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
             onSettings = { profile, page -> leave { if (state.editing) vm.phoneSettings.editBot(false); vm.openSettingsProfileTool(profile, settingsRoute(page)) } },
             onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
-            renderBehavior = { Markdown(it, vm) },
+            onEditDescription = { vm.profileAdmin.clearError(); describing = true }, onEditInstructions = { vm.profileAdmin.clearError(); instructing = true },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },
             onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it },
             activeProfile = ui.profile, approvals = { ProfileApprovalSettings(vm) })
+    }
+    state.selected?.let { bot ->
+        if (describing) EditRoleDialog(bot.profile, bot.description, admin, onSave = { text -> vm.profileAdmin.setRole(bot.profile, text) { vm.phoneSettings.botEdited(bot.profile, description = it) } },
+            onDismiss = { describing = false }, title = uiText("Edit description"), label = uiText("Description"))
+        if (instructing) EditInstructionsDialog(bot.profile, bot.soul, admin, onSave = { text -> vm.profileAdmin.setInstructions(bot.profile, text) { vm.phoneSettings.botEdited(bot.profile, soul = it) } },
+            onDismiss = { instructing = false })
     }
     if (creating) NewProfileDialog(profileRows.map { it.string("name") to profileDisplayName(it.string("name"), profileRows) }, admin,
         onCreate = { name, from, role -> vm.profileAdmin.create(name, from, role, profileRows.map { it.string("name") }) }, onDismiss = { creating = false })

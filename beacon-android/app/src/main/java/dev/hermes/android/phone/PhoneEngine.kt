@@ -51,7 +51,7 @@ internal class PhoneEngine(
     }
 
     /**
-     * The one rule for the owner's tap (Settings › Assistant › Ask for approval). A phone call always waits (for the tap or the countdown,
+     * The one rule for the owner's tap (Settings › Assistant › Approvals). A phone call always waits (for the tap or the countdown,
      * see [PhoneCountdown.forHermes]). Any other change needs it unless the owner chose Never, in a chat, a call or the assistant alike:
      * they are one Hermes. A Hermes chat's read needs it while the choice is Always; calls and the assistant read freely.
      */

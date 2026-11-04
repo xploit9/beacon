@@ -279,7 +279,9 @@ class SetupWizardUiTest {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val targetContext = instrumentation.targetContext
         val hadMicrophonePermission = ContextCompat.checkSelfPermission(targetContext, android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
-        if (hadMicrophonePermission) instrumentation.uiAutomation.revokeRuntimePermission(app.packageName, android.Manifest.permission.RECORD_AUDIO)
+        // Revoking a granted microphone kills this test's own process (it ended the 4 Nov 2026 full suite after KeepConnectedUiTest
+        // granted it), so this step runs only on a phone that starts without it, as device-test.py's baseline does.
+        org.junit.Assume.assumeFalse("The microphone is already granted; run this class on its own", hadMicrophonePermission)
         val store = ViewModelStore()
         var viewModel: BeaconViewModel? = null
         try {

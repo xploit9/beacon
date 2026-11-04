@@ -68,8 +68,8 @@ class CheckupSettingsUiTest {
             compose.waitUntil(15_000) { vm.data.value.any { (key, value) -> key.startsWith("checkup-capabilities:") && value.has("_error") } }
             val writes = { fixture.requests.filter { it.string("path").endsWith("/tasks/checkups") && it.string("method") == "POST" } }
             assertTrue(writes().isEmpty())
-            // Check-up calls are a section of their own, with no expander; a failed read shows a short error and Retry instead of the switch.
-            compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Check-up calls"))
+            // Check-in calls are a section of their own, with no expander; a failed read shows a short error and Retry instead of the switch.
+            compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Check-in calls"))
             compose.onNodeWithText("Couldn't load check-up calls").assertExists()
             compose.onAllNodesWithTag("assistant-checkups-toggle").assertCountEquals(0)
             fixture.checkupCapabilitiesFailure = false
@@ -87,6 +87,26 @@ class CheckupSettingsUiTest {
             assertEquals(0, request.getJSONObject("body").length())
             assertTrue(fixture.jobs.getValue("task-a").optBoolean("paused"))
             assertFalse(fixture.jobs.getValue("task-a").optBoolean("enabled"))
+        }
+    }
+
+    /** Owner, 4 Nov 2026: check-ins come as often as the owner picks; the choice reaches Hermes and the switch says it. */
+    @Test fun howOftenSendsTheChosenFrequencyAndTheSwitchSaysIt() {
+        val fixture = NativeExperienceFixture()
+        fixture.checkupCapabilities = json("timezone" to "Asia/Dubai", "checkups_ready" to true, "checkup_cadence" to "random",
+            "checkup_cadences" to org.json.JSONArray(listOf("hourly", "every_2h", "every_3h", "random", "daily")))
+        fixture.checkupPostEnabled = true
+        fixture.jobs["checkups-job"] = json("id" to "checkups-job", "name" to "Beacon check-ins · 3–4 daily · local 10–22", "script" to "beacon-checkups.py",
+            "no_agent" to true, "deliver" to "local", "paused" to false, "enabled" to true, "schedule" to json("kind" to "interval", "display" to "every 1m"))
+        withAssistant(fixture) { vm ->
+            val writes = { fixture.requests.filter { it.string("path").endsWith("/tasks/checkups") && it.string("method") == "POST" } }
+            compose.waitUntil(15_000) { runCatching { compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("checkin-cadence")); true }.getOrDefault(false) }
+            compose.onNodeWithTag("assistant-checkups-toggle").assertTextContains("A few times a day", substring = true)
+            compose.onNodeWithTag("checkin-cadence").performScrollTo().performClick()
+            compose.onNodeWithTag("checkin-cadence-every_2h").performClick()
+            compose.waitUntil(15_000) { writes().size == 1 }
+            assertEquals("every_2h", writes().single().getJSONObject("body").getString("cadence"))
+            compose.waitUntil(15_000) { runCatching { compose.onNodeWithTag("assistant-checkups-toggle").assertTextContains("Every 2 hours", substring = true); true }.getOrDefault(false) }
         }
     }
 

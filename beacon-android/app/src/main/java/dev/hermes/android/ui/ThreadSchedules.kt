@@ -84,7 +84,7 @@ internal fun threadJobs(jobs: List<JSONObject>, threadId: String): List<JSONObje
                                 scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { ScheduleDeliveryError(it) }
                                 if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
                             }
-                            ScheduleRunNow(id, pending.isBlank()) { runSchedule(vm, job, refresh) }
+                            ScheduleRunNow(id, pending.isBlank(), running = pending == id) { pending = id; actionScope.launch { runSchedule(vm, job, refresh).join(); pending = "" } }
                         } }
                     }
                     if (completed.isNotEmpty()) {

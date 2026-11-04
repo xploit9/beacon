@@ -16,10 +16,33 @@ def _profile_now(profile):
     return sys.modules[key].profile_now(profile)
 
 
-def slots(owner,profile,day):
+# How often Beacon calls to check in (the app's How often): on the hour, or random times on each day of the owner's.
+CADENCES=('hourly','every_2h','every_3h','random','daily')
+CADENCE_NAMES={'hourly':'hourly','every_2h':'every 2 hours','every_3h':'every 3 hours','random':'3–4 daily','daily':'once daily'}
+# The native ticker runs a one-minute job about every two minutes: a check-in still counts this long after its time, once.
+DUE_MINUTES=10
+
+
+def cadence(mobile,owner,profile):
+    with mobile.LOCK,mobile.connect() as conn:
+        row=conn.execute('SELECT value FROM meta WHERE key=?',('checkup-cadence:'+owner+':'+profile,)).fetchone()
+    value=(row[0].decode() if isinstance(row[0],bytes) else str(row[0])) if row else 'random'
+    return value if value in CADENCES else 'random'
+
+
+def set_cadence(mobile,owner,profile,value):
+    if value not in CADENCES: raise ValueError('Choose how often Beacon checks in')
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('INSERT OR REPLACE INTO meta VALUES(?,?)',('checkup-cadence:'+owner+':'+profile,value.encode()))
+
+
+def slots(owner,profile,day,every='random'):
+    # 10:00 to 22:00 (exclusive), the profile's local day.
+    step={'hourly':60,'every_2h':120,'every_3h':180}.get(every)
+    if step: return list(range(600,1320,step))
     seed=int.from_bytes(hashlib.sha256((owner+'\0'+profile+'\0'+day).encode()).digest(),'big')
     rng=random.Random(seed)
-    count=rng.choice((3,4))
+    count=1 if every=='daily' else rng.choice((3,4))
     # One opportunity per distinct window segment; 22:00 is the exclusive quiet boundary.
     width=720//count
     return sorted(600+i*width+rng.randrange(width) for i in range(count))
@@ -32,7 +55,9 @@ def tick(mobile,native,cfg,profile,now):
             or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])):
         raise ValueError('Configure an owned callback conversation before enabling check-ups')
     minute=now.hour*60+now.minute
-    if minute not in slots(owner,profile,now.date().isoformat()): return {'state':'no_opportunity'}
+    due=[slot for slot in slots(owner,profile,now.date().isoformat(),cadence(mobile,owner,profile)) if 0<=minute-slot<DUE_MINUTES]
+    if not due: return {'state':'no_opportunity'}
+    slot=due[-1]
     profile_clock=_profile_now(profile)
     if profile_clock.tzinfo is None or profile_clock.utcoffset() is None:
         raise ValueError('Check-up time must match the profile timezone')
@@ -41,7 +66,8 @@ def tick(mobile,native,cfg,profile,now):
             or (getattr(now.tzinfo,'key',None) or now.tzname())!=profile_timezone):
         raise ValueError('Check-up time must match the profile timezone')
     native.verify(owner,provider,profile,stored)
-    key='checkup:'+owner+':'+profile+':'+now.date().isoformat()+':'+str(minute)
+    # Keyed by the check-in's own time: a later tick inside its window finds it considered.
+    key='checkup:'+owner+':'+profile+':'+now.date().isoformat()+':'+str(slot)
     with mobile.LOCK,mobile.connect() as conn:
         if conn.execute('SELECT 1 FROM meta WHERE key=?',(key,)).fetchone(): return {'state':'already_considered'}
         # Consumed even if busy; later ticks must not catch up missed opportunities.

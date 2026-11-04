@@ -40,6 +40,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     @Volatile var toolEnabled = true
     @Volatile var connectionEnabled = true
     @Volatile var profileModel = "synthetic-model"
+    @Volatile var profileSoul = "Check sources before answering."
+    @Volatile var profileDescription = "Synthetic assistant"
     @Volatile var profileIsolationBots = false
     @Volatile var profileCatalogUnavailable = false
     val isolationModels = ConcurrentHashMap(mapOf("default" to "default-model", "coder" to "coder-model", "academic" to "academic-model"))
@@ -532,6 +534,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         path == "/api/profiles" -> if (profileCatalogUnavailable) 404 to json("detail" to "Synthetic catalog unavailable")
             else 200 to json("profiles" to JSONArray(notificationProfiles.map { id -> json("name" to id).apply { profileDisplayNames[id]?.let { put("display_name", it) } } }))
         path == "/api/profiles/active" -> 200 to json("current" to profile, "active" to profile)
+        method == "PUT" && path == "/api/profiles/$profile/soul" -> { profileSoul = body.getString("content"); 200 to json("ok" to true) }
+        method == "PUT" && path == "/api/profiles/$profile/description" -> { profileDescription = body.getString("description"); 200 to json("ok" to true, "description" to profileDescription) }
         path == "/api/plugins/beacon/mobile/proactive" -> {
             if (proactiveRouteMissing) return 404 to json("detail" to "Unknown route")
             if (proactiveStatusCode != 200) return proactiveStatusCode to json("detail" to "Email access needs attention")
@@ -792,7 +796,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         })
         path == "/api/plugins/beacon/admin/bot" -> {
             if (method == "PUT") { if (profileIsolationBots) isolationModels[profile] = body.getString("model") else profileModel = body.getString("model") }
-            val bot = json("profile" to profile, "title" to "Personal", "description" to "Synthetic assistant", "soul" to "Check sources before answering.", "provider" to "fixture", "model" to if (profileIsolationBots) isolationModels.getValue(profile) else profileModel, "revision" to "a".repeat(64))
+            val bot = json("profile" to profile, "title" to "Personal", "description" to profileDescription, "soul" to profileSoul, "provider" to "fixture", "model" to if (profileIsolationBots) isolationModels.getValue(profile) else profileModel, "revision" to "a".repeat(64))
             200 to if (method == "PUT") json("ok" to true, "bot" to bot) else bot
         }
         path == "/api/status" -> 200 to json("version" to "fixture", "overall" to "ok", "gateway_state" to "connected", "active_agents" to 0, "components" to json("gateway" to json("status" to "ok", "state" to "connected")))
@@ -890,7 +894,10 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         path.endsWith("/notifications/status") -> 200 to json("android_configured" to false, "targets" to JSONArray(), "delivery" to json("pending" to 0), "available" to false)
         path.endsWith("/tasks/capabilities") -> if (checkupCapabilitiesFailure) 503 to json("detail" to "Synthetic capabilities unavailable")
             else 200 to (checkupCapabilities?.copy() ?: json("timezone" to "Asia/Dubai", "random_checkups" to false))
-        path == "/api/plugins/beacon/mobile/tasks/checkups" && method == "POST" && checkupPostEnabled -> 200 to json("ok" to true)
+        path == "/api/plugins/beacon/mobile/tasks/checkups" && method == "POST" && checkupPostEnabled -> {
+            body.optString("cadence").takeIf { it.isNotBlank() }?.let { checkupCapabilities?.put("checkup_cadence", it) }
+            200 to json("ok" to true)
+        }
         path == "/api/plugins/beacon/mobile/bootstrap" -> 200 to json("contract_version" to 2, "backend" to "hermes-dashboard", "owner_id" to scope.owner, "profile" to profile, "voice" to json("available" to false)).apply {
             bootstrapPluginStatus?.let { put("optional_features", json("plugin" to it)) }
         }

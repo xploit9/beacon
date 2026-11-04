@@ -128,8 +128,12 @@ internal const val CALL_DROPPED = "The call dropped. Call again."
 internal const val CALL_VOICE_STOPPED = "Voice stopped answering. Call again."
 /** The call-start stages, in order; a failed start reports the first one that did not finish. */
 internal val CALL_START_STAGES = listOf("grant_ok", "context_ok", "provider_setup_ok", "mic_streaming")
+/** The steps a call takes with Hermes (its grant and the conversation's context), not with the voice service. */
+internal fun hermesStage(stage: String) = stage == "grant_ok" || stage == "context_ok"
 internal fun callFailureText(stage: String, error: Throwable?): String = when {
     error is ApiFailure && error.status in setOf(401, 403) -> CALL_SIGN_IN_EXPIRED
+    // The phone could not connect to Hermes at all (a VPN that dropped): say so, not that Hermes stayed silent (owner, 4 Nov 2026).
+    hermesStage(stage) && error != null && dev.hermes.android.data.requestNeverSent(error) -> dev.hermes.android.data.APP_CONNECTION_ERROR
     stage == "grant_ok" || stage == "context_ok" -> CALL_HERMES_NO_ANSWER
     stage == "mic_streaming" -> CALL_MIC_FAILED
     else -> CALL_VOICE_NO_ANSWER
@@ -138,7 +142,7 @@ internal fun callFailureText(stage: String, error: Throwable?): String = when {
 internal class CallAdmissionFailed(cause: Throwable) : Exception(cause)
 
 /** The functions the live model may call in a direct call; anything else is refused without running. */
-internal val DIRECT_CALL_TOOLS = setOf("hermes_work", "hermes_callback", "hermes_cancel", "get_visual_state", "discover_tools", "invoke_tool", "tool_status",
+internal val DIRECT_CALL_TOOLS = setOf("hermes_work", "hermes_callback", "schedule_callback", "hermes_cancel", "get_visual_state", "discover_tools", "invoke_tool", "tool_status",
     "hermes_search", "hermes_memory", "hermes_skills", "hermes_context")
 
 /** What the live model is told beside a result that carries no message of its own, so it can say the outcome plainly. */
@@ -146,7 +150,11 @@ internal fun callToolHint(name:String,result:JSONObject):String {
     val status=result.optString("status")
     return when {
         name=="hermes_callback" && result.optBoolean("subscribed") -> "Tell the owner you will call back when the selected work is ready."
-        name=="hermes_callback" && status=="not_sent" -> "A callback is unavailable for this work. Tell the owner to check the attached conversation."
+        name=="hermes_callback" && status=="not_sent" -> "There is no Hermes work from this call to call back about yet. Hand the task to hermes_work with callback true; to call the owner back after a while or at a time, use schedule_callback."
+        name=="hermes_work" && result.optString("callback")=="scheduled" -> "Hermes is doing it in the attached chat and will call the owner when it is done. Tell them in a few words that they can hang up."
+        name=="hermes_work" && result.optString("callback")=="unavailable_while_queued" -> "Hermes queued it behind other work in the chat; a callback can be asked with hermes_callback once it starts. Tell the owner it is queued."
+        name=="hermes_work" && result.optString("callback")=="unavailable" -> "Hermes is doing it in the attached chat, but a callback could not be set for it. Tell the owner the result will be in the chat."
+        name=="schedule_callback" && status=="scheduled" -> "The callback is scheduled for scheduled_at. Tell the owner when you will call, in their words."
         status=="not_sent" && result.optString("reason")=="gateway_unconfirmed" -> "The request was not sent because Hermes did not confirm the connection. Tell the owner to reconnect and try again."
         status=="not_sent" && result.optString("reason")=="job_capacity" -> "This call reached its work limit. Tell the owner to start a new call to continue."
         status=="not_sent" && result.optString("error_code")=="hermes_updating" -> "Hermes is updating. Nothing was sent; tell the owner to try again later."
@@ -349,6 +357,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     /** The call failed before or after connecting: the diagnostic names the unfinished stage and is uploaded before the call is released. */
     private fun fail(error:Throwable,stage:String=failedStage()) {
         diagnostic("voice_error",error,failed=stage)
+        // Out of reach of Hermes: the app's banner says so as well, and clears once Hermes answers.
+        if(hermesStage(stage)) dev.hermes.android.data.HermesReach.failed(client.auth.origin,error)
         if(stopped) return
         failure(when {
             error is VoiceProviderRejected || error is VoiceStalled -> error.message.orEmpty()
@@ -372,13 +382,20 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         notePlaying(pcm.size/2*1000L/GeminiWire.OUTPUT_RATE)
         audio(pcm)
     }
+    private val repeats=RepeatGuard()
     private fun notePlaying(ms:Long) {
         playUntil=maxOf(playUntil,clock())+ms
         stall.playing(ms)
     }
     /** The live model's own reply: its audio to the speaker, both sides' words to the call card, and the end of its turn. */
     private fun modelContent(content:JSONObject,greetingTurn:Boolean) {
-        if(!greetingTurn) content.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
+        // Gemini can say a sentence again after each tool result; the guard holds a repeat back (see RepeatGuard).
+        val guarded=!greetingTurn&&provider=="gemini"
+        if(guarded&&content.optJSONObject("inputTranscription")?.optString("text").orEmpty().isNotBlank()) repeats.ownerSpoke()
+        val spoken=content.optJSONObject("outputTranscription")?.optString("text")
+        val shown=if(guarded&&spoken!=null) repeats.words(spoken) else spoken
+        val holding=guarded&&repeats.repeating
+        if(!greetingTurn&&!holding) content.optJSONObject("modelTurn")?.optJSONArray("parts")?.let { parts ->
             for(i in 0 until parts.length()) parts.optJSONObject(i)?.optJSONObject("inlineData")?.let { data ->
                 val pcm=try { java.util.Base64.getDecoder().decode(data.optString("data")) } catch(_:Exception) { null }
                 if(pcm!=null&&GeminiWire.validAudio(data.optString("mimeType"),pcm.size)) {
@@ -391,11 +408,14 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             // The greeting's words are shown by the greeting turn, and only once the owner heard them.
             if(greetingTurn&&role=="assistant") continue
             content.optJSONObject(key)?.let {
-                val transcript=JSONObject().put("type","transcript").put("role",role).put("text",it.optString("text")).put("final",it.optBoolean("final",false))
+                val text=if(role=="assistant") shown.orEmpty() else it.optString("text")
+                if(role=="assistant"&&guarded&&text.isEmpty()&&!it.optBoolean("final",false)) return@let
+                val transcript=JSONObject().put("type","transcript").put("role",role).put("text",text).put("final",it.optBoolean("final",false))
                 if(it.has("item_id")) transcript.put("provider_item",it.getString("item_id")).put("content_index",it.optInt("content_index",0))
                 event(transcript)
             }
         }
+        if(guarded&&(content.optBoolean("turnComplete")||content.optBoolean("interrupted"))) repeats.turnEnded()
         if(!greetingTurn&&content.optBoolean("turnComplete")) event(JSONObject().put("type","turn_complete"))
     }
     /** One frame of the live model's greeting turn: its audio, its words, and its end. */
@@ -863,6 +883,15 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         return accepted
     }
     /** The call's tool gateway, bound to the admitted call. */
+    /** The owner's Approvals choice, read at each request; only a plugin that says it takes one is sent it. */
+    private fun approvalChoice():String?=if(context.optBoolean("tool_approval_choice")) PhoneVoiceTools.approvalMode() else null
+    /** Links admitted Hermes work as this call's job with its callback on; the job id, or null when the plugin refused it. */
+    private suspend fun linkCallback(admitted:JSONObject):String? = try {
+        client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/jobs","POST",JSONObject().put("stored_session_id",admitted.getString("stored_session_id"))
+            .put("runtime_session_id",admitted.getString("runtime_session_id")).put("request_id",admitted.getString("request_id"))
+            .put("user_row_id",admitted.get("user_row_id")).put("title",admitted.optString("title").ifBlank { "Hermes work" }.take(100)).put("callback",true))
+            .optString("job_id").takeIf(String::isNotBlank)
+    } catch(error:CancellationException) { throw error } catch(_:Exception) { null }
     private suspend fun gateway():NativeToolGateway { val id=admittedCall();return gatewayFor.getOrPut(id) { NativeToolGateway(client,id) } }
     private suspend fun resolveToolName(name:String):String? {
         val found=try { withTimeoutOrNull(8000) { gatewayRequests.withPermit { gateway().discover(name) } } }
@@ -975,7 +1004,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 val duplicate=gatewayReceipts.reserve(requestId,id,toolId,arguments)
                 if(duplicate!=null) duplicate else {
                 if(!claimMutation(id)) return
-                var receipt=try { withTimeoutOrNull(20000) { gatewayRequests.withPermit { check(callOwned()) { "Call authority changed" };gateway().invoke(requestId,toolId,arguments) } } ?: throw java.io.IOException("Tool submission timed out") }
+                var receipt=try { withTimeoutOrNull(20000) { gatewayRequests.withPermit { check(callOwned()) { "Call authority changed" };gateway().invoke(requestId,toolId,arguments,approvalChoice()) } } ?: throw java.io.IOException("Tool submission timed out") }
                 catch(error:CancellationException) { throw error }
                 catch(error:Exception) { directInvokeFailure(requestId,toolId,error) }
                 try { publishGatewayReceipt(requestId,receipt) }
@@ -1000,10 +1029,18 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 }
                 check(callOwned()) { "Call authority changed" }
                 GeminiWire.evidence(evidence,name=="hermes_search")
+            } else if(name=="schedule_callback") {
+                val body=ScheduledCallback.body(call.optJSONObject("args")?:JSONObject(),callId,id,java.time.ZonedDateTime.now())
+                if(!claimMutation(id)) JSONObject().put("status","not_sent")
+                else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/schedule-callback","POST",body)
             } else if(name=="hermes_callback") {
                 val selection=call.optJSONObject("args")?.optString("scope","latest")?:"latest";require(selection in setOf("latest","all"))
-                val hasJob=synchronized(toolReceipts) { toolReceipts.values.lastOrNull { it.optString("function_name")=="hermes_work" }?.optString("job_id")?.isNotBlank()==true }
-                if(!hasJob || !claimMutation(id)) JSONObject().put("status","not_sent") else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/callback","POST",JSONObject().put("scope",selection))
+                val work=synchronized(toolReceipts) { toolReceipts.values.lastOrNull { it.optString("function_name")=="hermes_work" }?.let { JSONObject(it.toString()) } }
+                val hasJob=work?.optString("job_id")?.isNotBlank()==true
+                // Work Hermes admitted on its canonical path has no job yet: link the latest one now, with its callback.
+                val linkable=!hasJob&&selection=="latest"&&work?.optString("admission_id")?.isNotBlank()==true&&work.opt("user_row_id") is Number
+                if(linkable) { if(!claimMutation(id)) JSONObject().put("status","not_sent") else linkCallback(work!!)?.let { JSONObject().put("subscribed",true).put("job_ids",org.json.JSONArray().put(it)) } ?: JSONObject().put("status","not_sent") }
+                else if(!hasJob || !claimMutation(id)) JSONObject().put("status","not_sent") else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/callback","POST",JSONObject().put("scope",selection))
             } else if(name=="hermes_cancel") {
                 val jobId=call.getJSONObject("args").getString("job_id")
                 check(callOwned()) { "Call ended before job lookup" }
@@ -1016,7 +1053,9 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             } else {
             require(name=="hermes_work")
             val args=call.getJSONObject("args");val text=args.getString("text");require(text.isNotBlank()&&text.length<=16000)
-            require(args.keys().asSequence().toSet()==setOf("text")) { "Voice requests stay in their attached conversation" }
+            require(args.keys().asSequence().toSet().let { it.contains("text")&&(it-setOf("text","callback")).isEmpty() }) { "Voice requests stay in their attached conversation" }
+            // callback: the owner wants a call once this is done (they may hang up; Hermes finishes it in the chat).
+            val callBack=args.optBoolean("callback",false)
             check(callOwned()) { "Call ended before native admission" }
             ensureNativeEvents()
             require(selectedSession.isNotBlank()) { "The attached conversation is unavailable" }
@@ -1065,17 +1104,27 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 } else if(receipt.optString("status")=="unknown" || receipt.optBoolean("voice_authority") && receipt.optString("admission_id").isBlank()) {
                     JSONObject().put("status","submission_unconfirmed").put("request_id",requestId)
                 } else if(receipt.optBoolean("voice_authority")) {
-                    JSONObject().put("status",receipt.optString("status")).put("request_id",requestId).put("admission_id",receipt.getString("admission_id"))
-                        .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
+                    // A canonical admission keeps out of the legacy job table (its per-call capacity is not Hermes'); its user row is kept
+                    // so a callback can still be linked, now if asked or later through hermes_callback.
+                    val row=receipt.opt("user_row_id")?.takeIf { it is Number }
+                    val admitted=JSONObject().put("status",receipt.optString("status")).put("request_id",requestId).put("admission_id",receipt.getString("admission_id"))
+                        .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId).put("title",text.take(100))
+                        .apply { row?.let { put("user_row_id",it) } }
+                    when {
+                        !callBack -> admitted
+                        row==null -> admitted.put("callback","unavailable_while_queued")
+                        else -> linkCallback(admitted)?.let { admitted.put("job_id",it).put("callback","scheduled") } ?: admitted.put("callback","unavailable")
+                    }
                 } else if(!receipt.has("user_row_id")||receipt.isNull("user_row_id")) {
                     JSONObject().put("status",receipt.optString("status","accepted_unlinked")).put("request_id",requestId)
                         .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
                 } else {
                     val linked=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/jobs","POST",JSONObject().put("stored_session_id",binding.storedSessionId)
-                        .put("runtime_session_id",binding.runtimeSessionId).put("request_id",requestId).put("user_row_id",receipt.opt("user_row_id")).put("title",text.take(100)).put("callback",false))
+                        .put("runtime_session_id",binding.runtimeSessionId).put("request_id",requestId).put("user_row_id",receipt.opt("user_row_id")).put("title",text.take(100)).put("callback",callBack))
                     require(linked.optString("job_id").isNotBlank()) { "Native job linkage was not confirmed" }
                     JSONObject().put("status",receipt.optString("status","submitted")).put("job_id",linked.getString("job_id")).put("request_id",requestId)
                         .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
+                        .apply { if(callBack) put("callback","scheduled") }
                 }
             }
             }

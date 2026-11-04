@@ -41,7 +41,9 @@ class BeaconVoiceInteractionService : VoiceInteractionService() {
 
 /** Makes one overlay session per show request; Android keeps it while hidden, so the next gesture opens warm. */
 class BeaconAssistSessionService : VoiceInteractionSessionService() {
-    override fun onNewSession(args: Bundle?): VoiceInteractionSession = BeaconAssistSession(this)
+    // The window is clear from the start (it must be set before the session is created): a first show that draws late never
+    // shows the phone's default pale window at its edges (owner, 4 Nov 2026: "the screen sides turn white and nothing appears").
+    override fun onNewSession(args: Bundle?): VoiceInteractionSession = BeaconAssistSession(this).apply { setTheme(dev.hermes.android.R.style.Theme_Beacon_Assist) }
 }
 
 /** Set on a show that brings back the same answer after an unlock, instead of a fresh pill. */

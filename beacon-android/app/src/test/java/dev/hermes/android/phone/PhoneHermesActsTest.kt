@@ -37,7 +37,7 @@ class PhoneHermesActsTest {
             for (name in writes.keys) assertFalse("$origin $name", rig.engine.needsApproval(name, origin))
             assertTrue("$origin: a phone call keeps its tap or countdown", rig.engine.needsApproval("phone_call", origin))
         }
-        // Ask for approval is one choice for calls and the side button too, so it holds whether or not Hermes chats may use the phone.
+        // Approvals is one choice for calls and the side button too, so it holds whether or not Hermes chats may use the phone.
         rig.settings.hermes = false
         for (origin in listOf(PhoneOrigin.LiveCall, PhoneOrigin.Overlay)) for (name in writes.keys) assertFalse("$origin $name", rig.engine.needsApproval(name, origin))
         rig.settings.hermes = true

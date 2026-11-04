@@ -297,6 +297,21 @@ def test_failed_enable_restores_owned_jobs_setup_and_instructions(harness, monke
     assert next(row for row in jobs if row["id"] == "owner-job") == unrelated
 
 
+def test_the_switch_alone_turns_the_watch_on_set_up(harness, monkeypatch):
+    """Owner, 4 Nov 2026: Watch for me was on but never checked: the switch never completed the setup, so no run got its guard."""
+    api, _, _, home, _ = harness
+    _fake_cron(api, monkeypatch, home)
+    state = api.proactive.set_enabled(api.mobile, "owner", "default", True)
+    assert state["enabled"] and state["setup_complete"]
+    assert api.proactive._meta_get(api.mobile, api.proactive._key("owner", "default", "setup_complete")) == "1"
+    # An install switched on before this fix (enabled, no setup record) counts as set up.
+    api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", "setup_complete"), None)
+    assert api.proactive._setup_complete(api.mobile, "owner", "default")
+    api.proactive.set_enabled(api.mobile, "owner", "default", False)
+    api.proactive._meta_set(api.mobile, api.proactive._key("owner", "default", "setup_complete"), None)
+    assert not api.proactive._setup_complete(api.mobile, "owner", "default")
+
+
 @pytest.mark.parametrize("conflict", ["Beacon: what needs you", "Beacon proactive: Nightly memory upkeep"])
 def test_failed_enable_never_adopts_or_changes_unowned_name_conflict(harness, monkeypatch, conflict):
     api, _, _, home, _ = harness

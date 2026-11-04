@@ -1064,6 +1064,8 @@ def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutation
     assert dispatches[0][0]=='read_file' and dispatches[0][2]['session_id']=='native-stored'
     assert dispatches[0][2]['task_id']=='call'
     assert dispatches[0][3]['profile']=='profile' and dispatches[0][3]['session_id']=='native-stored'
+    # Each run has its own tool_call_id: Hermes keys concurrent hook runs by it, and without one a second tool is blocked.
+    assert handled[0][2]['tool_call_id'].startswith('beacon-tool/')
 
     proposal=api.invoke(SCOPE,{'request_id':'native-write','tool_id':'b'*64,
                                'arguments':{'path':'notes.txt','content':'safe text'}},
@@ -1431,3 +1433,37 @@ def test_a_call_search_never_waits_out_a_slow_first_scan(tmp_path):
     found=api.discover(profile,'open a web page')
     assert found['tools'][0]['name']==late['name'] and 'still_starting' not in found
     assert 'acme browser: page navigate' in found['sources']
+
+
+def test_full_access_runs_a_change_at_once_approved_by_the_owner(gateway):
+    """Owner, 4 Nov 2026: with Full access no approval card shows, not even for a moment."""
+    api,backend,_=gateway;backend.read_only=False
+    receipt=api.invoke(SCOPE,{'request_id':'r1','tool_id':'a'*64,'arguments':{'query':'weather'},'approval':'owner'})
+    assert receipt['status'] in ('running','completed') and 'proposal' not in receipt and receipt['approved_by']=='owner'
+    done=settled(api)
+    assert done['status']=='completed' and len(backend.calls)==1 and backend.calls[0][2] is True
+
+
+def test_auto_asks_only_for_changes_and_manual_asks_for_reads_too(gateway):
+    api,backend,_=gateway
+    read=api.invoke(SCOPE,{'request_id':'auto-read','tool_id':'a'*64,'arguments':{'query':'weather'},'approval':'changes'})
+    assert read['status']!='needs_approval'
+    assert settled(api,'auto-read')['status']=='completed'
+    manual=api.invoke(SCOPE,{'request_id':'manual-read','tool_id':'a'*64,'arguments':{'query':'weather'},'approval':'ask'})
+    assert manual['status']=='needs_approval' and len(backend.calls)==1
+    api.decide(SCOPE,'manual-read',{'proposal_id':manual['proposal']['id'],'decision':'approve'})
+    assert settled(api,'manual-read')['status']=='completed' and len(backend.calls)==2
+    backend.read_only=False
+    change=api.invoke(SCOPE,{'request_id':'auto-change','tool_id':'a'*64,'arguments':{'query':'weather'},'approval':'changes'})
+    assert change['status']=='needs_approval'
+    # An older app sends no choice: changes still ask, as before.
+    assert invoke(api,'no-choice')['status']=='needs_approval'
+
+
+def test_an_unknown_approval_choice_is_refused(gateway):
+    api,backend,_=gateway;backend.read_only=False
+    for bad in ('never','yes',True):
+        with pytest.raises(HTTPException) as error:
+            api.invoke(SCOPE,{'request_id':'r9','tool_id':'a'*64,'arguments':{'query':'weather'},'approval':bad})
+        assert error.value.status_code==400
+    assert backend.calls==[]

@@ -97,6 +97,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             val request = client.request("/api/ws").header("Sec-WebSocket-Protocol", "hermes-gateway-v1, hermes-gateway-ticket.$ticket").build()
             val socket = socketFactory.newWebSocket(request, object : WebSocketListener() {
                 override fun onOpen(ws: WebSocket, response: Response) {
+                    HermesReach.answered(client.auth.origin)
                     mine.socket = ws
                     if (connection !== mine || mine.failure != null) { ws.cancel(); return }
                     // No acknowledgement is required; a legacy gateway's method-not-found response is dropped below.
@@ -139,7 +140,11 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                         if (!mine.frames.trySend(frame).isSuccess) { terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel() }
                     }
                 }
-                override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { terminate(mine, IOException("Native connection interrupted", t)) }
+                override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
+                    // A connection that could not open (not one that dropped later) says Hermes is out of reach right now.
+                    if (response == null) HermesReach.failed(client.auth.origin, t)
+                    terminate(mine, IOException("Native connection interrupted", t))
+                }
                 override fun onClosing(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")); ws.close(code, reason) }
                 override fun onClosed(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")) }
             })

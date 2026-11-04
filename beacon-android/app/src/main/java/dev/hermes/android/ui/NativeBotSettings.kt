@@ -1,28 +1,18 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
 package dev.hermes.android.ui
 
-import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.semantics.Role
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.data.NativeBotsState
 import kotlinx.coroutines.delay
@@ -43,10 +33,9 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
  */
 @Composable fun NativeBotSettings(state: NativeBotsState, onOpen: (String) -> Unit, onBack: () -> Unit,
     onEditModel: () -> Unit, onModelDraft: (String, String) -> Unit, onSaveModel: () -> Unit, onCancel: () -> Unit,
-    onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), renderBehavior: @Composable (String) -> Unit = { SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge) } }, profileLabel: (String) -> String = { it },
+    onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), onEditDescription: (() -> Unit)? = null, onEditInstructions: (() -> Unit)? = null, profileLabel: (String) -> String = { it },
     onNewProfile: (() -> Unit)? = null, canDelete: (String) -> Boolean = { false }, onDelete: (String) -> Unit = {},
     activeProfile: String = "", approvals: (@Composable () -> Unit)? = null) {
-    var showBehavior by rememberSaveable(state.selected?.profile) { mutableStateOf(false) }
     var modelSearch by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf("") }
     var customModel by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
     var moreModels by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
@@ -86,9 +75,10 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                 }
             } else {
                 val active = activeProfile.isNotBlank() && bot.profile == activeProfile
+                // The description is its own editable row under Behavior, so the hero shows it nowhere else.
                 item(key = "hero") {
                     ProfileEntrance(0, motionEnabled) {
-                        SettingsStatusHero(status = null, title = profileLabel(bot.profile), line = bot.description, icon = ProfilesIcon,
+                        SettingsStatusHero(status = null, title = profileLabel(bot.profile), line = "", icon = ProfilesIcon,
                             meta = if (active) ({ SettingsStatusPill(SettingsStatus.Ok, uiText("Active")) }) else null, testTag = "profile-hero")
                     }
                 }
@@ -110,11 +100,15 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                 }
                 item(key = "behavior") {
                     ProfileEntrance(3, motionEnabled) {
+                        // Owner, 4 Nov 2026: both are edited here. The instructions are a plain preview that opens the whole text to edit; the chat
+                        // renderer drew Beacon's own <!-- markers --> as empty cards.
                         SettingsSection(title = uiText("Behavior"), testTag = "profile-behavior-section") {
-                            Column(Modifier.animateContentSize(tween(if (motionEnabled) 200 else 0))) {
-                                SettingsExpandRow(uiText("Instructions"), showBehavior, { showBehavior = !showBehavior }, icon = Icons.Rounded.Description, testTag = "profile-instructions")
-                                if (showBehavior) Box(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp)) { renderBehavior(bot.soul.ifBlank { uiText("No instructions") }) }
-                            }
+                            SettingsNavRow(uiText("Description"), { onEditDescription?.invoke() }, icon = Icons.Rounded.Edit, value = bot.description,
+                                enabled = onEditDescription != null && !state.loading && !state.saving, testTag = "profile-description")
+                            SettingsDivider()
+                            SettingsNavRow(uiText("Instructions"), { onEditInstructions?.invoke() }, icon = Icons.Rounded.Description,
+                                value = profileInstructionsPreview(bot.soul).ifBlank { uiText("No instructions") },
+                                enabled = onEditInstructions != null && !state.loading && !state.saving, testTag = "profile-instructions")
                         }
                     }
                 }
@@ -138,6 +132,11 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
         }
     }
 }
+
+/** The first words of a profile's instructions, without Markdown marks or the <!-- markers --> Beacon keeps in the file. */
+internal fun profileInstructionsPreview(soul: String): String =
+    soul.replace(Regex("<!--.*?-->", RegexOption.DOT_MATCHES_ALL), "\n").lineSequence()
+        .map { it.trim().trimStart('#', '>', '-', '*', ' ').trim() }.firstOrNull { it.isNotBlank() }.orEmpty().take(200)
 
 /** The error (with Retry when a reload is safe) and the last saved notice, at the top of the section they are about. */
 @Composable private fun ColumnScope.ProfileFeedback(state: NativeBotsState, onRetry: (() -> Unit)?) {
@@ -178,18 +177,6 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
         Button(onClick = onSave, enabled = !state.saving && state.draftModel.isNotBlank() && state.draftProvider.isNotBlank() && (state.draftModel != savedModel || state.draftProvider != savedProvider),
             modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("profile-model-save")) { Text(uiText("Save default model")) }
         TextButton(onClick = onCancel, enabled = !state.saving, modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("profile-model-cancel")) { Text(uiText("Cancel")) }
-    }
-}
-
-/** A row that opens and closes something right under it (a profile's instructions): the chevron points down or up and TalkBack hears Expanded or Collapsed. */
-@Composable private fun SettingsExpandRow(label: String, expanded: Boolean, onToggle: () -> Unit, modifier: Modifier = Modifier, icon: ImageVector? = null, testTag: String = "") {
-    val stateText = uiText(if (expanded) "Expanded" else "Collapsed")
-    val tagged = if (testTag.isBlank()) modifier else modifier.testTag(testTag)
-    Row(tagged.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeight).clickable(role = Role.Button, onClick = onToggle).semantics { stateDescription = stateText }
-        .padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-        if (icon != null) SettingsIconTile(icon)
-        Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        Icon(if (expanded) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 

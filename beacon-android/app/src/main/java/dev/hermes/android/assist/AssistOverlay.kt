@@ -228,7 +228,9 @@ private val OnGold = Color(0xFF2E1C00)
     // Locked, the conversation's words, the tool in use and the approval's details stay off the window. One value decides all of them: the
     // controller's flag follows the broadcasts and the lock screen is read now as well, so a lock that came up between two broadcasts is not missed.
     val keyguardLocked = rememberKeyguardLocked()
-    val phoneLocked = overlayLocked(c.locked, keyguardLocked())
+    // With "Personal info when locked" on, the lock screen shows what the unlocked phone shows (Settings › Assistant).
+    val lockAccess = remember { dev.hermes.android.voice.LockScreenAccess.allowed(context) }
+    val phoneLocked = overlayLocked(c.locked, keyguardLocked()) && !lockAccess
     // Locked with no conversation running, the text box is inert: nothing to type, send or dictate (a written question goes into the private chat); its orb talks.
     val pillLocked = pillInert(phoneLocked, live)
     // The chips start rising a frame after the overlay shows (they are clear for their first 200 ms), so the first frame after

@@ -197,7 +197,7 @@ class AssistLiveModelTest {
         listOf("summary", "phone", "target", "countdown", "arguments", "toolName").forEach { assertFalse("The locked row never reads $it", locked.contains(it)) }
         // The controller refuses a yes while locked, whatever asks for it, reading the lock screen live at that moment; a no is always allowed.
         val decide = source("AssistOverlayController.kt").substringAfter("fun decide(").substringBefore("private fun typeIntoCall")
-        assertTrue(decide.contains("if (decision != \"deny\" && overlayLocked(locked, keyguardLocked())) return"))
+        assertTrue(decide.contains("if (decision != \"deny\" && overlayLocked(locked, keyguardLocked()) && !dev.hermes.android.voice.LockScreenAccess.allowed(session.context)) return"))
         // The lock state follows the screen turning off and on and the unlock while the overlay shows, not only the moment it was shown.
         val controller = source("AssistOverlayController.kt")
         assertTrue(controller.contains("ACTION_SCREEN_OFF") && controller.contains("ACTION_SCREEN_ON") && controller.contains("ACTION_USER_PRESENT"))

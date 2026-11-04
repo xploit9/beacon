@@ -6,6 +6,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowDropDown
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -63,12 +64,14 @@ private val noCapitals = KeyboardOptions(capitalization = KeyboardCapitalization
 }
 
 /** Edit role: the one line a bot's row shows under its name (Hermes keeps it as the profile's description). */
-@Composable internal fun EditRoleDialog(profile: String, current: String, admin: NativeProfileAdminState, onSave: (String) -> Unit, onDismiss: () -> Unit) {
+/** A profile's role (Bot Mode) or description (Profiles): Hermes keeps one short line. [title] and [label] are already translated. */
+@Composable internal fun EditRoleDialog(profile: String, current: String, admin: NativeProfileAdminState, onSave: (String) -> Unit, onDismiss: () -> Unit,
+    title: String = uiText("Edit role"), label: String = uiText("Role")) {
     var role by rememberSaveable(profile) { mutableStateOf(current) }
     CloseWhenDone(admin, onDismiss)
-    AlertDialog(onDismissRequest = { if (!admin.busy) onDismiss() }, title = { Text(uiText("Edit role")) },
+    AlertDialog(onDismissRequest = { if (!admin.busy) onDismiss() }, title = { Text(title) },
         text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(role, { role = it.take(PROFILE_ROLE_MAX) }, label = { Text(uiText("Role")) }, singleLine = true, enabled = !admin.busy, modifier = Modifier.fillMaxWidth().testTag("edit-role-field"))
+            OutlinedTextField(role, { role = it.take(PROFILE_ROLE_MAX) }, label = { Text(label) }, singleLine = true, enabled = !admin.busy, modifier = Modifier.fillMaxWidth().testTag("edit-role-field"))
             if (admin.error.isNotBlank()) Text(uiText(admin.error), color = MaterialTheme.colorScheme.error)
         } },
         confirmButton = { TextButton(onClick = { onSave(role) }, enabled = !admin.busy && role.trim() != current.trim(), modifier = Modifier.heightIn(min = 48.dp).testTag("edit-role-save")) { Text(uiText(if (admin.busy) "Saving…" else "Save")) } },
@@ -89,4 +92,37 @@ private val noCapitals = KeyboardOptions(capitalization = KeyboardCapitalization
         } },
         confirmButton = { TextButton(onClick = onDelete, enabled = !admin.busy && typed.trim() == profile, modifier = Modifier.heightIn(min = 48.dp).testTag("delete-profile-confirm-button")) { Text(uiText(if (admin.busy) "Deleting…" else "Delete"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = onDismiss, enabled = !admin.busy) { Text(uiText("Cancel")) } })
+}
+
+/**
+ * A profile's instructions, whole and editable, over the page: Save keeps them in Hermes; leaving with changes asks first.
+ * Owner, 4 Nov 2026: the page showed them read-only, through the chat renderer.
+ */
+@Composable internal fun EditInstructionsDialog(profile: String, current: String, admin: NativeProfileAdminState, onSave: (String) -> Unit, onDismiss: () -> Unit) {
+    var draft by rememberSaveable(profile) { mutableStateOf(current) }
+    var leaving by remember { mutableStateOf(false) }
+    CloseWhenDone(admin, onDismiss)
+    val changed = draft != current
+    val close = { if (!admin.busy) { if (changed) leaving = true else onDismiss() } }
+    androidx.compose.ui.window.Dialog(onDismissRequest = close, properties = androidx.compose.ui.window.DialogProperties(usePlatformDefaultWidth = false, decorFitsSystemWindows = false)) {
+        androidx.compose.material3.Surface(Modifier.fillMaxSize().testTag("profile-instructions-editor"), color = MaterialTheme.colorScheme.surface) {
+            Column(Modifier.fillMaxSize().windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing)) {
+                androidx.compose.foundation.layout.Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 4.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                    androidx.compose.material3.IconButton(onClick = close, enabled = !admin.busy, modifier = Modifier.testTag("profile-instructions-close")) {
+                        androidx.compose.material3.Icon(Icons.Rounded.Close, uiText("Close"))
+                    }
+                    Text(uiText("Instructions"), Modifier.weight(1f).padding(start = 4.dp), style = MaterialTheme.typography.titleLarge)
+                    TextButton(onClick = { onSave(draft) }, enabled = !admin.busy && changed, modifier = Modifier.heightIn(min = 48.dp).testTag("profile-instructions-save")) {
+                        Text(uiText(if (admin.busy) "Saving..." else "Save"))
+                    }
+                }
+                if (admin.error.isNotBlank()) Text(uiText(admin.error), Modifier.padding(horizontal = 16.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.error)
+                OutlinedTextField(draft, { draft = it }, Modifier.fillMaxWidth().weight(1f).padding(horizontal = 16.dp, vertical = 8.dp).testTag("profile-instructions-field"),
+                    enabled = !admin.busy, textStyle = MaterialTheme.typography.bodyLarge, placeholder = { Text(uiText("No instructions")) })
+            }
+        }
+    }
+    if (leaving) AlertDialog(onDismissRequest = { leaving = false }, title = { Text(uiText("Discard changes?")) },
+        confirmButton = { TextButton(onClick = { leaving = false; onDismiss() }, modifier = Modifier.heightIn(min = 48.dp).testTag("profile-instructions-discard")) { Text(uiText("Discard")) } },
+        dismissButton = { TextButton(onClick = { leaving = false }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Keep editing")) } })
 }

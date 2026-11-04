@@ -922,7 +922,8 @@ def _job_status(mobile, owner, profile, jobs, specs):
 
 
 def _setup_complete(mobile, owner, profile):
-    return _meta_get(mobile, _key(owner, profile, "setup_complete")) == "1"
+    # Turning Proactive on is its setup: an install switched on before set_enabled saved it (through 1.1.29) counts as set up.
+    return _meta_get(mobile, _key(owner, profile, "setup_complete")) == "1" or enabled(mobile, owner, profile)
 
 
 def health(mobile, owner, profile, setup, now=None):
@@ -1204,7 +1205,9 @@ def set_enabled(mobile, owner, profile, value):
     with _SET_ENABLED_LOCK:
         if value:
             setup = _setup(mobile, owner, profile)
-            _enable_locked(mobile, owner, profile, setup)
+            # The switch turns the watch on with the settings the page shows, so it completes the setup too: without that the
+            # watch never got its read-only guard and every run stopped at [SILENT] (owner, 4 Nov 2026).
+            _enable_locked(mobile, owner, profile, setup, save_setup=True)
         else:
             _disable_locked(mobile, owner, profile)
     return status(mobile, owner, profile)

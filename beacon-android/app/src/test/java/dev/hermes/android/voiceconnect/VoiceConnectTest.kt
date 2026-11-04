@@ -168,7 +168,9 @@ class VoiceConnectTest {
             c.microphone()
             val cues = c.provider.cues().size
             assertTrue(c.voice.sendText("  What's on my calendar?  "))
-            val turn = c.provider.cues().drop(cues).single().getJSONObject("clientContent")
+            // Only the typed words count: the call's own opening cue may land in the same moment on a slow run (4 Nov 2026 build).
+            val turn = c.provider.cues().drop(cues).single { it.optJSONObject("clientContent")?.toString()?.contains("What's on my calendar?") == true }
+                .getJSONObject("clientContent")
             assertTrue(turn.getBoolean("turnComplete"))
             assertEquals("What's on my calendar?", turn.getJSONArray("turns").getJSONObject(0).getJSONArray("parts").getJSONObject(0).getString("text"))
             assertTrue("The owner's typed words show in the captions", c.events.any { it.optString("type") == "transcript" && it.optString("role") == "user" && it.optString("text") == "What's on my calendar?" })
@@ -311,6 +313,12 @@ class VoiceConnectTest {
         } finally { expired.close() }
         assertEquals("The voice service didn't answer. Try again.", callFailureText("provider_setup_ok", java.net.SocketTimeoutException()))
         assertEquals("The microphone didn't start. Try again.", callFailureText("mic_streaming", null))
+        // Owner, 4 Nov 2026: a callback sat on Connecting when the VPN dropped; a call that cannot reach Hermes says so.
+        assertEquals("Can't reach Hermes. Check your connection, then try again.",
+            callFailureText("context_ok", java.io.IOException("Native connection interrupted", java.net.ConnectException("Failed to connect"))))
+        assertEquals("Hermes didn't answer. Try again.", callFailureText("context_ok", java.net.SocketTimeoutException("timeout")))
+        // The voice service out of reach is the voice service, not Hermes.
+        assertEquals("The voice service didn't answer. Try again.", callFailureText("provider_setup_ok", java.net.ConnectException("Failed to connect")))
     }
 
     @Test(timeout = 10000) fun aFailedCallUploadsItsStageDiagnosticsBeforeItIsReleased() = runBlocking {

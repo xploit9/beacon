@@ -38,7 +38,7 @@ class NativeVoiceReadTest {
         val gemini=GeminiWire.setup("model","",null,context).getJSONObject("setup")
         fun names(rows:JSONArray)=(0 until rows.length()).associate { rows.getJSONObject(it).getString("name") to rows.getJSONObject(it) }
         val declared=names(gemini.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations"))
-        assertEquals(setOf("text"),declared.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
+        assertEquals(setOf("text","callback"),declared.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         val grok=names(GrokWire.setup(gemini,"eve").getJSONObject("session").getJSONArray("tools"))
         assertEquals("object",grok.getValue("hermes_work").getJSONObject("parameters").getString("type"))
         assertEquals(declared.keys,grok.keys)

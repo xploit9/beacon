@@ -50,3 +50,32 @@ def test_checkup_tick_skips_profile_clock_import_when_no_slot_is_due(env,monkeyp
     monkeypatch.setattr(ch,'_profile_now',lambda profile:pytest.fail('non-slot tick must not load profile clock'),raising=False)
 
     assert ch.tick(m,n,cfg,'default',now)=={'state':'no_opportunity'}
+
+
+def test_a_check_in_still_counts_minutes_after_its_time_but_only_once(env,monkeypatch):
+    """Owner, 4 Nov 2026: no check-in ever came. Hermes runs the one-minute job about every two minutes, so an exact minute was missed."""
+    _,m,n,cfg,_,_=env;ch=load('checkups');cfg['scheduled_callback_conversation_id']='owned'
+    zone=ZoneInfo('America/Los_Angeles')
+    monkeypatch.setattr(ch,'_profile_now',lambda profile:datetime(2026,10,16,12,tzinfo=zone),raising=False)
+    slot=ch.slots('owner','default','2026-10-16')[0]
+    late=datetime(2026,10,16,(slot+3)//60,(slot+3)%60,tzinfo=zone)
+    assert ch.tick(m,n,cfg,'default',late)['state']=='pending'
+    later=datetime(2026,10,16,(slot+5)//60,(slot+5)%60,tzinfo=zone)
+    assert ch.tick(m,n,cfg,'default',later)['state']=='already_considered'
+    too_late=datetime(2026,10,16,(slot+ch.DUE_MINUTES)//60,(slot+ch.DUE_MINUTES)%60,tzinfo=zone)
+    assert ch.tick(m,n,cfg,'default',too_late)['state'] in ('no_opportunity','already_considered')
+
+
+def test_each_frequency_has_its_times_inside_the_day_window(env):
+    _,m,_,_,_,_=env;ch=load('checkups')
+    assert ch.slots('owner','default','2026-10-16','hourly')==list(range(600,1320,60))
+    assert ch.slots('owner','default','2026-10-16','every_2h')==[600,720,840,960,1080,1200]
+    assert ch.slots('owner','default','2026-10-16','every_3h')==[600,780,960,1140]
+    once=ch.slots('owner','default','2026-10-16','daily')
+    assert len(once)==1 and 600<=once[0]<1320
+    # The few-times-a-day choice keeps the times it always had.
+    assert ch.slots('owner','default','2026-10-16','random')==ch.slots('owner','default','2026-10-16')
+    assert ch.cadence(m,'owner','default')=='random'
+    ch.set_cadence(m,'owner','default','every_3h')
+    assert ch.cadence(m,'owner','default')=='every_3h'
+    with pytest.raises(ValueError): ch.set_cadence(m,'owner','default','minutely')

@@ -86,8 +86,9 @@ internal fun heldBackWhileLocked(locked: Boolean, allowedWhileLocked: Boolean): 
 
 /**
  * Settings › Assistant › "Personal info when locked" (owner, 4 Nov 2026). Off, the default: on a locked phone the assistant talks at once
- * and anything personal waits for the unlock. On: the owner's memory, chats and tools work on the lock screen too. Changes still need
- * the unlock: the phone changes nothing while locked (PhoneEngine) and an approval card's tap counts only on an unlocked screen.
+ * and anything personal waits for the unlock. On (owner, 4 Nov 2026: control even on the lock screen): the owner's memory, chats and
+ * tools work there too, the phone's own actions run (PhoneEngine) and an approval can be given on the lock screen; a phone call still
+ * waits for its tap or countdown.
  */
 internal object LockScreenAccess {
     private const val FILE = "beacon_lock_screen"

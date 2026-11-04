@@ -114,6 +114,8 @@ internal class CallSpec(val client: BeaconClient, val admission: Deferred<JSONOb
 
 /** What the owner reads when the phone itself can't start a call; {0} is the assistant's name. The precise reason stays in diagnostics. */
 internal const val CALL_START_FAILED = "Couldn't start the call"
+/** How long the steps before the voice connection may take before the start ends with [CALL_START_FAILED]. */
+internal const val TRANSPORT_START_LIMIT_MS = 12_000L
 internal const val CALL_ALREADY_ON = "{0} is already on a call."
 internal const val CALL_STILL_CONNECTING = "{0} is still connecting."
 internal const val CALL_ALLOW_MIC = "Allow the microphone to call {0}."
@@ -550,13 +552,29 @@ class BeaconCallService : Service() {
             if(!closed.get()&&app.calls.service===this@BeaconCallService&&current.active&&current.callId==callId&&spec?.grant?.optString("call_id")==callId) visual?.preview(view,attached)
         }
     }
+    /** One step of the transport before the voice connection, kept with the call's timeline (it names where a stuck start stopped). */
+    private fun transportStage(spec: CallSpec, stage: String) {
+        val value = JSONObject().put("type", "media_diagnostic").put("stage", stage).put("elapsed_ms", android.os.SystemClock.elapsedRealtime() - spec.tappedAt)
+            .put("provider", spec.credentials?.provider.orEmpty().takeIf { it in setOf("gemini", "grok", "openai") } ?: "gemini").put("attempt", 0)
+        app.calls.stageLog.add(value)
+        if (transcriptSync != null) syncEvent(diagnosticReceipt(value)) else spec.early.add(value)
+    }
     private fun openTransport(spec: CallSpec) {
+        val service = this
+        // The voice connection keeps its own 20 s limit once it starts; this one covers the steps before it, so a start that
+        // stops there (audio or the media thread held up) ends with a reason instead of "Connecting" for good.
+        scope.launch {
+            delay(TRANSPORT_START_LIMIT_MS)
+            if (directVoice == null && !closed.get() && service.spec === spec) { transportStage(spec, "transport_timeout"); failure(callText(service, CALL_START_FAILED)) }
+        }
         connectionJob = scope.launch(mediaDispatcher, start=CoroutineStart.LAZY) {
+            transportStage(spec, "transport_started")
             // Read before admission: the admitted block is not a coroutine body.
             val ownerName=try { withContext(Dispatchers.IO) { app.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).ownerName } }
                 catch(error:CancellationException) { throw error } catch(_:Exception) { "" }
             admitCallTransport(mediaLock,closed,{app.calls.service===this@BeaconCallService}) {
             try {
+                transportStage(spec, "transport_open")
                 if(spec.admission.isCompleted) admitted(spec)
                 val voiceSettings=checkNotNull(spec.credentials)
                 val audio = NativePcm(scope,{ bytes,at ->
@@ -564,6 +582,7 @@ class BeaconCallService : Service() {
                     if(directVoice?.pcm(bytes) { microphoneGate.current(intent)&&intent.enabled&&!closed.get() }!=true) app.calls.updateFrom(this@BeaconCallService) { it.copy(state="connecting") }
                 },{bytes,_ -> directVoice?.played(bytes.size) },::failure,::audioLevel,PcmQueue(),captureRate=if(voiceSettings.provider=="openai")48000 else 16000)
                 pcm=audio;audio.start(this@BeaconCallService);audio.mute(muted||held||closed.get())
+                transportStage(spec, "audio_ready")
                 if(closed.get()) return@admitCallTransport
                 visual=NativeVisual(this@BeaconCallService,Handler(mediaThread.looper),{
                     !closed.get()&&!held&&(screenRequested||cameraMayShare(cameraRequested,app.calls.uiVisible,held,closed.get()))
@@ -641,8 +660,8 @@ class BeaconCallService : Service() {
             "tool_approval" -> {
                 val approval=runCatching { CallToolApproval.from(value) }.getOrNull() ?: return
                 app.calls.updateFrom(this) { it.copy(toolApprovals=pendingCallToolApprovals(it.toolApprovals,value)) }
-                // Ask for approval: Never. The owner's standing yes, given by the phone as soon as the card exists.
-                if(approvesItself(dev.hermes.android.phone.PhoneAccess.approvalChoice(this),dev.hermes.android.phone.deviceLockedNow(this),approval)) {
+                // Approvals: Full access with a plugin that cannot take the choice: the owner's standing yes, given as soon as the card exists.
+                if(approvesItself(dev.hermes.android.phone.PhoneAccess.approvalChoice(this),heldBackWhileLocked(dev.hermes.android.phone.deviceLockedNow(this),LockScreenAccess.allowed(this)),approval)) {
                     decideTool(approval.requestId,approval.proposalId,"approve"); return
                 }
                 refreshNotification()

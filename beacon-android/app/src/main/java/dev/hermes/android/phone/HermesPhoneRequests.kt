@@ -367,7 +367,7 @@ object HermesPhoneRequests {
     private fun stateStore(context: Context) = context.applicationContext.getSharedPreferences("hermes-phone-requests-state", Context.MODE_PRIVATE)
 
     private fun engine(context: Context, client: BeaconClient) = HermesPhoneEngine(
-        RealPhoneTools(context.applicationContext), ClientLink(client), handled(context), ::elapsed, { !isLocked(context) }, inFront = { front },
+        RealPhoneTools(context.applicationContext), ClientLink(client), handled(context), ::elapsed, { !dev.hermes.android.voice.heldBackWhileLocked(isLocked(context), dev.hermes.android.voice.LockScreenAccess.allowed(context)) }, inFront = { front },
     )
 
     /** A push said Hermes has a phone request: read what is waiting and show it. */

@@ -137,13 +137,16 @@ class NativeOperationPolicyTest {
             assertTrue("PUT $name role", NativeOperationPolicy.direct("/api/profiles/$name/description", "PUT"))
             for (method in listOf("GET", "POST", "PUT", "PATCH", "delete")) assertFalse("$method $name", NativeOperationPolicy.direct("/api/profiles/$name", method))
             for (method in listOf("GET", "POST", "PATCH", "DELETE")) assertFalse("$method $name role", NativeOperationPolicy.direct("/api/profiles/$name/description", method))
+            // Owner, 4 Nov 2026: a profile's instructions are edited in the app, saved whole through Hermes' own route.
+            assertTrue("PUT $name instructions", NativeOperationPolicy.direct("/api/profiles/$name/soul", "PUT"))
+            for (method in listOf("GET", "POST", "PATCH", "DELETE")) assertFalse("$method $name instructions", NativeOperationPolicy.direct("/api/profiles/$name/soul", method))
         }
         // The built-in profile cannot be deleted from here (its role can be set); anything that is not a plain profile id is refused.
         assertFalse(NativeOperationPolicy.direct("/api/profiles/default", "DELETE"))
         assertTrue(NativeOperationPolicy.direct("/api/profiles/default/description", "PUT"))
         for (path in listOf(
             "/api/profiles/", "/api/profiles/Coder", "/api/profiles/-x", "/api/profiles/_x", "/api/profiles/x y", "/api/profiles/..", "/api/profiles/../auth/me",
-            "/api/profiles/a/b", "/api/profiles/${"x".repeat(65)}", "/api/profiles/coder/soul", "/api/profiles/coder/description/extra", "/api/profiles/sessions/pull-requests",
+            "/api/profiles/a/b", "/api/profiles/${"x".repeat(65)}", "/api/profiles/coder/soul/extra", "/api/profiles/coder/description/extra", "/api/profiles/sessions/pull-requests",
         )) for (method in listOf("GET", "POST", "PUT", "PATCH", "DELETE")) assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
     }
 

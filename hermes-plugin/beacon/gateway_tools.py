@@ -857,8 +857,9 @@ class NativeMcp:
                         approval.resolve_gateway_approval(key,'once' if accept else 'deny',request_id=request)
                     approval.register_gateway_notify(key,notify);registered=True
                 from model_tools import handle_function_call
-                # Keep Hermes hooks, middleware, and terminal safety guards in the call path.
-                return handle_function_call(tool['_raw'],arguments,task_id=scope[3],session_id=session_id,
+                # Keep Hermes hooks, middleware, and terminal safety guards in the call path. The run's own tool_call_id lets
+                # Hermes tell concurrent runs apart: without one, a second tool started while the first one's hooks run is blocked.
+                return handle_function_call(tool['_raw'],arguments,task_id=scope[3],tool_call_id=key,session_id=session_id,
                                             enabled_tools=tool.get('_enabled_tools'))
             finally:
                 if registered: approval.unregister_gateway_notify(key)
@@ -889,7 +890,7 @@ class NativeMcp:
         approval.register_gateway_notify(key, notify)
         try:
             from model_tools import handle_function_call
-            result = handle_function_call(tool['name'],arguments,task_id=scope[3],session_id=session_id,
+            result = handle_function_call(tool['name'],arguments,task_id=scope[3],tool_call_id=key,session_id=session_id,
                                           enabled_tools=tool.get('_enabled_tools'))
             if native_consent_required:
                 return encoded({'error':'Hermes needs this approval. Approve the action in Hermes.'})
@@ -898,6 +899,10 @@ class NativeMcp:
             approval.unregister_gateway_notify(key)
             approval_context.reset_current_session_key(token)
             session_context.clear_session_vars(session_tokens)
+
+
+# The app's Ask for approval choices a tool request may carry (Manual, Auto, Full access).
+APPROVAL_CHOICES=('ask','changes','owner')
 
 
 class Gateway:
@@ -1143,7 +1148,10 @@ class Gateway:
             return None  # Missing/malformed state or a failed guardian always asks the phone.
 
     def invoke(self, scope, value, session_id=None):
-        if set(value)!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
+        # approval is the owner's Ask for approval choice in the app: ask (Manual), changes (Auto) or owner (Full access).
+        if set(value)-{'approval'}!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
+        choice=value.get('approval','changes')
+        if choice not in APPROVAL_CHOICES: raise HTTPException(400, 'Invalid approval choice')
         try: request=self.mobile.ident(value['request_id'])
         except ValueError: raise HTTPException(400,'Invalid tool request identity') from None
         if not isinstance(value['tool_id'],str) or len(value['tool_id'])!=64: raise HTTPException(400, 'Invalid tool handle')
@@ -1165,8 +1173,11 @@ class Gateway:
         read_only=tool_read_only(tool,arguments)
         tool={**tool,'read_only':read_only}
         session_id=session_id or scope[3]
-        approved_by=None if read_only else self._approval_source(scope,tool,arguments,session_id)
-        needs_approval=not read_only and approved_by is None
+        asks=choice=='ask' or not read_only
+        approved_by=self._approval_source(scope,tool,arguments,session_id) if asks else None
+        # Full access is the owner's own standing approval, given in the app before the call: the change starts at once.
+        if asks and approved_by is None and choice=='owner' and not read_only: approved_by='owner'
+        needs_approval=asks and approved_by is None
         # The name is shown to the model and on the approval card as plain text; the real one still runs the tool.
         shown_name=plain_line(tool['name'],MAX_TOOL_NAME)
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':shown_name,

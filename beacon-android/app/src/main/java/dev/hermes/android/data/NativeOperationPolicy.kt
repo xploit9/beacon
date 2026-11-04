@@ -25,7 +25,7 @@ internal object NativeOperationPolicy {
     private val devicePath = Regex("/api/plugins/beacon/devices/[A-Za-z0-9_-]{1,128}")
     // Hermes' profile id (hermes_constants.PROFILE_ID_RE). Only the routes the app uses for profiles are open, each with its own method.
     private val profilePath = Regex("/api/profiles/[a-z0-9][a-z0-9_-]{0,63}")
-    private val profileRolePath = Regex("/api/profiles/[a-z0-9][a-z0-9_-]{0,63}/description")
+    private val profileRolePath = Regex("/api/profiles/[a-z0-9][a-z0-9_-]{0,63}/(?:description|soul)")
     // Supported upstream history reads only (latest-descendant verifies a compression chain); mutations stay in the native /api/ws RPC surface.
     private val sessionPath = Regex("/api/sessions/[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}(?:/(?:messages(?:/around)?|timeline|latest-descendant|mutation-snapshot))?")
     // Compatibility for stock Hermes without the optional gateway-safe pin route.

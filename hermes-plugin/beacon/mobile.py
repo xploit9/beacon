@@ -727,7 +727,7 @@ def status(row):
 
 # The call-start stages the phone reports, in order: a failed call names the one that did not finish.
 CALL_STAGES = ('grant_sent','grant_ok','context_sent','context_ok','provider_open','provider_setup_ok','mic_streaming','first_model_audio')
-DIAGNOSTIC_STAGES = ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error')+CALL_STAGES
+DIAGNOSTIC_STAGES = ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','transport_started','transport_open','audio_ready','transport_timeout','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error')+CALL_STAGES
 EVENT_TYPES = {'transcript','interruption','capture_started','capture_stopped','playout_started','playout_stopped','upload_gap','state','media_diagnostic','job_link','visual_state','tool_receipt'}
 def events(call_id,owner,body):
     rows=body.get('events')

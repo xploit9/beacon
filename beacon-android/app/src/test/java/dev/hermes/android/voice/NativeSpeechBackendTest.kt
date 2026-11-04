@@ -1030,6 +1030,34 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
+    /** Owner, 4 Nov 2026: "ask for an email to be drafted and ask for a call back then close" — Hermes finishes it and calls back. */
+    @Test(timeout = 8000) fun handingWorkToHermesWithACallbackLinksTheJobSoTheCallBackComes() = runBlocking {
+        val f=Fixture(authority=true)
+        try {
+            f.rowBound=true;f.canonicalAlsoRow=true
+            f.start();f.call("hermes_work",json("text" to "Draft the reply to Carlos","callback" to true))
+            assertTrue("The admitted work is linked with its callback on",waitFor { f.jobPosts.size==1 })
+            assertTrue(f.jobPosts.single().getBoolean("callback"))
+            assertEquals(101,f.jobPosts.single().getInt("user_row_id"))
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun aCallbackAskedAfterTheHandOffLinksThatWorkWithoutSendingItAgain() = runBlocking {
+        val f=Fixture(authority=true)
+        try {
+            f.rowBound=true;f.canonicalAlsoRow=true
+            f.start();f.work("Draft the reply to Carlos")
+            @Suppress("UNCHECKED_CAST")
+            val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(f.voice) as Map<String,JSONObject>
+            assertTrue(waitFor { synchronized(receipts) { receipts.values.any { it.optString("admission_id")=="admission-1" } } })
+            assertTrue("No job without a callback",f.jobPosts.isEmpty())
+            f.call("hermes_callback",json("scope" to "latest"))
+            assertTrue(waitFor { f.jobPosts.size==1 })
+            assertTrue(f.jobPosts.single().getBoolean("callback"))
+            assertEquals("Hermes got the work once",1,f.prompts().size)
+        } finally { f.close() }
+    }
+
     @Test(timeout = 12000) fun delayedGatewayReadyNeverFallsBackToLegacyStaging() = runBlocking {
         val f=Fixture(authority=true,sendGatewayReady=false)
         try {

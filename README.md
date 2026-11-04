@@ -91,7 +91,7 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
   things wait for the unlock, unless you allow them in Settings > Assistant ([phone access](docs/phone-access.md)).
 - **All of Hermes.** Profiles, skills, memory, schedules, files, Kanban and Bot Mode, with screens that open ready.
   Editing a profile in Settings keeps the active chat profile; switch chats' profiles from the top drawer selector.
-  Check-up calls are in Settings > Assistant.
+  Check-in calls (every hour to once a day) and profile descriptions and instructions are edited in the app.
 - **Updates from GitHub.** Beacon tells you when a release is out; tap Update for the app and the Hermes plugin.
 - **Foldables.** On a wide screen, the chat list and the chat sit side by side.
 - **Your language.** The app follows your phone's language in 16 languages, including right-to-left Arabic.

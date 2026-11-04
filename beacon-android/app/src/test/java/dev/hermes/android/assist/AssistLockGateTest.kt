@@ -34,7 +34,7 @@ class AssistLockGateTest {
 
     @Test fun theApprovalCardCaptionsAndTheToolLineAllReadTheSameValueOnTheFrame() {
         val overlay = source("assist/AssistOverlay.kt")
-        assertTrue(overlay.contains("val phoneLocked = overlayLocked(c.locked, keyguardLocked())"))
+        assertTrue(overlay.contains("val phoneLocked = overlayLocked(c.locked, keyguardLocked()) && !lockAccess"))
         assertFalse("the card must not read the cached flag alone", overlay.contains("approvalShow(live, approval, c.locked)"))
         assertTrue(overlay.contains("approvalShow(live, approval, phoneLocked)"))
         assertTrue(overlay.contains("phoneLocked = phoneLocked, onUnlock = c::unlock)"))
@@ -65,11 +65,12 @@ class AssistLockGateTest {
         assertTrue(controller.contains("private fun keyguardLocked() = deviceLockedNow(session.context)"))
         assertFalse(controller.contains("isKeyguardLocked"))
         // A tap that approves reads the lock live, with the cached flag, through the same helper.
-        assertTrue(controller.contains("if (decision != \"deny\" && overlayLocked(locked, keyguardLocked())) return"))
+        assertTrue(controller.contains("if (decision != \"deny\" && overlayLocked(locked, keyguardLocked()) && !dev.hermes.android.voice.LockScreenAccess.allowed(session.context)) return"))
         // So does the decision to unlock before opening the app.
         assertTrue(controller.contains("needsUnlock(action, overlayLocked(locked, keyguardLocked()))"))
         assertTrue(controller.contains("needsUnlock(OverlayAction.Settings, overlayLocked(locked, keyguardLocked()))"))
-        assertTrue(source("phone/PhoneTools.kt").contains("locked = { deviceLockedNow(app) }"))
+        // The phone reads the same lock; "Personal info when locked" on lets it act there (owner, 4 Nov 2026).
+        assertTrue(source("phone/PhoneTools.kt").contains("locked = { dev.hermes.android.voice.heldBackWhileLocked(deviceLockedNow(app), dev.hermes.android.voice.LockScreenAccess.allowed(app)) }"))
     }
 
     @Test fun theRuleIsWrittenInTheOverlaysCommentBlock() {

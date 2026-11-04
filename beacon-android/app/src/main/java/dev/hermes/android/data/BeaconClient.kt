@@ -321,11 +321,13 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         // Cancellation must close a stalled body too, after response headers have arrived.
         val watcher = kotlinx.coroutines.CoroutineScope(currentCoroutineContext()).launchCancel(call)
         try { return call.execute().use { response ->
+            // Any answer, an error status included, means Hermes is reachable again.
+            HermesReach.answered(auth.origin)
             // Retain native rotations before any status/body failure, after loopback verification.
             if (retainCookies && auth.loopbackSession?.verified != false) retainCookieRotation()
             read(response)
         } }
-        catch (error: IOException) { currentCoroutineContext().ensureActive(); throw error }
+        catch (error: IOException) { currentCoroutineContext().ensureActive(); HermesReach.failed(auth.origin, error); throw error }
         finally { watcher.cancel(); call.cancel() }
     }
     /** A caller-parsed native response that still keeps Hermes' cookie rotation. */

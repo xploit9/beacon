@@ -29,7 +29,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api','checkups')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -650,31 +650,40 @@ async def task_capabilities(request:Request):
     ready=cfg.get('scheduled_callbacks_enabled') is True and bool(cfg.get('scheduled_callback_conversation_id')) and bool(zone)
     try: callbacks=await feature(sys.modules['beacon_callbacks'].reasons,mobile,owner,provider,profile,timeout=8)
     except HTTPException: callbacks={}  # reasons are extra; the clock and check-up state still answer
-    return {'timezone':zone,'checkups_ready':ready,'callbacks':callbacks,'checkups_preview':'3–4 random opportunities daily, 10:00 inclusive to 22:00 exclusive, profile local time; busy and missed opportunities are skipped.'}
+    checkups=sys.modules['beacon_checkups']
+    every=await feature(checkups.cadence,mobile,owner,profile,timeout=8)
+    return {'timezone':zone,'checkups_ready':ready,'callbacks':callbacks,'checkup_cadence':every,'checkup_cadences':list(checkups.CADENCES),
+            'checkups_preview':'Check-ins '+checkups.CADENCE_NAMES[every]+', 10:00 inclusive to 22:00 exclusive, profile local time; busy and missed check-ins are skipped.'}
 @router.post('/mobile/tasks/checkups')
 async def create_checkups(request:Request):
     value=await body(request,1024)
-    if value: raise HTTPException(400,'Check-up cadence is fixed to 3–4 daily opportunities in the profile local 10:00–22:00 window')
+    # An older app sends nothing and keeps the saved frequency; the app's How often sends one of checkups.CADENCES.
+    if set(value)-{'cadence'}: raise HTTPException(400,'Only how often Beacon checks in can be chosen')
+    checkups=sys.modules['beacon_checkups']
+    if 'cadence' in value and value['cadence'] not in checkups.CADENCES: raise HTTPException(400,'Choose how often Beacon checks in')
     owner,provider,profile,cfg=await identity_async(request)
     if cfg.get('scheduled_callbacks_enabled') is not True: raise HTTPException(409,'Scheduled callbacks are disabled on the host')
     stored=cfg.get('scheduled_callback_conversation_id')
     await feature(native.verify,owner,provider,profile,stored,timeout=8)
     if not await feature(task_clock,profile,timeout=8): raise HTTPException(409,'The native profile timezone is unavailable')
-    return await task_install(install_checkup_task,profile)
+    if 'cadence' in value: await feature(checkups.set_cadence,mobile,owner,profile,value['cadence'],timeout=8)
+    every=await feature(checkups.cadence,mobile,owner,profile,timeout=8)
+    return await task_install(install_checkup_task,profile,every)
 async def task_install(fn,*args):
     try: return await feature(fn,*args,timeout=8)
     except HTTPException as exc:
         if exc.status_code==504: raise HTTPException(504,'Task creation status is unknown. Refresh Tasks before retrying; the native save may still finish.') from None
         raise
 
-def install_checkup_task(profile):
-    with mobile.LOCK: return _install_checkup_task(profile)
+def install_checkup_task(profile,every='random'):
+    with mobile.LOCK: return _install_checkup_task(profile,every)
 
-def _install_checkup_task(profile):
+def _install_checkup_task(profile,every='random'):
     from hermes_cli.web_server_cron import _cron_profile_home,_call_cron_for_profile,_create_cron_job_sync
     from hermes_cli.web_models import CronJobCreate
     _,home=_cron_profile_home(profile)
-    name='Beacon check-ups · 3–4 daily · local 10–22'
+    # The name says how often, so Schedules reads the same as Settings › Assistant › Check-in calls.
+    name='Beacon check-ins · '+sys.modules['beacon_checkups'].CADENCE_NAMES.get(every,'3–4 daily')+' · local 10–22'
     existing=_call_cron_for_profile(profile,'list_jobs',True)
     matches=[job for job in existing if job.get('script')=='beacon-checkups.py']
     if len(matches)>1: raise RuntimeError('Multiple Beacon check-up tasks require host inspection')
@@ -694,7 +703,7 @@ def _install_checkup_task(profile):
             if not isinstance(renamed,dict): raise RuntimeError('Existing check-up task could not be renamed')
             matches[0]=renamed
         return {'job':matches[0],'existing':True}
-    return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-ups: 3–4 random opportunities in the profile local 10:00–22:00 window; missed/busy opportunities skipped.',deliver='local',script='beacon-checkups.py',no_agent=True),profile),'existing':False}
+    return {'job':_create_cron_job_sync(CronJobCreate(name=name,schedule='every 1m',prompt='Owner-requested check-in calls in the profile local 10:00–22:00 window; missed/busy check-ins skipped.',deliver='local',script='beacon-checkups.py',no_agent=True),profile),'existing':False}
 # Phone access: Hermes asks, this phone approves. Only a linked phone of the owner may list, decide or answer a request.
 def phone_device(request,owner,provider,profile):
     try: mobile.touch_device(owner,provider,profile,request.headers.get('x-beacon-device-id'),True,True)

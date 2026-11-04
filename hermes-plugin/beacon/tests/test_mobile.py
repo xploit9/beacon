@@ -1262,7 +1262,7 @@ def test_checkups_accept_a_non_default_profile_timezone(harness,monkeypatch):
     api,c,cfg,_,_=harness
     cfg.update(scheduled_callbacks_enabled=True,scheduled_callback_conversation_id='owned-chat')
     monkeypatch.setattr(api,'task_clock',lambda profile:'America/Los_Angeles')
-    async def install(fn,profile): return {'installed_for':profile}
+    async def install(fn,profile,every='random'): return {'installed_for':profile,'every':every}
     monkeypatch.setattr(api,'task_install',install)
     base='/api/plugins/beacon/mobile/tasks'
 
@@ -1270,8 +1270,16 @@ def test_checkups_accept_a_non_default_profile_timezone(harness,monkeypatch):
     assert capabilities.status_code==200
     assert capabilities.json()['timezone']=='America/Los_Angeles'
     assert capabilities.json()['checkups_ready'] is True
+    assert capabilities.json()['checkup_cadence']=='random' and 'every_2h' in capabilities.json()['checkup_cadences']
     created=c.post(base+'/checkups',json={})
-    assert created.status_code==200 and created.json()=={'installed_for':'default'}
+    assert created.status_code==200 and created.json()=={'installed_for':'default','every':'random'}
+    # Owner, 4 Nov 2026: how often Beacon checks in is chosen in the app, kept for the profile, and named in Schedules.
+    chosen=c.post(base+'/checkups',json={'cadence':'every_2h'})
+    assert chosen.status_code==200 and chosen.json()['every']=='every_2h'
+    assert c.get(base+'/capabilities').json()['checkup_cadence']=='every_2h'
+    assert c.post(base+'/checkups',json={}).json()['every']=='every_2h'
+    for bad in ({'cadence':'minutely'},{'cadence':'hourly','extra':1}):
+        assert c.post(base+'/checkups',json=bad).status_code==400
 
 
 def test_native_task_presets_use_native_cron_contract_and_script_only_fixture_home(harness,monkeypatch):

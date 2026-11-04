@@ -855,6 +855,8 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
         first_name=_owner_first_name(greeting_name)
         greeting=greeting_for(greeting_name,clock,bool(callback))
         return {'backend':'hermes' if native_backend else 'direct','profile':profile,'selected_session_id':stored,'system_instruction':'' if native_backend else instruction,'context_summary':summary,
+                # The app may send the owner's Ask for approval choice with each tool request (gateway_tools.APPROVAL_CHOICES).
+                'tool_approval_choice':True,
                 'tool_catalogue':catalogue,'greeting':greeting,'greeting_plan':greeting_plan(greeting_name,zone),'owner_first_name':first_name,'callback':callback,
                 # The profile's clock zone: the live model's opening takes the owner's time of day from it at the tap.
                 'zone':zone,

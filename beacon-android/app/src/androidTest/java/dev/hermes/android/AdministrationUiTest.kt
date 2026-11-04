@@ -24,8 +24,7 @@ class AdministrationUiTest {
                 { saved = state.draftModel; state = state.copy(error = "Model changed elsewhere. Review before saving.") },
                 { state = state.copy(editing = false) }, { _, _ -> }, {}, models = listOf("custom" to "listed-model")) }
         }
-        compose.onNodeWithTag("profile-instructions").performScrollTo().performClick()
-        compose.onNodeWithText("Use the approved work inbox.").performScrollTo().assertExists()
+        compose.onNodeWithTag("profile-instructions").performScrollTo().assertTextContains("Use the approved work inbox.")
         compose.onNodeWithTag("profile-model").performScrollTo().performClick()
         compose.onNodeWithText("Search models or providers").performScrollTo().performTextInput("listed")
         compose.onNodeWithText("listed-model").performScrollTo().performClick()

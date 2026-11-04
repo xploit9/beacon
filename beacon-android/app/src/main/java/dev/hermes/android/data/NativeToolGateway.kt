@@ -16,10 +16,13 @@ class NativeToolGateway(private val client: BeaconClient, private val callId: St
         bound(); require(query.length <= 240)
         return client.nativeGet(path, mapOf("query" to query), maxBytes = 65536)
     }
-    suspend fun invoke(requestId: String, toolId: String, arguments: JSONObject): JSONObject {
+    /** [approval] is the owner's Approvals choice (ask, changes or owner), sent only to a plugin that takes it. */
+    suspend fun invoke(requestId: String, toolId: String, arguments: JSONObject, approval: String? = null): JSONObject {
         bound(); requireRequestId(requestId); require(toolId.matches(Regex("[a-f0-9]{64}")))
         require(arguments.toString().toByteArray(Charsets.UTF_8).size <= 16384)
-        return client.nativeRequest("$path/invoke", "POST", json("request_id" to requestId, "tool_id" to toolId, "arguments" to arguments))
+        require(approval == null || approval in setOf("ask", "changes", "owner"))
+        return client.nativeRequest("$path/invoke", "POST", json("request_id" to requestId, "tool_id" to toolId, "arguments" to arguments)
+            .apply { approval?.let { put("approval", it) } })
     }
     suspend fun status(requestId: String): JSONObject {
         bound(); requireRequestId(requestId)

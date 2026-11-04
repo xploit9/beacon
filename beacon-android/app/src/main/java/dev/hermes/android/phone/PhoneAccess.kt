@@ -80,7 +80,7 @@ object PhoneAccess {
     fun askBeforeHermesActs(context: Context): Boolean = prefs(context).getBoolean(HERMES_ASK_ACTS, true)
     fun setAskBeforeHermesActs(context: Context, on: Boolean) { prefs(context).edit().putBoolean(HERMES_ASK_ACTS, on).apply() }
 
-    /** Ask for approval, the one choice the owner sees: the two stored switches below, read and written together. */
+    /** Approvals (Manual, Auto, Full access), the one choice the owner sees: the two stored switches below, read and written together. */
     fun approvalChoice(context: Context): ApprovalChoice = ApprovalChoice.of(askBeforeHermesReads(context), askBeforeHermesActs(context))
     fun setApprovalChoice(context: Context, choice: ApprovalChoice) {
         prefs(context).edit().putBoolean(HERMES_ASK, choice.asksReads).putBoolean(HERMES_ASK_ACTS, choice.asksChanges).apply()

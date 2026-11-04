@@ -63,10 +63,20 @@ internal fun approvalNeedingNotification(approvals: List<CallToolApproval>, card
 
 /** Pending work shares the gateway's 64-request bound; only cosmetic recent receipts may be clipped. */
 /**
- * Whether the phone answers [approval] itself: the owner chose Never in Ask for approval, the phone is unlocked (a change made on a
+ * Whether the phone answers [approval] itself (an older plugin, which still asks): the owner chose Full access in Approvals, the phone is unlocked (a change made on a
  * locked phone still needs the unlock), and it is one of Hermes' own tools. This phone's own actions keep their rules (a call still
  * waits for the tap or its countdown).
  */
+/**
+ * The owner's Approvals choice as a call's tool request carries it to Hermes: ask (Manual: every tool), changes (Auto: changes only)
+ * or owner (Full access: Hermes runs it at once, no card). A phone that holds back what is personal while locked asks as Auto does.
+ */
+internal fun callApprovalMode(choice: dev.hermes.android.phone.ApprovalChoice, heldBack: Boolean): String = when {
+    choice == dev.hermes.android.phone.ApprovalChoice.Always -> "ask"
+    choice == dev.hermes.android.phone.ApprovalChoice.Never && !heldBack -> "owner"
+    else -> "changes"
+}
+
 internal fun approvesItself(choice: dev.hermes.android.phone.ApprovalChoice, locked: Boolean, approval: CallToolApproval): Boolean =
     choice == dev.hermes.android.phone.ApprovalChoice.Never && !locked && approval.phone == null && approval.toolName !in PhoneTools.names
 

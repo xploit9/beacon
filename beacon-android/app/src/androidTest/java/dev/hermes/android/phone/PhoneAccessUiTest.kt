@@ -113,7 +113,7 @@ class PhoneAccessUiTest {
         // Short enough for its two lines at large text, so nothing of it is cut off; the section's line covers every other number.
         compose.onNodeWithText("Call saved contacts after 3 seconds").performScrollTo().assertExists()
         compose.onNodeWithText("Write message drafts").performScrollTo().assertExists()
-        // The section says what Ask for approval does now (Always by default).
+        // The section says what Approvals does now (Manual by default).
         compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
         compose.onNodeWithText("Only what you turned on above").performScrollTo().assertExists()
     }
@@ -127,14 +127,14 @@ class PhoneAccessUiTest {
         assertFalse("allowing the permission again must not switch it back on", PhoneAccess.switchedOn(context, PhoneCapability.Calendar))
     }
 
-    // Owner, 4 Nov 2026: the two switches were confusing; one menu, Ask for approval, answers whether Hermes asks at all.
+    // Owner, 4 Nov 2026: the two switches were confusing; one menu, Approvals, answers whether Hermes asks at all.
     @Test fun askForApprovalIsOneMenuThatMovesBothStoredChoicesAndTheEngine() {
         PhoneAccess.setHermesAllowed(context, true)
         PhoneAccess.setApprovalChoice(context, ApprovalChoice.Always)
         show()
         compose.onAllNodesWithTag("phone-access-hermes-ask").assertCountEquals(0)
         compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
-        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Ask for approval").assertTextContains("Always")
+        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Approvals").assertTextContains("Manual")
         compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
 
         compose.onNodeWithTag("approval-choice").performClick()
@@ -160,7 +160,7 @@ class PhoneAccessUiTest {
     @Test fun theMenuShowsEvenWithHermesAccessOffBecauseItAlsoCoversCallsAndTheSideButton() {
         PhoneAccess.setApprovalChoice(context, ApprovalChoice.Changes)
         show()
-        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Only for changes")
+        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Auto")
     }
 
     @Test fun withNotificationsOffAndHermesAccessOnThePageSaysRequestsShowOnlyInTheOpenApp() {

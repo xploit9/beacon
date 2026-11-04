@@ -32,7 +32,8 @@ object PhoneTools {
         return engine ?: synchronized(this) {
             engine ?: PhoneEngine(PhoneAccess.settings(app), CalendarProviderBackend(app), ContactsProviderBackend(app), IntentActionsBackend(app),
                 PhoneActivityLog.of(app), PhoneRateLimiter(System::currentTimeMillis),
-                locked = { deviceLockedNow(app) }).also { engine = it }
+                // "Personal info when locked" on: the owner lets the assistant act on the lock screen too.
+                locked = { dev.hermes.android.voice.heldBackWhileLocked(deviceLockedNow(app), dev.hermes.android.voice.LockScreenAccess.allowed(app)) }).also { engine = it }
         }
     }
 

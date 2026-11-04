@@ -17,6 +17,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
@@ -100,7 +101,9 @@ class HermesSettingsUiTest {
         }
         compose.onNodeWithTag("profile-hero").assertIsDisplayed()
         compose.onNodeWithText("Work profile").assertIsDisplayed()
-        compose.onNodeWithText("Route work tasks").assertIsDisplayed()
+        // The description is shown once, in its editable row (owner, 4 Nov 2026).
+        compose.onNodeWithTag("profile-description").performScrollTo().assertTextContains("Route work tasks")
+        compose.onAllNodesWithText("Route work tasks").assertCountEquals(1)
         val hero = compose.onNodeWithTag("profile-hero").fetchSemanticsNode().boundsInRoot.top
         assertTrue("Approvals sit right under the hero", hero < compose.onNodeWithText("approvals slot").fetchSemanticsNode().boundsInRoot.top)
         compose.onNodeWithText("Skills for this profile").assertDoesNotExist()
@@ -113,12 +116,18 @@ class HermesSettingsUiTest {
         compose.onAllNodesWithText("Delete profile").assertCountEquals(1)
     }
 
-    @Test fun instructionsOpenInPlaceAndTheRowSaysSo() {
-        compose.setContent { MaterialTheme { NativeBotSettings(NativeBotsState(selected = work), {}, {}, {}, { _, _ -> }, {}, {}, { _, _ -> }, {}) } }
-        compose.onNodeWithText("Use the approved work inbox.").assertDoesNotExist()
-        compose.onNodeWithTag("profile-instructions").performScrollTo().assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "Collapsed")).performClick()
-        compose.onNodeWithText("Use the approved work inbox.").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithTag("profile-instructions").assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "Expanded"))
+    /** Owner, 4 Nov 2026: the instructions are a plain preview that opens the editor, and the description is editable too. */
+    @Test fun instructionsAndDescriptionAreRowsThatOpenTheirEditors() {
+        var instructions = 0; var description = 0
+        val marked = work.copy(soul = "<!-- beacon-identity:start -->\nCurrent identity.\n<!-- beacon-identity:end -->\n# Use the approved work inbox.")
+        compose.setContent { MaterialTheme { NativeBotSettings(NativeBotsState(selected = marked), {}, {}, {}, { _, _ -> }, {}, {}, { _, _ -> }, {},
+            onEditDescription = { description++ }, onEditInstructions = { instructions++ }) } }
+        // Beacon's markers are never shown; the first words are.
+        compose.onNodeWithTag("profile-instructions").performScrollTo().assertTextContains("Current identity.").performClick()
+        compose.onAllNodesWithText("beacon-identity", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("Fullscreen card").assertCountEquals(0)
+        compose.onNodeWithTag("profile-description").performScrollTo().performClick()
+        compose.runOnIdle { assertEquals(1, instructions); assertEquals(1, description) }
     }
 
     @Test fun theModelEditorPicksACardAndSavesOnlyAChange() {

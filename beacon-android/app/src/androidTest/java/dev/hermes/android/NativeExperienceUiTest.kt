@@ -491,12 +491,10 @@ class NativeExperienceUiTest {
         compose.waitForIdle(); scheduleAction("task-a", "pause"); await { !fixture.jobs.getValue("task-a").optBoolean("paused") }
         // The button merges its icon and word, so its text is read from the merged node.
         compose.onNodeWithTag("schedule-run:task-a").assertTextContains("Run now")
-        compose.onNodeWithTag("schedule-run:task-a", useUnmergedTree = true).performScrollTo().performClick(); await { vm.form.value != null }
-        compose.onNodeWithText("Cancel").performClick()
-        assertFalse(fixture.requests.any { it.string("path").endsWith("/trigger") })
-        compose.onNodeWithTag("schedule-run:task-a", useUnmergedTree = true).performScrollTo().performClick(); await { vm.form.value != null }
-        compose.onAllNodesWithText("Run", useUnmergedTree = true).onLast().performClick()
-        await { vm.form.value == null && fixture.requests.any { it.string("path").endsWith("/trigger") } }
+        // Owner, 4 Nov 2026: Run now runs at once, with no window to wait in; the card shows the run.
+        compose.onNodeWithTag("schedule-run:task-a", useUnmergedTree = true).performScrollTo().performClick()
+        await { fixture.requests.any { it.string("path").endsWith("/trigger") } }
+        assertTrue(vm.form.value == null)
         scheduleAction("task-a", "history"); await { vm.data.value["cron-history:task-a"] != null }
         clickText("Synthetic completed run"); await { vm.chat.value.sessionId == "chat-b" }
         compose.runOnIdle { vm.tab("Tasks") }
@@ -509,7 +507,7 @@ class NativeExperienceUiTest {
         await { fixture.jobs.containsKey("task-new") && vm.form.value == null }
         assertEquals("Owned schedule fixture", fixture.jobs.getValue("task-new").string("name"))
         assertEquals("every 2h", fixture.jobs.getValue("task-new").string("schedule"))
-        compose.onNodeWithText("Check-up calls").assertDoesNotExist()
+        compose.onNodeWithText("Check-in calls").assertDoesNotExist()
         compose.onNodeWithText("Create vetted mail task").assertDoesNotExist()
         receipts += "Schedule create, pause, resume, run/cancel, history/result and delete use actual controls; check-up creation and the retired mail preset are absent from Schedules."
         capture("audit-schedule-workflow")
@@ -4081,9 +4079,19 @@ class NativeExperienceUiTest {
         await { vm.phoneSettings.bots.value.profiles.isNotEmpty() && !vm.phoneSettings.bots.value.loading }
         compose.onNodeWithTag("profile-open:default").performScrollTo().performClick()
         await { vm.phoneSettings.bots.value.selected != null && !vm.phoneSettings.bots.value.loading }
-        compose.onNodeWithTag("profile-instructions").performScrollTo().performClick()
-        compose.onNodeWithText("Check sources before answering.").performScrollTo().assertExists()
-        compose.onNodeWithTag("profile-instructions").performScrollTo().performClick()
+        // Owner, 4 Nov 2026: the instructions preview opens the whole text to edit, and Save keeps it in Hermes.
+        compose.onNodeWithTag("profile-instructions").performScrollTo().assertTextContains("Check sources before answering.").performClick()
+        compose.onNodeWithTag("profile-instructions-field").performTextReplacement("Check two sources before answering.")
+        compose.onNodeWithTag("profile-instructions-save").performClick()
+        await { fixture.profileSoul == "Check two sources before answering." }
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("profile-instructions-editor").fetchSemanticsNodes().isEmpty() }
+        compose.onNodeWithTag("profile-instructions").performScrollTo().assertTextContains("Check two sources before answering.")
+        compose.onNodeWithTag("profile-description").performScrollTo().assertTextContains("Synthetic assistant").performClick()
+        compose.onNodeWithTag("edit-role-field").performTextReplacement("Answers with sources")
+        compose.onNodeWithTag("edit-role-save").performClick()
+        await { fixture.profileDescription == "Answers with sources" }
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("edit-role-field").fetchSemanticsNodes().isEmpty() }
+        compose.onNodeWithTag("profile-description").performScrollTo().assertTextContains("Answers with sources")
         compose.onNodeWithTag("profile-model").performScrollTo().performClick()
         await { vm.phoneSettings.bots.value.editing }
         val modelList = compose.onAllNodes(hasScrollToNodeAction()).fetchSemanticsNodes().maxBy { it.boundsInRoot.right }
@@ -4700,6 +4708,16 @@ class NativeExperienceUiTest {
         }
     }
 
+    /** Owner, 4 Nov 2026: Tailscale dropped on its own and nothing said Hermes was out of reach; a send only came back to the box. */
+    @Test fun hermesOutOfReachShowsTheBannerAndRetryClearsItOnceHermesAnswers() = withFixture { vm, _ ->
+        await { vm.ui.value.connected && vm.client != null }
+        compose.onAllNodesWithTag("beacon-offline-banner").assertCountEquals(0)
+        dev.hermes.android.data.HermesReach.failed(vm.ui.value.origin, java.net.ConnectException("Failed to connect"))
+        compose.waitUntil(10_000) { compose.onAllNodesWithText("Can't reach Hermes · check your connection").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("beacon-offline-retry").assertTextContains("Retry").performClick()
+        compose.waitUntil(15_000) { compose.onAllNodesWithTag("beacon-offline-banner").fetchSemanticsNodes().isEmpty() }
+    }
+
     @Test fun interruptedTurnKeepsLiveProgressAndQueuedDraftUntilTerminalReplay() = withFixture { vm, fixture ->
         kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
         val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
@@ -4723,6 +4741,8 @@ class NativeExperienceUiTest {
         assertTrue("The UI keeps explicit recovery uncertainty", vm.chat.value.status.contains("unknown", ignoreCase = true))
         assertFalse("An unproven outcome is not shown as complete", vm.chat.value.status.contains("complete", ignoreCase = true))
         assertEquals("No queued prompt is submitted on an unproven outcome", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        // The recovery reads the active list on its own schedule; the emulator can be a beat behind (4 Nov 2026 run).
+        await { fixture.requests.any { it.string("method") == "session.active_list" } }
         val activeList = fixture.requests.last { it.string("method") == "session.active_list" }.getJSONObject("params")
         assertEquals("runtime-chat-a", activeList.getString("current_session_id"))
         assertEquals(fixture.scope.profile, activeList.getString("profile"))

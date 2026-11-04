@@ -405,6 +405,11 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
         return botJob
     }
+    /** Hermes confirmed a new [description] or instructions ([soul]) for [profile]: the open profile shows it without a reload. */
+    fun botEdited(profile: String, description: String? = null, soul: String? = null) {
+        _bots.update { state -> state.selected?.takeIf { it.profile == profile }?.let { bot ->
+            state.copy(selected = bot.copy(description = description ?: bot.description, soul = soul ?: bot.soul)) } ?: state }
+    }
     fun closeBot() { if (!_bots.value.saving) { botJob?.cancel(); _bots.update { it.copy(selected = null, editing = false, loading = false) }; draftChanged() } }
     fun editBot(editing: Boolean) { if (!_bots.value.saving && (!editing || !_bots.value.loading && _bots.value.selected != null)) { _bots.update { it.copy(editing = editing, draftProvider = it.selected?.provider.orEmpty(), draftModel = it.selected?.model.orEmpty(), error = "") }; draftChanged() } }
     fun botDraft(provider: String, model: String) { _bots.update { it.copy(draftProvider = provider, draftModel = model) }; draftChanged() }

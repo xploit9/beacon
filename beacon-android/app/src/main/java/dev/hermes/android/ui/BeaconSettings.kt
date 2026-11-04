@@ -84,7 +84,19 @@ internal fun proactiveSettingsKey(scope: Scope) = "proactive-settings:${scope.co
 internal const val CHECKUP_SCRIPT = "beacon-checkups.py"
 /** The check-up task in this profile's schedules, if the plugin installed one. */
 internal fun checkupJob(crons: JSONObject?): JSONObject? = crons?.rows("jobs").orEmpty().firstOrNull { it.string("script").endsWith(CHECKUP_SCRIPT) }
-/** Check-up calls are on while their task exists and is not paused. */
+/** How often Beacon calls to check in (the plugin's checkups.CADENCES), in the order How often lists them. */
+internal val CHECKIN_CADENCES = listOf("hourly", "every_2h", "every_3h", "random", "daily")
+internal fun checkinCadenceLabel(id: String): String = when (id) {
+    "hourly" -> "Every hour"
+    "every_2h" -> "Every 2 hours"
+    "every_3h" -> "Every 3 hours"
+    "daily" -> "Once a day"
+    else -> "A few times a day"
+}
+/** The choices a plugin offers (none from one before 1.1.30, which only knows a few times a day). */
+internal fun checkinCadences(capabilities: JSONObject?): List<String> =
+    capabilities?.optJSONArray("checkup_cadences")?.let { a -> (0 until a.length()).map(a::optString) }.orEmpty().let { offered -> CHECKIN_CADENCES.filter { it in offered } }
+/** Check-in calls are on while their task exists and is not paused. */
 internal fun checkupsOn(crons: JSONObject?): Boolean = checkupJob(crons)?.let { !schedulePaused(it) } == true
 /** A capabilities answer worth showing: one came back (fresh or saved), not only the first-load placeholder or a bare failure. */
 internal fun checkupCapabilitiesKnown(record: JSONObject?): Boolean =
@@ -369,10 +381,11 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     // Check-ups are the plugin's; the schedules list says whether their task is there.
     LaunchedEffect(checkupKey, ui.connected, vm.client, pluginStatus) { if (ui.connected && pluginStatus != "absent") { refreshCheckups(); vm.ensureLoaded("crons", "/api/crons") } }
     val activeProfileLabel = if (profileLoading) loadingProfile else profileDisplayName(ui.profile, profileRows)
-    val checkupTitle = assistantText("Check-up calls")
-    val checkupExplanation = assistantText("Beacon calls 3–4 times a day, 10:00–22:00. Do Not Disturb applies.")
+    // Owner, 4 Nov 2026: "Check-in calls", and how often they come is a choice.
+    val checkupTitle = assistantText("Check-in calls")
+    val checkupExplanation = assistantText("Beacon calls you to check in between 10:00 and 22:00. Do Not Disturb applies.")
     val checkupAction = uiText("Turn on")
-    val checkupOffTitle = uiText("Turn off check-up calls?")
+    val checkupOffTitle = uiText("Turn off check-in calls?")
     val checkupOffExplanation = assistantText("Beacon stops these calls.")
     val checkupOffAction = uiText("Turn off")
     /** On runs the plugin's own install (or resumes a paused task); off deletes the task. Both ask first. */
@@ -506,10 +519,24 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 val failed = !ui.connected || activeScope == null || (recordError(checkupCapabilities).isNotBlank() && !(checkupKey in refreshing))
                 if (failed) SettingsErrorRow(uiText("Couldn't load check-up calls"), if (ui.connected && activeScope != null) ({ refreshCheckups() }) else null, uiText("Retry"), retryTestTag = "checkups-retry")
                 if (!known && !failed) SettingsSkeletonRows(1)
-                else if (known) SettingsSwitchRow(assistantText("Beacon calls you"), checkupsActive, ::setCheckups, icon = Icons.AutoMirrored.Rounded.PhoneCallback,
-                    summary = uiText("3–4 a day, 10:00–22:00"),
+                val cadences = checkinCadences(checkupCapabilities)
+                val cadence = checkupCapabilities?.optString("checkup_cadence")?.takeIf { it in CHECKIN_CADENCES } ?: "random"
+                if (known) SettingsSwitchRow(assistantText("Beacon calls you"), checkupsActive, ::setCheckups, icon = Icons.AutoMirrored.Rounded.PhoneCallback,
+                    summary = uiText(checkinCadenceLabel(cadence)) + ", 10:00–22:00",
                     status = if (!ready && !checkupsActive) SettingsStatus.Attention else null, statusLabel = uiText("Set up on your computer"),
                     enabled = connected && (ready || checkupsActive), testTag = "assistant-checkups-toggle")
+                if (known && checkupsActive && cadences.isNotEmpty()) {
+                    SettingsDivider()
+                    // The choice shows at once; Hermes keeps it for this profile and names the schedule after it.
+                    SettingsChoiceRow(label = uiText("How often"), selected = cadence, options = cadences,
+                        onSelect = { id -> if (id != cadence && checkupKey != null) {
+                            vm.storeData(checkupKey, JSONObject(checkupCapabilities.toString()).put("checkup_cadence", id))
+                            vm.action("/api/plugins/beacon/mobile/tasks/checkups", json("cadence" to id), refresh = false, successNotice = "Saved") { _, _ -> refreshCheckups(); refreshSchedules(vm) }
+                        } },
+                        icon = Icons.Rounded.Timer, optionLabels = cadences.associateWith { uiText(checkinCadenceLabel(it)) },
+                        optionTestTags = cadences.associateWith { "checkin-cadence-$it" }, style = ChoiceStyle.Menu,
+                        anchorTestTag = "checkin-cadence", valueTestTag = "checkin-cadence-value", enabled = connected)
+                }
             }
         }
     }

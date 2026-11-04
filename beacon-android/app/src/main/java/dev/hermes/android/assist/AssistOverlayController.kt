@@ -570,7 +570,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
     /** The owner's answer to the approval the conversation waits on, from its card in the overlay. Locked, only no can be said. */
     fun decide(approval: CallToolApproval, decision: String) {
         // Read live as well: the phone may have locked since the card was drawn, whatever the last broadcast said.
-        if (decision != "deny" && overlayLocked(locked, keyguardLocked())) return
+        if (decision != "deny" && overlayLocked(locked, keyguardLocked()) && !dev.hermes.android.voice.LockScreenAccess.allowed(session.context)) return
         app.calls.decideTool(app.calls.state.value.callId, approval.requestId, approval.proposalId, decision)
     }
 

@@ -23,7 +23,8 @@ class VoiceLookupLiveTest {
     private val LookupPhrases=mapOf(
         "ordinary" to "Without using any tools, what is two plus three?",
         "tools" to "Please use your normal skill tools to name just one available skill without changing anything.",
-        "memory" to "Please use your normal memory tools to recall my preferred name without saving or changing anything.")
+        "memory" to "Please use your normal memory tools to recall my preferred name without saving or changing anything.",
+        "callback" to "Please call me back in one hour about the garden plan.")
     /** One phrase as PCM16 at [rate], spoken by Gemini's speech model with the key saved on this test phone. */
     private suspend fun spoken(phrase:String,rate:Int):ByteArray {
         val app=ApplicationProvider.getApplicationContext<BeaconApplication>()
@@ -48,8 +49,10 @@ class VoiceLookupLiveTest {
     }
     @Test(timeout=360_000) fun grokAnswersDirectlyAndUsesHermesTools() = exercise("grok")
     @Test(timeout=360_000) fun geminiAnswersDirectlyAndUsesHermesTools() = exercise("gemini")
+    /** Owner, 4 Nov 2026: a callback can be asked for any time, with no Hermes work behind it. */
+    @Test(timeout=360_000) fun geminiSchedulesACallbackWhenAsked() = exercise("gemini", listOf("callback"))
 
-    private fun exercise(provider:String)=runBlocking<Unit> {
+    private fun exercise(provider:String,kinds:List<String> = listOf("ordinary","tools","memory"))=runBlocking<Unit> {
         val args=InstrumentationRegistry.getArguments()
         assumeTrue(args.getString("beaconLiveService")=="1")
         require(args.getString("beaconNoHostAudio")=="1")
@@ -69,6 +72,7 @@ class VoiceLookupLiveTest {
         val nativeTrace=ConcurrentLinkedQueue<JSONObject>()
         val phases=JSONObject().put("provider",provider).put("fixture_source","synthetic private PCM16")
         val completed=mutableListOf<JSONObject>()
+        val callbacks=mutableSetOf<String>()
         try {
             voiceStore.setSelection(selected)
             if(auth!=null) {
@@ -96,6 +100,8 @@ class VoiceLookupLiveTest {
             assertTrue(context.getString("backend") in setOf("hermes","direct"))
             assertEquals(client.auth.profile,context.getString("profile"))
             assertEquals(session,context.getString("selected_session_id"))
+            // The plugin takes the owner's Approvals choice with each tool request (Full access runs a change with no card).
+            assertTrue(context.optBoolean("tool_approval_choice"))
             val service=requireNotNull(app.calls.service)
             val pcm=BeaconCallService::class.java.getDeclaredField("pcm").apply { isAccessible=true }.get(service) as NativePcm
             service.mute(true) // Keep the owner's gate muted too; routing callbacks may reapply it.
@@ -136,6 +142,7 @@ class VoiceLookupLiveTest {
                 }
             }
             suspend fun jobs()=client.nativeRequest("/api/plugins/beacon/mobile/calls/$call").rows("jobs")
+            suspend fun callbackSchedules()=client.get("/api/crons").rows("jobs").filter { it.optString("name").startsWith("Beacon callback ") }.map { it.getString("id") }.toSet()
             suspend fun drainSpeech() {
                 val queue=NativePcm::class.java.getDeclaredField("queue").apply { isAccessible=true }.get(pcm) as PcmQueue
                 val ledger=NativePcm::class.java.getDeclaredField("ledger").apply { isAccessible=true }.get(pcm) as PlaybackLedger
@@ -163,12 +170,14 @@ class VoiceLookupLiveTest {
                     offset=end;delay(20)
                 }
             }
-            for((kind,purpose) in listOf("ordinary" to "brief arithmetic question","tools" to "read-only skill listing","memory" to "read-only preferred-name recall")) {
+            for((kind,purpose) in listOf("ordinary" to "brief arithmetic question","tools" to "read-only skill listing","memory" to "read-only preferred-name recall",
+                    "callback" to "a callback in an hour").filter { it.first in kinds }) {
                 phases.put("phase",kind+"_input").put(kind+"_fixture_purpose",purpose)
                 val prior=jobs().map { it.getString("job_id") }.toSet()
                 val priorReceipts=app.calls.state.value.toolReceipts.map { it.requestId }.toSet()
                 val priorUsers=app.calls.state.value.transcripts.filter { it.role=="user"&&it.final }.map { it.eventId }.toSet()
                 val priorAssistant=app.calls.state.value.transcripts.filter { it.role=="assistant"&&it.final }.map { it.eventId }.toSet()
+                val priorCallbacks=if(kind=="callback") callbackSchedules() else emptySet()
                 // The owner's words are synthesized for the test with the phone's own Gemini key (a staged file still wins).
                 val file=File(app.filesDir,"voice-lookup-$provider-$kind.pcm")
                 val fixture=if(file.isFile) try {
@@ -192,6 +201,7 @@ class VoiceLookupLiveTest {
                 val cues=when(kind) {
                     "ordinary" -> listOf(Regex("(?i)\\b(?:two|2)\\b"),Regex("(?i)\\b(?:three|3)\\b"))
                     "tools" -> listOf(Regex("(?i)\\bskills?\\b"))
+                    "callback" -> listOf(Regex("(?i)\\bcall\\b"),Regex("(?i)\\bhour\\b"))
                     else -> listOf(Regex("(?i)\\b(?:memory|remember)\\b"),Regex("(?i)\\bname\\b"))
                 }
                 assertTrue("Speech keeps the fixture purpose",cues.all { it.containsMatchIn(accepted!!.text) })
@@ -205,6 +215,12 @@ class VoiceLookupLiveTest {
                     val name=context.optString("owner_first_name")
                     val reply=app.calls.state.value.transcripts.filter { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant }.joinToString(" ") { it.text }
                     assertTrue("The preferred name is recalled from the brief or a Hermes tool",(name.isNotBlank()&&reply.contains(name,true))||started.isNotEmpty()||tools.isNotEmpty())
+                }
+                else if(kind=="callback") {
+                    withTimeoutOrNull(30_000) { await { (callbackSchedules()-priorCallbacks).isNotEmpty() } }
+                    val made=callbackSchedules()-priorCallbacks
+                    callbacks+=made
+                    assertEquals("The call schedules the one callback it was asked for",1,made.size)
                 }
                 else assertTrue("A Hermes tool or job backs the answer",started.isNotEmpty()||tools.isNotEmpty())
                 started.forEach { job ->
@@ -223,6 +239,9 @@ class VoiceLookupLiveTest {
             File(app.filesDir,"voice-lookup-$provider.json").writeText(phases.toString(),Charsets.UTF_8)
         } finally { withContext(NonCancellable) {
             nativeTraceJob?.cancelAndJoin()
+            // The demo Hermes would otherwise ring this test phone in an hour.
+            callbacks.forEach { id -> runCatching { client?.post("/api/crons/delete",json("job_id" to id)) } }
+            phases.put("callbacks_scheduled",callbacks.size)
             phases.put("native_connection_trace",org.json.JSONArray(nativeTrace.toList()))
             observedDirect?.let { direct ->
                 val callClient=DirectVoice::class.java.getDeclaredField("client").apply { isAccessible=true }.get(direct) as BeaconClient
@@ -243,7 +262,7 @@ class VoiceLookupLiveTest {
                 val events=DirectVoice::class.java.getDeclaredField("nativeEvents").apply { isAccessible=true }.get(direct) as? Job
                 phases.put("native_event_collector_active",events?.isActive==true)
             }
-            val removed=listOf("ordinary","tools","memory").map { kind -> File(app.filesDir,"voice-lookup-$provider-$kind.pcm").let { !it.exists()||it.delete() } }.all { it }
+            val removed=listOf("ordinary","tools","memory","callback").map { kind -> File(app.filesDir,"voice-lookup-$provider-$kind.pcm").let { !it.exists()||it.delete() } }.all { it }
             phases.put("fixtures_removed",removed).put("completed_jobs",completed.size)
             app.calls.hangup();withTimeoutOrNull(60_000) { while(app.calls.service!=null) delay(100) }
             runCatching { voiceStore.setSelection(previous) }

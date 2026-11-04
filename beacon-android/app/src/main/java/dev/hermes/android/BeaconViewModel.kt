@@ -282,6 +282,8 @@ internal fun liveAfterEvent(s: ChatState, type: String, o: JSONObject, previousC
 }
 data class EditorState(val scope: Scope? = null, val path: String = "", val text: TextFieldValue = TextFieldValue(), val serverText: String = "", val metadata: JSONObject = JSONObject(), val loading: Boolean = false, val saving: Boolean = false, val error: String = "", val reviewRequired: Boolean = false) { val dirty get() = text.text != serverText }
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
+/** How often a phone that cannot reach Hermes asks again while Beacon is on screen. */
+internal const val REACH_CHECK_MS = 5_000L
 data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val beaconOpening: Boolean = false, val beaconError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "", val historyUnreadable: List<String> = emptyList())
 internal fun voiceKeySetupPage(): String = "Beacon"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
@@ -595,8 +597,30 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         catch (_: Exception) { /* Reconnect stays a tap if Android refuses the callback. */ }
     }
 
+    private var reachProbe: Job? = null
+    /**
+     * While Hermes is out of reach, ask it quietly every few seconds (only on screen); its first answer clears "Can't reach Hermes".
+     * Nothing else: refreshing the open chat from here raised errors of its own (KeepConnectedUiTest). [now] asks at once (Retry).
+     */
+    fun checkHermesReach(now: Boolean = false) {
+        if (reachProbe?.isActive == true && !now) return
+        reachProbe?.cancel()
+        reachProbe = viewModelScope.launch {
+            var wait = !now
+            while (_ui.value.origin in HermesReach.origins.value) {
+                if (wait) delay(REACH_CHECK_MS)
+                wait = true
+                if (!foreground) continue
+                val active = client ?: continue
+                val c = active.detached()
+                try { c.get("/api/status") } catch (e: CancellationException) { throw e } catch (_: Exception) { } finally { runCatching { c.closeNative() } }
+            }
+        }
+    }
+
     init {
         reconnectWhenNetworkReturns()
+        viewModelScope.launch { HermesReach.origins.collect { if (_ui.value.origin in it) checkHermesReach() } }
         viewModelScope.launch {
             app.push.emailAlerts.collect { scope -> if (scope == sourceScope) client?.let { refreshChatAlerts(scope, it) } }
         }
@@ -3372,6 +3396,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
         } catch (e: Throwable) {
             if (e is CancellationException) throw e
+            // A send that could not reach Hermes says so in the app's banner too, not only by giving the draft back.
+            HermesReach.failed(scope.origin, e)
             if (sourceScope != scope || sessionGeneration != generation || originGeneration != origin || client !== active) return@launch
             if (attempted && pending[scope.key] !== send) return@launch
             val notSent = e is NativeTurnNotSent || requestNeverSent(e)

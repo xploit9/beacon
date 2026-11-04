@@ -19,6 +19,8 @@ private val profileId = Regex("[a-z0-9][a-z0-9_-]{0,63}")
 // "active" is also refused: /api/profiles/active is Hermes' own route, so such a profile could never be deleted from here.
 private val reservedProfileNames = setOf("hermes", "default", "test", "tmp", "root", "sudo", "active")
 internal const val PROFILE_ROLE_MAX = 280
+/** The plugin reads a profile's instructions up to 128 KiB for the phone; a longer save could not be shown again. */
+internal const val PROFILE_INSTRUCTIONS_MAX_BYTES = 128 * 1024
 
 /** The id Hermes stores for what was typed: trimmed and lower case. */
 internal fun profileNameOf(input: String): String = input.trim().lowercase()
@@ -83,7 +85,7 @@ class NativeProfileAdmin(
     fun opened() = mutable.update { it.copy(open = "") }
 
     /** Runs one change on a short-lived view of the signed-in client; [work] returns the notice, or null when Hermes did not confirm it. */
-    private fun perform(deleted: String = "", failure: (Exception) -> String = ::appErrorText, work: suspend (BeaconClient) -> String?) {
+    private fun perform(deleted: String = "", failure: (Exception) -> String = ::appErrorText, done: () -> Unit = {}, work: suspend (BeaconClient) -> String?) {
         val active = client() ?: run { fail("Reconnect, then try again."); return }
         if (mutable.value.busy) return
         mutable.update { it.copy(busy = true, error = "") }
@@ -95,7 +97,7 @@ class NativeProfileAdmin(
                 when {
                     !live -> mutable.update { it.copy(busy = false) }
                     notice == null -> mutable.update { it.copy(busy = false, error = "Hermes didn't confirm that. Refresh and try again.") }
-                    else -> { mutable.update { it.copy(busy = false, completed = it.completed + 1) }; changed(deleted, notice) }
+                    else -> { mutable.update { it.copy(busy = false, completed = it.completed + 1) }; done(); changed(deleted, notice) }
                 }
             }
             catch (e: CancellationException) { mutable.update { it.copy(busy = false) }; throw e }
@@ -130,9 +132,18 @@ class NativeProfileAdmin(
         }
     }
 
-    fun setRole(name: String, role: String) {
+    /** [done] runs once Hermes confirms, before the lists reload (the open profile shows the change at once). */
+    fun setRole(name: String, role: String, done: (String) -> Unit = {}) {
         if (!profileId.matches(name)) { fail("This profile can't be changed."); return }
-        val body = json("description" to role.trim().take(PROFILE_ROLE_MAX))
-        perform { c -> "Role saved".takeIf { c.nativeRequest("/api/profiles/$name/description", "PUT", body).optBoolean("ok") } }
+        val text = role.trim().take(PROFILE_ROLE_MAX)
+        val body = json("description" to text)
+        perform(done = { done(text) }) { c -> "Role saved".takeIf { c.nativeRequest("/api/profiles/$name/description", "PUT", body).optBoolean("ok") } }
+    }
+
+    /** A profile's instructions (its SOUL.md), saved whole through Hermes' own route. */
+    fun setInstructions(name: String, content: String, done: (String) -> Unit = {}) {
+        if (!profileId.matches(name)) { fail("This profile can't be changed."); return }
+        if (content.toByteArray(Charsets.UTF_8).size > PROFILE_INSTRUCTIONS_MAX_BYTES) { fail("Instructions are too long"); return }
+        perform(done = { done(content) }) { c -> "Saved".takeIf { c.nativeRequest("/api/profiles/$name/soul", "PUT", json("content" to content)).optBoolean("ok") } }
     }
 }

@@ -227,6 +227,12 @@ internal class IntentActionsBackend(context: Context) : ActionsBackend {
     override fun dial(number: String, direct: Boolean): Boolean {
         // A direct call needs Android's phone permission; without it nothing is placed, not even the dialer.
         if (direct && ContextCompat.checkSelfPermission(app, Manifest.permission.CALL_PHONE) != PackageManager.PERMISSION_GRANTED) throw SecurityException("The phone permission is missing")
+        // Owner, 4 Nov 2026: with several calling apps and no default, ACTION_CALL opened Android's "Complete action using" picker under
+        // the assistant and nothing was called. Telecom places it with the phone's own dialer; the intent stays as the fallback.
+        if (direct) app.getSystemService(android.telecom.TelecomManager::class.java)?.let { telecom ->
+            try { telecom.placeCall(Uri.fromParts("tel", number, null), android.os.Bundle()); return true }
+            catch (e: SecurityException) { throw e } catch (_: Exception) { }
+        }
         return start(Intent(if (direct) Intent.ACTION_CALL else Intent.ACTION_DIAL, Uri.fromParts("tel", number, null)))
     }
 

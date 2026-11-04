@@ -527,11 +527,16 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
                 // The shell owns system/IME space; descendants receive already-consumed insets.
                 CompositionLocalProvider(LocalOpenNavigationMenu provides openMenu) {
                     Column(Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Brush.linearGradient(nativeAmbientColors(MaterialTheme.colorScheme))).padding(padding).padding(bottom = feedbackReserve).consumeWindowInsets(padding)) {
-                        if (!ui.connected) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
+                        // Signed in but Hermes stopped answering (a VPN that dropped): the same banner says so (owner, 4 Nov 2026).
+                        val unreachableOrigins by dev.hermes.android.data.HermesReach.origins.collectAsState()
+                        val cantReach = ui.connected && ui.origin in unreachableOrigins
+                        if (!ui.connected || cantReach) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
                             Row(Modifier.padding(start = 16.dp).heightIn(min = 48.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 if (ui.loading) BeaconDustCore(18.dp) else Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.labelMedium)
-                                TextButton(enabled = !ui.loading, onClick = { vm.connect(ui.origin) }) { Text(uiText("Reconnect")) }
+                                Text(if (cantReach) uiText("Can't reach Hermes · check your connection") else if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.labelMedium)
+                                TextButton(enabled = !ui.loading, onClick = { if (cantReach) vm.checkHermesReach(now = true) else vm.connect(ui.origin) }, modifier = Modifier.testTag("beacon-offline-retry")) {
+                                    Text(if (cantReach) uiText("Retry") else uiText("Reconnect"))
+                                }
                             }
                         }
                         if (call.active && (ui.tab !in setOf("Chat","Beacon") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) CallBanner(call, onOpen = { vm.openCurrentCall() }, onHangUp = vm.app.calls::hangup)
