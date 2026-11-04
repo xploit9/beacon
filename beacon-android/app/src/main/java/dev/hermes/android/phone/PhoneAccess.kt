@@ -27,6 +27,22 @@ internal interface PhoneSettings {
  * The owner's Phone access choices, kept on this phone only. Every capability starts off, and so does Hermes access; a revoked
  * Android permission makes the capability read as off even while its switch is stored on.
  */
+/**
+ * Whether Hermes asks before it uses the phone: [Always] for reads and changes, [Changes] for changes only, [Never] at all (a phone
+ * call still waits for the tap or its countdown, and nothing changes on a locked phone). A pair the menu cannot make (reads asked,
+ * changes not) reads as [Always], the stricter one.
+ */
+enum class ApprovalChoice(val asksReads: Boolean, val asksChanges: Boolean) {
+    Always(true, true), Changes(false, true), Never(false, false);
+    companion object {
+        fun of(asksReads: Boolean, asksChanges: Boolean): ApprovalChoice = when {
+            asksReads -> Always
+            asksChanges -> Changes
+            else -> Never
+        }
+    }
+}
+
 object PhoneAccess {
     private const val FILE = "beacon_phone_access"
     private const val HERMES = "hermes_allowed"
@@ -63,6 +79,12 @@ object PhoneAccess {
     /** "Ask before Hermes acts": on until the owner turns it off. */
     fun askBeforeHermesActs(context: Context): Boolean = prefs(context).getBoolean(HERMES_ASK_ACTS, true)
     fun setAskBeforeHermesActs(context: Context, on: Boolean) { prefs(context).edit().putBoolean(HERMES_ASK_ACTS, on).apply() }
+
+    /** Ask for approval, the one choice the owner sees: the two stored switches below, read and written together. */
+    fun approvalChoice(context: Context): ApprovalChoice = ApprovalChoice.of(askBeforeHermesReads(context), askBeforeHermesActs(context))
+    fun setApprovalChoice(context: Context, choice: ApprovalChoice) {
+        prefs(context).edit().putBoolean(HERMES_ASK, choice.asksReads).putBoolean(HERMES_ASK_ACTS, choice.asksChanges).apply()
+    }
 
     internal fun settings(context: Context): PhoneSettings {
         val app = context.applicationContext

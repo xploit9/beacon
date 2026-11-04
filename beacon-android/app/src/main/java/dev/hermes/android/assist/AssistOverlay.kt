@@ -284,7 +284,7 @@ private val OnGold = Color(0xFF2E1C00)
                 val show = approvalShow(live, approval, phoneLocked)
                 // Only a card that is really drawn counts as the approval; locked, the call posts its notification instead.
                 if (approval != null) ApprovalCardOnScreen(approval.requestId, c.app.calls::approvalCardShown, shown = show == ApprovalShow.Card)
-                LiveAbovePill(captions, activity, approval, show, { decision -> approval?.let { c.decide(it, decision) } }, phoneLocked = phoneLocked)
+                LiveAbovePill(captions, activity, approval, show, { decision -> approval?.let { c.decide(it, decision) } }, phoneLocked = phoneLocked, onUnlock = c::unlock)
             } else {
                 // The chips join a frame after the show (they are clear for their first 200 ms anyway), so fitting them never
                 // costs the first frame. While the unlock line waits, it is the only thing the overlay shows.

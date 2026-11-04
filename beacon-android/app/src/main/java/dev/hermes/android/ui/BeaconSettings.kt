@@ -427,6 +427,14 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
             }) { if (!dev.hermes.android.assist.openAssistantSettings(context)) vm.notice("Open Beacon’s app settings in Android") }
         }
         item {
+            // Whether Hermes asks before it acts, in chats, calls and from the side button (Phone access shows the same choice).
+            val approvalContext = LocalContext.current
+            var approvals by remember { mutableStateOf(dev.hermes.android.phone.PhoneAccess.approvalChoice(approvalContext)) }
+            SettingsSection(footer = uiText(approvalChoiceMeaning(approvals)), testTag = "approval-choice-section") {
+                ApprovalChoiceRow { approvals = it }
+            }
+        }
+        item {
             SettingsSection(uiText("What needs you"), trailing = { SettingsBadge(profileLabel, Modifier.padding(end = 4.dp)) }) {
                 if (pluginMissing) MissingBeaconPluginState(compact = true, update = pluginStatus != "absent")
                 else {

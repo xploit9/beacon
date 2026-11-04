@@ -132,6 +132,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         if (!watchingAsks) { watchingAsks = true; scope.launch { CallTrust.lockedAsks.collect { askedToUnlock(it) } } }
         state = reduce(state, OverlayEvent.Show(fresh = !reveal, callActive = app.calls.state.value.active))
         holdCallWindow()
+        watchLock()
         // The first dust frame starts the conversation (see drawn); a window slow to draw one (a screen that comes on late) must never leave the show with nothing started.
         scope.launch { delay(FIRST_FRAME_FALLBACK_MILLIS); if (awaitingFrame && shownAt == at && state.phase != OverlayPhase.Hidden) { awaitingFrame = false; settle() } }
     }
@@ -211,7 +212,27 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
 
     fun screenshot(bitmap: Bitmap?) { if (!overlayLocked(locked, keyguardLocked())) screen = bitmap }
 
+    private var lockLook: Job? = null
+
+    /**
+     * While the overlay shows, the lock is read again every second with the screen on, so a broadcast the phone held back (MagicOS
+     * does) never leaves an unlocked phone showing the locked overlay. A screen that is off is left to the broadcasts.
+     */
+    private fun watchLock() {
+        lockLook?.cancel()
+        lockLook = scope.launch {
+            val power = session.context.getSystemService(android.os.PowerManager::class.java)
+            while (true) {
+                delay(LOCK_LOOK_MILLIS)
+                if (power?.isInteractive != true) continue
+                val now = keyguardLocked()
+                if (now != locked) { locked = now; if (now) lockedWhileOpen() else unlockedWhileOpen() }
+            }
+        }
+    }
+
     fun hidden() {
+        lockLook?.cancel()
         dictation.cancel()
         // Whatever closes the overlay ends the conversation it started, before the window is let go (which would float the call).
         closeLive()
@@ -504,7 +525,10 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         // Closed, or ended with the orb, while the chat opened: nothing starts.
         if (!live.wanted) return
         val active = model.client
-        if (active == null || active.scope != request.scope || model.chat.value.sessionId != request.conversationId) { endWanted(OverlayLine.CallFailed); return }
+        if (active == null || active.scope != request.scope || model.chat.value.sessionId != request.conversationId) {
+            if (live.retryOnce(running = false)) retryLive(model) else endWanted(OverlayLine.CallFailed)
+            return
+        }
         scope.launch {
             if (!voiceKeyConfiguredOnIo { VoiceKeyStore(app) }) { endWanted(OverlayLine.VoiceKey); return@launch }
             if (!live.wanted) return@launch
@@ -600,5 +624,7 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         const val FIRST_FRAME_FALLBACK_MILLIS = 1_000L
         /** The pause before the automatic second try of a start that failed: long enough for a blink in the network or Android to pass. */
         const val RETRY_DELAY_MILLIS = 700L
+        /** How often the overlay reads the lock again while it shows. */
+        const val LOCK_LOOK_MILLIS = 1_000L
     }
 }

@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.hasTestTag
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertWidthIsAtLeast
@@ -58,6 +60,9 @@ class PhoneAccessUiTest {
         logBefore.forEach(log::add)
     }
 
+    // The Activity list is one item of the page (it scrolls inside itself), built once the page reaches it.
+    private fun toActivity() = compose.onNodeWithTag("phone-access").performScrollToNode(hasTestTag("phone-access-activity-list"))
+
     private fun show(notificationsOn: (() -> Boolean)? = null) = compose.setContent {
         MaterialTheme(colorScheme = darkColorScheme()) { Column(Modifier.fillMaxSize()) { PhoneAccessBody(Modifier.weight(1f), notificationsOn) } }
     }
@@ -66,7 +71,6 @@ class PhoneAccessUiTest {
         show()
         for (capability in PhoneCapability.entries) compose.onNodeWithTag("phone-access-${capability.key}").performScrollTo().assertIsOff()
         compose.onNodeWithTag("phone-access-hermes-switch").performScrollTo().assertIsOff()
-        compose.onAllNodesWithTag("phone-access-hermes-ask").assertCountEquals(0)
         compose.onNodeWithText("Nothing yet").performScrollTo()
     }
 
@@ -109,7 +113,8 @@ class PhoneAccessUiTest {
         // Short enough for its two lines at large text, so nothing of it is cut off; the section's line covers every other number.
         compose.onNodeWithText("Call saved contacts after 3 seconds").performScrollTo().assertExists()
         compose.onNodeWithText("Write message drafts").performScrollTo().assertExists()
-        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
+        // The section says what Ask for approval does now (Always by default).
+        compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
         compose.onNodeWithText("Only what you turned on above").performScrollTo().assertExists()
     }
 
@@ -122,65 +127,40 @@ class PhoneAccessUiTest {
         assertFalse("allowing the permission again must not switch it back on", PhoneAccess.switchedOn(context, PhoneCapability.Calendar))
     }
 
-    @Test fun hermesAccessShowsItsAskBeforeReadsChoiceOnlyWhileOn() {
+    // Owner, 4 Nov 2026: the two switches were confusing; one menu, Ask for approval, answers whether Hermes asks at all.
+    @Test fun askForApprovalIsOneMenuThatMovesBothStoredChoicesAndTheEngine() {
+        PhoneAccess.setHermesAllowed(context, true)
+        PhoneAccess.setApprovalChoice(context, ApprovalChoice.Always)
         show()
-        compose.onNodeWithTag("phone-access-hermes-switch").performScrollTo().performClick()
-        compose.waitForIdle()
-        assertTrue(PhoneAccess.hermesAllowed(context))
-        compose.onNodeWithTag("phone-access-hermes-ask").performScrollTo().assertIsOn()
-        compose.onNodeWithText("Reads need your tap too").assertExists()
-        compose.onNodeWithTag("phone-access-hermes-ask").performClick()
+        compose.onAllNodesWithTag("phone-access-hermes-ask").assertCountEquals(0)
+        compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
+        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Ask for approval").assertTextContains("Always")
+        compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
+
+        compose.onNodeWithTag("approval-choice").performClick()
+        compose.onNodeWithTag("approval-choice-Changes").performClick()
         compose.waitForIdle()
         assertFalse(PhoneAccess.askBeforeHermesReads(context))
-        compose.onNodeWithTag("phone-access-hermes-ask").assertIsOff()
-        // With reads unasked, the page says so under the switch.
-        compose.onNodeWithText("Hermes can read your calendar and contacts without asking").assertExists()
-        compose.onNodeWithTag("phone-access-hermes-switch").performClick()
-        compose.waitForIdle()
-        assertFalse(PhoneAccess.hermesAllowed(context))
-        compose.onAllNodesWithTag("phone-access-hermes-ask").assertCountEquals(0)
-    }
-
-    @Test fun askBeforeHermesActsIsOnByDefaultShowsOnlyWhileHermesAccessIsOnAndKeepsTheFooterTrue() {
-        // Nothing is stored yet: asking is the default, so every Hermes change keeps its card.
         assertTrue(PhoneAccess.askBeforeHermesActs(context))
-        show()
-        compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
-        compose.onNodeWithTag("phone-access-hermes-switch").performScrollTo().performClick()
-        compose.waitForIdle()
-        val acts = compose.onNodeWithTag("phone-access-hermes-ask-acts").performScrollTo()
-        acts.assertIsOn()
-        compose.onNodeWithText("Ask before Hermes acts").assertExists()
-        compose.onNodeWithText("Changes need your tap").assertExists()
-        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
-        // Reads and changes are separate choices: turning one off leaves the other alone.
-        acts.performClick()
-        compose.waitForIdle()
-        assertFalse(PhoneAccess.askBeforeHermesActs(context))
-        assertTrue(PhoneAccess.askBeforeHermesReads(context))
-        acts.assertIsOff()
-        compose.onNodeWithTag("phone-access-hermes-ask").assertIsOn()
-        compose.onNodeWithText("Hermes can add events, set alarms and more without asking").assertExists()
-        // The footer under the switches no longer claims Beacon asks before everything.
-        compose.onNodeWithText("Phone calls still ask first").performScrollTo().assertExists()
-        compose.onAllNodesWithText("Beacon asks before it changes anything").assertCountEquals(0)
-        // The engine reads the same stored choice: a change needs no tap in a chat or from the assistant, a phone call still does.
-        assertFalse(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Hermes))
-        assertTrue(PhoneTools.needsApproval(context, "phone_call", PhoneOrigin.Hermes))
-        assertFalse(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Overlay))
-        acts.performScrollTo().performClick()
-        compose.waitForIdle()
-        assertTrue(PhoneAccess.askBeforeHermesActs(context))
+        compose.onNodeWithText("Hermes asks before it changes anything").performScrollTo().assertExists()
+        assertFalse(PhoneTools.needsApproval(context, "phone_calendars", PhoneOrigin.Hermes))
         assertTrue(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Hermes))
-        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
+
+        compose.onNodeWithTag("approval-choice").performScrollTo().performClick()
+        compose.onNodeWithTag("approval-choice-Never").performClick()
+        compose.waitForIdle()
+        assertEquals(ApprovalChoice.Never, PhoneAccess.approvalChoice(context))
+        compose.onNodeWithText("Hermes acts without asking. Phone calls still ask.").performScrollTo().assertExists()
+        // A change needs no tap from a chat or the assistant; a phone call still does.
+        assertFalse(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Hermes))
+        assertFalse(PhoneTools.needsApproval(context, "phone_calendar_create", PhoneOrigin.Overlay))
+        assertTrue(PhoneTools.needsApproval(context, "phone_call", PhoneOrigin.Hermes))
     }
 
-    @Test fun theFooterKeepsSayingBeaconAsksWhenHermesAccessIsOffEvenIfActingWasFreed() {
-        // With Hermes locked out the switch is hidden and Hermes cannot act at all, so nothing changes without asking.
-        PhoneAccess.setAskBeforeHermesActs(context, false)
+    @Test fun theMenuShowsEvenWithHermesAccessOffBecauseItAlsoCoversCallsAndTheSideButton() {
+        PhoneAccess.setApprovalChoice(context, ApprovalChoice.Changes)
         show()
-        compose.onNodeWithText("Beacon asks before it changes anything").performScrollTo().assertExists()
-        compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
+        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Only for changes")
     }
 
     @Test fun withNotificationsOffAndHermesAccessOnThePageSaysRequestsShowOnlyInTheOpenApp() {
@@ -206,6 +186,7 @@ class PhoneAccessUiTest {
     @Test fun aRequestRefusedBecauseThePhoneWasLockedIsListedWithItsReason() {
         log.add(PhoneActivityEntry(System.currentTimeMillis() - 30_000, PhoneOrigin.Overlay, "phone_calendars", PhoneLine("Read your calendars"), "locked"))
         show()
+        toActivity()
         compose.onAllNodesWithTag("phone-access-entry")[0].performScrollTo().assertTextContains("Read your calendars", substring = true)
         compose.onAllNodesWithTag("phone-access-entry")[0].assertTextContains("Unlock your phone first.", substring = true)
         compose.onAllNodesWithTag("phone-access-entry")[0].assertTextContains("Assistant", substring = true)
@@ -215,6 +196,7 @@ class PhoneAccessUiTest {
         log.add(PhoneActivityEntry(System.currentTimeMillis() - 120_000, PhoneOrigin.Hermes, "phone_timer_set", PhoneLine("Start a timer for {0}", listOf("5 min")), "done"))
         log.add(PhoneActivityEntry(System.currentTimeMillis() - 60_000, PhoneOrigin.LiveCall, "phone_call", PhoneLine("Call {0} {1}", listOf("Mona", "+966501234567")), "denied"))
         show()
+        toActivity()
         compose.onAllNodesWithTag("phone-access-entry").assertCountEquals(2)
         // The owner's own words (a name, a number, a time) are isolated, so a name in the other script never flips the line.
         compose.onAllNodesWithTag("phone-access-entry")[0].performScrollTo().assertTextContains(PhoneLine("Call {0} {1}", listOf("Mona", "+966501234567")).shown())

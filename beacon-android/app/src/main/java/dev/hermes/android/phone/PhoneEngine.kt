@@ -51,13 +51,13 @@ internal class PhoneEngine(
     }
 
     /**
-     * The one rule for the owner's tap. A phone call always waits (for the tap or the countdown, see [PhoneCountdown.forHermes]).
-     * Any other write needs it unless Hermes may use phone access and "Ask before Hermes acts" is off, in a chat, a call or the
-     * assistant alike: they are one Hermes. A Hermes read needs it while "Ask before Hermes reads" is on; calls and the assistant read freely.
+     * The one rule for the owner's tap (Settings › Assistant › Ask for approval). A phone call always waits (for the tap or the countdown,
+     * see [PhoneCountdown.forHermes]). Any other change needs it unless the owner chose Never, in a chat, a call or the assistant alike:
+     * they are one Hermes. A Hermes chat's read needs it while the choice is Always; calls and the assistant read freely.
      */
     fun needsApproval(name: String, origin: PhoneOrigin): Boolean = when {
         name == CALL -> true
-        PhoneSpecs.isWrite(name) -> !settings.hermesAllowed() || settings.askBeforeHermesActs()
+        PhoneSpecs.isWrite(name) -> settings.askBeforeHermesActs()
         origin != PhoneOrigin.Hermes -> false
         else -> settings.askBeforeHermesReads()
     }

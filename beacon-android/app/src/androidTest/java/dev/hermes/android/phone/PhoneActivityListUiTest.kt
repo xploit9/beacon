@@ -7,6 +7,9 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.test.getBoundsInRoot
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.hasTestTag
@@ -20,6 +23,7 @@ import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextInput
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.ui.PhoneAccessBody
+import org.junit.Assert.assertTrue
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Before
@@ -67,7 +71,8 @@ class PhoneActivityListUiTest {
     // The page is a lazy list: the Activity controls are its third item, and what follows them is composed only while it is near the screen.
     // From the top of the Activity block a short list is wholly on screen, so a count means the whole list.
     private fun fromTop() = compose.onNodeWithTag("phone-access").performScrollToIndex(2)
-    private fun scrollTo(tag: String) = compose.onNodeWithTag("phone-access").performScrollToNode(hasTestTag(tag))
+    // The page brings the Activity list into view; the list then scrolls inside itself to the node.
+    private fun scrollTo(tag: String) { compose.onNodeWithTag("phone-access").performScrollToNode(hasTestTag(tag)); compose.onNodeWithTag(tag).performScrollTo() }
     private fun rows() = compose.onAllNodesWithTag("phone-access-entry")
     private fun pick(menu: String, option: String) {
         fromTop()
@@ -184,6 +189,9 @@ class PhoneActivityListUiTest {
         rows().assertCountEquals(20)
         // The newest twenty: 45 down to 26.
         rows()[0].assertTextContains(PhoneLine("Start a timer for {0}", listOf("45 min")).shown(), substring = true)
+        // Owner, 4 Nov 2026: about ten rows at most, then the list scrolls inside itself instead of making the page longer.
+        val list = compose.onNodeWithTag("phone-access-activity-list").getBoundsInRoot()
+        assertTrue("the list is at most ten rows tall", list.bottom - list.top <= dev.hermes.android.ui.SettingsKit.RowMinHeightTwoLine * dev.hermes.android.phone.ACTIVITY_VISIBLE_ROWS)
         scrollTo("phone-access-more")
         compose.onNodeWithTag("phone-access-more").performClick()
         compose.waitForIdle()

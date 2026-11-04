@@ -177,7 +177,15 @@ class Host:
             return None
 
     def processes(self):
-        return [row for row in (self.info(pid) for pid in self.ps.pids()) if row]
+        # Only Python and Hermes processes can be a dashboard. Their names are cheap to read; a command line, environment and
+        # folder are not (reading all three for every process on a busy Windows PC took 11 s, longer than Hermes lets a plugin load).
+        named = []
+        for process in self.ps.process_iter(['name']):
+            try:
+                if PROCESS_NAME.fullmatch(process.info.get('name') or ''): named.append(process.pid)
+            except (self.ps.Error, OSError):
+                continue
+        return [row for row in (self.info(pid) for pid in named) if row]
 
     def children(self, pid):
         try:

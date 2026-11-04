@@ -37,7 +37,7 @@ class AssistLockGateTest {
         assertTrue(overlay.contains("val phoneLocked = overlayLocked(c.locked, keyguardLocked())"))
         assertFalse("the card must not read the cached flag alone", overlay.contains("approvalShow(live, approval, c.locked)"))
         assertTrue(overlay.contains("approvalShow(live, approval, phoneLocked)"))
-        assertTrue(overlay.contains("phoneLocked = phoneLocked)"))
+        assertTrue(overlay.contains("phoneLocked = phoneLocked, onUnlock = c::unlock)"))
         assertTrue(overlay.contains("liveStatusLabel(call, phoneLocked)"))
         // The answer card and the chips take the same value as a parameter.
         assertTrue(overlay.contains("AnswerCard(it, vm, clock, motion, phoneLocked, c::closeCard, c::reveal)"))

@@ -1,6 +1,7 @@
 package dev.hermes.android.assist
 
 import android.os.SystemClock
+import androidx.compose.foundation.clickable
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.snap
 import androidx.compose.animation.core.tween
@@ -88,6 +89,7 @@ import kotlin.math.sin
     now: () -> Long = SystemClock::elapsedRealtime,
     locked: () -> Boolean = rememberKeyguardLocked(),
     phoneLocked: Boolean = false,
+    onUnlock: () -> Unit = {},
 ) {
     val card = show == ApprovalShow.Card && approval != null
     // With the card up, the note it carries gets the room: one caption line and no tool line above the text box.
@@ -98,7 +100,7 @@ import kotlin.math.sin
     Column(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(10.dp)) {
         when (show) {
             ApprovalShow.Card -> if (approval != null) AssistApprovalCard(approval, onDecision, now, locked)
-            ApprovalShow.Locked -> LockedApprovalRow { onDecision("deny") }
+            ApprovalShow.Locked -> LockedApprovalRow(onUnlock) { onDecision("deny") }
             ApprovalShow.None -> Unit
         }
         if (words) LiveCaptions(shownCaptions, shownActivity)
@@ -202,11 +204,14 @@ internal fun liveActivityColor(light: Boolean, primary: Color): Color = if (ligh
 }
 
 /** Locked, the overlay says only that something waits, never what; the one thing offered is no. Allowing needs the phone unlocked. */
-@Composable internal fun LockedApprovalRow(onDeny: () -> Unit) {
-    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).glass(RoundedCornerShape(24.dp), solid = true, halo = .2f).padding(start = 16.dp)
+/** Locked, the approval shows only that something waits: a tap asks for the unlock (then the whole card shows), and Deny says no at once. */
+@Composable internal fun LockedApprovalRow(onUnlock: () -> Unit, onDeny: () -> Unit) {
+    val unlockLabel = uiText("Unlock to approve")
+    Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).glass(RoundedCornerShape(24.dp), solid = true, halo = .2f)
+        .clickable(onClickLabel = unlockLabel, onClick = onUnlock).padding(start = 16.dp)
         .semantics { liveRegion = LiveRegionMode.Polite }.testTag("assist-approval-locked"), verticalAlignment = Alignment.CenterVertically) {
         Icon(Icons.Rounded.Lock, null, Modifier.size(20.dp), tint = Gold)
-        Text(uiText("Approval needed"), Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
+        Text(unlockLabel, Modifier.weight(1f).padding(horizontal = 12.dp, vertical = 6.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface)
         TextButton(onDeny, Modifier.heightIn(min = 48.dp).testTag("assist-approval-deny")) { Text(uiText("Deny")) }
     }
 }

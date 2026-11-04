@@ -97,7 +97,8 @@ class CheckupSettingsUiTest {
             "no_agent" to true, "deliver" to "local", "paused" to false, "enabled" to true, "schedule" to json("kind" to "interval", "display" to "every 1m"))
         withAssistant(fixture) { vm ->
             val deletes = { fixture.requests.filter { it.string("path").startsWith("/api/cron/jobs/") && it.string("method") == "DELETE" } }
-            compose.waitUntil(15_000) { runCatching { compose.onNodeWithTag("assistant-checkups-toggle").assertIsOn() }.isSuccess }
+            // The section sits below the side button and approval cards: the page scrolls to it before the switch can be read.
+            compose.waitUntil(15_000) { runCatching { compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("assistant-checkups-toggle")); compose.onNodeWithTag("assistant-checkups-toggle").assertIsOn() }.isSuccess }
             compose.onNodeWithTag("assistant-checkups-toggle").performScrollTo().assertIsEnabled().performClick()
             // Turning off asks first; Cancel deletes nothing.
             compose.onNode(hasText("Cancel") and hasClickAction()).performClick()
@@ -110,7 +111,7 @@ class CheckupSettingsUiTest {
             assertFalse(fixture.jobs.containsKey("checkups-job"))
             // The owner's other schedules are untouched, and the switch follows the refreshed list.
             assertTrue(fixture.jobs.containsKey("task-a"))
-            compose.waitUntil(15_000) { runCatching { compose.onNodeWithTag("assistant-checkups-toggle").assertIsOff() }.isSuccess }
+            compose.waitUntil(15_000) { runCatching { compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("assistant-checkups-toggle")); compose.onNodeWithTag("assistant-checkups-toggle").assertIsOff() }.isSuccess }
         }
     }
 }

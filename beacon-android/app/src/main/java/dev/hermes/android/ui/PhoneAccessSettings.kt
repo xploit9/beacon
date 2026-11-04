@@ -7,6 +7,9 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.fillMaxWidth
+import dev.hermes.android.phone.ACTIVITY_VISIBLE_ROWS
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -178,8 +181,7 @@ private fun capabilityIcon(capability: PhoneCapability) = when (capability) {
     val log = remember { PhoneActivityLog.of(context) }
     val entries = remember(version) { log.recent() }
     val hermes = remember(version) { PhoneAccess.hermesAllowed(context) }
-    val ask = remember(version) { PhoneAccess.askBeforeHermesReads(context) }
-    val askActs = remember(version) { PhoneAccess.askBeforeHermesActs(context) }
+    val approvals = remember(version) { PhoneAccess.approvalChoice(context) }
     // The Activity list's search, its three choices and how many pages it shows; a change of any of them starts again at the first page.
     var query by rememberSaveable { mutableStateOf("") }
     var typeKey by rememberSaveable { mutableStateOf("") }
@@ -200,7 +202,7 @@ private fun capabilityIcon(capability: PhoneCapability) = when (capability) {
 
     SettingsList(modifier, testTag = "phone-access") {
         item {
-            SettingsSection(uiText("Beacon can use"), footer = uiText(if (hermes && !askActs) "Phone calls still ask first" else "Beacon asks before it changes anything"),
+            SettingsSection(uiText("Beacon can use"), footer = uiText(approvalChoiceMeaning(approvals)),
                 testTag = "phone-access-capabilities") {
                 PhoneCapability.entries.forEachIndexed { index, capability ->
                     if (index > 0) SettingsDivider()
@@ -242,20 +244,9 @@ private fun capabilityIcon(capability: PhoneCapability) = when (capability) {
                     onCheckedChange = { PhoneAccess.setHermesAllowed(context, it); version++ },
                     icon = Icons.Rounded.SmartToy, summary = uiText("Only what you turned on above"), testTag = "phone-access-hermes-switch",
                 )
-                if (hermes) {
-                    SettingsDivider()
-                    SettingsSwitchRow(
-                        label = uiText("Ask before Hermes reads"), checked = ask,
-                        onCheckedChange = { PhoneAccess.setAskBeforeHermesReads(context, it); version++ },
-                        summary = uiText(if (ask) "Reads need your tap too" else "Hermes can read your calendar and contacts without asking"), testTag = "phone-access-hermes-ask",
-                    )
-                    SettingsDivider()
-                    SettingsSwitchRow(
-                        label = uiText("Ask before Hermes acts"), checked = askActs,
-                        onCheckedChange = { PhoneAccess.setAskBeforeHermesActs(context, it); version++ },
-                        summary = uiText(if (askActs) "Changes need your tap" else "Hermes can add events, set alarms and more without asking"), testTag = "phone-access-hermes-ask-acts",
-                    )
-                }
+                // The same choice as Settings › Assistant: one answer to whether Hermes asks, in chats, calls and from the side button.
+                SettingsDivider()
+                ApprovalChoiceRow { version++ }
                 if (notificationsOff) {
                     SettingsDivider()
                     SettingsValueRow(label = uiText("Notifications are off. Hermes requests show only when Beacon is open."), icon = Icons.Rounded.NotificationsOff,
@@ -293,18 +284,22 @@ private fun capabilityIcon(capability: PhoneCapability) = when (capability) {
                 }, testTag = "phone-access-clear-filters"))
             }
         }
-        // One titled card for each day, newest first; a day's rows are compact: what was done, then who asked, how long ago and how it ended.
-        items(days, key = { it.day.toString() }) { group ->
-            SettingsSection(dayLabel(group, today), testTag = "phone-access-day") {
-                group.entries.forEachIndexed { index, entry ->
-                    if (index > 0) SettingsDivider()
-                    ActivityRow(entry)
+        // One titled card for each day, newest first; a day's rows are compact: what was done, then who asked, at what time and how it
+        // ended. The list is about ten rows tall at most and scrolls inside itself past that, so the page never grows with it (owner, 4 Nov).
+        if (days.isNotEmpty()) item {
+            Column(Modifier.fillMaxWidth().heightIn(max = SettingsKit.RowMinHeightTwoLine * ACTIVITY_VISIBLE_ROWS).verticalScroll(rememberScrollState())
+                .testTag("phone-access-activity-list")) {
+                days.forEach { group ->
+                    SettingsSection(dayLabel(group, today), testTag = "phone-access-day") {
+                        group.entries.forEachIndexed { index, entry ->
+                            if (index > 0) SettingsDivider()
+                            ActivityRow(entry)
+                        }
+                    }
                 }
-            }
-        }
-        if (matching.size > visible.size) item {
-            SettingsSection(testTag = "phone-access-more-section") {
-                SettingsActionRow(uiText("Show more"), onClick = { pages++ }, testTag = "phone-access-more")
+                if (matching.size > visible.size) SettingsSection(testTag = "phone-access-more-section") {
+                    SettingsActionRow(uiText("Show more"), onClick = { pages++ }, testTag = "phone-access-more")
+                }
             }
         }
     }

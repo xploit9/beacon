@@ -73,5 +73,8 @@ internal fun phoneDayName(day: LocalDate, today: LocalDate): PhoneDayName = when
 /** The list shows this many rows first, and this many more each time the owner asks for more. */
 internal const val ACTIVITY_PAGE = 20
 
+/** How many rows tall the Activity list is at most; past that it scrolls inside itself. */
+internal const val ACTIVITY_VISIBLE_ROWS = 10
+
 /** The first [pages] pages of [entries]: [ACTIVITY_PAGE] rows each, so the list never runs on without the owner asking. */
 internal fun activityPage(entries: List<PhoneActivityEntry>, pages: Int): List<PhoneActivityEntry> = entries.take(ACTIVITY_PAGE * pages.coerceAtLeast(1))

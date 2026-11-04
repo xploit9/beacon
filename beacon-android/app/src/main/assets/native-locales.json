@@ -5407,7 +5407,14 @@
     "phone calls still ask first": "Le chiamate chiedono sempre prima",
     "opens over any app, even locked": "Si apre sopra qualsiasi app, anche col telefono bloccato",
     "memory and tools work while locked": "Memoria e strumenti funzionano anche col telefono bloccato",
-    "send email": "Invia email"
+    "send email": "Invia email",
+    "ask for approval": "Chiedi l'approvazione",
+    "always": "Sempre",
+    "only for changes": "Solo per le modifiche",
+    "hermes asks before it reads or changes anything": "Hermes chiede prima di leggere o modificare qualcosa",
+    "hermes asks before it changes anything": "Hermes chiede prima di modificare qualcosa",
+    "hermes acts without asking. phone calls still ask.": "Hermes agisce senza chiedere. Le chiamate chiedono comunque.",
+    "unlock to approve": "Sblocca per approvare"
   },
   "ja": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "選択した Live モデルが音声を聞き取ります。応答の読み上げには、同じキーと声で Gemini 3.8 Flash-Lite TTS を使用します。",
@@ -9017,7 +9024,14 @@
     "phone calls still ask first": "電話の発信は引き続き先に確認します",
     "opens over any app, even locked": "どのアプリの上でも、ロック中でも開きます",
     "memory and tools work while locked": "ロック中もメモリーとツールが使えます",
-    "send email": "メールを送信"
+    "send email": "メールを送信",
+    "ask for approval": "承認を求める",
+    "always": "常に",
+    "only for changes": "変更のときだけ",
+    "hermes asks before it reads or changes anything": "Hermes は読み取りや変更の前に確認します",
+    "hermes asks before it changes anything": "Hermes は変更の前に確認します",
+    "hermes acts without asking. phone calls still ask.": "Hermes は確認せずに実行します。電話の発信は引き続き確認します。",
+    "unlock to approve": "ロックを解除して承認"
   },
   "ru": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Выбранная модель Live распознаёт речь. Для озвучивания ответов используется Gemini 3.8 Flash-Lite TTS с тем же ключом и голосом.",
@@ -12627,7 +12641,14 @@
     "phone calls still ask first": "Перед звонком всё равно спросит",
     "opens over any app, even locked": "Открывается поверх любого приложения, даже на заблокированном телефоне",
     "memory and tools work while locked": "Память и инструменты работают на заблокированном телефоне",
-    "send email": "Отправить письмо"
+    "send email": "Отправить письмо",
+    "ask for approval": "Спрашивать разрешение",
+    "always": "Всегда",
+    "only for changes": "Только для изменений",
+    "hermes asks before it reads or changes anything": "Hermes спрашивает перед тем, как что-то прочитать или изменить",
+    "hermes asks before it changes anything": "Hermes спрашивает перед любыми изменениями",
+    "hermes acts without asking. phone calls still ask.": "Hermes действует без вопросов. Перед звонком всё равно спросит.",
+    "unlock to approve": "Разблокируйте, чтобы одобрить"
   },
   "es": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "El modelo Live seleccionado escucha. Las respuestas habladas usan Gemini 3.8 Flash-Lite TTS con la misma clave y voz.",
@@ -16201,7 +16222,14 @@
     "phone calls still ask first": "Las llamadas siguen preguntando antes",
     "opens over any app, even locked": "Se abre sobre cualquier app, incluso bloqueado",
     "memory and tools work while locked": "La memoria y las herramientas funcionan con el teléfono bloqueado",
-    "send email": "Enviar correo"
+    "send email": "Enviar correo",
+    "ask for approval": "Pedir aprobación",
+    "always": "Siempre",
+    "only for changes": "Solo para cambios",
+    "hermes asks before it reads or changes anything": "Hermes pregunta antes de leer o cambiar algo",
+    "hermes asks before it changes anything": "Hermes pregunta antes de cambiar algo",
+    "hermes acts without asking. phone calls still ask.": "Hermes actúa sin preguntar. Las llamadas siguen preguntando.",
+    "unlock to approve": "Desbloquea para aprobar"
   },
   "de": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Das ausgewählte Live-Modell hört zu. Gesprochene Antworten verwenden Gemini 3.8 Flash-Lite TTS mit demselben Schlüssel und derselben Stimme.",
@@ -19765,7 +19793,14 @@
     "phone calls still ask first": "Anrufe fragen weiterhin vorher",
     "opens over any app, even locked": "Öffnet sich über jeder App, auch gesperrt",
     "memory and tools work while locked": "Erinnerungen und Werkzeuge funktionieren auch gesperrt",
-    "send email": "E-Mail senden"
+    "send email": "E-Mail senden",
+    "ask for approval": "Um Zustimmung bitten",
+    "always": "Immer",
+    "only for changes": "Nur bei Änderungen",
+    "hermes asks before it reads or changes anything": "Hermes fragt, bevor es etwas liest oder ändert",
+    "hermes asks before it changes anything": "Hermes fragt, bevor es etwas ändert",
+    "hermes acts without asking. phone calls still ask.": "Hermes handelt ohne Nachfrage. Anrufe fragen weiterhin.",
+    "unlock to approve": "Zum Zustimmen entsperren"
   },
   "zh": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "所选 Live 模型负责听取语音。回复由 Gemini 3.8 Flash-Lite TTS 朗读，使用相同的密钥和声音。",
@@ -23329,7 +23364,14 @@
     "phone calls still ask first": "拨打电话仍会先询问",
     "opens over any app, even locked": "可在任何应用上打开，锁定时也可以",
     "memory and tools work while locked": "锁定时也能使用记忆和工具",
-    "send email": "发送邮件"
+    "send email": "发送邮件",
+    "ask for approval": "请求批准",
+    "always": "始终",
+    "only for changes": "仅限更改",
+    "hermes asks before it reads or changes anything": "Hermes 在读取或更改任何内容前都会询问",
+    "hermes asks before it changes anything": "Hermes 在更改任何内容前都会询问",
+    "hermes acts without asking. phone calls still ask.": "Hermes 不经询问直接执行。拨打电话仍会询问。",
+    "unlock to approve": "解锁以批准"
   },
   "zh-Hant": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "所選 Live 模型負責聆聽語音。回覆由 Gemini 3.8 Flash-Lite TTS 朗讀，使用相同的金鑰和聲音。",
@@ -26939,7 +26981,14 @@
     "phone calls still ask first": "撥打電話仍會先詢問",
     "opens over any app, even locked": "可在任何應用程式上開啟，鎖定時也可以",
     "memory and tools work while locked": "鎖定時也能使用記憶和工具",
-    "send email": "傳送郵件"
+    "send email": "傳送郵件",
+    "ask for approval": "請求核准",
+    "always": "一律",
+    "only for changes": "僅限變更",
+    "hermes asks before it reads or changes anything": "Hermes 在讀取或變更任何內容前都會詢問",
+    "hermes asks before it changes anything": "Hermes 在變更任何內容前都會詢問",
+    "hermes acts without asking. phone calls still ask.": "Hermes 不經詢問直接執行。撥打電話仍會詢問。",
+    "unlock to approve": "解鎖以核准"
   },
   "pt": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "O modelo Live selecionado escuta. As respostas faladas usam Gemini 3.8 Flash-Lite TTS com a mesma chave e voz.",
@@ -30408,7 +30457,14 @@
     "phone calls still ask first": "As chamadas continuam a perguntar antes",
     "opens over any app, even locked": "Abre sobre qualquer app, mesmo bloqueado",
     "memory and tools work while locked": "A memória e as ferramentas funcionam com o telemóvel bloqueado",
-    "send email": "Enviar email"
+    "send email": "Enviar email",
+    "ask for approval": "Pedir aprovação",
+    "always": "Sempre",
+    "only for changes": "Só para alterações",
+    "hermes asks before it reads or changes anything": "O Hermes pergunta antes de ler ou alterar algo",
+    "hermes asks before it changes anything": "O Hermes pergunta antes de alterar algo",
+    "hermes acts without asking. phone calls still ask.": "O Hermes age sem perguntar. As chamadas continuam a perguntar.",
+    "unlock to approve": "Desbloqueie para aprovar"
   },
   "ko": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "선택한 Live 모델이 음성을 듣습니다. 응답 읽기에는 같은 키와 음성으로 Gemini 3.8 Flash-Lite TTS를 사용합니다.",
@@ -34018,7 +34074,14 @@
     "phone calls still ask first": "전화 걸기는 여전히 먼저 묻습니다",
     "opens over any app, even locked": "어떤 앱 위에서도, 잠금 상태에서도 열립니다",
     "memory and tools work while locked": "잠금 상태에서도 메모리와 도구를 쓸 수 있습니다",
-    "send email": "이메일 보내기"
+    "send email": "이메일 보내기",
+    "ask for approval": "승인 요청",
+    "always": "항상",
+    "only for changes": "변경할 때만",
+    "hermes asks before it reads or changes anything": "Hermes는 무엇이든 읽거나 바꾸기 전에 묻습니다",
+    "hermes asks before it changes anything": "Hermes는 무엇이든 바꾸기 전에 묻습니다",
+    "hermes acts without asking. phone calls still ask.": "Hermes가 묻지 않고 실행합니다. 전화 걸기는 여전히 묻습니다.",
+    "unlock to approve": "잠금 해제하고 승인"
   },
   "fr": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Le modèle Live sélectionné écoute. Les réponses vocales utilisent Gemini 3.8 Flash-Lite TTS avec la même clé et la même voix.",
@@ -37628,7 +37691,14 @@
     "phone calls still ask first": "Les appels demandent toujours avant",
     "opens over any app, even locked": "S'ouvre par-dessus toute appli, même verrouillé",
     "memory and tools work while locked": "La mémoire et les outils fonctionnent écran verrouillé",
-    "send email": "Envoyer l'e-mail"
+    "send email": "Envoyer l'e-mail",
+    "ask for approval": "Demander l'approbation",
+    "always": "Toujours",
+    "only for changes": "Seulement pour les modifications",
+    "hermes asks before it reads or changes anything": "Hermes demande avant de lire ou de modifier quoi que ce soit",
+    "hermes asks before it changes anything": "Hermes demande avant de modifier quoi que ce soit",
+    "hermes acts without asking. phone calls still ask.": "Hermes agit sans demander. Les appels demandent toujours.",
+    "unlock to approve": "Déverrouillez pour approuver"
   },
   "cs": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Vybraný model Live poslouchá. Mluvené odpovědi používají Gemini 3.8 Flash-Lite TTS se stejným klíčem a hlasem.",
@@ -41238,7 +41308,14 @@
     "phone calls still ask first": "Hovory se stále nejdřív zeptají",
     "opens over any app, even locked": "Otevře se nad jakoukoli aplikací, i při zamčení",
     "memory and tools work while locked": "Paměť a nástroje fungují i při zamčení",
-    "send email": "Odeslat e-mail"
+    "send email": "Odeslat e-mail",
+    "ask for approval": "Žádat o schválení",
+    "always": "Vždy",
+    "only for changes": "Jen u změn",
+    "hermes asks before it reads or changes anything": "Hermes se zeptá, než něco přečte nebo změní",
+    "hermes asks before it changes anything": "Hermes se zeptá, než něco změní",
+    "hermes acts without asking. phone calls still ask.": "Hermes jedná bez ptaní. Hovory se stále zeptají.",
+    "unlock to approve": "Odemkněte a schvalte"
   },
   "tr": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Seçilen Live modeli dinler. Sesli yanıtlar, aynı anahtar ve sesle Gemini 3.8 Flash-Lite TTS kullanır.",
@@ -44848,7 +44925,14 @@
     "phone calls still ask first": "Aramalar yine önce sorar",
     "opens over any app, even locked": "Her uygulamanın üzerinde, kilitliyken bile açılır",
     "memory and tools work while locked": "Hafıza ve araçlar kilitliyken de çalışır",
-    "send email": "E-postayı gönder"
+    "send email": "E-postayı gönder",
+    "ask for approval": "Onay iste",
+    "always": "Her zaman",
+    "only for changes": "Yalnızca değişiklikler için",
+    "hermes asks before it reads or changes anything": "Hermes bir şeyi okumadan veya değiştirmeden önce sorar",
+    "hermes asks before it changes anything": "Hermes bir şeyi değiştirmeden önce sorar",
+    "hermes acts without asking. phone calls still ask.": "Hermes sormadan işlem yapar. Aramalar yine sorar.",
+    "unlock to approve": "Onaylamak için kilidi açın"
   },
   "pl": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Wybrany model Live słucha. Odpowiedzi głosowe korzystają z Gemini 3.8 Flash-Lite TTS z tym samym kluczem i głosem.",
@@ -48458,7 +48542,14 @@
     "phone calls still ask first": "Połączenia nadal pytają najpierw",
     "opens over any app, even locked": "Otwiera się nad każdą aplikacją, nawet po zablokowaniu",
     "memory and tools work while locked": "Pamięć i narzędzia działają przy zablokowanym telefonie",
-    "send email": "Wyślij e-mail"
+    "send email": "Wyślij e-mail",
+    "ask for approval": "Proś o zgodę",
+    "always": "Zawsze",
+    "only for changes": "Tylko przy zmianach",
+    "hermes asks before it reads or changes anything": "Hermes pyta, zanim coś odczyta lub zmieni",
+    "hermes asks before it changes anything": "Hermes pyta, zanim coś zmieni",
+    "hermes acts without asking. phone calls still ask.": "Hermes działa bez pytania. Połączenia nadal pytają.",
+    "unlock to approve": "Odblokuj, aby zatwierdzić"
   },
   "vi": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "Mô hình Live đã chọn đảm nhiệm việc nghe. Câu trả lời được đọc bằng Gemini 3.8 Flash-Lite TTS với cùng khóa và giọng nói.",
@@ -52068,7 +52159,14 @@
     "phone calls still ask first": "Cuộc gọi vẫn hỏi trước",
     "opens over any app, even locked": "Mở trên mọi ứng dụng, kể cả khi khóa",
     "memory and tools work while locked": "Bộ nhớ và công cụ vẫn dùng được khi khóa",
-    "send email": "Gửi email"
+    "send email": "Gửi email",
+    "ask for approval": "Hỏi phê duyệt",
+    "always": "Luôn luôn",
+    "only for changes": "Chỉ khi thay đổi",
+    "hermes asks before it reads or changes anything": "Hermes hỏi trước khi đọc hoặc thay đổi bất cứ điều gì",
+    "hermes asks before it changes anything": "Hermes hỏi trước khi thay đổi bất cứ điều gì",
+    "hermes acts without asking. phone calls still ask.": "Hermes hành động mà không hỏi. Cuộc gọi vẫn hỏi.",
+    "unlock to approve": "Mở khóa để phê duyệt"
   },
   "ar": {
     "the selected live model listens. spoken replies use gemini 3.8 flash-lite tts with the same key and voice.": "يتولى نموذج Live المحدد الاستماع. تستخدم الردود المنطوقة Gemini 3.8 Flash-Lite TTS بالمفتاح والصوت نفسيهما.",
@@ -54292,6 +54390,13 @@
     "phone calls still ask first": "المكالمات ما زالت تسأل أولًا",
     "opens over any app, even locked": "يفتح فوق أي تطبيق، حتى والهاتف مقفل",
     "memory and tools work while locked": "تعمل الذاكرة والأدوات والهاتف مقفل",
-    "send email": "إرسال البريد"
+    "send email": "إرسال البريد",
+    "ask for approval": "طلب الموافقة",
+    "always": "دائمًا",
+    "only for changes": "للتغييرات فقط",
+    "hermes asks before it reads or changes anything": "يسأل Hermes قبل أن يقرأ أو يغيّر أي شيء",
+    "hermes asks before it changes anything": "يسأل Hermes قبل أن يغيّر أي شيء",
+    "hermes acts without asking. phone calls still ask.": "يتصرف Hermes دون أن يسأل. المكالمات ما زالت تسأل.",
+    "unlock to approve": "افتح القفل للموافقة"
   }
 }

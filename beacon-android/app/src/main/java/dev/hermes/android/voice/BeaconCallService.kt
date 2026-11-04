@@ -639,8 +639,12 @@ class BeaconCallService : Service() {
             "state" -> app.calls.updateFrom(this) { it.copy(state=value.string("state")) }
             "warning" -> handleControl(value)
             "tool_approval" -> {
-                runCatching { CallToolApproval.from(value) }.getOrNull() ?: return
+                val approval=runCatching { CallToolApproval.from(value) }.getOrNull() ?: return
                 app.calls.updateFrom(this) { it.copy(toolApprovals=pendingCallToolApprovals(it.toolApprovals,value)) }
+                // Ask for approval: Never. The owner's standing yes, given by the phone as soon as the card exists.
+                if(approvesItself(dev.hermes.android.phone.PhoneAccess.approvalChoice(this),dev.hermes.android.phone.deviceLockedNow(this),approval)) {
+                    decideTool(approval.requestId,approval.proposalId,"approve"); return
+                }
                 refreshNotification()
                 updateToolNotification()
             }

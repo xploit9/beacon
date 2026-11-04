@@ -421,7 +421,7 @@ class AssistLiveUiTest {
     @Test fun lockedTheCardOnlySaysSomethingWaitsAndOffersNo() {
         show(approval = countdown, show = ApprovalShow.Locked)
         compose.onNodeWithTag("assist-approval-locked").assertIsDisplayed()
-        compose.onNodeWithText("Approval needed").assertIsDisplayed()
+        compose.onNodeWithText("Unlock to approve").assertIsDisplayed()
         // None of what the request would do is on screen, and nothing counts down or can be allowed.
         compose.onNodeWithText("Call Alex Example").assertDoesNotExist()
         compose.onNodeWithText("+15550100").assertDoesNotExist()

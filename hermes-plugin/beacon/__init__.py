@@ -711,5 +711,16 @@ def register(ctx):
     phone_delivery.register(ctx)
     phone_tools.register(ctx)
     email_drafts.register(ctx)
-    _record_gateway_plugin_version()
-    _restart_stale_dashboard()
+    _after_load(_record_gateway_plugin_version,_restart_stale_dashboard)
+
+_after_load_thread=None
+
+def _after_load(*steps):
+    # Hermes gives a plugin 10 s to import and register, then loads Hermes without it: these steps read the database and the
+    # machine's processes, so they run beside the load instead of inside it.
+    global _after_load_thread
+    import threading
+    def run():
+        for step in steps: step()
+    _after_load_thread=threading.Thread(target=run,name='beacon-after-load',daemon=True)
+    _after_load_thread.start()

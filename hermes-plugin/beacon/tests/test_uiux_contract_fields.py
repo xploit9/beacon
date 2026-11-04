@@ -37,6 +37,12 @@ def _push_one_notice(harness, monkeypatch, created):
     return sent[0]['data'], expires
 
 
+def _register(plugin, ctx):
+    # The version note is written beside the load (Hermes drops a plugin whose register() takes 10 s), so the test waits for it.
+    plugin.register(ctx)
+    if plugin._after_load_thread is not None: plugin._after_load_thread.join(10)
+
+
 def test_fcm_data_carries_the_notice_creation_time_as_epoch_seconds_text(harness, monkeypatch):
     created = time.time() - 1234.9
     data, expires = _push_one_notice(harness, monkeypatch, created)
@@ -98,7 +104,7 @@ def test_the_gateway_records_version_pid_and_time_at_plugin_load(harness, monkey
     _loaded_by(monkeypatch, 'gateway', 'run')
     before = int(time.time())
 
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
 
     assert _gateway_version(client) == '2.5.0'
     with api.mobile.connect() as conn:
@@ -110,7 +116,7 @@ def test_a_profile_flag_before_the_gateway_command_is_still_the_gateway(harness,
     _, client, _, _, _ = harness
     plugin = _plugin(harness, monkeypatch, tmp_path, '2.5.0')
     _loaded_by(monkeypatch, '-p', 'work', 'gateway', 'run', '--replace')
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
     assert _gateway_version(client) == '2.5.0'
 
 
@@ -120,7 +126,7 @@ def test_only_the_gateway_role_records_its_version(harness, monkeypatch, tmp_pat
     plugin = _plugin(harness, monkeypatch, tmp_path, '2.5.0')
     _loaded_by(monkeypatch, *argv)
 
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
 
     assert _gateway_version(client) == ''
 
@@ -129,15 +135,15 @@ def test_the_dashboard_loading_a_newer_plugin_does_not_overwrite_the_gateway_rec
     _, client, _, _, _ = harness
     plugin = _plugin(harness, monkeypatch, tmp_path, '2.4.0')
     _loaded_by(monkeypatch, 'gateway', 'run')
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
 
     (tmp_path / 'plugin.yaml').write_text('name: beacon\nversion: 2.5.0\n', encoding='utf-8')
     _loaded_by(monkeypatch, 'dashboard')
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
     assert _gateway_version(client) == '2.4.0'
 
     _loaded_by(monkeypatch, 'gateway', 'run')  # a restarted gateway loads the new plugin
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
     assert _gateway_version(client) == '2.5.0'
 
 
@@ -148,7 +154,7 @@ def test_registration_survives_a_store_that_cannot_record_the_version(harness, m
     monkeypatch.setattr(plugin.mobile, 'record_gateway_plugin_version',
                         lambda *args, **kwargs: (_ for _ in ()).throw(OSError('store unavailable')))
 
-    plugin.register(SimpleNamespace(register_tool=lambda **kwargs: tools.append(kwargs['name']), register_hook=lambda *args: None))
+    _register(plugin, SimpleNamespace(register_tool=lambda **kwargs: tools.append(kwargs['name']), register_hook=lambda *args: None))
 
     assert 'beacon_call_user' in tools
 
@@ -158,7 +164,7 @@ def test_an_unreadable_manifest_records_nothing(harness, monkeypatch, tmp_path):
     plugin = _plugin(harness, monkeypatch, tmp_path, '2.5.0')
     (tmp_path / 'plugin.yaml').write_text('name: beacon\nversion: [not, a, version]\n', encoding='utf-8')
     _loaded_by(monkeypatch, 'gateway', 'run')
-    plugin.register(_ctx())
+    _register(plugin, _ctx())
     assert _gateway_version(client) == ''
 
 
