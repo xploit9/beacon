@@ -232,7 +232,8 @@ class NativeBotModeController(
         val at = c.scope
         if (text == rosterSaved && cache.exact(at, "bot-mode:roster") != null) return
         rosterSaved = text
-        scope.launch(Dispatchers.Default) { try { cache.set(at, "bot-mode:roster", value) } catch (e: Exception) { if (e is CancellationException) throw e } }
+        // Publish memory snapshots in order; ScreenCache already writes the disk row asynchronously.
+        try { cache.set(at, "bot-mode:roster", value) } catch (e: Exception) { if (e is CancellationException) throw e }
     }
     fun refresh(silent: Boolean = false) {
         launch(userAction = !silent) { c, token ->

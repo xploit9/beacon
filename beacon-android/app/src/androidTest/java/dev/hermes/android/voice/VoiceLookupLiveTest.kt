@@ -25,7 +25,8 @@ class VoiceLookupLiveTest {
         "tools" to "Please use your normal skill tools to name just one available skill without changing anything.",
         "memory" to "Please use your normal memory tools to recall my preferred name without saving or changing anything.",
         "callback" to "Please call me back in one hour about the garden plan.",
-        "discover" to "Please use discover tools to find a tool that can read a file, and tell me its name.")
+        "discover" to "Please use discover tools to find a tool that can read a file, and tell me its name.",
+        "email" to "Use discover tools to find my email read tools, then check only how many unread emails I have. Do not send or change anything. Tell me only the count, without quoting messages, subjects, or senders.")
     /** One phrase as PCM16 at [rate], spoken by Gemini's speech model with the key saved on this test phone. */
     private suspend fun spoken(phrase:String,rate:Int):ByteArray {
         val app=ApplicationProvider.getApplicationContext<BeaconApplication>()
@@ -54,14 +55,24 @@ class VoiceLookupLiveTest {
     @Test(timeout=360_000) fun geminiSchedulesACallbackWhenAsked() = exercise("gemini", listOf("callback"))
     /** Owner, 4 Nov 2026: "now she cannot see the tools" - the call finds Hermes' tools by searching for them. */
     @Test(timeout=360_000) fun geminiFindsHermesToolsBySearching() = exercise("gemini", listOf("discover"))
+    @Test(timeout=360_000) fun grokFindsAndReadsEmailThroughOwnerHermes() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("beaconOwnerRuntime")=="1")
+        exercise("grok", listOf("email"))
+    }
+    @Test(timeout=360_000) fun grokFindsAndReadsEmailFromATypedOwnerCallMessage() {
+        assumeTrue(InstrumentationRegistry.getArguments().getString("beaconOwnerRuntime")=="1")
+        exercise("grok", listOf("email"), typed=true)
+    }
 
-    private fun exercise(provider:String,kinds:List<String> = listOf("ordinary","tools","memory"))=runBlocking<Unit> {
+    private fun exercise(provider:String,kinds:List<String> = listOf("ordinary","tools","memory"),typed:Boolean=false)=runBlocking<Unit> {
         val args=InstrumentationRegistry.getArguments()
         assumeTrue(args.getString("beaconLiveService")=="1")
         require(args.getString("beaconNoHostAudio")=="1")
         require(android.os.Build.FINGERPRINT.contains("generic")||android.os.Build.MODEL.contains("sdk"))
         val app=ApplicationProvider.getApplicationContext<BeaconApplication>()
         require(app.packageName.endsWith(".debug")&&!app.calls.state.value.active)
+        val screenWasKeptOn=rule.activity.window.attributes.flags and android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON!=0
+        withContext(Dispatchers.Main.immediate) { rule.activity.window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
         val authFile=File(app.filesDir,"live-auth.json")
         val auth=if(authFile.isFile) JSONObject(authFile.readText(Charsets.UTF_8)).also { check(authFile.delete()) } else null
         val voiceStore=VoiceKeyStore(app)
@@ -73,7 +84,7 @@ class VoiceLookupLiveTest {
         var client:BeaconClient?=null;var session="";var call="";var observedDirect:DirectVoice?=null
         var nativeTraceJob:Job?=null
         val nativeTrace=ConcurrentLinkedQueue<JSONObject>()
-        val phases=JSONObject().put("provider",provider).put("fixture_source","synthetic private PCM16")
+        val phases=JSONObject().put("provider",provider).put("fixture_source",if(typed) "production typed call action" else "synthetic private PCM16")
         val completed=mutableListOf<JSONObject>()
         val callbacks=mutableSetOf<String>()
         try {
@@ -89,15 +100,18 @@ class VoiceLookupLiveTest {
                 (vm.chat.value.sessionId.isBlank()||vm.chat.value.projectionReady) }
             val previousSession=vm.chat.value.sessionId
             phases.put("phase","opening_native_chat")
-            withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Native voice backend verification")) }.join()
+            val qaTitle = "Native voice verification " + java.util.UUID.randomUUID().toString().take(8)
+            withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to qaTitle)) }.join()
             await { vm.chat.value.sessionId.isNotBlank()&&vm.chat.value.sessionId!=previousSession&&
                 vm.chat.value.projectionReady&&!vm.ui.value.newChatOpening&&
                 vm.authenticatedScope()?.session==vm.chat.value.sessionId }
             session=vm.chat.value.sessionId
+            phases.put("qa_session_id",session)
             phases.put("phase","connecting")
             rule.onNodeWithTag("chat-call-beacon").performClick()
             await(45_000) { app.calls.state.value.active&&app.calls.state.value.state in setOf("thinking","listening","speaking") }
             call=app.calls.state.value.callId
+            phases.put("qa_call_id",call).put("qa_session_id",session)
             assertEquals(provider,app.calls.state.value.voiceProvider)
             val context=client.nativeCallContext(call)
             assertTrue(context.getString("backend") in setOf("hermes","direct"))
@@ -145,6 +159,19 @@ class VoiceLookupLiveTest {
                 }
             }
             suspend fun jobs()=client.nativeRequest("/api/plugins/beacon/mobile/calls/$call").rows("jobs")
+            val mailToolName=Regex("(?i)(mail|inbox|gmai(?:_|$)|outlook)")
+            val numberWords="zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty sixty seventy eighty ninety hundred thousand million".split(' ').toSet()
+            fun countAnswer(text:String):Boolean {
+                val words=text.lowercase().replace("you've","you have").split(Regex("[^a-z0-9]+")).filter(String::isNotBlank)
+                val filler=setOf("and","you","have","got","there","are","is","i","found","unread","email","emails","message","messages","in","your","inbox","currently","about","approximately","at","least")
+                return words.any { it in numberWords||it.all(Char::isDigit) }&&words.all { it in numberWords||it in filler||it.all(Char::isDigit) }
+            }
+            suspend fun verifiedRead(requestId:String,toolName:String):Boolean {
+                val receipt=client.nativeRequest("/api/plugins/beacon/mobile/calls/$call/tools/requests/$requestId")
+                val catalogue=client.nativeRequest("/api/plugins/beacon/mobile/calls/$call/tools",params=mapOf("query" to toolName))
+                val matches=catalogue.rows("tools").filter { it.optString("tool_id")==receipt.optString("tool_id") }
+                return matches.size==1&&matches.single().opt("read_only")==true
+            }
             suspend fun callbackSchedules()=client.get("/api/crons").rows("jobs").filter { it.optString("name").startsWith("Beacon callback ") }.map { it.getString("id") }.toSet()
             suspend fun drainSpeech() {
                 val queue=NativePcm::class.java.getDeclaredField("queue").apply { isAccessible=true }.get(pcm) as PcmQueue
@@ -169,12 +196,27 @@ class VoiceLookupLiveTest {
                 var offset=0
                 while(offset<bytes.size) {
                     val end=minOf(offset+rate*2/50,bytes.size)
-                    check(direct.pcm(bytes.copyOfRange(offset,end)) { true }) { "Speech input stopped before the fixture finished" }
+                    val piece=bytes.copyOfRange(offset,end)
+                    var accepted=direct.pcm(piece) { true }
+                    if(!accepted) {
+                        val state=app.calls.state.value
+                        val ready=DirectVoice::class.java.getDeclaredField("ready").apply { isAccessible=true }.getBoolean(direct)
+                        val stopped=DirectVoice::class.java.getDeclaredField("stopped").apply { isAccessible=true }.getBoolean(direct)
+                        phases.put("input_rejections",phases.optInt("input_rejections")+1).put("input_rejected_active",state.active)
+                            .put("input_rejected_ready",ready).put("input_rejected_stopped",stopped)
+                            .put("input_rejected_state",state.state.takeIf { it in setOf("connecting","listening","speaking","thinking","reconnecting","ending","idle") }?:"other")
+                        withTimeout(2000) {
+                            while(!accepted) {
+                                check(app.calls.state.value.active&&!stopped) { "Call ended while forwarding synthetic input" }
+                                delay(5);accepted=direct.pcm(piece) { true }
+                            }
+                        }
+                    }
                     offset=end;delay(20)
                 }
             }
             for((kind,purpose) in listOf("ordinary" to "brief arithmetic question","tools" to "read-only skill listing","memory" to "read-only preferred-name recall",
-                    "callback" to "a callback in an hour","discover" to "a tool search").filter { it.first in kinds }) {
+                    "callback" to "a callback in an hour","discover" to "a tool search", "email" to "read-only unread email count").filter { it.first in kinds }) {
                 phases.put("phase",kind+"_input").put(kind+"_fixture_purpose",purpose)
                 val prior=jobs().map { it.getString("job_id") }.toSet()
                 val priorReceipts=app.calls.state.value.toolReceipts.map { it.requestId }.toSet()
@@ -183,13 +225,14 @@ class VoiceLookupLiveTest {
                 val priorCallbacks=if(kind=="callback") callbackSchedules() else emptySet()
                 // The owner's words are synthesized for the test with the phone's own Gemini key (a staged file still wins).
                 val file=File(app.filesDir,"voice-lookup-$provider-$kind.pcm")
-                val fixture=if(file.isFile) try {
+                val fixture=if(typed) ByteArray(0) else if(file.isFile) try {
                     check(file.length() in 2L..(rate*2L*60)&&file.length()%2L==0L) { "A bounded synthetic PCM16 fixture is required" }
                     file.readBytes()
                 } finally { check(file.delete()) } else spoken(LookupPhrases.getValue(kind),rate)
                 try {
-                    stream(ByteArray(rate*2*600/1000));stream(fixture);stream(ByteArray(rate*2*2200/1000))
-                    if(provider=="gemini") {
+                    if(typed) assertTrue("The production typed call action accepts this turn",app.calls.sendText(call,LookupPhrases.getValue(kind)))
+                    else { stream(ByteArray(rate*2*600/1000));stream(fixture);stream(ByteArray(rate*2*2200/1000)) }
+                    if(provider=="gemini"&&!typed) {
                         val pendingInput=DirectVoice::class.java.getDeclaredField("microphone").apply { isAccessible=true }.get(direct) as kotlinx.coroutines.channels.Channel<*>
                         @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
                         suspend fun drained() { await(5_000) { pendingInput.isEmpty } }
@@ -200,17 +243,18 @@ class VoiceLookupLiveTest {
                 finally { fixture.fill(0) }
                 phases.put("phase",kind+"_direct_answer")
                 var accepted:CallTranscript?=null
-                await { accepted=app.calls.state.value.transcripts.lastOrNull { it.role=="user"&&it.eventId !in priorUsers&&it.text.isNotBlank() };accepted!=null }
                 val cues=when(kind) {
                     "ordinary" -> listOf(Regex("(?i)\\b(?:two|2)\\b"),Regex("(?i)\\b(?:three|3)\\b"))
                     "tools" -> listOf(Regex("(?i)\\bskills?\\b"))
                     "callback" -> listOf(Regex("(?i)\\bcall\\b"),Regex("(?i)\\bhour\\b"))
                     "discover" -> listOf(Regex("(?i)\\btools?\\b"),Regex("(?i)\\bfile\\b"))
+                    "email" -> listOf(Regex("(?i)\\b(?:emails?|mail|inbox)\\b"))
                     else -> listOf(Regex("(?i)\\b(?:memory|remember)\\b"),Regex("(?i)\\bname\\b"))
                 }
+                await { accepted=app.calls.state.value.transcripts.lastOrNull { it.role=="user"&&it.final&&it.eventId !in priorUsers&&cues.all { cue -> cue.containsMatchIn(it.text) } };accepted!=null }
                 assertTrue("Speech keeps the fixture purpose",cues.all { it.containsMatchIn(accepted!!.text) })
-                phases.put(kind+"_asr_shown",true)
-                await(60_000) { app.calls.state.value.transcripts.any { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant&&it.text.isNotBlank() } }
+                phases.put(kind+if(typed) "_typed_turn_shown" else "_asr_shown",true)
+                if(kind!="email") await(60_000) { app.calls.state.value.transcripts.any { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant&&it.text.isNotBlank() } }
                 val started=jobs().filter { it.getString("job_id") !in prior }
                 val tools=app.calls.state.value.toolReceipts.filter { it.requestId !in priorReceipts }
                 if(kind=="ordinary") assertTrue("A plain question is answered by the live model itself, without Hermes",started.isEmpty()&&tools.isEmpty())
@@ -226,6 +270,32 @@ class VoiceLookupLiveTest {
                     phases.put("discover_receipts",app.calls.state.value.toolReceipts.filter { it.toolName=="discover_tools" }.joinToString { it.status })
                     assertTrue("The tool search completes",app.calls.state.value.toolReceipts.any { it.toolName=="discover_tools"&&it.status=="completed" })
                 }
+                else if(kind=="email") {
+                    val approved=mutableSetOf<String>()
+                    suspend fun approvePendingReads() {
+                        for(card in app.calls.state.value.toolApprovals.filter { it.requestId !in approved }) {
+                            check(verifiedRead(card.requestId,card.toolName)) { "The email acceptance check never approves a write" }
+                            check(mailToolName.containsMatchIn(card.toolName)) { "Only the requested mail read is eligible" }
+                            check(approved.size<8) { "The email count exceeded the bounded read budget" }
+                            approved+=card.requestId
+                            withContext(Dispatchers.Main.immediate) { app.calls.decideTool(call,card.requestId,card.proposalId,"approve") }
+                        }
+                    }
+                    await(120_000) {
+                        approvePendingReads()
+                        app.calls.state.value.toolReceipts.any { it.requestId !in priorReceipts && it.status=="completed" && it.hasResult && mailToolName.containsMatchIn(it.toolName) }
+                    }
+                    assertTrue("Email discovery completes on the actual Grok call", app.calls.state.value.toolReceipts.any { it.requestId !in priorReceipts && it.toolName=="discover_tools" && it.status=="completed" })
+                    for(receipt in app.calls.state.value.toolReceipts.filter { it.requestId !in priorReceipts && it.status=="completed" && mailToolName.containsMatchIn(it.toolName) }) {
+                        assertTrue("The completed mail operation is a verified read",verifiedRead(receipt.requestId,receipt.toolName))
+                    }
+                    await(60_000) {
+                        approvePendingReads()
+                        app.calls.state.value.transcripts.lastOrNull { it.role=="assistant"&&it.final&&it.eventId !in priorAssistant }?.let { countAnswer(it.text) }==true
+                    }
+                    phases.put("email_count_answered",true)
+                    phases.put("email_read_verified",true).put("email_contents_retained",false).put("email_approvals",approved.size)
+                }
                 else if(kind=="callback") {
                     withTimeoutOrNull(30_000) { await { (callbackSchedules()-priorCallbacks).isNotEmpty() } }
                     val made=callbackSchedules()-priorCallbacks
@@ -237,7 +307,8 @@ class VoiceLookupLiveTest {
                     assertEquals(session,job.getString("stored_session_id"));completed+=job
                     check(job.getString("status") !in setOf("failed","cancelled")) { "Hermes job is ${job.getString("status")}" }
                 }
-                phases.put(kind+"_answered",true).put(kind+"_hermes_jobs",started.size).put(kind+"_hermes_tools",tools.size)
+                phases.put(kind+"_answered",true).put(kind+"_hermes_jobs",jobs().count { it.getString("job_id") !in prior })
+                    .put(kind+"_hermes_tools",app.calls.state.value.toolReceipts.count { it.requestId !in priorReceipts })
                 drainSpeech()
             }
             app.calls.hangup();await { !app.calls.state.value.active&&app.calls.service==null }
@@ -272,10 +343,11 @@ class VoiceLookupLiveTest {
                 val events=DirectVoice::class.java.getDeclaredField("nativeEvents").apply { isAccessible=true }.get(direct) as? Job
                 phases.put("native_event_collector_active",events?.isActive==true)
             }
-            val removed=listOf("ordinary","tools","memory","callback","discover").map { kind -> File(app.filesDir,"voice-lookup-$provider-$kind.pcm").let { !it.exists()||it.delete() } }.all { it }
+            val removed=listOf("ordinary","tools","memory","callback","discover","email").map { kind -> File(app.filesDir,"voice-lookup-$provider-$kind.pcm").let { !it.exists()||it.delete() } }.all { it }
             phases.put("fixtures_removed",removed).put("completed_jobs",completed.size)
             app.calls.hangup();withTimeoutOrNull(60_000) { while(app.calls.service!=null) delay(100) }
             runCatching { voiceStore.setSelection(previous) }
+            if(!screenWasKeptOn) withContext(Dispatchers.Main.immediate) { rule.activity.window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
             if(call.isNotBlank()) runCatching { client?.nativeRequest("/api/plugins/beacon/mobile/calls/$call","DELETE") }
             if(session.isNotBlank()) runCatching { client?.nativeRpc("session.set_hidden",json("session_id" to session,"hidden" to true)) }
             phases.put("warning_present",app.calls.state.value.error.isNotBlank())

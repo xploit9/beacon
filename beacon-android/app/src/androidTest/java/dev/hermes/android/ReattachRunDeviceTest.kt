@@ -1,8 +1,6 @@
 package dev.hermes.android
 
 import android.app.Notification
-import android.app.NotificationManager
-import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -31,8 +29,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.BeaconClient
-import dev.hermes.android.push.cancelNativeActivities
-import dev.hermes.android.push.presentNativeActivity
+import dev.hermes.android.push.receivePush
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,7 +43,7 @@ import org.junit.Test
 
 /**
  * Pins the 1.1.15 fixes that had no test (ponytail-1115a-check.md, finding 6): the cold reattach of a reply that was running when Beacon was killed,
- * and the "working" notification's channel. The synthetic fixture and Android's own notifications only; no service, model or network.
+ * and quiet working events with meaningful reply notices. The synthetic fixture and Android's own notifications only; no service, model or network.
  */
 class ReattachRunDeviceTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
@@ -208,8 +205,10 @@ class ReattachRunDeviceTest {
         val vm = restart(fixture) { it.selectSession("chat-a") }
         try {
             await(vm, fixture, "Completed history not restored") { vm.chat.value.messages.any { it.text == reply } }
-            await(vm, fixture, "Scoped idle not requested") { fixture.requests.drop(mark).any { it.string("method") == "session.active_list" } }
-            val probe = fixture.requests.drop(mark).last { it.string("method") == "session.active_list" }.getJSONObject("params")
+            fun idleProbe() = fixture.requests.drop(mark).lastOrNull { it.string("method") == "session.active_list" &&
+                it.getJSONObject("params").string("current_session_id") == runtime }?.getJSONObject("params")
+            await(vm, fixture, "Scoped idle not requested") { idleProbe() != null }
+            val probe = checkNotNull(idleProbe())
             assertEquals(runtime, probe.string("current_session_id"))
             assertEquals(fixture.scope.profile, probe.string("profile"))
             assertEquals("No FIFO send before the idle response", 1, promptSubmits(fixture))
@@ -250,35 +249,30 @@ class ReattachRunDeviceTest {
         // The open, including its decision to reattach or not, is over when its selection job is.
         val selection = BeaconViewModel::class.java.getDeclaredField("selectionJob").apply { isAccessible = true }.get(vm) as Job?
         runBlocking { withTimeout(15_000) { selection?.join() } }
-        val asked = fixture.requests.drop(mark).filter { it.string("method") in setOf("session.resume", "session.active_list") }
-        assertTrue("Opening an unmarked chat asks Hermes nothing: $asked", asked.isEmpty())
+        val asked = fixture.requests.drop(mark).filter { it.string("method") == "session.resume" ||
+            it.string("method") == "session.active_list" && it.getJSONObject("params").string("current_session_id").isNotBlank() }
+        assertTrue("Opening an unmarked chat neither resumes nor probes its turn: $asked", asked.isEmpty())
         assertTrue(vm.chat.value.streamId.isBlank())
         compose.onAllNodesWithTag("message-stop").assertCountEquals(0)
     }
 
     // Beacon 1.1.15 (ffdce12) moved replies to hermes-messages-v2 and deleted hermes-messages. The "working" notification still named the deleted channel, so Android dropped it.
     // Kept here, not in NativeActivityDeviceTest (the closest fit), because that file is not this leaf's to edit; it uses the same source binding.
-    @Test fun aWorkingNotificationIsPostedOnAChannelThatExists() {
-        val context = app
-        val manager = context.getSystemService(NotificationManager::class.java)
-        val source = "synthetic-working-source"
-        val origin = "https://notification-fixture.invalid"
-        val previousAuth = context.auth.read(origin)
-        val auth = AuthContext(origin, emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard", nativeProvider = "fixture")
-        val prefs = context.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
-        val key = "source:${source.digest()}"
-        try {
-            context.auth.write(auth)
-            val binding = json("source" to source, "origin" to origin, "owner" to auth.owner, "profile" to auth.profile, "native_provider" to auth.nativeProvider, "backend" to "hermes-dashboard")
-            assertTrue(prefs.edit().putString(key, android.util.Base64.encodeToString(context.cipher.encrypt(binding.toString().toByteArray(), key), android.util.Base64.NO_WRAP)).commit())
-            presentNativeActivity(context, source, "synthetic-working-event", "synthetic-working-${System.currentTimeMillis()}", "working", System.currentTimeMillis() / 1000 + 120)
-            val deadline = System.currentTimeMillis() + 3000
-            while (manager.activeNotifications.none { it.notification.extras.getString("native_source") == source } && System.currentTimeMillis() < deadline) Thread.sleep(20)
-            val posted = manager.activeNotifications.singleOrNull { it.notification.extras.getString("native_source") == source }
-            assertNotNull("The working notification is not among the active notifications (posted to a channel that does not exist?)", posted)
-            val channel = posted!!.notification.channelId
-            assertNotNull("The working notification names channel $channel, which does not exist", manager.getNotificationChannel(channel))
-            assertTrue("A working notification stays until the turn ends", posted.notification.flags and Notification.FLAG_ONGOING_EVENT != 0)
-        } finally { cancelNativeActivities(context, source); prefs.edit().remove(key).commit(); context.auth.write(previousAuth) }
+    @Test fun aWorkingEventPostsNoCardAndPreservesChannelsWhileAReplyStillPosts() {
+        BackgroundActivityFixture(app).use { fixture ->
+            fixture.postLegacyWorkingCard()
+            val channels = fixture.channelSettings()
+            assertNull(receivePush(app, fixture.data("working"), null, deferPreview = true))
+            fixture.await { fixture.manager.activeNotifications.none { it.tag == fixture.nativeTag && it.id == 3 } }
+            assertNull("Ordinary work has no redundant alert", fixture.card(fixture.event))
+            assertEquals("Working does not change channel preferences", channels, fixture.channelSettings())
+            app.calls.uiVisible = true
+            val reply = "completion-${fixture.event}"
+            assertNotNull(receivePush(app, fixture.data("completion", reply).minus("activity_ref"), null, deferPreview = true))
+            fixture.await { fixture.card(reply) != null }
+            val posted = checkNotNull(fixture.card(reply))
+            assertNotNull(fixture.manager.getNotificationChannel(posted.channelId))
+            assertTrue("A meaningful reply is still an alert card", posted.flags and Notification.FLAG_AUTO_CANCEL != 0)
+        }
     }
 }

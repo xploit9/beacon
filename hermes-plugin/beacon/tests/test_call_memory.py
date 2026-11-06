@@ -717,3 +717,15 @@ def test_first_final_words_on_a_call_start_the_warm_up_and_the_memory_route_name
 
     assert client.post(path + '/memory', json={'query': 'tea'}).status_code == 200
     assert looked_up == [('owner', 'basic', 'default', 'native-stored', 'tea', call_id)]
+
+
+def test_canonical_memory_agent_lookup_does_not_use_legacy_or_other_issuer(memory_env):
+    from gateway.session_identity import authenticated_subject
+    _,_,voice,server,_=memory_env
+    principal=authenticated_subject({'provider':'basic','issuer':'issuer-one','user_id':'owner'})
+    other=authenticated_subject({'provider':'basic','issuer':'issuer-two','user_id':'owner'})
+    server._sessions['legacy']={'auth_user_id':'basic:owner','profile_home':None,'session_key':'chat','agent':'legacy'}
+    server._sessions['foreign']={'auth_user_id':other,'profile_home':None,'session_key':'chat','agent':'foreign'}
+    server._sessions['own']={'auth_user_id':principal,'profile_home':None,'session_key':'chat','agent':'own'}
+    assert voice.live_agents('owner','basic','default','chat',principal)==['own']
+    assert voice.live_agents('owner','basic','default','chat')==['legacy']

@@ -20,6 +20,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /** [plugin]: the failure came from the optional Beacon plugin, whose 401 is a plugin answer, never a native sign-out. */
 class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message) {
@@ -29,12 +30,40 @@ internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Pas
 internal const val HERMES_LOOPBACK_SESSION_HEADER = "X-Hermes-Session-Token"
 private const val MAX_LOOPBACK_ROOT_BYTES = 256L * 1024L
 private const val BEACON_PLUGIN_PATH = "/api/plugins/beacon/"
+internal const val CANONICAL_TICKET_PATH = BEACON_PLUGIN_PATH + "mobile/gateway-ticket"
+internal const val CANONICAL_SOCKET_PATH = BEACON_PLUGIN_PATH + "gateway/ws"
+internal class CanonicalRouteMissing : RuntimeException("Canonical gateway route is unavailable")
+private val GATEWAY_JSON_STRING = "\"" + """(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*""" + "\""
+private val GATEWAY_JSON_VALUE = """(?:$GATEWAY_JSON_STRING|true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"""
+private val GATEWAY_JSON_PAIR = """$GATEWAY_JSON_STRING[ \t\r\n]*:[ \t\r\n]*$GATEWAY_JSON_VALUE"""
+private val GATEWAY_JSON_OBJECT = Regex("""[ \t\r\n]*\{[ \t\r\n]*(?:$GATEWAY_JSON_PAIR(?:[ \t\r\n]*,[ \t\r\n]*$GATEWAY_JSON_PAIR)*)?[ \t\r\n]*\}[ \t\r\n]*""")
 private const val OPTIONAL_BOOTSTRAP_PATH = BEACON_PLUGIN_PATH + "mobile/bootstrap"
+private const val VAULT_PATH = BEACON_PLUGIN_PATH + "mobile/vault"
+private val VAULT_RESPONSE_KEYS = setOf("items", "item", "capabilities", "identity", "request_id", "removed", "id", "kind", "label", "origin",
+    "identifier_type", "identifier", "has_otp", "created_at", "backend", "supported", "local", "signup", "otp", "secure_prompts", "name", "email", "status")
+internal fun vaultMetadataOnly(value: Any?, depth: Int = 0): Boolean {
+    if (depth > 32) return false
+    return when (value) {
+        is JSONObject -> value.keys().asSequence().all { key ->
+            key in VAULT_RESPONSE_KEYS && vaultMetadataOnly(value.opt(key), depth + 1)
+        }
+        is JSONArray -> (0 until value.length()).all { vaultMetadataOnly(value.opt(it), depth + 1) }
+        else -> true
+    }
+}
+/** Carry the request's authority to each target, including work deferred until after the response. */
+internal class DeviceRemovalAuthority(val scope: Scope, private val removeIfCurrent: (() -> Unit) -> Boolean) {
+    fun ifCurrent(remove: () -> Unit): Boolean = removeIfCurrent(remove)
+}
 internal object NativeDeviceRemoval {
-    @Volatile var onRemoved: ((Scope) -> Unit)? = null
+    @Volatile var onRemoved: ((DeviceRemovalAuthority) -> Unit)? = null
     /** Set by the ViewModel: a removed phone keeps none of its account's saved screen answers. */
-    @Volatile var onForgetScreens: ((Scope) -> Unit)? = null
-    fun removed(scope: Scope) { onRemoved?.invoke(scope); onForgetScreens?.invoke(scope) }
+    @Volatile var onForgetScreens: ((DeviceRemovalAuthority) -> Unit)? = null
+    fun removed(removal: DeviceRemovalAuthority) {
+        // Hooks may take PushManager's lock or suspend later; no authority monitor spans a hook.
+        if (removal.ifCurrent {}) onRemoved?.invoke(removal)
+        if (removal.ifCurrent {}) onForgetScreens?.invoke(removal)
+    }
 }
 private val LOOPBACK_SESSION_ASSIGNMENT = Regex("""window\.__HERMES_SESSION_TOKEN__\s*=\s*("(?:\\.|[^"\\])*")\s*;""")
 
@@ -53,21 +82,35 @@ private fun Response.isLoopbackSessionRejection() = runCatching {
     JSONObject(peekBody(4 * 1024L).string()).optString("detail") == "Unauthorized"
 }.getOrDefault(false)
 
-class BeaconClient internal constructor(initial: AuthContext, private val authStore: AuthStore?, private val socketFactory: WebSocket.Factory? = null, private val sharedHttp: OkHttpClient? = null, private val detachedView: Boolean = false, private val persistContext: Boolean = true, private val credentialSource: BeaconClient? = null, private val configureHttp: (OkHttpClient.Builder) -> Unit) {
+class BeaconClient internal constructor(initial: AuthContext, private val authStore: AuthStore?, private val socketFactory: WebSocket.Factory? = null, private val sharedHttp: OkHttpClient? = null, private val detachedView: Boolean = false, private val persistContext: Boolean = true, private val credentialSource: BeaconClient? = null, private val canonicalScopes: MutableSet<Scope> = mutableSetOf(), private val configureHttp: (OkHttpClient.Builder) -> Unit) {
     constructor(initial: AuthContext, authStore: AuthStore? = null, persistContext: Boolean = true) : this(initial, authStore, null, null, persistContext = persistContext, configureHttp = {})
     private val origin = trustedOrigin(initial.origin).toHttpUrl()
     val jar = ScopedCookies(origin, initial.cookies) { auth.bearer != null || auth.loopbackSession != null }
-    @Volatile var auth: AuthContext = initial; private set
+    private val scopeGeneration = AtomicLong()
+    @Volatile var auth: AuthContext = initial
+        private set(value) {
+            synchronized(this) {
+                if (field.scope() != value.scope()) scopeGeneration.incrementAndGet()
+                field = value
+            }
+        }
     // Detached jars normalize cookie text; retain the exact CAS baseline and its admission.
     @Volatile private var expectedCookies = initial.cookies
     @Volatile private var cookieVersion = authStore?.authorityEpoch?.readVersion()
+    @Volatile private var cookieAuthorityLost = false
     val scope get() = auth.scope()
     // A coroutine Mutex: the refresh suspends (network read with timeout) while holding the lock.
     private val loopbackRefreshLock = kotlinx.coroutines.sync.Mutex()
     val http: OkHttpClient = (sharedHttp?.newBuilder() ?: OkHttpClient.Builder()).cookieJar(object : CookieJar {
         override fun loadForRequest(url: HttpUrl): List<Cookie> {
-            adoptCookieRotation()
-            return jar.loadForRequest(url)
+            if (url.host != origin.host || url.port != origin.port || url.scheme != origin.scheme) return emptyList()
+            return synchronized(this@BeaconClient) {
+                if (auth.bearer == null && auth.loopbackSession == null) {
+                    adoptCookieRotation()
+                    retainCookieRotationLocked()
+                }
+                jar.loadForRequest(url)
+            }
         }
         override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
             // The in-process probe may rotate native credentials, but cannot plant other cookies.
@@ -78,6 +121,64 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }.build()
     private val nativeAuth = NativeAuth(auth.origin, http.newBuilder().cookieJar(CookieJar.NO_COOKIES).build())
     private val operationLock = kotlinx.coroutines.sync.Mutex()
+    private data class RequestAuthority(val scope: Scope, val generation: Long, val version: Long?, val admission: String?)
+    private suspend fun requestAuthority(trackRemoval: Boolean): RequestAuthority {
+        val (bound, generation) = synchronized(this) { scope to scopeGeneration.get() }
+        val version = nativeAuthorityVersion()
+        val admission = if (trackRemoval && authStore != null) withContext(Dispatchers.IO) {
+            runCatching { authStore?.incidentAdmission(bound) }.getOrNull()
+        } else null
+        return RequestAuthority(bound, generation, version, admission)
+    }
+    private suspend fun requestStillCurrent(bound: RequestAuthority): Boolean = withContext(Dispatchers.IO) {
+        if (bound.version == null || nativeAuthorityVersion() != bound.version ||
+            authStore != null && (bound.admission == null || runCatching { authStore?.incidentAdmission(bound.scope) }.getOrNull() != bound.admission)) return@withContext false
+        synchronized(this@BeaconClient) { scope == bound.scope && scopeGeneration.get() == bound.generation }
+    }
+    private suspend fun removeDeviceIfCurrent(bound: RequestAuthority, query: Map<String, String>) = withContext(Dispatchers.IO) {
+        val target = query["beacon_profile"] ?: query["profile"] ?: bound.scope.profile
+        if (target == bound.scope.profile && requestStillCurrent(bound)) NativeDeviceRemoval.removed(DeviceRemovalAuthority(bound.scope) { remove ->
+            synchronized(this) {
+                if (scope != bound.scope || scopeGeneration.get() != bound.generation || bound.version == null || nativeAuthorityVersion() != bound.version) false
+                else if (authStore != null) authStore.applyDeviceRemoval(bound.scope, bound.version, bound.admission, remove)
+                else { remove(); true }
+            }
+        })
+    }
+    internal fun nativeAuthorityVersion(): Long? = authStore?.authorityEpoch?.readVersion() ?: if (authStore == null) Long.MIN_VALUE else null
+    internal data class GatewayIdentity(val scope: Scope, val generation: Long, val authority: Long?, val admission: String?)
+    internal fun gatewayIdentity(): GatewayIdentity {
+        val (scope, generation) = synchronized(this) { scope to scopeGeneration.get() }
+        return GatewayIdentity(scope, generation, nativeAuthorityVersion(), nativeSecureAdmission())
+    }
+    internal fun gatewayIdentityCurrent(identity: GatewayIdentity, checkAdmission: Boolean = false): Boolean {
+        val generation = scopeGeneration.get()
+        return generation == identity.generation && scope == identity.scope && scopeGeneration.get() == generation && identity.authority != null &&
+            nativeAuthorityVersion() == identity.authority && (!checkAdmission || identity.admission == null || nativeSecureAdmission() == identity.admission) &&
+            nativeAuthorityVersion() == identity.authority && scopeGeneration.get() == generation
+    }
+    private fun canonicalRemembered(scope: Scope): Boolean = if (scope.nativeProvider.isBlank()) canonicalScopes.any { it.origin == scope.origin }
+        else scope in canonicalScopes || scope.copy(nativeProvider = "") in canonicalScopes
+    internal fun canonicalRequired(identity: GatewayIdentity): Boolean = synchronized(canonicalScopes) {
+        canonicalRemembered(identity.scope) || authStore?.canonicalRequired(identity.scope) == true
+    }
+    internal fun rememberCanonical(identity: GatewayIdentity): Boolean = synchronized(canonicalScopes) {
+        if (!gatewayIdentityCurrent(identity, checkAdmission = true) || authStore?.rememberCanonical(identity.scope, identity.authority) == false) false
+        else { canonicalScopes += identity.scope; true }
+    }
+    internal fun withLegacyCanonicalPermit(identity: GatewayIdentity, send: () -> Boolean): Boolean = synchronized(canonicalScopes) {
+        if (!gatewayIdentityCurrent(identity) || canonicalRemembered(identity.scope)) false
+        else if (authStore == null) send() else authStore.withLegacyCanonicalPermit(identity.scope, identity.authority) {
+            gatewayIdentityCurrent(identity) && send()
+        }
+    }
+    internal fun incidentAdmission(): String? = authStore?.incidentAdmission(scope)
+    internal fun nativeSecureAdmission(): String? = if (authStore == null) "transient-native-client" else runCatching { incidentAdmission() }.getOrNull()
+    internal fun enqueueSecureResponse(admission: String?, enqueue: () -> Boolean): Boolean {
+        if (admission == null) return false
+        return if (authStore == null) nativeSecureAdmission() == admission && enqueue()
+        else authStore.withIncidentAdmission(scope, admission, enqueue)
+    }
     internal suspend fun bindProfile(profile: String) {
         closeNative(); auth = auth.copy(profile = profile, bearer = auth.bearer?.copy(profile = profile))
         authStore?.takeIf { !detachedView }?.let {
@@ -105,19 +206,44 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             }
         }
     }
+    private fun retainCookieRotationLocked() {
+        if (cookieAuthorityLost) throw CachedIdentityMismatch()
+        val cookies = jar.snapshot()
+        val store = authStore
+        val version = cookieVersion
+        if (store != null && (version == null || !store.authorityEpoch.current(version))) {
+            cookieAuthorityLost = true
+            jar.replaceIfUnchanged(cookies, emptyList())
+            throw CachedIdentityMismatch()
+        }
+        val normalized = expectedCookies.mapNotNull { Cookie.parse(origin, it)?.toString() }
+        if (cookies == normalized) return
+        if (store != null && !store.replaceCookies(auth.copy(cookies = expectedCookies), cookies, version)) {
+            val latest = store.read(auth.origin)
+            if (version != null && store.authorityEpoch.current(version) && latest.sameCookieAuthority(auth) &&
+                jar.replaceIfUnchanged(cookies, latest.cookies)) {
+                expectedCookies = latest.cookies
+                auth = auth.copy(cookies = latest.cookies)
+                return
+            }
+            cookieAuthorityLost = true
+            jar.replaceIfUnchanged(cookies, emptyList())
+            throw CachedIdentityMismatch()
+        }
+        expectedCookies = cookies
+        auth = auth.copy(cookies = cookies)
+    }
     internal suspend fun retainCookieRotation() = withContext(Dispatchers.IO) {
         synchronized(this@BeaconClient) {
-            val cookies = jar.snapshot()
-            if (cookies != expectedCookies) authStore?.replaceCookies(auth.copy(cookies = expectedCookies), cookies, cookieVersion)
-            expectedCookies = cookies
-            auth = auth.copy(cookies = cookies)
+            if (auth.bearer == null && auth.loopbackSession == null) adoptCookieRotation()
+            retainCookieRotationLocked()
         }
     }
-    fun detached(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), authStore, socketFactory, http, detachedView = true, persistContext = persistContext, configureHttp = configureHttp, credentialSource = credentialSource).also {
+    fun detached(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), authStore, socketFactory, http, detachedView = true, persistContext = persistContext, configureHttp = configureHttp, credentialSource = credentialSource, canonicalScopes = canonicalScopes).also {
         it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion
     }
     /** Cleanup owns its captured credential; it cannot adopt or persist a later phone sign-in. */
-    internal fun detachedForLogout(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), null, socketFactory, detachedView = true, persistContext = false, configureHttp = configureHttp)
+    internal fun detachedForLogout(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), null, socketFactory, detachedView = true, persistContext = false, canonicalScopes = canonicalScopes, configureHttp = configureHttp)
     /** A short-lived profile view shares the signed-in account's refresh owner without persisting a profile switch. */
     internal fun forAuthorizedProfile(profile: String): BeaconClient {
         require(validNativeProfile(profile) && auth.owner.isNotBlank()) { "Invalid native profile scope" }
@@ -126,7 +252,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         return BeaconClient(
             auth.copy(profile = profile, bearer = source.auth.bearer?.copy(profile = profile), loopbackSession = source.auth.loopbackSession, cookies = jar.snapshot()),
             authStore, socketFactory, source.http, detachedView = true, persistContext = false,
-            configureHttp = configureHttp, credentialSource = source,
+            configureHttp = configureHttp, credentialSource = source, canonicalScopes = canonicalScopes,
         ).also { it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion }
     }
     fun url(path: String, query: Map<String, String> = emptyMap()): HttpUrl {
@@ -148,7 +274,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }.header("Accept", "application/json").apply {
         val session = requestAuth()
         if (path != "/api/ws") {
-            val bearer = session.bearer?.takeIf { it.accessToken.isNotBlank() && it.accessToken.none { ch -> ch.isWhitespace() || ch.isISOControl() } && it.origin == session.origin && it.owner == session.owner && it.profile == session.profile && it.provider == session.nativeProvider }
+            val bearer = session.bearer?.takeIf { validNativeBearerToken(it.accessToken) && it.origin == session.origin && it.owner == session.owner && it.profile == session.profile && it.provider == session.nativeProvider }
             val loopback = session.loopbackSession?.takeIf { it.origin == session.origin && it.owner == session.owner && it.owner == "local" && session.backend == "hermes-dashboard" && validLoopbackSessionToken(it.token) }
             if (bearer != null) header("Authorization", "Bearer " + bearer.accessToken)
             else loopback?.let { header(HERMES_LOOPBACK_SESSION_HEADER, it.token) }
@@ -166,7 +292,9 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         }
     }
     private val native = NativeGateway(this, socketFactory ?: http.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(30, TimeUnit.SECONDS).build())
-    suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = native.rpc(method, params)
+    suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = try { native.rpc(method, params) }
+        catch (error: Throwable) { reportIncident("gateway", if (method in setOf("session.list", "session.history", "session.active_list", "status", "health")) "lookup" else "invoke_tool", error); throw error }
+    internal suspend fun nativeSessionAuthority(): Boolean = native.sessionAuthority()
     internal suspend fun nativeTurnLease(storedSessionId: String, expectedRuntimeSessionId: String? = null): NativeTurnLease =
         native.turnLease(storedSessionId, expectedRuntimeSessionId)
     internal suspend fun nativeTurnRpc(lease: NativeTurnLease, method: String, params: JSONObject): JSONObject =
@@ -178,11 +306,12 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         native.answerServerRequest(method, requestId, sessionId, payload)
     suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap()): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
-        if (body?.has("profile") == true) require(body.string("profile") == auth.profile) { "Native request belongs to another profile" }
-        val query = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(params, auth.profile) else params
-        val deviceId = NativePairing.deviceHeader(path, scope)
-        val result = rawCall(path, query = query, method = method, data = body)
-        if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") NativeDeviceRemoval.removed(scope)
+        val bound = requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
+        if (body?.has("profile") == true) require(body.string("profile") == bound.scope.profile) { "Native request belongs to another profile" }
+        val query = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(params, bound.scope.profile) else params
+        val deviceId = NativePairing.deviceHeader(path, bound.scope)
+        val result = rawCall(path, query = query, method = method, data = body, maxBytes = if (path == CANONICAL_TICKET_PATH) 8192 else 32 * 1024 * 1024, boundRequest = bound)
+        if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") removeDeviceIfCurrent(bound, query)
         return result
     }
     // Phone access: Hermes asks this phone to use its calendar, alarms, contacts, calls or messages, and the phone decides.
@@ -224,7 +353,11 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         if (storedRows.singleOrNull() !== row) return null
         return (row.opt("status") as? String)?.takeIf { it in setOf("idle", "working", "waiting") }
     }
-    suspend fun nativeEvents(onEvent: suspend (JSONObject) -> Unit) = native.events(onEvent)
+    suspend fun nativeEvents(onEvent: suspend (JSONObject) -> Unit) = try { native.events(onEvent) }
+        catch (error: Throwable) { reportIncident("gateway", "sync", error); throw error }
+    internal fun reportIncident(component: String, operation: String, error: Throwable) {
+        runCatching { authStore?.incidentSink?.invoke(this, component, operation, error) }
+    }
     fun closeNative() = native.close()
     private fun bearerAuthInterceptor() = Interceptor { chain ->
         val request = chain.request()
@@ -305,11 +438,12 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
                     },
                 )
             }
-        } catch (error: NativeAuthException) {
+        } catch (error: Throwable) {
             response.close()
-            if (!error.sessionExpired) throw error
-            if (authStore?.removeIfBearerUnchanged(bearer) != false) auth = auth.copy(bearer = null, cookies = emptyList())
-            throw NativeAuthExpiredException()
+            if (error !is NativeAuthException || !error.sessionExpired) throw error
+            val retired = authStore?.retireBearerIfUnchanged(bearer)
+            if (retired?.removed != false) auth = auth.copy(bearer = null, cookies = emptyList())
+            throw NativeAuthExpiredException(retired?.authority)
         }
         auth = auth.copy(bearer = refreshed.copy(profile = auth.profile), nativeProvider = refreshed.provider)
         response.close()
@@ -335,29 +469,111 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         withContext(Dispatchers.IO) { execute(request, timeoutMillis, retainCookies = true, read) }
     suspend fun get(path: String, query: Map<String, String> = emptyMap(), maxBytes: Int = 32 * 1024 * 1024): JSONObject = call(path, query, maxBytes = maxBytes)
     suspend fun post(path: String, body: JSONObject = JSONObject()): JSONObject = call(path, method = "POST", data = body)
-    private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true, timeoutMillis: Long? = null): JSONObject = withContext(Dispatchers.IO) {
+    private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true, timeoutMillis: Long? = null, sensitive: Boolean = false, boundRequest: RequestAuthority? = null, sensitiveDeviceId: String? = null): JSONObject = withContext(Dispatchers.IO) {
+        val requestBound = boundRequest ?: requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
         require(maxBytes in 1..32 * 1024 * 1024) { "Invalid response size limit" }
-        val body = data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())
+        val body = if (sensitive) object : RequestBody() {
+            private val encoded = (data?.toString() ?: "{}").toByteArray(Charsets.UTF_8)
+            override fun contentType() = "application/json; charset=utf-8".toMediaType()
+            override fun contentLength() = encoded.size.toLong()
+            override fun isOneShot() = true
+            override fun writeTo(sink: okio.BufferedSink) { sink.write(encoded) }
+        } else data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())
         // /auth/me credentials are retained by bootstrap only after identity verification.
-        execute(request(path, query, method, body).build(), timeoutMillis, retainCookies = persistAuth || path != "/api/auth/me") { response ->
+        suspend fun fetch() = execute(request(path, query, method, body).apply {
+            if (sensitive) {
+                if (sensitiveDeviceId == null) removeHeader("X-Beacon-Device-ID") else header("X-Beacon-Device-ID", sensitiveDeviceId)
+            }
+        }.build(), timeoutMillis, retainCookies = persistAuth || path != "/api/auth/me") { response ->
+            if (sensitive && !response.isSuccessful) throw ApiFailure(response.code, "Vault change could not be confirmed. Refresh Vault before trying again.", plugin = true)
             val input = response.body?.source()
             val payload = java.io.ByteArrayOutputStream()
             val chunk = ByteArray(32768)
             if (input != null) while (true) { currentCoroutineContext().ensureActive(); val n = input.read(chunk); if (n < 0) break; require(payload.size().toLong() + n <= maxBytes) { "Server response exceeds the size limit" }; payload.write(chunk, 0, n) }
             val raw = payload.toString("UTF-8")
-            val result = runCatching { JSONObject(raw) }.getOrElse { if (raw.trim().startsWith('[')) json("items" to org.json.JSONArray(raw)) else json("message" to raw.take(2048)) }
-            if (response.code == 403 && path.startsWith(BEACON_PLUGIN_PATH) && listOf("code", "error", "detail").any { result.string(it) == "device_removed" }) NativeDeviceRemoval.removed(scope)
+            val result = runCatching {
+                if (path == CANONICAL_TICKET_PATH) {
+                    require(!response.isSuccessful || GATEWAY_JSON_OBJECT.matches(raw))
+                    val tokenizer = org.json.JSONTokener(raw)
+                    val parsed = tokenizer.nextValue()
+                    require(parsed is JSONObject && tokenizer.nextClean() == '\u0000')
+                    parsed
+                } else JSONObject(raw)
+            }.getOrElse {
+                if (sensitive) throw ApiFailure(502, "Vault response could not be verified.", plugin = true)
+                if (path == CANONICAL_TICKET_PATH) throw IOException("Canonical gateway response is not a JSON object", it)
+                if (raw.trim().startsWith('[')) json("items" to org.json.JSONArray(raw)) else json("message" to raw.take(2048))
+            }
+            if (path == CANONICAL_TICKET_PATH && response.code == 404 && raw.matches(Regex("""[ \t\r\n]*\{[ \t\r\n]*"detail"[ \t\r\n]*:[ \t\r\n]*"Not Found"[ \t\r\n]*\}[ \t\r\n]*""")))
+                throw CanonicalRouteMissing()
+            if (sensitive && (!vaultMetadataOnly(result) || result.has("error") && !result.isNull("error"))) throw ApiFailure(502, "Vault response could not be verified.", plugin = true)
+            if (response.code == 403 && path.startsWith(BEACON_PLUGIN_PATH) && listOf("code", "error", "detail").any { result.string(it) == "device_removed" }) removeDeviceIfCurrent(requestBound, query)
             if (!response.isSuccessful || result.has("error") && !result.isNull("error") && result.string("error").isNotBlank()) throw ApiFailure(response.code, nativeErrorMessage(result, response.code), plugin = path.startsWith(BEACON_PLUGIN_PATH))
             result
         }
+        val bound = requestBound.scope; val authority = requestBound.version
+        try {
+            try { fetch() }
+            catch (error: java.net.SocketException) {
+                if (sensitive || method != "GET" || authority == null || scope != bound || nativeAuthorityVersion() != authority) throw error
+                kotlinx.coroutines.delay(150)
+                if (scope != bound || nativeAuthorityVersion() != authority) throw error
+                fetch()
+            }
+        } catch (error: Throwable) {
+            if (error !is CanonicalRouteMissing && !path.startsWith(BEACON_PLUGIN_PATH + "mobile/incidents") && path != BEACON_PLUGIN_PATH + "mobile/healing/capabilities")
+                reportIncident(if (path.startsWith(VAULT_PATH)) "vault" else "network", if (method == "GET") "request" else "save", error)
+            throw error
+        }
     }
     suspend fun call(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024): JSONObject = operationLock.withLock { NativeOperations(this).call(path, query, method, data, maxBytes) }
+    /** Write-only secret input: no transport retry, response-body error echo, draft or mutation cache. */
+    suspend fun nativeSensitiveRequest(path: String, method: String, body: JSONObject?): JSONObject {
+        val bound = requestAuthority(trackRemoval = true)
+        if (bound.version == null || authStore != null && bound.admission == null) throw ApiFailure(409, "Vault needs a stable signed-in account.", plugin = true)
+        val origin = bound.scope.origin.toHttpUrl()
+        require(origin.isHttps || origin.host in setOf("localhost", "127.0.0.1", "::1")) { "Vault requires a secure connection" }
+        require((path == VAULT_PATH || path.startsWith("$VAULT_PATH/")) && method in setOf("POST", "PUT", "DELETE") && NativeOperationPolicy.direct(path, method)) { "Unsupported sensitive request" }
+        val captured = synchronized(this) {
+            if (scope != bound.scope || scopeGeneration.get() != bound.generation) throw ApiFailure(409, "Vault needs a stable signed-in account.", plugin = true)
+            if (auth.bearer == null && auth.loopbackSession == null) { adoptCookieRotation(); retainCookieRotationLocked() }
+            requestAuth().also { require(it.scope() == bound.scope) }.copy(cookies = jar.snapshot())
+        }
+        if (!requestStillCurrent(bound)) throw ApiFailure(409, "Vault needs a stable signed-in account.", plugin = true)
+        val device = NativePairing.deviceHeader(path, bound.scope)
+        // The isolated jar and credentials cannot adopt a later profile or token rotation.
+        val isolated = BeaconClient(captured, null, socketFactory, http, detachedView = true, persistContext = false,
+            credentialSource = null, configureHttp = configureHttp)
+        try {
+            currentCoroutineContext().ensureActive()
+            val frozen = try { withContext(Dispatchers.IO) { JSONObject(if (body == null) "{}" else requireNotNull(body.toString())) } }
+                catch (error: kotlinx.coroutines.CancellationException) { throw error }
+                catch (_: Exception) { throw ApiFailure(400, "Vault input could not be verified.", plugin = true) }
+            require(!frozen.has("profile") || frozen.string("profile") == bound.scope.profile) { "Vault belongs to another profile" }
+            val result = isolated.rawCall(path, beaconPluginProfileQuery(emptyMap(), bound.scope.profile), method, frozen, 1024 * 1024,
+                timeoutMillis = 15000, sensitive = true, sensitiveDeviceId = device)
+            if (!requestStillCurrent(bound)) throw ApiFailure(409, "Vault change could not be confirmed after the account or profile changed.", plugin = true)
+            return result
+        } catch (error: Throwable) {
+            reportIncident("vault", "save", error)
+            throw error
+        } finally {
+            try {
+                val returned = isolated.jar.snapshot()
+                if (captured.loopbackSession?.verified != false && returned != captured.cookies && requestStillCurrent(bound)) synchronized(this) {
+                    if (scope == bound.scope && scopeGeneration.get() == bound.generation && jar.replaceIfUnchanged(captured.cookies, returned))
+                        retainCookieRotationLocked()
+                }
+            } finally { isolated.closeNative() }
+        }
+    }
     internal suspend fun nativeGet(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "This capability is unavailable in native Hermes" }
-        if (query.containsKey("profile")) require(query["profile"] == auth.profile) { "Native request belongs to another profile" }
-        if (data?.has("profile") == true) require(data.string("profile") == auth.profile) { "Native request belongs to another profile" }
-        val scoped = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(query, auth.profile) else query
-        return rawCall(path, scoped, method, data, maxBytes, persistAuth)
+        val bound = requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
+        if (query.containsKey("profile")) require(query["profile"] == bound.scope.profile) { "Native request belongs to another profile" }
+        if (data?.has("profile") == true) require(data.string("profile") == bound.scope.profile) { "Native request belongs to another profile" }
+        val scoped = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(query, bound.scope.profile) else query
+        return rawCall(path, scoped, method, data, maxBytes, persistAuth, boundRequest = bound)
     }
     internal suspend fun nativeAuthorizedProfiles(): List<String> = nativeProfileCatalog() ?: listOf(auth.profile)
     internal suspend fun nativeGetForProfile(

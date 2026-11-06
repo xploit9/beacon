@@ -4,7 +4,35 @@ from types import SimpleNamespace
 
 import pytest
 
+import time
+import json
 from test_mobile import harness, reserve
+from test_voice_continuation import continuation,residency_preparations,admit,settle,row,notices
+
+
+@pytest.mark.parametrize('consent',[None,False,True])
+def test_residency_late_native_receipt_keeps_exact_job_and_committed_callback_contract(continuation,consent):
+    c=continuation;first=residency_preparations(c,consent=consent)
+    module=sys.modules['beacon_voice_continuation'];module.sync(c[0].mobile,c[0].native,'owner','basic','default')
+    assert row(c)['parked']==1 and not notices(c)
+    accepted=admit(c)
+    c[0].watch('owner','basic','default')
+    actual=row(c)
+    assert actual['id']==first['job_id'] and actual['admission']==accepted['admission_id'] and actual['parked']==0
+    assert actual['status']=='queued' and not notices(c)
+    now=time.time()
+    with c[0].mobile.connect() as conn:
+        conn.execute('UPDATE calls SET created=?,ended=?,receipt=? WHERE id=?',
+            (now-31*86400,now-31*86400,json.dumps({'preview':'Synthetic expired call payload'}),c[-1]))
+        c[0].mobile._prune_history(conn,'owner',30,now)
+        stub=dict(conn.execute('SELECT * FROM calls WHERE id=?',(c[-1],)).fetchone())
+    assert stub['closed']==1 and json.loads(stub['receipt'])=={'history_pruned':True,'transcript_available':False}
+    settle(c)
+    for _ in range(3):c[0].watch('owner','basic','default')
+    assert row(c)['status']==('callback_pending' if consent is True else 'completed')
+    assert len(notices(c))==int(consent is True)
+    from hermes_state_runtime import list_session_admissions
+    assert len(list_session_admissions(c[3],session_id='native-stored',pending_only=False))==1
 
 
 def add_job(api, client, monkeypatch, *, callback=False, history=None):
@@ -511,9 +539,8 @@ def test_unavailable_native_proof_reports_pending_uncertainty(harness, monkeypat
     api, client, _, _, _ = harness
     call_id, first = add_job(api, client, monkeypatch)
     monkeypatch.setattr(api.native, 'verify', lambda *args: (_ for _ in ()).throw(RuntimeError('store unavailable')))
-    job = client.get(f'/api/plugins/beacon/mobile/calls/{call_id}').json()['jobs'][0]
-    assert job['job_id'] == first and job['status'] == 'uncertain'
-    assert job['error_code'] == 'native_turn_pending_confirmation' and job['will_continue'] is True
+    response = client.get(f'/api/plugins/beacon/mobile/calls/{call_id}')
+    assert response.status_code == 503
     assert job_row(api, first)['status'] == 'watching'
 
 
@@ -521,9 +548,9 @@ def test_missing_native_session_does_not_claim_native_work_failed(harness, monke
     api, client, _, _, _ = harness
     call_id, first = add_job(api, client, monkeypatch)
     monkeypatch.setattr(api.native, 'verify', lambda *args: (_ for _ in ()).throw(LookupError('missing')))
-    job = client.get(f'/api/plugins/beacon/mobile/calls/{call_id}').json()['jobs'][0]
-    assert job['job_id'] == first and job['status'] == 'uncertain'
-    assert job['error_code'] == 'native_turn_unconfirmed' and not job.get('will_continue', False)
+    response = client.get(f'/api/plugins/beacon/mobile/calls/{call_id}')
+    assert response.status_code == 404
+    assert job_row(api,first)['status']=='watching'
 
 
 def test_call_status_advertises_bound_row_job_linkage(harness):
@@ -577,7 +604,8 @@ def test_foreign_or_unknown_epoch_public_status_is_uncertain_without_mutation(ha
     job = response.json()['jobs'][0]
     assert job['status'] == 'uncertain' and job['error_code'] == 'native_turn_unconfirmed'
     assert not job.get('will_continue', False)
-    assert job_row(api, job_id) == before and calls == []
+    assert job_row(api, job_id) == before
+    assert calls == [('owner','basic','default','native-stored')]
 
 
 def test_foreign_pending_rows_do_not_starve_same_epoch_watch_or_callback(harness, monkeypatch):
@@ -607,7 +635,7 @@ def test_foreign_pending_rows_do_not_starve_same_epoch_watch_or_callback(harness
 
     api.watch('owner', 'basic', 'default')
 
-    assert len(calls) == 2
+    assert len(calls) == 3  # Runtime, committed history and saved callback ownership.
     assert job_row(api, 'own')['status'] == 'completed' and job_row(api, 'own')['result'] == 'verified'
     assert job_row(api, seed)['status'] == 'watching'
     assert job_row(api, 'done')['status'] == 'callback_pending'

@@ -40,6 +40,8 @@ internal suspend fun awaitNativeVoiceAgent(client:BeaconClient,binding:NativeSes
         return admitted
     }
     // session.history neither waits for the agent nor bounds inline photo data.
+    // Canonical Hermes admits durably before it builds an agent; its FIFO also owns busy turns.
+    if(client.nativeTurnLease(binding.storedSessionId,binding.runtimeSessionId).authority) return
     resume()
     // A live lazy watch ignores eager_build; this scoped read starts and waits for its agent.
     client.nativeRpc("approval.pending",JSONObject().put("session_id",binding.runtimeSessionId))
@@ -53,7 +55,7 @@ internal suspend fun awaitNativeVoiceAgent(client:BeaconClient,binding:NativeSes
  *  marks uncertain. A tool still running when the call ends is only cancelled, never reported as unknown work. */
 internal fun outcomeUnknownAtCallEnd(receipt:JSONObject):Boolean {
     val status=receipt.optString("status")
-    return receipt.optString("function_name")=="hermes_work"&&status in setOf("creating_native_session","submitting_native","submission_unconfirmed") ||
+    return receipt.optString("function_name") in setOf("hermes_work","hermes_follow")&&status in setOf("creating_native_session","submitting_native","submission_unconfirmed") ||
         status=="uncertain"&&!receipt.optBoolean("read_only",false)
 }
 /** What the voice agent hears when Hermes accepted a hand-off but returned no row id (it queued behind a running reply). */
@@ -142,16 +144,23 @@ internal fun callFailureText(stage: String, error: Throwable?): String = when {
 internal class CallAdmissionFailed(cause: Throwable) : Exception(cause)
 
 /** The functions the live model may call in a direct call; anything else is refused without running. */
-internal val DIRECT_CALL_TOOLS = setOf("hermes_work", "hermes_callback", "schedule_callback", "hermes_cancel", "get_visual_state", "discover_tools", "invoke_tool", "tool_status",
+internal val DIRECT_CALL_TOOLS = setOf("hermes_work", "hermes_follow", "hermes_callback", "schedule_callback", "hermes_cancel", "get_visual_state", "discover_tools", "invoke_tool", "tool_status",
     "hermes_search", "hermes_memory", "hermes_skills", "hermes_context")
 
 /** What the live model is told beside a result that carries no message of its own, so it can say the outcome plainly. */
 internal fun callToolHint(name:String,result:JSONObject):String {
     val status=result.optString("status")
     return when {
+        name in setOf("hermes_work","hermes_follow") && status in setOf("failed","denied","expired","cancelled") -> "The exact operation did not complete successfully. Explain its verified status; do not offer a success callback or repeat the operation."
+        name in setOf("hermes_work","hermes_follow") && status in setOf("submission_unconfirmed","uncertain") -> "The exact outcome is unconfirmed. Inspect this same receipt; never repeat the operation or claim completion or a successful callback."
         name=="hermes_callback" && result.optBoolean("subscribed") -> "Tell the owner you will call back when the selected work is ready."
+        name=="hermes_callback" && result.opt("subscribed")==false -> "The callback was withdrawn. The existing work continues; do not offer another callback unless the owner asks."
         name=="hermes_callback" && status=="not_sent" -> "There is no Hermes work from this call to call back about yet. Hand the task to hermes_work with callback true; to call the owner back after a while or at a time, use schedule_callback."
-        name=="hermes_work" && result.optString("callback")=="scheduled" -> "Hermes is doing it in the attached chat and will call the owner when it is done. Tell them in a few words that they can hang up."
+        name=="hermes_work" && result.optString("callback")=="scheduled" -> "Say you are doing it in the attached chat and will call them when it is done. Tell them in a few words that they can hang up."
+        name in setOf("hermes_work","hermes_follow") && result.optString("callback_consent")=="requested" -> "The owner's callback consent is recorded. Follow this exact receipt; do not ask again or claim completion before its verified result."
+        name in setOf("hermes_work","hermes_follow") && result.optString("callback_consent")=="declined" -> "Continue without a callback. Respect the owner's decline and report only verified results."
+        name=="hermes_work" && result.optString("work_mode")=="inline" -> "Follow this exact native receipt and finish the quick work in this call; no completion claim before its result."
+        name in setOf("hermes_work","hermes_follow") && result.optString("callback_consent")=="unset" -> "The work stays in the same conversation. For longer work, naturally offer a callback once; an unanswered offer never schedules one. Follow this receipt without repeating the original action."
         name=="hermes_work" && result.optString("callback")=="unavailable_while_queued" -> "Hermes queued it behind other work in the chat; a callback can be asked with hermes_callback once it starts. Tell the owner it is queued."
         name=="hermes_work" && result.optString("callback")=="unavailable" -> "Hermes is doing it in the attached chat, but a callback could not be set for it. Tell the owner the result will be in the chat."
         name=="schedule_callback" && status=="scheduled" -> "The callback is scheduled for scheduled_at. Tell the owner when you will call, in their words."
@@ -186,7 +195,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     /** Runs the phone tools (calendar, alarms, contacts, calls, messages) on this phone; null in tests and sessions without them. */
     private val phone:PhoneVoiceBridge?=null,
     /** Whether this conversation may read or do anything private: not until the phone has been unlocked since it started ([CallTrust]). */
-    private val trust:CallTrust=CallTrust.open()) {
+    private val trust:CallTrust=CallTrust.open(),
+    private val microphoneMuted:()->Boolean={false}) {
     // One call clock: every diagnostic's elapsed_ms counts from the owner's tap when the service supplies it.
     private val origin=tappedAt.takeIf { it>0 }?:clock()
     private fun elapsedMs()=clock()-origin
@@ -220,6 +230,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private val visual=NativeVoiceVisual()
     private val gatewayFor=java.util.concurrent.ConcurrentHashMap<String,NativeToolGateway>()
     private val gatewayReceipts=DirectGatewayReceipts()
+    private val workProgress=VoiceWorkProgress()
     private val gatewayDeliveryLock=Mutex()
     private val gatewayRequests=Semaphore(4)
     private var gatewayPolling:Job?=null
@@ -228,7 +239,6 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private val toolReceipts=mutableMapOf<String,JSONObject>()
     private val functionSessions=mutableMapOf<String,Long>()
     private val cancelledFunctions=mutableSetOf<String>()
-    private val submissionLock=Mutex()
     private val reported=mutableSetOf<String>()
     private var polling:Job?=null
     private var nativeEvents:Job?=null
@@ -238,6 +248,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     @Volatile private var context=JSONObject()
     private val callScope=client.scope
     private val toolJobs=mutableMapOf<Job,String>()
+    private val submissionLock=Mutex()
     @Volatile private var contextReady=false
     // An older plugin has no conversation context route: the call reads its own context once Hermes admitted it.
     @Volatile private var callContextOnly=callback
@@ -252,6 +263,9 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     @Volatile private var greetingOpen=false
     private var greetingHeard=false // guarded by greetingLock: the model's greeting audio has arrived
     private var greetingCut=false // guarded by greetingLock
+    private var greetingComplete=false // guarded by greetingLock
+    private var greetingReported=false // guarded by greetingLock
+    private var greetingFlushing=false // guarded by greetingLock
     private val greetingText=StringBuilder() // guarded by greetingLock
     private var streamEndHeld=false // guarded by greetingLock: a mute during the greeting, sent once it ends
     private val heldGreeting=ArrayList<ByteArray>() // guarded by greetingLock: audio that arrived before the call connected
@@ -285,6 +299,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     /** [at] is a phase that happened earlier on the tap clock; [warm] marks work done before the tap; [failed] names the stage a failed call did not finish. */
     private fun diagnostic(stage:String,error:Throwable?=null,closeCode:Int?=null,at:Long?=null,warm:Boolean?=null,failed:String?=null) {
         if(stopped) return
+        if(error!=null&&stage=="provider_error") client.reportIncident("voice","connect",error)
         event(JSONObject().put("type","media_diagnostic").put("stage",stage)
             .put("elapsed_ms",at?:elapsedMs()).put("provider",provider).put("attempt",reconnects.failures).apply {
                 warm?.let { put("warm",it) }
@@ -366,16 +381,21 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             else -> callFailureText(stage,error)
         })
     }
-    /** Every condition of a connected call holds: the call leaves connecting, and the greeting heard so far plays. */
+    fun microphoneModeChanged() { if(callOwned()) checkConnected() }
+    /** Muting deliberately stops microphone frames; it must not strand an otherwise admitted call. */
     private fun checkConnected() {
-        val flush=synchronized(greetingLock) {
-            if(connected||!ready||streamsMicrophone&&!micStreaming||!admitted||stopped) return
+        val speaking=synchronized(greetingLock) {
+            if(connected||!ready||streamsMicrophone&&!micStreaming&&!microphoneMuted()||!admitted||stopped) return
             connected=true
-            heldGreeting.toList().also { heldGreeting.clear() }
+            greetingFlushing=true
+            heldGreeting.isNotEmpty()
         }
         // The greeting the live model already sent plays at once, so the first state after connecting is its speech.
-        event(JSONObject().put("type","state").put("state",if(flush.isEmpty()) "listening" else "speaking"))
-        flush.forEach(::presentGreeting)
+        event(JSONObject().put("type","state").put("state",if(speaking) "speaking" else "listening"))
+        synchronized(greetingLock) {
+            if(!stopped&&!greetingCut) heldGreeting.forEach(::presentGreeting)
+            heldGreeting.clear();greetingFlushing=false
+        }
     }
     private fun presentGreeting(pcm:ByteArray) {
         greetingOutstanding.addAndGet(pcm.size.toLong())
@@ -436,38 +456,47 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         else if(content.optBoolean("turnComplete")) endGreeting(cut=false)
     }
     private fun greetingAudio(pcm:ByteArray) {
-        val present=synchronized(greetingLock) {
+        synchronized(greetingLock) {
             if(greetingCut||stopped||!greetingOpen) return
             if(!greetingHeard) greetingArrivedMs=elapsedMs()
             greetingHeard=true
-            if(connected) true else { if(heldGreeting.sumOf { it.size }+pcm.size<=60*48000) heldGreeting+=pcm;false }
+            if(connected&&!greetingFlushing) presentGreeting(pcm)
+            else if(heldGreeting.sumOf { it.size }+pcm.size<=60*48000) heldGreeting+=pcm
         }
-        if(present) presentGreeting(pcm)
     }
     private fun endGreeting(cut:Boolean) {
-        val words=synchronized(greetingLock) {
-            if(!greetingOpen) return
+        val releaseMute=synchronized(greetingLock) {
+            if(!greetingOpen&&!(cut&&greetingComplete)) return
             greetingOpen=false
-            // Words are shown only for a greeting the owner heard.
-            val said=if(cut||greetingCut||!greetingHeard) "" else greetingText.toString().trim()
-            greetingText.setLength(0);heldGreeting.clear()
-            said
+            if(cut||greetingCut) {
+                greetingCut=true;greetingComplete=false;greetingText.setLength(0);heldGreeting.clear();greetingOutstanding.set(0)
+            } else greetingComplete=true
+            streamEndHeld.also { streamEndHeld=false }
         }
         if(stopped) return
-        if(synchronized(greetingLock) { streamEndHeld.also { streamEndHeld=false } }) controls.trySend(Outbound(GeminiWire.endAudio().toString(),{ true },control=true))
+        if(releaseMute) controls.trySend(Outbound(GeminiWire.endAudio().toString(),{ true },control=true))
+        reportGreeting()
+    }
+    /** A completed greeting is captioned only after its audio reached the speaker. */
+    private fun reportGreeting() = synchronized(greetingLock) {
+        if(stopped||greetingCut||!greetingComplete||!greetingPresented.get()||greetingReported) return@synchronized
+        greetingReported=true
+        val words=greetingText.toString().trim();greetingText.setLength(0)
         if(words.isNotBlank()) {
             event(JSONObject().put("type","transcript").put("role","assistant").put("text",words).put("final",false))
             event(JSONObject().put("type","turn_complete"))
         }
-        if(greetingPresented.get()) diagnostic("playout_stopped")
+        diagnostic("playout_stopped")
     }
     /** The greeting turn opens when the start note is sent: at the tap for a warm session, at admission otherwise. */
     private fun beginGreeting() = synchronized(greetingLock) {
-        if(!greetingOpen) { greetingOpen=true;greetingHeard=false;greetingCut=false;greetingText.setLength(0) }
+        if(greetingComplete) return@synchronized false
+        if(!greetingOpen) { greetingOpen=true;greetingHeard=false;greetingCut=false;greetingReported=false;greetingText.setLength(0) }
+        true
     }
     /** Opens the greeting turn and sends the start note unless the warm session already sent it at the tap. */
     private fun openGreeting(ws:WebSocket,adopted:LiveSession?,send:(WebSocket,String)->Boolean) {
-        beginGreeting()
+        if(!beginGreeting()) return
         if(adopted==null||!adopted.cueRequested) {
             val cue=JSONObject().put("clientContent",JSONObject().put("turns",org.json.JSONArray().put(JSONObject().put("role","user")
                 .put("parts",org.json.JSONArray().put(JSONObject().put("text",liveStartCue(context)))))).put("turnComplete",true))
@@ -480,7 +509,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private fun bargeIn(force:Boolean=false) {
         val close=synchronized(greetingLock) {
             heldGreeting.clear();greetingOutstanding.set(0)
-            if(!greetingOpen) false else { greetingCut=true;!greetingHeard }
+            if(!greetingOpen&&!greetingComplete) false else { greetingCut=true;!greetingOpen||!greetingHeard }
         }
         if(close) endGreeting(cut=true)
         else if(greetingOpen) scope.launch { delay(1500);if(greetingOpen) endGreeting(cut=true) }
@@ -494,6 +523,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 if(stopped) return@nativeEvents
                 if(frame.has("id")&&frame.optString("method") in setOf("approval","clarify"))
                     event(JSONObject().put("type","warning").put("message","${dev.hermes.android.data.currentAssistantName} needs your approval or answer. Open the attached conversation."))
+                if(frame.has("id")&&frame.optString("method") in setOf("vault.save_login","vault.code","vault.unlock_prompt","secret"))
+                    event(JSONObject().put("type","warning").put("message","Secure input is needed. Open the conversation to continue."))
             } } catch(e:CancellationException) { throw e } catch(e:Exception) {
                 if(!stopped) event(JSONObject().put("type","warning").put("message","Native live events disconnected. Job status continues through verified polling."))
             }
@@ -502,7 +533,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private suspend fun pollNativeAdmissions() {
         val pending=synchronized(toolReceipts) { toolReceipts.entries.mapNotNull { (id,value) ->
             val admission=value.optString("admission_id")
-            if(admission.isBlank() || value.optString("receipt_reported").isNotBlank()) null
+            if(admission.isBlank() || value.optString("job_id").isNotBlank() || value.optString("receipt_reported").isNotBlank()) null
             else Triple(id,admission,value.optString("runtime_session_id"))
         } }
         if(pending.isNotEmpty()) ensureNativeEvents()
@@ -571,18 +602,27 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                     } == true }) ensureNativeEvents()
                 for(i in 0 until jobs.length()) {
                     val job=jobs.optJSONObject(i)?:continue
-                    if(job.optString("status") !in setOf("done","completed","failed","needs_input","cancelled","uncertain")) continue
                     val own=synchronized(toolReceipts) { toolReceipts.values.any {
                         it.optString("job_id")==job.optString("job_id") && it.optString("request_id")==job.optString("request_id") &&
                             it.optString("stored_session_id")==selectedSession && it.optString("runtime_session_id")==job.optString("runtime_session_id")
                     } }
                     if(!own) continue
+                    val sourceRequest=job.optString("tool_request_id")
+                    if(sourceRequest.isNotBlank()&&gatewayReceipts.receipt(sourceRequest)!=null&&job.optString("status") in setOf("done","completed")) {
+                        val receipt=withTimeoutOrNull(8000) { gatewayRequests.withPermit { gateway().status(sourceRequest) } }
+                        if(receipt!=null) publishGatewayReceipt(sourceRequest,receipt)
+                        continue
+                    }
+                    val progressId=job.optString("tool_request_id").ifBlank { job.optString("request_id") }
+                    if(workProgress.overrun(progressId,job.optString("status"),elapsedMs())) tellModel(
+                        "The admitted work is still ${job.optString("status")}. Give one brief progress line and follow this existing job, never submit it again. Callback consent is ${job.optString("callback_consent","unset")}; do not ask again if requested or declined, and never infer consent from delay.")
+                    if(job.optString("status") !in setOf("done","completed","failed","needs_input","cancelled","uncertain")) continue
                     val identity=job.optString("job_id")+":"+job.optString("status")+":"+job.optString("error_code")+":"+job.optBoolean("will_continue")
                     if(identity in reported) continue
                     val text=when(job.optString("status")) {
                         "done","completed" -> job.optString("result").take(65536).ifBlank { "The reply is available in the attached conversation." }
                         "needs_input" -> "Hermes needs your approval or answer. Open the attached conversation."
-                        "failed" -> "Hermes could not complete that request. Open the attached conversation for details."
+                        "failed" -> if(sourceRequest.isNotBlank()&&gatewayReceipts.receipt(sourceRequest)?.optString("status")=="completed") "The operation has a verified result, but its callback could not be confirmed. Check this conversation; do not repeat the action." else "Hermes could not complete that request. Open the attached conversation for details."
                         "cancelled" -> "The Hermes request was cancelled."
                         else -> if(job.optBoolean("will_continue")) "Your request is still pending; its outcome is not yet confirmed." else "The outcome could not be confirmed. Open the attached conversation before retrying."
                     }
@@ -635,14 +675,14 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 // A Gemini session continues from its resumption handle; any other replacement starts from what was said so far.
                 val resumption=resume.takeIf { provider=="gemini" }
                 if(resumption==null) providerSession.incrementAndGet()
-                fun sendFrames(ws:WebSocket,json:String):Boolean {
+                fun sendFrames(ws:WebSocket,json:String,requireFrame:Boolean=false,typed:Boolean=false):Boolean {
                     val frame=JSONObject(json)
                     val frames=when {
-                        grok!=null -> grok.outbound(frame)
+                        grok!=null -> if(typed) grok.outboundTyped(frame)?:return false else grok.outbound(frame)
                         openAi!=null -> openAi.outbound(frame)
                         else -> listOf(frame)
                     }
-                    return frames.all { ws.send(it.toString()) }
+                    return (frames.isNotEmpty()||!requireFrame)&&frames.all { ws.send(it.toString()) }
                 }
                 val setupSeen=CompletableDeferred<Unit>();val ended=CompletableDeferred<Unit>();val opened=CompletableDeferred<Unit>()
                 var ownerSpeaking=false
@@ -697,6 +737,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                                 for(i in 0 until minOf(ids.length(),64)) { val id=ids.optString(i);if(toolReceipts.containsKey(id)) cancelledFunctions.add(id) }
                             } }
                         } catch(e:Exception) {
+                            diagnostic("provider_error",e)
                             ended.complete(Unit);ws.cancel()
                         }
                         }
@@ -717,9 +758,21 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 replaceSession={ if(!ended.isCompleted&&voiceProviderCurrent(generation,epoch.get(),stopped,false)) ended.complete(Unit) }
                 // The setup carries this conversation's verified context, so it waits for that read; the socket's handshake does not.
                 val setupSender=if(adopted!=null) null else launch {
-                    opened.await()
-                    if(load.result.await()!=null) return@launch
-                    if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)&&!sendFrames(ws,liveSetup(credentials,callBrief(context,briefTrust()),resumption,recentSpeech()).toString())) { ended.complete(Unit);ws.cancel() }
+                    fun setupStage(name:String) { event(JSONObject().put("type","media_diagnostic").put("stage",name)
+                        .put("elapsed_ms",elapsedMs()).put("attempt",reconnects.failures)) }
+                    try {
+                        opened.await()
+                        if(load.result.await()!=null) return@launch
+                        if(voiceProviderCurrent(generation,epoch.get(),stopped,ended.isCompleted)) {
+                            check(sendFrames(ws,liveSetup(credentials,callBrief(context,briefTrust()),resumption,recentSpeech()).toString(),true))
+                            setupStage("provider_setup_sent")
+                        }
+                    } catch(error:CancellationException) { throw error }
+                    catch(_:Exception) {
+                        setupStage("provider_setup_failed")
+                        setupSeen.completeExceptionally(java.io.IOException("Voice setup submission failed"))
+                        ended.complete(Unit);ws.cancel()
+                    }
                 }
                 var fatal=false
                 fun admit():Boolean = synchronized(socketFence) {
@@ -728,7 +781,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                     reconnects.admitted()
                     // A typed turn rides this session's own wire, like the start note; a later socket replaces it.
                     typedTurn={ words -> socket===ws&&sendFrames(ws,JSONObject().put("clientContent",JSONObject().put("turns",org.json.JSONArray().put(JSONObject().put("role","user")
-                        .put("parts",org.json.JSONArray().put(JSONObject().put("text",words))))).put("turnComplete",true)).toString()) }
+                        .put("parts",org.json.JSONArray().put(JSONObject().put("text",words))))).put("turnComplete",true)).toString(),typed=true) }
                     diagnostic("provider_ready")
                     // The microphone is live from here on; the call reads as connected once it streams and Hermes admitted it.
                     if(!greeted) { greeted=true;openGreeting(ws,adopted) { socket,json -> sendFrames(socket,json) } }
@@ -765,20 +818,23 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                         next.onSent()
                         if(next.mic&&!micStreaming) { micStreaming=true;stage("mic_streaming");checkConnected() }
                     } }
+                    var stalledHere=false
                     val watchdog=launch { while(isActive) {
                         delay(stallPoll)
                         // A conversation set up locked looks for the unlock itself, so its upgrade never depends on a broadcast reaching it.
                         if(!briefedTrusted) trust.trusted()
                         // End this session before re-queuing what it was owed, so its writer cannot send that into the dead socket.
-                        if(ready&&stall.stalled()) { ended.complete(Unit);stalledSession();break }
+                        if(ready&&stall.stalled()) { stalledHere=ended.complete(Unit);break }
                     } }
-                    ended.await();watchdog.cancel();writer.cancelAndJoin()
+                    ended.await();watchdog.cancelAndJoin();writer.cancelAndJoin()
+                    // Replay only after the old writer is gone, before the next session resets its obligation.
+                    if(stalledHere) stalledSession()
                 } catch(e:CancellationException) { throw e }
                 catch(e:ContextFailed) { fatal=true;throw e }
                 catch(e:CallAdmissionFailed) { fatal=true;throw e }
                 catch(e:Exception) { /* Reconnect with the same phone-held key and refreshed Hermes context. */ }
                 // A fatal context failure ends the call next (the call ends next), so it shows no interim state.
-                finally { replaceSession=null;setupSender?.cancel();epoch.compareAndSet(generation,generation+1);ready=false;if(!fatal) { playUntil=0;event(JSONObject().put("type","interrupted")) };endGreeting(cut=true);ws.cancel();if(!stopped&&!fatal) event(JSONObject().put("type","state").put("state","reconnecting")) }
+                finally { replaceSession=null;setupSender?.cancel();epoch.compareAndSet(generation,generation+1);ready=false;endGreeting(cut=true);if(!fatal) { playUntil=0;event(JSONObject().put("type","interrupted")) };ws.cancel();if(!stopped&&!fatal) event(JSONObject().put("type","state").put("state","reconnecting")) }
                 reconnects.failed()
             }
         } catch(e:CallAdmissionFailed) { /* The service ends the call with Hermes' own reason for refusing it. */ }
@@ -836,7 +892,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             val taken=minOf(owed,left)
             if(!greetingOutstanding.compareAndSet(owed,owed-taken)) continue
             left-=taken
-            if(taken>0&&greetingPresented.compareAndSet(false,true)) { val at=elapsedMs();scope.launch { stage("first_model_audio",at);diagnostic("playout_started",at=at) } }
+            if(taken>0&&greetingPresented.compareAndSet(false,true)) { val at=elapsedMs();scope.launch { stage("first_model_audio",at);diagnostic("playout_started",at=at);reportGreeting() } }
             break
         }
     }
@@ -887,17 +943,29 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private fun approvalChoice():String?=if(context.optBoolean("tool_approval_choice")) PhoneVoiceTools.approvalMode() else null
     /** Links admitted Hermes work as this call's job with its callback on; the job id, or null when the plugin refused it. */
     private suspend fun linkCallback(admitted:JSONObject):String? = try {
-        client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/jobs","POST",JSONObject().put("stored_session_id",admitted.getString("stored_session_id"))
+        if(admitted.optString("job_id").isNotBlank()) {
+            client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/callback","POST",JSONObject().put("job_id",admitted.getString("job_id")))
+            admitted.getString("job_id")
+        } else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/jobs","POST",JSONObject().put("stored_session_id",admitted.getString("stored_session_id"))
             .put("runtime_session_id",admitted.getString("runtime_session_id")).put("request_id",admitted.getString("request_id"))
             .put("user_row_id",admitted.get("user_row_id")).put("title",admitted.optString("title").ifBlank { "Hermes work" }.take(100)).put("callback",true))
             .optString("job_id").takeIf(String::isNotBlank)
     } catch(error:CancellationException) { throw error } catch(_:Exception) { null }
     private suspend fun gateway():NativeToolGateway { val id=admittedCall();return gatewayFor.getOrPut(id) { NativeToolGateway(client,id) } }
+    private suspend fun discoverTools(query:String):JSONObject =
+        withTimeoutOrNull(15000) { gatewayRequests.withPermit { gateway().discover(query) } }
+            ?: throw java.net.SocketTimeoutException("Tool discovery timed out")
+    private class ToolNameLookupFailed(cause:Throwable):Exception(cause)
     private suspend fun resolveToolName(name:String):String? {
-        val found=try { withTimeoutOrNull(8000) { gatewayRequests.withPermit { gateway().discover(name) } } }
-            catch(error:CancellationException) { throw error } catch(_:Exception) { null } ?: return null
-        val tools=found.optJSONArray("tools") ?: return null
-        return GeminiWire.pickToolId(tools,name)
+        try {
+            val found=discoverTools(name)
+            require(found.optString("status") !in setOf("unavailable","failed","error")) { "Tool discovery unavailable" }
+            return GeminiWire.pickToolId(found.getJSONArray("tools"),name)
+        } catch(error:CancellationException) { throw error }
+        catch(error:Exception) {
+            if(error is ApiFailure&&error.status==503&&error.message=="Hermes is updating") throw error
+            throw ToolNameLookupFailed(error)
+        }
     }
     private suspend fun toolResponse(id:String,name:String,result:JSONObject):Boolean {
         if(!callOwned()) return false
@@ -916,6 +984,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         if(stopped) return@withLock
         val previous=gatewayReceipts.receipt(requestId)?.toString()
         val verified=gatewayReceipts.record(requestId,receipt)
+        if(workProgress.overrun(requestId,verified.optString("status"),elapsedMs())) tellModel(
+            "The admitted tool request $requestId is still ${verified.optString("status")}; it has overrun the quick-work window. Judge capabilities, remaining steps and observed progress. Briefly explain the delay and use hermes_follow for this exact receipt if longer work is appropriate; never invoke the original action again. Callback consent must be explicit.")
         if(verified.toString()==previous) return@withLock
         val proposal=callProposalNeedingOwnerApproval(verified)
         val toolName=verified.optString("tool_name").ifBlank { "MCP tool request" }.take(200)
@@ -981,7 +1051,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         if(lookup) event(JSONObject().put("type","tool_receipt").put("request_id",requestId).put("tool_name",name).put("status","running"))
         val result=try {
             if(name=="discover_tools") {
-                withTimeoutOrNull(15000) { gatewayRequests.withPermit { gateway().discover(call.optJSONObject("args")?.optString("query").orEmpty()) } } ?: throw java.net.SocketTimeoutException("Tool discovery timed out")
+                discoverTools(call.optJSONObject("args")?.optString("query").orEmpty())
             } else if(name=="get_visual_state") {
                 visual.snapshot()
             } else if(name=="tool_status") {
@@ -1033,108 +1103,181 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 val body=ScheduledCallback.body(call.optJSONObject("args")?:JSONObject(),callId,id,java.time.ZonedDateTime.now())
                 if(!claimMutation(id)) JSONObject().put("status","not_sent")
                 else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/schedule-callback","POST",body)
+            } else if(name=="hermes_follow") {
+                val args=call.getJSONObject("args")
+                require((args.keys().asSequence().toSet()-setOf("request_id","callback")).isEmpty())
+                require(!args.has("callback")||args.opt("callback") is Boolean)
+                val source=args.getString("request_id");require(source.matches(Regex("[A-Za-z0-9_.:-]{1,160}")))
+                val binding=client.nativeSession(selectedSession)
+                val lease=client.nativeTurnLease(binding.storedSessionId,binding.runtimeSessionId)
+                val original=withTimeoutOrNull(8000) { gatewayRequests.withPermit { gateway().status(source) } }?:throw java.io.IOException("Original receipt lookup timed out")
+                if(original.optString("status")=="needs_approval"&&!lease.authority) JSONObject().put("status","unavailable")
+                    .put("message","The proposal was not transferred. Native continuation approval is unavailable; do not promise preservation or repeat the action.")
+                else if(!claimMutation(id)) JSONObject().put("status","not_sent") else {
+                    val body=JSONObject().put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
+                        .put("request_id",requestId).put("tool_request_id",source).apply { if(args.has("callback")) put("callback",args.getBoolean("callback")) }
+                    val prepared=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/work","POST",body)
+                    if(prepared.optBoolean("native_transfer")) {
+                        require(original.optString("status")=="needs_approval"&&lease.authority)
+                        if(gatewayReceipts.receipt(source)!=null) publishGatewayReceipt(source,JSONObject(original.toString()).put("status","transferred"))
+                    }
+                    if(args.has("callback")) {
+                        val desired=if(args.getBoolean("callback")) "requested" else "declined"
+                        if(prepared.optString("callback_consent")!=desired) {
+                            val consent=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/callback","POST",
+                                JSONObject().put("job_id",prepared.getString("job_id")).put("enabled",args.getBoolean("callback")))
+                            require(consent.opt("subscribed")==args.getBoolean("callback"))
+                            prepared.put("callback_consent",desired)
+                        }
+                    }
+                    if(prepared.optBoolean("native_transfer")&&prepared.optBoolean("submit")) {
+                        val admitted=submitVoiceContinuation({callOwned()},{prepared},{
+                            client.nativeVoiceSubmit(binding,JSONObject().put("session_id",binding.runtimeSessionId).put("text",prepared.getString("text"))
+                                .put("submission_id",prepared.getString("request_id")).put("surface","voice-live").put("queued",true),null,true,
+                                ownerFence,{callOwned()},{true},{false})
+                        })
+                        JSONObject(prepared.toString()).put("status",if(admitted.optString("admission_id").isBlank()) "submission_unconfirmed" else admitted.optString("status"))
+                            .apply { admitted.optString("admission_id").takeIf(String::isNotBlank)?.let { put("admission_id",it) } }
+                    } else prepared
+                }.apply { put("stored_session_id",binding.storedSessionId);put("runtime_session_id",binding.runtimeSessionId);put("work_mode","background") }
             } else if(name=="hermes_callback") {
+                val args=call.optJSONObject("args")?:JSONObject()
+                require((args.keys().asSequence().toSet()-setOf("scope","enabled")).isEmpty())
+                require(!args.has("enabled")||args.opt("enabled") is Boolean)
+                val enabled=args.optBoolean("enabled",true)
                 val selection=call.optJSONObject("args")?.optString("scope","latest")?:"latest";require(selection in setOf("latest","all"))
-                val work=synchronized(toolReceipts) { toolReceipts.values.lastOrNull { it.optString("function_name")=="hermes_work" }?.let { JSONObject(it.toString()) } }
+                val work=synchronized(toolReceipts) { toolReceipts.values.lastOrNull { it.optString("function_name") in setOf("hermes_work","hermes_follow") }?.let { JSONObject(it.toString()) } }
                 val hasJob=work?.optString("job_id")?.isNotBlank()==true
                 // Work Hermes admitted on its canonical path has no job yet: link the latest one now, with its callback.
                 val linkable=!hasJob&&selection=="latest"&&work?.optString("admission_id")?.isNotBlank()==true&&work.opt("user_row_id") is Number
-                if(linkable) { if(!claimMutation(id)) JSONObject().put("status","not_sent") else linkCallback(work!!)?.let { JSONObject().put("subscribed",true).put("job_ids",org.json.JSONArray().put(it)) } ?: JSONObject().put("status","not_sent") }
-                else if(!hasJob || !claimMutation(id)) JSONObject().put("status","not_sent") else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/callback","POST",JSONObject().put("scope",selection))
+                if(linkable&&enabled) { if(!claimMutation(id)) JSONObject().put("status","not_sent") else linkCallback(work!!)?.let { JSONObject().put("subscribed",true).put("job_ids",org.json.JSONArray().put(it)) } ?: JSONObject().put("status","not_sent") }
+                else if(!hasJob || !claimMutation(id)) JSONObject().put("status","not_sent") else client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/callback","POST",JSONObject().put("scope",selection).apply { if(args.has("enabled")) put("enabled",enabled) })
             } else if(name=="hermes_cancel") {
                 val jobId=call.getJSONObject("args").getString("job_id")
                 check(callOwned()) { "Call ended before job lookup" }
                 val owned=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId").getJSONArray("jobs")
                 val job=(0 until owned.length()).map { owned.getJSONObject(it) }.firstOrNull { it.optString("job_id")==jobId }?:error("Unknown call job")
                 // A finished job has nothing left to stop; its runtime may already be working on something newer.
-                val running=job.optString("status") in setOf("working","watching","needs_input") || job.optString("status")=="uncertain"&&job.optBoolean("will_continue")
+                val running=job.optString("status") in setOf("working","watching","needs_input","queued") || job.optString("status")=="uncertain"&&job.optBoolean("will_continue")
                 if(!running) JSONObject().put("status","not_sent").put("reason","job_finished").put("message","That job already finished, so nothing was cancelled.")
-                else if(!claimMutation(id)) JSONObject().put("status","not_sent") else client.nativeRpc("session.interrupt",JSONObject().put("session_id",job.getString("runtime_session_id")))
+                else if(!claimMutation(id)) JSONObject().put("status","not_sent") else {
+                    val source=job.optString("tool_request_id")
+                    val cancelled=if(source.isNotBlank()) client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/tools/requests/$source/cancel","POST",JSONObject()) else null
+                    val outcome=if(job.optString("admission_id").isNotBlank()) {
+                    val exact=client.nativeRpc("prompt.receipt",JSONObject().put("session_id",job.getString("runtime_session_id")).put("admission_id",job.getString("admission_id")))
+                    require(exact.optString("admission_id")==job.getString("admission_id")&&exact.optJSONObject("ref")?.optString("session_id")==job.getString("runtime_session_id")) { "Native cancellation identity changed" }
+                    when(exact.optString("status")) {
+                        "queued" -> client.nativeRpc("prompt.cancel",JSONObject().put("session_id",job.getString("runtime_session_id")).put("admission_id",job.getString("admission_id")))
+                        "started" -> {
+                            require(exact.opt("execution_generation") is Number) { "Native turn generation unavailable" }
+                            client.nativeRpc("session.interrupt",JSONObject().put("session_id",job.getString("runtime_session_id")).put("execution_generation",exact.get("execution_generation")))
+                        }
+                        else -> JSONObject().put("status","not_sent").put("reason","job_finished")
+                    }
+                    } else cancelled ?: JSONObject().put("status","not_sent").put("reason","exact_cancel_unavailable")
+                        .put("message","That cached job has no exact cancellation authority. No runtime interrupt was sent and no later work was stopped. Check this same conversation before cancelling.")
+                    cancelled?.takeIf { it.optString("status")=="uncertain" }?:outcome
+                }
             } else {
             require(name=="hermes_work")
             val args=call.getJSONObject("args");val text=args.getString("text");require(text.isNotBlank()&&text.length<=16000)
-            require(args.keys().asSequence().toSet().let { it.contains("text")&&(it-setOf("text","callback")).isEmpty() }) { "Voice requests stay in their attached conversation" }
+            require(args.keys().asSequence().toSet().let { it.contains("text")&&(it-setOf("text","callback","mode")).isEmpty() }) { "Voice requests stay in their attached conversation" }
+            require(!args.has("callback")||args.opt("callback") is Boolean)
+            val mode=args.optString("mode","background");require(mode in setOf("inline","background"))
+            val consent=if(args.optBoolean("callback")) "requested" else if(args.has("callback")) "declined" else "unset"
             // callback: the owner wants a call once this is done (they may hang up; Hermes finishes it in the chat).
             val callBack=args.optBoolean("callback",false)
             check(callOwned()) { "Call ended before native admission" }
             ensureNativeEvents()
             require(selectedSession.isNotBlank()) { "The attached conversation is unavailable" }
             val binding=client.nativeSession(selectedSession)
+            val canonical=client.nativeTurnLease(binding.storedSessionId,binding.runtimeSessionId).authority
             // The same agent as text chat owns reasoning, memory, tools and approvals.
             // Hermes' approval read itself may wait up to 30 seconds for a cold agent build.
             if(directAdmissionAttempt(45000,{true}) {
                 awaitNativeVoiceAgent(client,binding)
                 true
             }!=true) throw java.net.SocketTimeoutException("Native agent admission timed out")
-            val waiting=JSONObject().put("status","waiting_for_idle").put("request_id",requestId).put("stored_session_id",binding.storedSessionId).put("function_name",name).put("message","This request is waiting locally for Hermes to become idle. It has not been submitted and will be cancelled if this call ends.").put("willContinue",true)
-            synchronized(toolReceipts) { toolReceipts[id]=waiting }
-            toolResponse(id,name,waiting)
-            submissionLock.withLock {
-                var legacyJobCapacity=false
-                val receipt=submitNativeWhenIdle({callOwned()},{
-                    // This read settles old watches; a still-live watch cannot own a second prompt.
+            suspend fun submitOnce():JSONObject {
+                val frame=visual.current()
+                val missingFrame=frame==null && visual.active()
+                if(missingFrame) event(JSONObject().put("type","warning").put("message","A fresh shared frame was not available for this request."))
+                val jpeg=frame?.let { java.util.Base64.getEncoder().encodeToString(it.bytes) }
+                val prompt=if(missingFrame) "$text\n[The current shared image could not be attached.]" else text
+                synchronized(toolReceipts) { toolReceipts[id]?.put("status","staging_native") }
+                val receipt=submitVoiceContinuation({callOwned()},{
+                    client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/work","POST",JSONObject()
+                        .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
+                        .put("request_id",requestId).put("text",text).apply { if(args.has("callback")) put("callback",callBack) })
+                },{
+                    client.nativeVoiceSubmit(binding,JSONObject().put("session_id",binding.runtimeSessionId).put("text",prompt)
+                        .put("submission_id",requestId).put("surface","voice-live").put("queued",true),jpeg,true,
+                        ownerFence,{ callOwned() },{
+                            synchronized(toolReceipts) { toolReceipts[id]?.takeIf { it.optString("status")=="staging_native" }?.let { it.put("status","submitting_native");true } == true }
+                        },{ callOwned() && frame != null && visual.permits(frame) })
+                })
+                if(frame!=null && receipt.optString("voice_visual") in setOf("image","file_reference")) visual.confirmed(frame)?.let(event)
+                if(frame!=null && receipt.optString("voice_visual")=="unavailable") event(JSONObject().put("type","warning").put("message","The current shared frame could not be attached to this request."))
+                return receipt
+            }
+            val receipt=if(canonical) submitOnce() else submissionLock.withLock {
+                var capacity=true
+                val admitted=submitNativeWhenIdle({callOwned()},{
                     val status=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId")
                     val jobs=status.optJSONArray("jobs") ?: throw java.io.IOException("Call job capacity is unavailable")
-                    legacyJobCapacity=jobs.length()<64
-                    val watching=status.optString("job_linkage")!="row_bound" && (0 until jobs.length()).any { i -> jobs.optJSONObject(i)?.let { job ->
-                        job.optString("runtime_session_id")==binding.runtimeSessionId &&
-                            (job.optString("status") in setOf("working","watching","needs_input") || job.optString("status")=="uncertain" && job.optBoolean("will_continue"))
-                    } == true }
-                    !watching && client.nativeSessionStatus(binding.storedSessionId,binding.runtimeSessionId)=="idle"
-                },{
-                    val claimed=synchronized(toolReceipts) { if(!callOwned()) false else { toolReceipts[id]=JSONObject(waiting.toString()).put("status","staging_native");true } }
-                    if(!claimed) JSONObject().put("status","not_sent") else {
-                        val frame=visual.current()
-                        val missingFrame=frame==null && visual.active()
-                        if(missingFrame) event(JSONObject().put("type","warning").put("message","A fresh shared frame was not available for this request."))
-                        val jpeg=frame?.let { java.util.Base64.getEncoder().encodeToString(it.bytes) }
-                        val prompt=if(missingFrame) "$text\n[The current shared image could not be attached.]" else text
-                        val result=client.nativeVoiceSubmit(binding,JSONObject().put("session_id",binding.runtimeSessionId).put("text",prompt)
-                            .put("submission_id",requestId).put("surface","voice-live").put("queued",true),jpeg,legacyJobCapacity,
-                            ownerFence,{ callOwned() },{
-                                synchronized(toolReceipts) { toolReceipts[id]?.takeIf { it.optString("status")=="staging_native" }?.let { it.put("status","submitting_native");true } == true }
-                            },{ callOwned() && frame != null && visual.permits(frame) })
-                        if(frame!=null && result.optString("voice_visual") in setOf("image","file_reference")) visual.confirmed(frame)?.let(event)
-                        if(frame!=null && result.optString("voice_visual")=="unavailable") event(JSONObject().put("type","warning").put("message","The current shared frame could not be attached to this request."))
-                        result
+                    capacity=jobs.length()<64
+                    if(!capacity) true else {
+                        val watching=status.optString("job_linkage")!="row_bound" && (0 until jobs.length()).any { i -> jobs.optJSONObject(i)?.let { job ->
+                            job.optString("runtime_session_id")==binding.runtimeSessionId &&
+                                (job.optString("status") in setOf("working","watching","needs_input") || job.optString("status")=="uncertain" && job.optBoolean("will_continue"))
+                        }==true }
+                        !watching && client.nativeSessionStatus(binding.storedSessionId,binding.runtimeSessionId)=="idle"
                     }
-                },{delay(1000)})
-                if(receipt.optString("status")=="not_sent") {
-                    JSONObject().put("status","not_sent").put("reason",receipt.optString("reason")).put("request_id",requestId).put("stored_session_id",binding.storedSessionId)
-                } else if(receipt.optString("status")=="unknown" || receipt.optBoolean("voice_authority") && receipt.optString("admission_id").isBlank()) {
-                    JSONObject().put("status","submission_unconfirmed").put("request_id",requestId)
-                } else if(receipt.optBoolean("voice_authority")) {
-                    // A canonical admission keeps out of the legacy job table (its per-call capacity is not Hermes'); its user row is kept
-                    // so a callback can still be linked, now if asked or later through hermes_callback.
-                    val row=receipt.opt("user_row_id")?.takeIf { it is Number }
-                    val admitted=JSONObject().put("status",receipt.optString("status")).put("request_id",requestId).put("admission_id",receipt.getString("admission_id"))
-                        .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId).put("title",text.take(100))
-                        .apply { row?.let { put("user_row_id",it) } }
-                    when {
-                        !callBack -> admitted
-                        row==null -> admitted.put("callback","unavailable_while_queued")
-                        else -> linkCallback(admitted)?.let { admitted.put("job_id",it).put("callback","scheduled") } ?: admitted.put("callback","unavailable")
-                    }
-                } else if(!receipt.has("user_row_id")||receipt.isNull("user_row_id")) {
-                    JSONObject().put("status",receipt.optString("status","accepted_unlinked")).put("request_id",requestId)
-                        .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
-                } else {
-                    val linked=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/jobs","POST",JSONObject().put("stored_session_id",binding.storedSessionId)
-                        .put("runtime_session_id",binding.runtimeSessionId).put("request_id",requestId).put("user_row_id",receipt.opt("user_row_id")).put("title",text.take(100)).put("callback",callBack))
-                    require(linked.optString("job_id").isNotBlank()) { "Native job linkage was not confirmed" }
-                    JSONObject().put("status",receipt.optString("status","submitted")).put("job_id",linked.getString("job_id")).put("request_id",requestId)
-                        .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
-                        .apply { if(callBack) put("callback","scheduled") }
+                },{ if(!capacity) JSONObject().put("status","not_sent").put("reason","job_capacity") else submitOnce() },{delay(1000)})
+                admitted
+            }
+            if(receipt.optString("status")=="not_sent") {
+                JSONObject().put("status","not_sent").put("reason",receipt.optString("reason")).put("request_id",requestId).put("stored_session_id",binding.storedSessionId)
+            } else if(receipt.optBoolean("continuation_replay")) {
+                receipt
+            } else if(receipt.optString("status")=="unknown" || receipt.optBoolean("voice_authority") && receipt.optString("admission_id").isBlank()) {
+                JSONObject().put("status","submission_unconfirmed").put("request_id",requestId)
+            } else if(receipt.optBoolean("voice_authority")) {
+                // Callback intent was persisted before this native admission; no post-hangup link race.
+                val row=receipt.opt("user_row_id")?.takeIf { it is Number }
+                val admitted=JSONObject().put("status",receipt.optString("status")).put("request_id",requestId).put("admission_id",receipt.getString("admission_id"))
+                    .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId).put("title",text.take(100)).put("job_id",receipt.getString("job_id"))
+                    .put("work_mode",mode).put("callback_consent",receipt.optString("callback_consent",consent))
+                    .apply { row?.let { put("user_row_id",it) } }
+                admitted.apply {
+                    if(receipt.has("outcome")) put("outcome",receipt.get("outcome"))
+                    if(callBack&&receipt.optString("status")!="terminal") put("callback","scheduled")
                 }
+            } else if(!receipt.has("user_row_id")||receipt.isNull("user_row_id")) {
+                JSONObject().put("status",receipt.optString("status","accepted_unlinked")).put("request_id",requestId)
+                    .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
+            } else {
+                val linked=client.nativeRequest("/api/plugins/beacon/mobile/calls/$callId/jobs","POST",JSONObject().put("stored_session_id",binding.storedSessionId)
+                    .put("runtime_session_id",binding.runtimeSessionId).put("request_id",requestId).put("user_row_id",receipt.opt("user_row_id")).put("title",text.take(100)).put("callback",callBack))
+                require(linked.optString("job_id").isNotBlank()) { "Native job linkage was not confirmed" }
+                JSONObject().put("status",receipt.optString("status","submitted")).put("job_id",linked.getString("job_id")).put("request_id",requestId)
+                    .put("stored_session_id",binding.storedSessionId).put("runtime_session_id",binding.runtimeSessionId)
+                    .put("work_mode",mode).put("callback_consent",consent)
+                    .apply { if(callBack) put("callback","scheduled") }
             }
             }
         } catch(error:CancellationException) { throw error }
         catch(e:Exception) {
             val stage=synchronized(toolReceipts) { toolReceipts[id]?.optString("status") }
+            client.reportIncident("tools",if(lookup) "discover_tools" else "invoke_tool",e)
             when {
+                e is ToolNameLookupFailed -> JSONObject().put("status","not_sent").put("request_id",requestId).put("fallback_tool","hermes_work")
+                    .put("message","Tool discovery failed or timed out; no tool was run. Use hermes_work once for the user's original request in this same conversation, with its normal approvals. Do not claim it was submitted until its receipt confirms admission.")
                 // The plugin answers this at once while Hermes updates (admin_api.UPDATING), before anything runs.
                 e is ApiFailure&&e.status==503&&e.message=="Hermes is updating" -> JSONObject().put("status","not_sent").put("error_code","hermes_updating").put("message","Hermes is updating, so nothing ran. Tell the user to try again in a few minutes.")
-                name in setOf("hermes_search","hermes_memory","hermes_skills","hermes_context","discover_tools","tool_status","get_visual_state") -> JSONObject().put("status","unavailable").put("error_code",errorCode(e)).put("message",(if(errorCode(e)=="timeout") "This lookup timed out." else "This lookup failed.")+" No current result was verified; report the failure without inventing facts or claiming the service is disconnected.")
+                name=="discover_tools" -> JSONObject().put("status","unavailable").put("error_code",errorCode(e)).put("fallback_tool","hermes_work")
+                    .put("message","Tool discovery is unavailable; no tool was run. Use hermes_work once for the user's original request in this same conversation, with its normal approvals. Do not claim it was submitted until its receipt confirms admission.")
+                name in setOf("hermes_search","hermes_memory","hermes_skills","hermes_context","tool_status","get_visual_state") -> JSONObject().put("status","unavailable").put("error_code",errorCode(e)).put("message",(if(errorCode(e)=="timeout") "This lookup timed out." else "This lookup failed.")+" No current result was verified; report the failure without inventing facts or claiming the service is disconnected.")
                 name=="hermes_work"&&stage in setOf("creating_native_session","waiting_for_idle","submitting","staging_native") -> JSONObject().put("status","not_sent").put("request_id",requestId).put("message","The request was not submitted because native admission failed or the call ended.")
                 stage=="submitting" -> JSONObject().put("status","not_sent").put("request_id",requestId).put("message","Native request validation failed; no mutation was attempted.")
                 else -> JSONObject().put("status","submission_unconfirmed").put("request_id",requestId).put("message","Do not retry automatically; submission or linkage may have succeeded.")
@@ -1149,11 +1292,16 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private fun claimMutation(id:String):Boolean=synchronized(toolReceipts) {
         if(!callOwned()) false else { toolReceipts[id]?.put("status","submitting_native");true }
     }
+    /** Audio closes immediately; an already sent admission/link may still return its single receipt. */
+    internal suspend fun settleAcceptedWork():Boolean=withTimeoutOrNull(25000) {
+        val accepted=synchronized(toolJobs) { toolJobs.filterValues { id -> synchronized(toolReceipts) { !directToolMayCancel(toolReceipts[id]?.optString("status")) } }.keys.toList() }
+        accepted.joinAll();true
+    }==true
     fun close():DirectCallEnd {
         val disposition=synchronized(ownerFence) {
             synchronized(toolReceipts) {
                 stopped=true
-                DirectCallEnd(toolReceipts.values.count { (it.optString("function_name")=="hermes_work"&&it.optString("status") in setOf("waiting_for_idle","submitting","staging_native")) || it.optString("status")=="needs_approval" },
+                DirectCallEnd(toolReceipts.values.count { (it.optString("function_name") in setOf("hermes_work","hermes_follow")&&it.optString("status") in setOf("waiting_for_idle","submitting","staging_native")) || it.optString("status")=="needs_approval" },
                     toolReceipts.values.count(::outcomeUnknownAtCallEnd))
             }
         }

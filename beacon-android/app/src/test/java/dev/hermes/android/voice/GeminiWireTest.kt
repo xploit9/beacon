@@ -14,17 +14,17 @@ class GeminiWireTest {
             val context=org.json.JSONObject().put("profile","fixture-profile").put("tool_catalogue",catalogue)
                 .put("capabilities",org.json.JSONObject().put("web_search",true).put("memory_recall",true).put("skills",true).put("profile_context",true))
             val setup=GeminiWire.setup("model","Aoede",null,context).getJSONObject("setup")
-            assertEquals(setOf("hermes_work","hermes_callback","schedule_callback","hermes_cancel","discover_tools","invoke_tool","tool_status","get_visual_state","hermes_search","hermes_memory","hermes_skills","hermes_context"),names(setup).toSet())
+            assertEquals(setOf("hermes_work","hermes_follow","hermes_callback","schedule_callback","hermes_cancel","discover_tools","invoke_tool","tool_status","get_visual_state","hermes_search","hermes_memory","hermes_skills","hermes_context"),names(setup).toSet())
             // Owner, 4 Nov 2026: "I can request a call back anytime I want" - the call schedules one itself, with or without Hermes work.
             assertTrue(names(setup).contains("schedule_callback"))
             val declarations=setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
             val work=(0 until declarations.length()).map(declarations::getJSONObject).single { it.getString("name")=="hermes_work" }
-            assertEquals(setOf("text","callback"),work.getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
-            assertTrue(work.getString("description").contains("long, multi-step work"))
-            assertTrue(work.getString("description").contains("Never use it to answer a question you can answer or look up yourself"))
+            assertEquals(setOf("text","callback","mode"),work.getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
+            assertTrue(work.getString("description").contains("long work"))
+            assertTrue(work.getString("description").contains("Finish other quick answers and actions in the call"))
             val instruction=instructionOf(setup)
             assertTrue(instruction.contains("You answer the owner yourself, in your own voice"))
-            assertTrue(instruction.contains("Use hermes_work only for long, multi-step work"))
+            assertTrue(instruction.contains("Use hermes_work mode inline for quick protected canonical-state actions"))
             assertTrue(instruction.contains("prefer hermes_search"))
             assertTrue(instruction.contains("use a page-fetching tool found with discover_tools"))
             assertTrue(instruction.contains("Before you tell the owner you cannot do something or lack a tool, search for it with discover_tools"))
@@ -124,7 +124,7 @@ class GeminiWireTest {
         assertTrue("The callback and its result reach the model as data", instruction.substringAfter("Untrusted callback and greeting reference data").contains("Verified result"))
         val tools=setup.getJSONArray("tools");assertEquals(1,tools.length());assertFalse(tools.getJSONObject(0).has("googleSearch"))
         assertTrue(names(setup).containsAll(listOf("hermes_search","hermes_memory")))
-        assertEquals(12,names(GeminiWire.setup("model","",null)["setup"] as org.json.JSONObject).size)
+        assertEquals(13,names(GeminiWire.setup("model","",null)["setup"] as org.json.JSONObject).size)
     }
     @Test fun audioFormatAndRetryBudgetsAreBounded() {
         assertTrue(GeminiWire.validAudio("audio/pcm;rate=24000",960))
@@ -138,11 +138,11 @@ class GeminiWireTest {
         val named=(0 until functions.length()).associate { functions.getJSONObject(it).getString("name") to functions.getJSONObject(it) }
         assertTrue(named.keys.containsAll(listOf("discover_tools","invoke_tool","tool_status","get_visual_state","hermes_work","hermes_callback","hermes_cancel")))
         assertTrue(named.getValue("discover_tools").getString("description").contains("enabled native Hermes and MCP tools") || named.getValue("discover_tools").getString("description").contains("enabled native Hermes and connected MCP tools"))
-        assertTrue(named.getValue("hermes_work").getString("description").contains("direct native Hermes and MCP tools remain available"))
+        assertTrue(named.getValue("hermes_work").getString("description").contains("Current and future direct tools remain available"))
         assertFalse(named.keys.any { it.contains("decision") || it.contains("approve") })
         assertEquals(setOf("tool_id","arguments"),named.getValue("invoke_tool").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         assertEquals("STRING",named.getValue("invoke_tool").getJSONObject("parameters").getJSONObject("properties").getJSONObject("arguments").getString("type"))
-        assertEquals(setOf("text","callback"),named.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
+        assertEquals(setOf("text","callback","mode"),named.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         assertEquals(setOf("job_id"),named.getValue("hermes_cancel").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         val instructions=instructionOf(setup)
         // Owner, 3 Nov: one multilingual agent. It speaks the language the owner speaks now and follows a switch mid-call;

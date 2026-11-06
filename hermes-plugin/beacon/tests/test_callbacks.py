@@ -492,3 +492,31 @@ def test_schedule_accepted_before_hangup_finishes_and_receipt_remains_readable(e
     assert closed['closed']==1
     assert cb.schedule(m,n,'owner','basic',closed,cfg,VALUE,NOW)==first
     assert first['status']=='scheduled' and len(jobs)==1
+
+
+def test_callback_persists_verified_principal_and_refuses_other_issuer(env):
+    from gateway.session_identity import authenticated_subject
+    cb,m,n,cfg,_,_=env
+    principal=authenticated_subject({'provider':'basic','issuer':'issuer-one','user_id':'owner'})
+    other=authenticated_subject({'provider':'basic','issuer':'issuer-two','user_id':'owner'})
+    with m.connect() as conn:
+        conn.execute('UPDATE calls SET principal=? WHERE id=?',(principal,ROW['id']))
+    calls=[]
+    def verify(*args):
+        calls.append(args)
+        if len(args)!=7 or args[-1]!=principal:
+            raise LookupError('unverified principal')
+        return {'user_id':principal}
+    n.verify=verify
+    scheduled=cb.schedule(m,n,'owner','basic',{**ROW,'principal':principal},cfg,VALUE,NOW)
+    with m.connect() as conn:
+        key,value=conn.execute("SELECT key,value FROM meta WHERE key LIKE 'scheduled-callback:%'").fetchone()
+        record=json.loads(value)
+        assert record['principal']==principal
+        record['principal']=other
+        conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(record).encode(),key))
+    with pytest.raises(LookupError):
+        cb.deliver(m,n,key,datetime.fromisoformat(scheduled['scheduled_at']))
+    with m.connect() as conn:
+        assert conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]==0
+    assert calls[0][-1]==principal

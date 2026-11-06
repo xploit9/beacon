@@ -60,7 +60,7 @@ class LockedStartCallTest {
             builder.addInterceptor { chain ->
                 val path = chain.request().url.encodedPath
                 paths += path
-                if (path.endsWith("/ws-ticket")) tickets.incrementAndGet()
+                if (path.endsWith("/ws-ticket") || path == "/api/plugins/beacon/mobile/gateway-ticket") tickets.incrementAndGet()
                 val body = when {
                     path.endsWith("/context") -> pluginContext()
                     path.endsWith("/tools") -> json("tools" to JSONArray().put(json("name" to "get_weather", "tool_id" to "a".repeat(64), "description" to "Weather")))

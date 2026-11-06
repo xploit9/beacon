@@ -17,6 +17,7 @@ import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.NativePairing
 import dev.hermes.android.data.NativeDeviceRemoval
+import dev.hermes.android.data.DeviceRemovalAuthority
 import dev.hermes.android.data.authorizesPushSource
 import dev.hermes.android.data.nativeErrorCodeText
 import kotlinx.coroutines.*
@@ -41,7 +42,7 @@ import kotlin.coroutines.resumeWithException
 private val opaquePattern=Regex("[A-Za-z0-9_.:-]+")
 fun validOpaque(value: String): Boolean = value.length in 1..200 && value != "." && value != ".." && value.matches(opaquePattern)
 // A reply that lands while Beacon is open is still listed, just without a sound.
-internal fun silentPushNotification(kind: String, uiVisible: Boolean) = kind == "completion" && uiVisible
+internal fun silentPushNotification(kind: String, uiVisible: Boolean) = kind == "working" || kind == "completion" && uiVisible
 internal fun requiresLocalKeepConnectedReceipt(localActionToken: String?): Boolean = localActionToken != null
 internal fun canAuthorizeWithoutKeepConnectedReceipt(receiptRequired: Boolean, action: String): Boolean =
     !receiptRequired && (action == "answer" || action == "decline")
@@ -100,7 +101,7 @@ class PushManager(private val app: BeaconApplication) {
                 check(privatePrefs.edit().remove("removed:${key.removePrefix("device:")}").commit()) { "Could not save phone notification authorization" }
             } else {
                 bindings().map(::bindingScope)
-                    .distinctBy(::removedKey).filter { NativePairing.accountKey(it) == key }
+                    .distinctBy(::removedKey).filter { NativePairing.accountKey(it) == key && !privatePrefs.getBoolean(removedKey(it), false) }
                     .forEach(::deviceRemoved)
             }
         }
@@ -121,14 +122,23 @@ class PushManager(private val app: BeaconApplication) {
         pairingPrefs.registerOnSharedPreferenceChangeListener(pairingListener)
     }
     private fun deviceRemoved(scope: Scope) {
-        synchronized(lock) {
-            check(privatePrefs.edit().putBoolean(removedKey(scope), true).commit()) { "Could not stop removed-device notifications" }
-            revokeLocalOwner(scope)
+        val current = app.auth.read(scope.origin).scope()
+        if (current.sameAccount(scope)) app.auth.deviceRemovalAuthority(current)?.let(::deviceRemoved)
+    }
+    private fun deviceRemoved(removal: DeviceRemovalAuthority) {
+        val scope = removal.scope
+        val applied = synchronized(lock) {
+            // Push already reads AuthStore under this lock; keep that order at the actual target mutation.
+            removal.ifCurrent {
+                check(privatePrefs.edit().putBoolean(removedKey(scope), true).commit()) { "Could not stop removed-device notifications" }
+                NativePairing.clearDeviceId(app, scope)
+            }
         }
-        NativePairing.clearDeviceId(app, scope)
+        if (!applied) return
+        revokeLocalWhere({ bindingScope(it).sameAccount(scope) || unstampedBindingOfAccount(it, scope) }, removal)
+        KeepConnectedService.onUserSignedOut(app, removal)
         // The screen cache's own hook exists only while a ViewModel is alive; the saved screens of a removed phone go either way.
-        cleanup.launch { runCatching { app.cache.delete(scope.copy(profile = "", session = ""), "screens") } }
-        if (app.auth.read(scope.origin).scope().sameAccount(scope)) KeepConnectedService.onUserSignedOut(app, scope.origin)
+        cleanup.launch { runCatching { app.cache.deleteIfCurrent(scope.copy(profile = "", session = ""), "screens", removal) } }
         cleanup.launch { runCatching { deleteUnusedFirebaseToken() }.onFailure { android.util.Log.w("BeaconPush", "Firebase token cleanup could not be confirmed") } }
     }
     private suspend fun deleteUnusedFirebaseToken() = registration.withLock { deleteUnusedFirebaseTokenLocked() }
@@ -316,12 +326,23 @@ class PushManager(private val app: BeaconApplication) {
             current.binding == call.binding && current.callId == event && current.actionToken == invite.actionToken &&
             current.remainingRingMillis(now, elapsed) > 0 && invite.actionDurationMillis(now, elapsed, bootCount()) > 0
     }
-    fun invalidateKeepConnectedInvitations() {
-        val receipts = synchronized(lock) { keepConnectedReceipts.values.toList().also { keepConnectedReceipts.clear() } }
-        receipts.forEach { receipt ->
-            receipt.prepared.protocol.invalidate(receipt.prepared.binding, receipt.prepared.preferences.copy(keepConnected = false))
-            discardInvitation(receipt.source, receipt.event)
+    fun invalidateKeepConnectedInvitations() = invalidateKeepConnectedInvitations(null)
+    internal fun invalidateKeepConnectedInvitations(authority: DeviceRemovalAuthority?) {
+        var change: LocalRevocation? = null
+        synchronized(lock) {
+            val remove = {
+                val receipts = keepConnectedReceipts.values.filter { authority == null || it.prepared.scope.sameAccount(authority.scope) }
+                val invitations = receipts.mapNotNull { receipt -> storedInvitation(receipt.source, receipt.event)?.takeIf { it.actionToken == receipt.prepared.call.actionToken } }
+                val edit = privatePrefs.edit()
+                invitations.forEach { edit.remove("incoming:${it.key}") }
+                check(edit.commit()) { "Could not retire notification invitations" }
+                receipts.forEach { receipt -> keepConnectedReceipts.entries.removeAll { it.value === receipt } }
+                invitations.forEach { invite -> if (_incoming.value?.actionToken == invite.actionToken) _incoming.value = null }
+                change = LocalRevocation(emptyList(), invitations, receipts)
+            }
+            if (authority == null) remove() else authority.ifCurrent(remove)
         }
+        change?.let(::finishLocalRevocation)
     }
     private fun bootCount() = android.provider.Settings.Global.getInt(app.contentResolver, android.provider.Settings.Global.BOOT_COUNT, -1)
     private fun storedInvitation(source: String, event: String): IncomingCall? = runCatching {
@@ -490,20 +511,43 @@ class PushManager(private val app: BeaconApplication) {
         check(!failed) { "Notification registration needs a retry" }
     } }
     private fun revokeLocalOwner(scope: Scope): List<JSONObject> = revokeLocalWhere { bindingScope(it).sameAccount(scope) || unstampedBindingOfAccount(it, scope) }
-    private fun revokeLocalWhere(match: (JSONObject) -> Boolean): List<JSONObject> = synchronized(lock) {
-        val owned = bindings().filter(match)
-        val ownedSources = owned.map { it.string("source") }.toSet()
-        // Local revocation precedes network IO, so an offline sign-out cannot be revived by a tap.
-        val edit = privatePrefs.edit()
-        val removed = removeIncoming(ownedSources, edit)
-        owned.forEach { binding -> edit.remove("source:${binding.string("source").digest()}").remove("active:${bindingScope(binding).key}") }
-        check(edit.commit()) { "Could not remove local notification authorization" }
-        keepConnectedReceipts.entries.removeAll { it.value.source in ownedSources }
-        owned.forEach { cancelNativeActivities(app, it.string("source")) }
-        removed.forEach { (source, event) -> dismissInvitation(source, event) }
-        owned
+    private data class LocalRevocation(val bindings: List<JSONObject>, val invitations: List<IncomingCall>, val receipts: List<KeepConnectedReceipt>)
+    private fun finishLocalRevocation(change: LocalRevocation) {
+        change.receipts.forEach { receipt -> receipt.prepared.protocol.invalidate(receipt.prepared.binding, receipt.prepared.preferences.copy(keepConnected = false)) }
+        change.bindings.forEach { cancelNativeActivities(app, it.string("source")) }
+        change.invitations.forEach { invite ->
+            val replaced = synchronized(lock) { storedInvitation(invite.source, invite.event)?.actionToken?.let { it != invite.actionToken } == true }
+            if (!replaced) {
+                dev.hermes.android.voice.IncomingRingtoneService.silence(invite.source, invite.event)
+                val manager = app.getSystemService(NotificationManager::class.java)
+                manager.cancel(invite.key, 2); manager.cancel(invite.key, 1)
+            }
+        }
+    }
+    private fun revokeLocalWhere(match: (JSONObject) -> Boolean): List<JSONObject> = revokeLocalWhere(match, null)
+    private fun revokeLocalWhere(match: (JSONObject) -> Boolean, authority: DeviceRemovalAuthority?): List<JSONObject> {
+        var change: LocalRevocation? = null
+        synchronized(lock) {
+            val remove = {
+                val owned = bindings().filter(match)
+                val sources = owned.map { it.string("source") }.toSet()
+                val edit = privatePrefs.edit()
+                val invitations = removeIncoming(sources, edit).mapNotNull { (source, event) -> storedInvitation(source, event) }
+                val receipts = keepConnectedReceipts.values.filter { it.source in sources }
+                owned.forEach { edit.remove("source:${it.string("source").digest()}").remove("active:${bindingScope(it).key}") }
+                check(edit.commit()) { "Could not remove local notification authorization" }
+                keepConnectedReceipts.entries.removeAll { it.value.source in sources }
+                invitations.forEach { invite -> if (_incoming.value?.actionToken == invite.actionToken) _incoming.value = null }
+                change = LocalRevocation(owned, invitations, receipts)
+            }
+            if (authority == null) remove() else authority.ifCurrent(remove)
+        }
+        change?.let(::finishLocalRevocation)
+        return change?.bindings.orEmpty()
     }
     internal fun prepareOwnerRevocation(scope: Scope): List<JSONObject> = revokeLocalOwner(scope)
+    internal fun prepareOwnerRevocation(scope: Scope, authority: DeviceRemovalAuthority): List<JSONObject> =
+        revokeLocalWhere({ bindingScope(it).sameAccount(scope) || unstampedBindingOfAccount(it, scope) }, authority)
     suspend fun revokeOwner(client: BeaconClient, captured: List<JSONObject> = prepareOwnerRevocation(client.scope)) {
         val remotelyOwned = captured.filter { bindingScope(it).sameAccount(client.scope) && validOpaque(it.string("target")) }
         registration.withLock {
@@ -699,6 +743,10 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
         if (validOpaque(activity) && (ongoingNativeKind(nativeKind) || nativeKind == "activity_end")) {
             presentNativeActivity(context, source, event, activity, nativeKind, data["expires_at"]?.toLongOrNull() ?: 0)
             if (nativeKind == "activity_end") return null
+            if (nativeKind == "working") {
+                DeliveryLog.markHeard(context)
+                return null
+            }
             DeliveryLog.recordArrival(context, nativeKind, event)
             return fetchPreview(nativeKind)
         }

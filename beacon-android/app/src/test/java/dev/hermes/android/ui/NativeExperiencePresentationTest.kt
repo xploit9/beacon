@@ -3,6 +3,7 @@ package dev.hermes.android.ui
 import dev.hermes.android.core.copy
 import dev.hermes.android.core.json
 import dev.hermes.android.updatedHistoryRows
+import dev.hermes.android.Message
 import org.json.JSONArray
 import org.junit.Assert.*
 import org.junit.Test
@@ -89,23 +90,19 @@ class NativeExperiencePresentationTest {
         assertFalse(imageMimeType("application/image"))
     }
     @Test fun backgroundActivitySummaryShowsCategoriesAndStaysEmptyWhenIdle() {
-        val activity = BackgroundActivitySummary(agents = 2, processes = 1, cronJobs = 1, watches = 1)
+        val activity = BackgroundActivitySummary(agents = 2, processes = 1)
         assertTrue(activity.active)
-        assertEquals("2 agents · 1 process · 1 schedule running · 1 watch", backgroundActivityStatus(activity))
+        assertEquals("2 agents · 1 process", backgroundActivityStatus(activity))
         assertFalse(BackgroundActivitySummary().active)
         assertEquals("", backgroundActivityStatus(BackgroundActivitySummary()))
         assertEquals("Background status unavailable", backgroundActivityStatus(BackgroundActivitySummary(available = false)))
         assertEquals("1 process · More may be active", backgroundActivityStatus(BackgroundActivitySummary(processes = 1, available = false)))
     }
-    @Test fun activeSubagentCountIntersectsTheSessionRosterWithProfileStatus() {
+    @Test fun activeSubagentCountUsesTheCanonicalConversationRoster() {
         val session = json("subagents" to JSONArray()
-            .put(json("subagent_id" to "sa-current"))
-            .put(json("subagent_id" to "sa-stale")))
-        val profile = json("active" to JSONArray()
-            .put(json("subagent_id" to "sa-current"))
-            .put(json("subagent_id" to "sa-other-session")))
-        assertEquals(1, sessionScopedSubagentCount(session, profile))
-        assertEquals(2, sessionScopedSubagentCount(session, null))
+            .put(json("subagent_id" to "sa-current", "status" to "running"))
+            .put(json("subagent_id" to "sa-stale", "status" to "completed")))
+        assertEquals(1, sessionScopedSubagentCount(session))
     }
     @Test fun mobileCommandSuggestionsOmitTerminalOnlyCommands() {
         val commands = listOf(
@@ -119,6 +116,41 @@ class NativeExperiencePresentationTest {
         assertEquals("branch-2", branchSessionId(json("session" to json("session_id" to "branch-2"))))
         assertEquals("", branchSessionId(json("ok" to true)))
         assertEquals("Archive", conversationMenuTitle("archive"))
+    }
+    @Test fun branchActionsCarryTheSelectedDurableRowIdentity() {
+        val rows = listOf(json("id" to 19, "row_id" to 19, "role" to "user", "content" to "Synthetic"),
+            json("id" to 20, "row_id" to 20, "role" to "assistant", "content" to "Synthetic reply"))
+        val selected = Message.from(rows[0], 0, "synthetic-session")
+        val through = branchMessageRequest(selected, 0, rows, before = false)
+        assertEquals(19L, through.getLong("through_message_id"))
+        assertEquals(1, through.getInt("keep_count"))
+        val before = branchMessageRequest(selected, 0, rows, before = true)
+        assertEquals(19L, before.getLong("before_message_id"))
+        assertEquals(0, before.getInt("keep_count"))
+        assertFalse(branchMessageRequest(selected, 1, rows, before = false).has("through_message_id"))
+        assertEquals(listOf("19", "20"), branchRowIds(rows).let { ids -> (0 until ids.length()).map { ids.opt(it).toString() } })
+    }
+    @Test fun branchProducerResultsCarryTheirRawDurableRoleAlongsideAssistantPresentation() {
+        for (kind in listOf("async_delegation_complete", "process_complete")) {
+            val rows = listOf(json("id" to 19, "row_id" to 19, "role" to "user", "content" to "Synthetic prompt"),
+                json("id" to 20, "row_id" to 20, "role" to "user", "content" to "Internal completion envelope", "display_kind" to kind,
+                    "display_metadata" to json("display_text" to "Synthetic producer result")),
+                json("id" to 21, "row_id" to 21, "role" to "assistant", "content" to "Synthetic reply"))
+            val selected = Message.from(rows[1], 1, "synthetic-session")
+            assertEquals("assistant", selected.role)
+            assertEquals("Synthetic producer result", selected.text)
+            val through = branchMessageRequest(selected, 1, rows, before = false)
+            assertEquals(20L, through.getLong("through_message_id"))
+            assertEquals("user", through.getString("selected_role"))
+            assertEquals(2, through.getInt("keep_count"))
+            val before = branchMessageRequest(selected, 1, rows, before = true)
+            assertEquals(20L, before.getLong("before_message_id"))
+            assertEquals("user", before.getString("selected_role"))
+            assertEquals(1, before.getInt("keep_count"))
+            assertFalse(branchMessageRequest(selected, 0, rows, before = false).has("through_message_id"))
+            assertFalse(branchMessageRequest(selected.copy(id = "foreign"), 1, rows, before = false).has("through_message_id"))
+            assertFalse(branchMessageRequest(selected.copy(role = "user"), 1, rows, before = false).has("through_message_id"))
+        }
     }
     @Test fun profileDisplayNamesFallBackToTheUnchangedProfileId() {
         assertEquals("Personal", profileDisplayName("default", listOf(json("name" to "default", "display_name" to "Personal"))))

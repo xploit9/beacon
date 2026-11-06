@@ -62,7 +62,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 internal class NativeAuthException(message: String, val sessionExpired: Boolean = false, cause: Throwable? = null) : IOException(message, cause)
-internal class NativeAuthExpiredException : IOException("Sign-in expired or couldn't be refreshed. Sign in again; your drafts and chats are safe.")
+internal class NativeAuthExpiredException(@Transient internal val retirementAuthority: DeviceRemovalAuthority? = null) : IOException("Sign-in expired or couldn't be refreshed. Sign in again; your drafts and chats are safe.")
 
 class NativeAuth internal constructor(
     baseUrl: String,
@@ -253,7 +253,7 @@ class NativeAuth internal constructor(
                 if (previous != null && (owner != previous.owner || previous.provider.isNotBlank() && provider != previous.provider)) {
                     throw NativeAuthException("Sign-in changed while refreshing. Sign in again.")
                 }
-                if (!json.optString("token_type").equals("Bearer", ignoreCase = true) || access.isBlank() || access.any { it.isWhitespace() || it.isISOControl() } || refresh.isBlank() || owner.isBlank()) {
+                if (!json.optString("token_type").equals("Bearer", ignoreCase = true) || !validNativeBearerToken(access) || refresh.isBlank() || owner.isBlank()) {
                     throw NativeAuthException(GENERIC_ERROR_MESSAGE)
                 }
                 NativeBearerRecord(

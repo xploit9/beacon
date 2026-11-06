@@ -54,6 +54,12 @@ class NativeGatewayProtocolTest {
         var activeListFailure = false
         var replayEpoch = "epoch-a"
         var replayTruncated = false
+        var securePrompts = false
+        var emitReady = true
+        var readyPayload: JSONObject? = json()
+        val opened = CompletableDeferred<Unit>()
+        var capabilityEntered: java.util.concurrent.CountDownLatch? = null
+        var capabilityRelease: java.util.concurrent.CountDownLatch? = null
         var legacyPhotoHistory = false
         var historyProfile = "work"
         var historyMessages = JSONArray()
@@ -78,6 +84,7 @@ class NativeGatewayProtocolTest {
                 override fun cancel() = Unit
                 override fun send(text: String): Boolean {
                     val call = JSONObject(text); sent.add(call)
+                    if (!call.has("method")) return true
                     if (failPrompt && call.getString("method") == "prompt.submit") {
                         listener.onFailure(this, IOException("Lost response"), null); return true
                     }
@@ -115,13 +122,20 @@ class NativeGatewayProtocolTest {
                 }
             }
             listener.onOpen(ws, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Switching Protocols").build())
-            listener.onMessage(ws, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json())).toString())
+            if (emitReady) ready(readyPayload)
+            opened.complete(Unit)
             return ws
         }
+        fun ready(payload: JSONObject?) = listener.onMessage(ws,
+            json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to payload)).toString())
         fun event(session: String, seq: Int) = listener.onMessage(ws, json("method" to "event", "params" to json("session_id" to session, "seq" to seq, "type" to "message.delta", "payload" to json("text" to "x"))).toString())
+        fun secureRequest(id: String, method: String, params: JSONObject) = listener.onMessage(ws,
+            json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to params).toString())
+        fun cancelRequest(id: String, method: String) = listener.onMessage(ws,
+            json("method" to "event", "params" to json("session_id" to "runtime-a", "type" to "request.cancel", "payload" to json("id" to id, "method" to method))).toString())
     }
     /** Synthetic stock dashboard history routes; [historyStatus] fails the native transcript read itself. */
-    private fun client(wire: Wire? = null, voiceStatus: Int = 404, historyStatus: Int = 200, authCookies: List<String> = emptyList(), voiceSetCookie: String? = null, requestCookies: MutableList<Pair<String, String?>>? = null): BeaconClient = BeaconClient(AuthContext("https://native.example", authCookies, "owner", "work", backend = "hermes-dashboard"), null, wire) { builder ->
+    private fun client(wire: Wire? = null, voiceStatus: Int = 404, historyStatus: Int = 200, authCookies: List<String> = emptyList(), voiceSetCookie: String? = null, requestCookies: MutableList<Pair<String, String?>>? = null, authStore: AuthStore? = null): BeaconClient = BeaconClient(AuthContext("https://native.example", authCookies, "owner", "work", backend = "hermes-dashboard"), authStore, wire) { builder ->
         builder.addInterceptor { chain ->
             val voice = chain.request().url.encodedPath.endsWith("/voice-history")
             val path = chain.request().url.encodedPath
@@ -133,7 +147,13 @@ class NativeGatewayProtocolTest {
             requestCookies?.add(path to cookieHeader)
             val history = path == "/api/sessions/stored-a/messages"
             val payload = when {
+                path == CANONICAL_TICKET_PATH -> json("detail" to "Not Found")
                 voice -> json("session_id" to "stored-a", "profile" to "work", "events" to JSONArray())
+                path == "/api/plugins/beacon/mobile/vault/capabilities" -> {
+                    wire?.capabilityEntered?.countDown()
+                    wire?.capabilityRelease?.await(3, java.util.concurrent.TimeUnit.SECONDS)
+                    json("capabilities" to json("secure_prompts" to (wire?.securePrompts == true)))
+                }
                 path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "work", "title" to "Fixture title", "message_count" to 0, "model" to wire?.profileModel,
                     "archived" to if (wire?.savedArchived == true) 1 else 0,
                     "model_config" to json("yolo_mode" to (wire?.savedYolo ?: (wire?.sessionBypass == true))).toString())
@@ -157,10 +177,10 @@ class NativeGatewayProtocolTest {
                 path.startsWith("/api/plugins/beacon/mobile/sessions") -> error("Native history must not use the optional plugin: $path")
                 else -> json("ticket" to "fixture-single-use-ticket")
             }
-            val status = if (voice) voiceStatus else if (history) historyStatus else if (path == "/api/sessions/stored-a") wire?.metadataStatus ?: if (wire?.savedRow == false) 404 else 200 else 200
+            val status = if (path == CANONICAL_TICKET_PATH) 404 else if (voice) voiceStatus else if (history) historyStatus else if (path == "/api/sessions/stored-a") wire?.metadataStatus ?: if (wire?.savedRow == false) 404 else 200 else 200
             val response = Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(status).message("Fixture").apply {
                 if (voice && voiceSetCookie != null) addHeader("Set-Cookie", voiceSetCookie)
-            }.body((if (status == 200) payload else json("detail" to "Fixture failure")).toString().toResponseBody("application/json".toMediaType())).build()
+            }.body((if (status == 200 || path == CANONICAL_TICKET_PATH) payload else json("detail" to "Fixture failure")).toString().toResponseBody("application/json".toMediaType())).build()
             val received = Cookie.parseAll(chain.request().url, response.headers)
             if (received.isNotEmpty()) jar.saveFromResponse(chain.request().url, received)
             response
@@ -192,6 +212,63 @@ class NativeGatewayProtocolTest {
         assertTrue(resumes.single().getJSONObject("params").getBoolean("omit_messages"))
         assertTrue(wire.sent.none { it.string("method") == "config.set" })
         c.closeNative()
+    }
+    @Test fun connectionAuthorityUsesItsReadyCapabilityWithoutAttachingASession() = runBlocking {
+        for (capability in listOf(null, false, true)) {
+            val wire = Wire().apply { readyPayload = json().apply { capability?.let { put("session_authority", it) } } }
+            val c = client(wire)
+            try {
+                repeat(2) { assertEquals(capability == true, c.nativeSessionAuthority()) }
+                assertEquals(1, wire.requests.size)
+                assertEquals(listOf("client.capabilities"), wire.sent.map { it.string("method") })
+                assertEquals(0, c.nativeSessionSnapshot().length())
+            } finally { c.closeNative() }
+        }
+    }
+    @Test fun invalidReadinessCannotSelectALegacyControlPath() = runBlocking {
+        for (payload in listOf(null, json("session_authority" to "false"), json("session_authority" to JSONObject.NULL))) {
+            for (control in listOf("approval", "archive", "stop")) {
+                val wire = Wire().apply { readyPayload = payload }; val c = client(wire)
+                try {
+                    val error = runCatching {
+                        when (control) {
+                            "approval" -> c.get("/api/approval/mode", mapOf("session_id" to "stored-a"))
+                            "archive" -> c.post("/api/session/archive", json("session_id" to "stored-a", "archived" to false))
+                            else -> c.get("/api/chat/cancel", mapOf("stream_id" to "runtime-a"))
+                        }
+                    }.exceptionOrNull()
+                    assertTrue("$control must reject unknown readiness: $error", error is IOException)
+                    assertTrue(wire.sent.none { it.string("method") in setOf("session.resume", "session.create", "session.archive", "session.set_hidden", "session.interrupt") })
+                } finally { c.closeNative() }
+            }
+        }
+    }
+    @Test fun missingReadinessFailsWithoutAttachingOrInterruptingASession() = runBlocking {
+        val wire = Wire().apply { emitReady = false }; val c = client(wire)
+        try {
+            val error = withTimeout(6_000) { runCatching { c.get("/api/chat/cancel", mapOf("stream_id" to "runtime-a")) }.exceptionOrNull() }
+            assertTrue(error is IOException && error.message.orEmpty().contains("readiness"))
+            assertEquals(listOf("client.capabilities"), wire.sent.map { it.string("method") })
+        } finally { c.closeNative() }
+    }
+    @Test fun authorityReadRejectsAConnectionOrIdentityChangedWhileAwaitingReady() = runBlocking {
+        for (change in listOf("connection", "identity")) {
+            val wire = Wire().apply { emitReady = false }; val c = client(wire)
+            try {
+                val pending = async { runCatching { c.nativeSessionAuthority() }.exceptionOrNull() }
+                withTimeout(2_000) { wire.opened.await() }
+                yield()
+                wire.ready(json("session_authority" to true))
+                if (change == "connection") c.closeNative()
+                else {
+                    // Invalidate the same generation used by real identity changes without also closing the socket.
+                    val generation = BeaconClient::class.java.getDeclaredField("scopeGeneration").apply { isAccessible = true }.get(c) as java.util.concurrent.atomic.AtomicLong
+                    generation.incrementAndGet()
+                }
+                assertTrue("$change must invalidate the completed readiness value", withTimeout(2_000) { pending.await() } is IOException)
+                assertEquals(listOf("client.capabilities"), wire.sent.map { it.string("method") })
+            } finally { c.closeNative() }
+        }
     }
     @Test fun profileManualAndAutoCanOnlyBeChangedThroughProfileSettings() = runBlocking {
         val wire = Wire(); val c = client(wire)
@@ -485,6 +562,233 @@ class NativeGatewayProtocolTest {
         assertEquals(1, c.get("/api/sessions/search", mapOf("q" to "Visible title")).getJSONArray("sessions").length())
         assertTrue(wire.sent.none { it.getString("method") == "session.create" })
     }
+    @Test(timeout = 10000) fun aVerifiedSecurePromptUsesItsOriginalSocketOnlyOnce() = runBlocking {
+        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("secure-1", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test", "hint" to "Authenticator"))
+            val shown = withTimeoutOrNull(1500) { prompts.receive() }
+            assertNotNull("A verified, session-bound prompt reaches the secure form", shown)
+            assertFalse(shown.toString().contains("123456"))
+            val marker = shown!!.getJSONObject("params").getString("secure_connection")
+            assertTrue("The form is bound to the delivering socket", marker.isNotBlank())
+            val other = NativeGateway(c.forAuthorizedProfile("other"), wire)
+            try { assertTrue(runCatching { other.answerServerRequest("vault.code", "secure-1", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to marker)) }.isFailure) }
+            finally { other.close() }
+            assertTrue(gateway.answerServerRequest("vault.code", "secure-1", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to marker)).optBoolean("ok"))
+            val answers = wire.sent.filter { !it.has("method") && it.optString("id") == "secure-1" && it.has("result") }
+            assertEquals(1, answers.size)
+            assertEquals("123456", answers.single().getJSONObject("result").getString("value"))
+            assertTrue("The response is single-use", runCatching { gateway.answerServerRequest("vault.code", "secure-1", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to marker)) }.isFailure)
+            wire.secureRequest("secure-1", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+            assertNull("A retired request cannot be reopened", withTimeoutOrNull(250) { prompts.receive() })
+            assertEquals(1, wire.requests.size)
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun securePromptCapabilityMustBeExplicitAndCancellationRetiresTheRequest() = runBlocking {
+        for (allowed in listOf(false, true)) {
+            val wire = Wire().apply { securePrompts = allowed }; val c = client(wire); val gateway = NativeGateway(c, wire)
+            val binding = gateway.session("stored-a")
+            val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+            val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+            try {
+                withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+                wire.secureRequest("secure-cancel", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+                val shown = withTimeoutOrNull(1000) { prompts.receive() }
+                if (allowed) {
+                    assertNotNull("A verified request must reach its own session", shown)
+                    wire.cancelRequest("secure-cancel", "vault.code")
+                } else assertNull("A server without verified secure prompts cannot ask for a secret", shown)
+                val marker = shown?.getJSONObject("params")?.optString("secure_connection").orEmpty()
+                assertTrue(runCatching { gateway.answerServerRequest("vault.code", "secure-cancel", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to marker)) }.isFailure)
+                assertTrue(wire.sent.none { !it.has("method") && it.optString("id") == "secure-cancel" && it.has("result") })
+            } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+        }
+    }
+
+    @Test(timeout = 10000) fun sameIdOnTwoSocketsCanOnlyBeAnsweredOnTheMarkedOriginalSocket() = runBlocking {
+        val firstWire = Wire().apply { securePrompts = true }; val secondWire = Wire().apply { securePrompts = true }
+        val firstClient = client(firstWire); val secondClient = client(secondWire)
+        val first = NativeGateway(firstClient, firstWire); val second = NativeGateway(secondClient, secondWire)
+        val firstBinding = first.session("stored-a"); val secondBinding = second.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val firstCollector = launch { first.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        val secondCollector = launch { second.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (firstWire.sent.none { it.optString("method") == "session.events.since" } || secondWire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            firstWire.secureRequest("shared-id", "vault.code", json("session_id" to firstBinding.runtimeSessionId, "site" to "first.example"))
+            val firstPrompt = withTimeoutOrNull(1500) { prompts.receive() }
+            assertNotNull("The first entitled socket delivers the prompt", firstPrompt)
+            secondWire.secureRequest("shared-id", "vault.code", json("session_id" to secondBinding.runtimeSessionId, "site" to "second.example"))
+            val secondPrompt = withTimeoutOrNull(1500) { prompts.receive() }
+            assertNotNull("The second entitled socket delivers its own prompt", secondPrompt)
+            val firstMarker = firstPrompt!!.getJSONObject("params").getString("secure_connection")
+            val secondMarker = secondPrompt!!.getJSONObject("params").getString("secure_connection")
+            assertNotEquals(firstMarker, secondMarker)
+            val pending = NativeGateway.pendingSecureRequests(firstClient.scope.session("stored-a"), firstClient.nativeAuthorityVersion())
+            assertTrue(pending.any { it.optString("secure_connection") == firstMarker })
+            assertTrue(pending.any { it.optString("secure_connection") == secondMarker })
+            assertTrue("Another profile cannot inspect the prompts", NativeGateway.pendingSecureRequests(firstClient.scope.copy(profile = "other").session("stored-a"), firstClient.nativeAuthorityVersion()).isEmpty())
+            assertTrue(runCatching { first.answerServerRequest("vault.code", "shared-id", firstBinding.runtimeSessionId, json("value" to "123456", "secure_connection" to "wrong")) }.isFailure)
+            assertTrue(second.answerServerRequest("vault.code", "shared-id", firstBinding.runtimeSessionId, json("value" to "123456", "secure_connection" to firstMarker)).optBoolean("ok"))
+            assertEquals(1, firstWire.sent.count { !it.has("method") && it.optString("id") == "shared-id" && it.has("result") })
+            assertEquals(0, secondWire.sent.count { !it.has("method") && it.optString("id") == "shared-id" && it.has("result") })
+            assertTrue(NativeGateway.pendingSecureRequests(firstClient.scope.session("stored-a"), firstClient.nativeAuthorityVersion()).none { it.optString("secure_connection") == firstMarker })
+            assertTrue(first.answerServerRequest("vault.code", "shared-id", secondBinding.runtimeSessionId, json("value" to "654321", "secure_connection" to secondMarker)).optBoolean("ok"))
+            assertEquals(1, secondWire.sent.count { !it.has("method") && it.optString("id") == "shared-id" && it.has("result") })
+        } finally { firstCollector.cancelAndJoin(); secondCollector.cancelAndJoin(); first.close(); second.close(); firstClient.closeNative(); secondClient.closeNative() }
+    }
+
+    @Test(timeout = 15000) fun idlePeersCannotHideOriginalSocketPrompts() = runBlocking {
+        val c = client(Wire().apply { securePrompts = true })
+        val peers = List(160) { Wire().apply { securePrompts = true }.let { wire -> NativeGateway(c, wire) to wire } }
+        val byGateway = peers.toMap()
+        val field = NativeGateway::class.java.getDeclaredField("gateways").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST") val registry = field.get(null) as MutableSet<NativeGateway>
+        // Choose from the actual weak-map order; 158 strongly retained idle peers precede these two.
+        val selected = synchronized(registry) { registry.filter { it in byGateway }.takeLast(2) }
+        val first = selected[0]; val second = selected[1]
+        val firstWire = byGateway.getValue(first); val secondWire = byGateway.getValue(second)
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        var firstCollector: Job? = null; var secondCollector: Job? = null
+        try {
+            val firstBinding = first.session("stored-a"); val secondBinding = second.session("stored-a")
+            firstCollector = launch { first.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+            secondCollector = launch { second.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+            withTimeout(3000) { while (firstWire.sent.none { it.optString("method") == "session.events.since" } || secondWire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            firstWire.secureRequest("crowded-id", "vault.code", json("session_id" to firstBinding.runtimeSessionId, "site" to "first.example"))
+            val firstMarker = withTimeout(1500) { prompts.receive() }.getJSONObject("params").getString("secure_connection")
+            secondWire.secureRequest("crowded-id", "vault.code", json("session_id" to secondBinding.runtimeSessionId, "site" to "second.example"))
+            val secondMarker = withTimeout(1500) { prompts.receive() }.getJSONObject("params").getString("secure_connection")
+            assertNotEquals(firstMarker, secondMarker)
+            assertTrue(synchronized(registry) { registry.take(128).none { it === first || it === second } })
+            val pending = NativeGateway.pendingSecureRequests(c.scope.session("stored-a"), c.nativeAuthorityVersion())
+            assertTrue("idle registry entries must not hide the first original socket", pending.any { it.optString("secure_connection") == firstMarker })
+            assertTrue("idle registry entries must not hide the second original socket", pending.any { it.optString("secure_connection") == secondMarker })
+            assertTrue(NativeGateway.pendingSecureRequests(c.scope.copy(profile = "other").session("stored-a"), c.nativeAuthorityVersion()).isEmpty())
+            assertTrue(runCatching { first.answerServerRequest("vault.code", "crowded-id", firstBinding.runtimeSessionId, json("value" to "123456", "secure_connection" to "wrong")) }.isFailure)
+            assertTrue(second.answerServerRequest("vault.code", "crowded-id", firstBinding.runtimeSessionId, json("value" to "123456", "secure_connection" to firstMarker)).optBoolean("ok"))
+            assertEquals(1, firstWire.sent.count { !it.has("method") && it.optString("id") == "crowded-id" && it.has("result") })
+            assertEquals(0, secondWire.sent.count { !it.has("method") && it.optString("id") == "crowded-id" && it.has("result") })
+            assertTrue(first.answerServerRequest("vault.code", "crowded-id", secondBinding.runtimeSessionId, json("value" to "654321", "secure_connection" to secondMarker)).optBoolean("ok"))
+            assertEquals(1, secondWire.sent.count { !it.has("method") && it.optString("id") == "crowded-id" && it.has("result") })
+        } finally { firstCollector?.cancelAndJoin(); secondCollector?.cancelAndJoin(); peers.forEach { it.first.close() }; c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun anAlreadyExpiredServerPromptIsNeverPresentedOrAnswered() = runBlocking {
+        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("expired", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test", "expires_at_ms" to System.currentTimeMillis() - 1))
+            assertNull(withTimeoutOrNull(500) { prompts.receive() })
+            assertTrue(runCatching { gateway.answerServerRequest("vault.code", "expired", binding.runtimeSessionId,
+                json("value" to "123456", "secure_connection" to "stale")) }.isFailure)
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun closingTheOriginalSocketRemovesItsPendingSecurePrompt() = runBlocking {
+        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { try { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } } catch (_: IOException) { } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("closed-socket", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+            val marker = withTimeout(3000) { prompts.receive() }.getJSONObject("params").getString("secure_connection")
+            gateway.close()
+            assertTrue(NativeGateway.pendingSecureRequests(c.scope.session("stored-a"), c.nativeAuthorityVersion()).isEmpty())
+            assertTrue(runCatching { gateway.answerServerRequest("vault.code", "closed-socket", binding.runtimeSessionId,
+                json("value" to "123456", "secure_connection" to marker)) }.isFailure)
+            assertTrue(wire.sent.none { !it.has("method") && it.optString("id") == "closed-socket" && it.has("result") })
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun anUnverifiedSavedAuthorityCannotExposeASecurePrompt() = runBlocking {
+        val prefs = java.lang.reflect.Proxy.newProxyInstance(android.content.SharedPreferences::class.java.classLoader,
+            arrayOf(android.content.SharedPreferences::class.java)) { _, method, args ->
+            if (method.name == "getString") args!![1] else error("Unexpected preference operation")
+        } as android.content.SharedPreferences
+        val store = AuthStore(object : android.content.ContextWrapper(null) {
+            override fun getSharedPreferences(name: String, mode: Int) = prefs
+        }, AppCipher())
+        val wire = Wire().apply { securePrompts = true }; val c = client(wire, authStore = store); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("old-epoch", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+            withTimeout(3000) { while (wire.sent.none { it.optString("id") == "old-epoch" && it.has("error") }) yield() }
+            assertNull(withTimeoutOrNull(100) { prompts.receive() })
+            val marker = "unavailable"
+            val old = c.nativeAuthorityVersion()
+            assertTrue(NativeGateway.pendingSecureRequests(c.scope.session("stored-a"), old).isEmpty())
+            store.authorityEpoch.mutate {
+                assertNull(c.nativeAuthorityVersion())
+                assertTrue(NativeGateway.pendingSecureRequests(c.scope.session("stored-a"), c.nativeAuthorityVersion()).isEmpty())
+                assertTrue(runCatching { gateway.answerServerRequest("vault.code", "old-epoch", binding.runtimeSessionId,
+                    json("value" to "123456", "secure_connection" to marker)) }.isFailure)
+            }
+            assertTrue(NativeGateway.pendingSecureRequests(c.scope.session("stored-a"), c.nativeAuthorityVersion()).isEmpty())
+            assertTrue(runCatching { gateway.answerServerRequest("vault.code", "old-epoch", binding.runtimeSessionId,
+                json("value" to "123456", "secure_connection" to marker)) }.isFailure)
+            assertTrue(wire.sent.none { !it.has("method") && it.optString("id") == "old-epoch" && it.has("result") })
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun cancellationWhileCheckingSecureCapabilityCannotResurrectThePrompt() = runBlocking {
+        val entered = java.util.concurrent.CountDownLatch(1); val release = java.util.concurrent.CountDownLatch(1)
+        val wire = Wire().apply { securePrompts = true; capabilityEntered = entered; capabilityRelease = release }
+        val c = client(wire); val gateway = NativeGateway(c, wire); val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("cancel-probe", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+            assertTrue(withTimeoutOrNull(3000) { while (entered.count != 0L) delay(10); true } == true)
+            wire.cancelRequest("cancel-probe", "vault.code"); release.countDown()
+            assertNull("A cancelled prompt is not presented after the capability returns", withTimeoutOrNull(500) { prompts.receive() })
+            assertTrue(runCatching { gateway.answerServerRequest("vault.code", "cancel-probe", binding.runtimeSessionId,
+                json("value" to "123456", "secure_connection" to "stale")) }.isFailure)
+        } finally { release.countDown(); collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun eachVerifiedSecureMethodSendsOnlyItsValueAndDropsUnknownPromptFields() = runBlocking {
+        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val methods = listOf("vault.save_login", "vault.code", "vault.unlock_prompt", "secret")
+        val collector = launch { gateway.events { if (it.optString("method") in methods) prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            methods.forEachIndexed { index, method ->
+                val params = json("session_id" to binding.runtimeSessionId, "private" to "private-canary")
+                when (method) {
+                    "vault.save_login" -> params.put("origin", "https://example.test").put("site", "example.test")
+                    "vault.code" -> params.put("site", "example.test")
+                    "vault.unlock_prompt" -> params.put("backend", "manager").put("display_name", "Manager")
+                    else -> params.put("env_var", "API_TOKEN").put("prompt", "Enter the token")
+                }
+                val id = "secure-$index"; wire.secureRequest(id, method, params)
+                val shown = withTimeout(3000) { prompts.receive() }
+                assertFalse(shown.toString().contains("private-canary"))
+                val marker = shown.getJSONObject("params").getString("secure_connection")
+                val value = if (method == "vault.save_login") json("identifier" to "test" + 64.toChar() + "example.test", "password" to "synthetic-password").toString() else "synthetic-value"
+                assertTrue(gateway.answerServerRequest(method, id, binding.runtimeSessionId, json("value" to value, "secure_connection" to marker)).optBoolean("ok"))
+                val result = wire.sent.single { !it.has("method") && it.optString("id") == id && it.has("result") }.getJSONObject("result")
+                assertEquals(setOf("value"), result.keys().asSequence().toSet())
+                assertEquals(value, result.getString("value"))
+            }
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
     @Test fun ticketAdmissionAndSessionIdentitiesAreSeparate() = runBlocking<Unit> {
         val wire = Wire(); val gateway = NativeGateway(client(), wire)
         val binding = gateway.session(null)
@@ -822,9 +1126,10 @@ class NativeGatewayProtocolTest {
         val redirected = Wire()
         val redirectClient = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "work", backend = "hermes-dashboard"), null, redirected) { builder ->
             builder.addInterceptor { chain ->
-                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(302).message("Found")
+                val missing = chain.request().url.encodedPath == CANONICAL_TICKET_PATH
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(if (missing) 404 else 302).message("Found")
                     .addHeader("Location", "https://other.example/api/auth/ws-ticket")
-                    .body(json("detail" to "Redirect").toString().toResponseBody("application/json".toMediaType())).build()
+                    .body(json("detail" to if (missing) "Not Found" else "Redirect").toString().toResponseBody("application/json".toMediaType())).build()
             }
         }
         assertTrue(runCatching { NativeGateway(redirectClient, redirected).rpc("session.create", JSONObject()) }.isFailure)
@@ -833,8 +1138,9 @@ class NativeGatewayProtocolTest {
         val injected = Wire()
         val blankTicket = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "work", backend = "hermes-dashboard"), null, injected) { builder ->
             builder.addInterceptor { chain ->
-                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                    .body(json("ticket" to "bad ticket").toString().toResponseBody("application/json".toMediaType())).build()
+                val missing = chain.request().url.encodedPath == CANONICAL_TICKET_PATH
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(if (missing) 404 else 200).message("Fixture")
+                    .body((if (missing) json("detail" to "Not Found") else json("ticket" to "bad ticket")).toString().toResponseBody("application/json".toMediaType())).build()
             }
         }
         assertTrue(runCatching { NativeGateway(blankTicket, injected).rpc("session.create", JSONObject()) }.isFailure)

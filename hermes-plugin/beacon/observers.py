@@ -130,7 +130,7 @@ def prune_meta(conn, now):
             conn.execute("DELETE FROM meta WHERE key=?", (key,))
 
 
-# Hermes' on_session_end hook passes no turn_id; that call has no turn to report and returns quietly.
+# Session-boundary cleanup has no turn_id; only the native per-turn finalizer can report a completion.
 def completion(mobile, native, cfg, profile, session_id, turn_id=None, completed=False, failed=False,
                interrupted=False, job_id=None, **kwargs):
     if (completed is not True and failed is not True) or interrupted or not session_id or not turn_id:
@@ -138,7 +138,9 @@ def completion(mobile, native, cfg, profile, session_id, turn_id=None, completed
     owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
     if not owner or not provider or not _profile_allowed(cfg,profile):
         return
-    row = native.verify(owner, provider, profile, session_id)
+    principal = native.current_principal(owner, provider, profile, session_id)
+    row = (native.verify(owner, provider, profile, session_id, None, True, principal) if principal
+           else native.verify(owner, provider, profile, session_id))
     kind = "failure" if failed is True else ("task_result" if row.get("source") == "cron" else "completion")
     key = "completion:" + owner + ":" + profile + ":" + session_id + ":" + str(turn_id)
     now = time.time()
@@ -152,9 +154,9 @@ def completion(mobile, native, cfg, profile, session_id, turn_id=None, completed
         # The owner is on a call in this conversation: the reply is spoken and shown there, so it is not also an alert.
         if kind != "task_result" and mobile.call_open_on(conn, owner, profile, session_id):
             return
-        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id) VALUES(?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,principal) VALUES(?,?,?,?,?,?,?,?,?)",
                      (uuid.uuid4().hex, owner, profile, kind, session_id, now, now + 86400,
-                      job_id if isinstance(job_id, str) and mobile.ID.fullmatch(job_id) else ""))
+                      job_id if isinstance(job_id, str) and mobile.ID.fullmatch(job_id) else "", principal or ""))
 
 
 def _digest(value):
@@ -466,7 +468,7 @@ def _take_run_slot(conn, owner, profile, session_id):
     conn.execute("UPDATE meta SET value=? WHERE key=?", (json.dumps(record, separators=(",", ":")).encode(), key))
 
 
-def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False, source="email", *, conn=None, run_session=None):
+def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_alert=False, source="email", *, conn=None, run_session=None,principal=''):
     from contextlib import nullcontext
     with mobile.LOCK, (mobile.connect() if conn is None else nullcontext(conn)) as conn:
         prune_meta(conn, now.timestamp())
@@ -478,9 +480,9 @@ def _notice(mobile, owner, profile, conversation, reason, alert_key, now, email_
         if run_session:
             _take_run_slot(conn, owner, profile, run_session)
         event = uuid.uuid4().hex
-        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason,principal) VALUES(?,?,?,?,?,?,?,?,?)",
                      (event, owner, profile, "task_result", conversation, now.timestamp(),
-                      now.timestamp() + 86400, reason[:240]))
+                      now.timestamp() + 86400, reason[:240],principal))
         conn.execute("INSERT INTO meta(key,value) VALUES(?,?)", (alert_key, str(now.timestamp()).encode()))
         if email_alert:
             conn.execute("INSERT INTO meta(key,value) VALUES(?,?)",

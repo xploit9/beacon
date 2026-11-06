@@ -33,6 +33,8 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -93,7 +95,9 @@ class VoiceConnectTest {
         }
 
     private inner class Call(val provider: Provider = Provider(), admission: Deferred<JSONObject>? = null, prefetched: JSONObject? = null,
-        warm: LiveSession? = null, val client: BeaconClient = client(), streamsMicrophone: Boolean = true, now: () -> Long = { 50_400L }) {
+        warm: LiveSession? = null, val client: BeaconClient = client(), streamsMicrophone: Boolean = true, now: () -> Long = { 50_400L },
+        microphoneMuted: () -> Boolean = { false },
+        onEvent: (JSONObject) -> Unit = {}) {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val events = CopyOnWriteArrayList<JSONObject>()
         val audio = CopyOnWriteArrayList<ByteArray>()
@@ -101,8 +105,9 @@ class VoiceConnectTest {
         lateinit var voice: DirectVoice
         init {
             voice = DirectVoice(client, if (admission == null) "call" else "", "stored", scope, { bytes -> audio += bytes; voice.played(bytes.size) },
-                { events += it }, { failure.complete(it) }, gemini, providerSocketFactory = provider, clock = now, tappedAt = 50_000L,
-                warm = warm, prefetched = prefetched, admission = admission, streamsMicrophone = streamsMicrophone)
+                { events += it; onEvent(it) }, { failure.complete(it) }, gemini, providerSocketFactory = provider, clock = now, tappedAt = 50_000L,
+                warm = warm, prefetched = prefetched, admission = admission, streamsMicrophone = streamsMicrophone,
+                microphoneMuted = microphoneMuted)
         }
         fun states() = events.filter { it.optString("type") == "state" }.map { it.getString("state") }
         fun stage(name: String) = events.filter { it.optString("type") == "media_diagnostic" && it.optString("stage") == name }
@@ -117,6 +122,365 @@ class VoiceConnectTest {
     }
 
     private suspend fun waitFor(predicate: () -> Boolean): Boolean = withTimeoutOrNull(3000) { while (!predicate()) delay(10); true } == true
+
+    @Test fun aCallMutedBeforeSetupConnectsWithoutPretendingItsMicrophoneStreamed() = runBlocking {
+        val c = Call(microphoneMuted = { true })
+        try {
+            c.voice.start()
+            assertTrue(waitFor { "listening" in c.states() })
+            assertTrue(c.stage("mic_streaming").isEmpty())
+            assertTrue(c.provider.frames.none { it.optJSONObject("realtimeInput")?.has("audio") == true })
+            c.provider.receive(greetingAudio())
+            assertTrue(waitFor { c.audio.size == 1 })
+            assertFalse(c.failure.isCompleted)
+        } finally { c.close() }
+    }
+
+    @Test fun mutingAnAdmittedCallReleasesItsHeldGreetingAndUnmuteStillSendsRealFrames() = runBlocking {
+        val muted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val c = Call(microphoneMuted = muted::get)
+        try {
+            c.voice.start()
+            assertTrue(waitFor { c.stage("provider_ready").isNotEmpty() })
+            assertFalse("Unmuted startup still waits for the microphone", "listening" in c.states())
+            c.provider.receive(greetingAudio())
+            assertTrue(c.audio.isEmpty())
+            muted.set(true); c.voice.microphoneModeChanged()
+            assertTrue(waitFor { c.audio.size == 1 })
+            assertTrue(c.stage("mic_streaming").isEmpty())
+            muted.set(false); c.voice.microphoneModeChanged(); c.microphone()
+            assertTrue(waitFor { c.stage("mic_streaming").size == 1 })
+            assertEquals(1, c.audio.size)
+            c.voice.close()
+            val count = c.events.size
+            muted.set(true); c.voice.microphoneModeChanged()
+            assertEquals("A closed call cannot reconnect", count, c.events.size)
+        } finally { c.close() }
+    }
+
+    @Test fun mutingDoesNotBypassTheHermesAdmission() = runBlocking {
+        val admission = CompletableDeferred<JSONObject>()
+        val c = Call(admission = admission, prefetched = context, microphoneMuted = { true })
+        try {
+            c.voice.start()
+            assertTrue(waitFor { c.provider.sockets.isNotEmpty() })
+            assertTrue(c.states().none { it in setOf("listening", "speaking") })
+            assertTrue(c.audio.isEmpty())
+            admission.complete(json("call_id" to "call", "conversation_id" to "stored", "profile" to "default"))
+            assertTrue(waitFor { "listening" in c.states() })
+            assertTrue(c.stage("mic_streaming").isEmpty())
+        } finally { c.close() }
+    }
+
+    private fun lookupClient(discover: () -> Pair<Int, JSONObject>, invocations: MutableList<JSONObject>) =
+        BeaconClient(AuthContext("https://voice-fixture.invalid", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
+            builder.addInterceptor { chain ->
+                val request = chain.request()
+                val (code, body) = when {
+                    request.url.encodedPath.endsWith("/context") -> 200 to context
+                    request.url.encodedPath.endsWith("/tools") -> discover()
+                    request.url.encodedPath.endsWith("/tools/invoke") -> {
+                        val buffer = okio.Buffer(); request.body!!.writeTo(buffer)
+                        val invocation = JSONObject(buffer.readUtf8()); invocations += invocation
+                        200 to json("request_id" to invocation.getString("request_id"), "tool_id" to invocation.getString("tool_id"),
+                            "tool_name" to "get_weather", "status" to "completed")
+                    }
+                    else -> 200 to json("jobs" to JSONArray())
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(code).message("Fixture")
+                    .body(body.toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+
+    private fun invokeWeather(c: Call) = c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
+        json("id" to "invoke-weather", "name" to "invoke_tool", "args" to json("tool_id" to "get_weather", "arguments" to "{}"))))))
+
+    private class ContinuationNative : WebSocket.Factory {
+        val methods=CopyOnWriteArrayList<String>()
+        val prompts=CopyOnWriteArrayList<JSONObject>()
+        val controls=CopyOnWriteArrayList<Pair<String,JSONObject>>()
+        var cancelState="queued"
+        var inlineStatus:String?=null
+        var callbackConsent="unset"
+        var completedReply=""
+        val inlineInvocations=CopyOnWriteArrayList<JSONObject>()
+        var accepted:()->Unit={}
+        override fun newWebSocket(request:okhttp3.Request,listener:WebSocketListener):WebSocket {
+            val socket=object:WebSocket {
+                override fun request()=request
+                override fun queueSize()=0L
+                override fun cancel()=Unit
+                override fun close(code:Int,reason:String?)=true
+                override fun send(bytes:ByteString)=false
+                override fun send(text:String):Boolean {
+                    val frame=JSONObject(text);val method=frame.getString("method");methods+=method
+                    val params=frame.getJSONObject("params")
+                    val result=when(method) {
+                        "session.resume" -> json("session_id" to "stored","stored_session_id" to "stored","messages" to JSONArray(),
+                            "running" to true,"info" to json("desktop_protocol" to "hermes-gateway-v1","lazy" to true))
+                        "session.events.since" -> json("epoch" to "fixture-epoch","latest_seq" to 0,"events" to JSONArray())
+                        "prompt.submit" -> {
+                            prompts+=params;accepted()
+                            json("status" to "queued","admission_id" to "native-admission","ref" to json("session_id" to "stored"))
+                        }
+                        "prompt.receipt" -> json("status" to cancelState,"admission_id" to "native-admission",
+                            "ref" to json("session_id" to "stored"),"execution_generation" to 17)
+                        "prompt.cancel","session.interrupt" -> {
+                            controls+=method to params
+                            json("status" to "terminal","outcome" to "cancelled")
+                        }
+                        else -> JSONObject()
+                    }
+                    listener.onMessage(this,json("jsonrpc" to "2.0","id" to frame.getString("id"),"result" to result).toString())
+                    return true
+                }
+            }
+            listener.onOpen(socket,Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+            listener.onMessage(socket,json("jsonrpc" to "2.0","method" to "event","params" to json("type" to "gateway.ready","payload" to json("session_authority" to true))).toString())
+            return socket
+        }
+    }
+
+    private fun continuationClient(native:ContinuationNative,preparations:MutableList<JSONObject>,posts:MutableList<String>)=
+        BeaconClient(AuthContext("https://voice-fixture.invalid",emptyList(),"owner","default",backend="hermes-dashboard"),null,native) { builder ->
+            builder.addInterceptor { chain ->
+                val request=chain.request();val path=request.url.encodedPath
+                val result=when {
+                    path=="/api/plugins/beacon/mobile/gateway-ticket" -> json("detail" to "Not Found")
+                    path=="/api/auth/ws-ticket" -> json("ticket" to "synthetic-ticket")
+                    path.endsWith("/context") -> context
+                    path.endsWith("/tools/invoke") || path.contains("/tools/requests/") -> {
+                        if(path.endsWith("/tools/invoke")) {
+                            val buffer=okio.Buffer();request.body!!.writeTo(buffer);native.inlineInvocations+=JSONObject(buffer.readUtf8())
+                        }
+                        val admitted=native.inlineInvocations.single()
+                        json("request_id" to admitted.getString("request_id"),"tool_id" to admitted.getString("tool_id"),
+                            "tool_name" to "synthetic_action","status" to native.inlineStatus).apply {
+                            if(native.inlineStatus=="needs_approval") put("proposal",json("id" to "p".repeat(40),"tool_name" to "synthetic_action","arguments" to admitted.getJSONObject("arguments")))
+                            if(native.inlineStatus=="completed") put("result",json("text" to "Synthetic original result"))
+                        }
+                    }
+                    path.endsWith("/work") -> {
+                        val buffer=okio.Buffer();request.body!!.writeTo(buffer);preparations+=JSONObject(buffer.readUtf8());posts+=path
+                        val body=preparations.last()
+                        native.callbackConsent=if(body.optBoolean("callback")) "requested" else if(body.has("callback")) "declined" else native.callbackConsent
+                        if(body.has("tool_request_id")) {
+                            val transfer=native.inlineStatus=="needs_approval"
+                            if(transfer) native.inlineStatus="transferred"
+                            json("status" to if(transfer) "prepared" else "following","job_id" to "durable-job","continuation" to true,
+                                "submit" to transfer,"native_transfer" to transfer,"request_id" to body.getString("request_id"),
+                                "text" to "Continue the exact original receipt","callback_consent" to native.callbackConsent)
+                        } else json("status" to "prepared","job_id" to "durable-job","continuation" to true,"submit" to true,"callback_consent" to native.callbackConsent)
+                    }
+                    path.endsWith("/callback") -> {
+                        val buffer=okio.Buffer();request.body!!.writeTo(buffer);val body=JSONObject(buffer.readUtf8());posts+=path
+                        native.callbackConsent=if(body.optBoolean("enabled",true)) "requested" else "declined"
+                        json("subscribed" to body.optBoolean("enabled",true))
+                    }
+                    path.endsWith("/calls/call")&&request.method=="GET" -> json("jobs" to JSONArray().apply {
+                        if(preparations.isNotEmpty()) put(json("job_id" to "durable-job","request_id" to preparations.first().getString("request_id"),
+                            "stored_session_id" to "stored","runtime_session_id" to "stored","status" to if(native.completedReply.isNotBlank()) "done" else "working",
+                            "result" to native.completedReply,"callback_consent" to native.callbackConsent).apply {
+                            if(native.prompts.isNotEmpty()) put("admission_id","native-admission")
+                            preparations.first().optString("tool_request_id").takeIf(String::isNotBlank)?.let { put("tool_request_id",it) }
+                        })
+                    })
+                    else -> { if(request.method=="POST") posts+=path;json("jobs" to JSONArray()) }
+                }
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if(path=="/api/plugins/beacon/mobile/gateway-ticket") 404 else 200).message("Fixture")
+                    .body(result.toString().toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+
+    private fun handOffDraft(c:Call)=c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
+        json("id" to "draft-once","name" to "hermes_work","args" to json("text" to "Prepare a synthetic draft only","callback" to true))))))
+
+    private fun adaptiveTool(c:Call,id:String,name:String,args:JSONObject)=c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
+        json("id" to id,"name" to name,"args" to args)))))
+
+    private suspend fun adaptiveResult(c:Call,name:String):JSONObject {
+        fun responses()=c.provider.frames.mapNotNull { it.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.optJSONObject(0) }
+        assertTrue(waitFor { responses().any { it.optString("name")==name } })
+        return responses().last { it.optString("name")==name }.getJSONObject("response")
+    }
+
+    @Test(timeout=10000) fun adaptiveQuickProtectedWorkFinishesInTheCallWithoutCallbackOffer()=runBlocking {
+        val native=ContinuationNative();val prepared=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+        val c=Call(client=continuationClient(native,prepared,posts))
+        try {
+            c.voice.start();c.microphone()
+            adaptiveTool(c,"quick-native","hermes_work",json("text" to "Synthetic protected quick read","mode" to "inline"))
+            val receipt=adaptiveResult(c,"hermes_work")
+            assertEquals("inline",receipt.getString("work_mode"));assertFalse(receipt.optString("message").contains("offer"))
+            native.completedReply="Synthetic protected result"
+            assertTrue(withTimeoutOrNull(6000) { while(c.provider.frames.none { it.toString().contains("Verified update from Hermes")&&it.toString().contains(native.completedReply) }) delay(10);true }==true)
+            assertEquals(1,native.prompts.size);assertEquals("unset",native.callbackConsent)
+            assertTrue(posts.none { it.endsWith("/callback") })
+        } finally { c.close() }
+    }
+
+    @Test(timeout=10000) fun adaptiveOverrunFollowNeverDispatchesTheOriginalActionAgain()=runBlocking {
+        val native=ContinuationNative().apply { inlineStatus="running" }
+        val prepared=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+        val c=Call(client=continuationClient(native,prepared,posts))
+        try {
+            c.voice.start();c.microphone()
+            adaptiveTool(c,"quick-action","invoke_tool",json("tool_id" to "a".repeat(64),"arguments" to "{\"query\":\"synthetic\"}"))
+            val original=adaptiveResult(c,"invoke_tool")
+            assertTrue(prepared.isEmpty());assertTrue(native.prompts.isEmpty())
+            adaptiveTool(c,"follow-existing","hermes_follow",json("request_id" to original.getString("request_id"),"callback" to true))
+            val followed=adaptiveResult(c,"hermes_follow")
+            assertEquals("requested",followed.getString("callback_consent"));assertEquals(1,native.inlineInvocations.size)
+            assertTrue(native.prompts.isEmpty());assertEquals(original.getString("request_id"),prepared.single().getString("tool_request_id"))
+            adaptiveTool(c,"decline-callback","hermes_callback",json("enabled" to false))
+            assertFalse(adaptiveResult(c,"hermes_callback").getBoolean("subscribed"));assertEquals("declined",native.callbackConsent)
+            assertEquals(1,native.inlineInvocations.size)
+        } finally { c.close() }
+    }
+
+    @Test(timeout=10000) fun adaptivePendingProposalTransfersOnlyItsReceiptIntoNativeConversation()=runBlocking {
+        val native=ContinuationNative().apply { inlineStatus="needs_approval" }
+        val prepared=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+        val c=Call(client=continuationClient(native,prepared,posts))
+        try {
+            c.voice.start();c.microphone()
+            adaptiveTool(c,"pending-action","invoke_tool",json("tool_id" to "a".repeat(64),"arguments" to "{\"query\":\"synthetic\"}"))
+            val original=adaptiveResult(c,"invoke_tool")
+            adaptiveTool(c,"transfer-pending","hermes_follow",json("request_id" to original.getString("request_id")))
+            assertEquals("queued",adaptiveResult(c,"hermes_follow").getString("status"))
+            assertEquals(1,native.inlineInvocations.size);assertEquals(1,native.prompts.size)
+            assertEquals("Continue the exact original receipt",native.prompts.single().getString("text"))
+            assertEquals("stored",native.prompts.single().getString("session_id"))
+            assertEquals("transferred",native.inlineStatus)
+            assertEquals(0,c.voice.close().notSent)
+        } finally { c.close() }
+    }
+
+    @Test(timeout=12000) fun nativeQueuedWorkKeepsItsDurableCallbackWhenHangupRacesTheAdmissionReceipt()=runBlocking {
+        val native=ContinuationNative();val preparations=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+        val c=Call(client=continuationClient(native,preparations,posts))
+        var unsent=-1
+        native.accepted={unsent=c.voice.close().notSent}
+        try {
+            c.voice.start();c.microphone();handOffDraft(c)
+            assertTrue(waitFor { native.prompts.size==1 })
+            assertTrue(c.voice.settleAcceptedWork())
+            assertEquals(0,unsent);assertEquals(1,preparations.size)
+            assertEquals(preparations.single().getString("request_id"),native.prompts.single().getString("submission_id"))
+            assertEquals("stored",native.prompts.single().getString("session_id"))
+            assertTrue(preparations.single().getBoolean("callback"))
+            assertTrue(posts.none { it.endsWith("/jobs") })
+            assertTrue(native.methods.none { it in setOf("session.interrupt","prompt.cancel","approval.respond","approval.pending","session.active_list") })
+        } finally { c.close() }
+    }
+
+    @Test(timeout=12000) fun duplicateQueuedNativeFunctionDoesNotResubmitOrLoseItsCallbackPromise()=runBlocking {
+        val native=ContinuationNative();val preparations=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+        val c=Call(client=continuationClient(native,preparations,posts))
+        try {
+            c.voice.start();c.microphone();handOffDraft(c)
+            val result=invocationResult(c)
+            assertEquals("queued",result.getString("status"));assertEquals("scheduled",result.getString("callback"))
+            assertEquals("durable-job",result.getString("job_id"))
+            handOffDraft(c)
+            assertTrue(waitFor { c.provider.frames.count { it.has("toolResponse") }>=2 })
+            assertEquals(1,native.prompts.size);assertEquals(1,preparations.size)
+        } finally { c.close() }
+    }
+
+    @Test(timeout=18000) fun explicitCancelUsesExactAdmissionOrGenerationAndNeverStopsNewerWork()=runBlocking {
+        for(state in listOf("queued","started","terminal")) {
+            val native=ContinuationNative().apply { cancelState=state }
+            val preparations=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+            val c=Call(client=continuationClient(native,preparations,posts))
+            try {
+                c.voice.start();c.microphone();handOffDraft(c);invocationResult(c)
+                c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
+                    json("id" to "cancel-exact","name" to "hermes_cancel","args" to json("job_id" to "durable-job"))))))
+                assertTrue(waitFor { c.provider.frames.count { it.has("toolResponse") }>=2 })
+                assertEquals(1,native.methods.count { it=="prompt.receipt" })
+                when(state) {
+                    "queued" -> {
+                        assertEquals("prompt.cancel",native.controls.single().first)
+                        assertEquals("native-admission",native.controls.single().second.getString("admission_id"))
+                    }
+                    "started" -> {
+                        assertEquals("session.interrupt",native.controls.single().first)
+                        assertEquals(17,native.controls.single().second.getInt("execution_generation"))
+                    }
+                    else -> assertTrue(native.controls.isEmpty())
+                }
+                assertEquals(1,native.prompts.size)
+            } finally { c.close() }
+        }
+    }
+
+    private suspend fun invocationResult(c: Call): JSONObject {
+        assertTrue("The model receives the tool result", waitFor { c.provider.frames.any { it.has("toolResponse") } })
+        return c.provider.frames.first { it.has("toolResponse") }.getJSONObject("toolResponse")
+            .getJSONArray("functionResponses").getJSONObject(0).getJSONObject("response")
+    }
+
+    @Test(timeout = 18000) fun nameLookupWaitsForAValidCatalogueBeyondTheOldEightSecondDeadline() = runBlocking {
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val invocations = CopyOnWriteArrayList<JSONObject>()
+        val client = lookupClient({
+            entered.countDown(); check(release.await(12, TimeUnit.SECONDS))
+            200 to json("tools" to JSONArray().put(json("name" to "get_weather", "tool_id" to "a".repeat(64))))
+        }, invocations)
+        val c = Call(client = client, streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); invokeWeather(c)
+            assertTrue("The catalogue request started", withTimeoutOrNull(3000) { while (entered.count != 0L) delay(10); true } == true)
+            delay(8300); release.countDown()
+            val result = invocationResult(c)
+            assertEquals("completed", result.getString("status"))
+            assertEquals("The resolved identity, not a false no-match, is submitted", "a".repeat(64), invocations.single().getString("tool_id"))
+        } finally { release.countDown(); c.close() }
+    }
+
+    @Test(timeout = 10000) fun failedNameLookupIsNotReportedAsAConfirmedMissingTool() = runBlocking {
+        for ((code, body) in listOf(503 to json("detail" to "Temporarily unavailable"), 200 to json("status" to "unavailable"))) {
+            val invocations = CopyOnWriteArrayList<JSONObject>()
+            val c = Call(client = lookupClient({ code to body }, invocations), streamsMicrophone = false)
+            try {
+                c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); invokeWeather(c)
+                val result = invocationResult(c)
+                assertTrue("An unverified lookup must be unavailable or not sent: $result", result.optString("status") in setOf("unavailable", "not_sent"))
+                assertFalse(result.toString().contains("no tool named", ignoreCase = true))
+                assertEquals("hermes_work", result.optString("fallback_tool"))
+                assertTrue("Lookup failure never invokes a tool", invocations.isEmpty())
+            } finally { c.close() }
+        }
+    }
+
+    @Test(timeout = 10000) fun aSuccessfulEmptyCatalogueReallyIsANoMatch() = runBlocking {
+        val invocations = CopyOnWriteArrayList<JSONObject>()
+        val c = Call(client = lookupClient({ 200 to json("tools" to JSONArray()) }, invocations), streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); invokeWeather(c)
+            val result = invocationResult(c)
+            assertEquals("failed", result.getString("status"))
+            assertTrue(result.toString().contains("no tool named", ignoreCase = true))
+            assertTrue(invocations.isEmpty())
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 10000) fun endingTheCallCancelsAnUnfinishedNameLookupWithoutInvoking() = runBlocking {
+        val entered = CountDownLatch(1); val release = CountDownLatch(1)
+        val invocations = CopyOnWriteArrayList<JSONObject>()
+        val c = Call(client = lookupClient({
+            entered.countDown(); check(release.await(5, TimeUnit.SECONDS))
+            200 to json("tools" to JSONArray().put(json("name" to "get_weather", "tool_id" to "a".repeat(64))))
+        }, invocations), streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); invokeWeather(c)
+            assertTrue(withTimeoutOrNull(3000) { while (entered.count != 0L) delay(10); true } == true)
+            c.voice.close(); release.countDown(); delay(200)
+            assertTrue(invocations.isEmpty())
+            assertTrue(c.provider.frames.none { it.has("toolResponse") })
+        } finally { release.countDown(); c.scope.cancel(); c.client.closeNative() }
+    }
 
     @Test fun noPhoneGreetingPathRemainsInTheApp() {
         val root = listOf("src/main/java/dev/hermes/android", "app/src/main/java/dev/hermes/android", "beacon-android/app/src/main/java/dev/hermes/android")
@@ -191,6 +555,66 @@ class VoiceConnectTest {
             assertEquals(1, c.stage("context_ok").size); assertEquals(true, c.stage("context_ok").single().getBoolean("warm"))
             admission.complete(json("call_id" to "admitted-call", "conversation_id" to "stored"))
             assertTrue(waitFor { "speaking" in c.states() && c.audio.size == 1 })
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 10000) fun aFinishedGreetingPlaysOnceAfterDelayedAdmission() = runBlocking {
+        val admission = CompletableDeferred<JSONObject>()
+        val c = Call(admission = admission, prefetched = context)
+        try {
+            c.voice.start(); assertTrue(waitFor { c.provider.cues().size == 1 }); c.microphone()
+            c.provider.receive(greetingAudio()); c.provider.receive(greetingWords("Hello, Maya.")); c.provider.receive(greetingDone())
+            assertTrue(c.audio.isEmpty())
+            admission.complete(json("call_id" to "admitted-call", "conversation_id" to "stored"))
+            assertTrue("A finished greeting is retained until the call connects", waitFor { c.audio.size == 1 })
+            assertArrayEquals(greetingPcm, c.audio.single())
+            assertTrue(waitFor { c.events.count { it.optString("type") == "transcript" && it.optString("text") == "Hello, Maya." } == 1 })
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 10000) fun aFinishedGreetingIsNotCaptionedBeforeItsAudioCanPlay() = runBlocking {
+        val admission = CompletableDeferred<JSONObject>()
+        val c = Call(admission = admission, prefetched = context)
+        try {
+            c.voice.start(); assertTrue(waitFor { c.provider.cues().size == 1 }); c.microphone()
+            c.provider.receive(greetingAudio()); c.provider.receive(greetingWords("Hello, Maya.")); c.provider.receive(greetingDone())
+            assertTrue("A greeting cannot be shown before it is heard", c.events.none { it.optString("type") == "transcript" && it.optString("role") == "assistant" })
+            admission.complete(json("call_id" to "admitted-call", "conversation_id" to "stored"))
+            assertTrue(waitFor { c.audio.size == 1 && c.events.any { it.optString("type") == "transcript" && it.optString("text") == "Hello, Maya." } })
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 10000) fun aWarmGreetingFinishedBeforeHandoffStillPlaysAfterAdmission() = runBlocking {
+        val provider = Provider()
+        val warm = LiveSession(Scope("https://voice-fixture.invalid", "owner", "default", session = "stored"), gemini, context, provider) { 49_000L }
+        assertTrue(waitFor { warm.setupAt >= 0 })
+        warm.startTurn(liveStartCue(context))
+        provider.receive(greetingAudio()); provider.receive(greetingWords("Hello, Maya.")); provider.receive(greetingDone())
+        val admission = CompletableDeferred<JSONObject>()
+        val c = Call(provider = provider, admission = admission, prefetched = context, warm = warm)
+        try {
+            c.voice.start(); c.microphone()
+            admission.complete(json("call_id" to "admitted-call", "conversation_id" to "stored"))
+            assertTrue("The greeting completed on the warm socket, not before the call", waitFor { c.audio.size == 1 })
+            assertArrayEquals(greetingPcm, c.audio.single())
+            assertEquals("No second greeting is requested", 1, provider.cues().size)
+            assertTrue(waitFor { c.events.count { it.optString("type") == "transcript" && it.optString("text") == "Hello, Maya." } == 1 })
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 10000) fun interruptionDuringConnectionCannotPlayTheHeldGreetingAfterward() = runBlocking {
+        val admission = CompletableDeferred<JSONObject>()
+        lateinit var c: Call
+        c = Call(admission = admission, prefetched = context, onEvent = { event ->
+            if (event.optString("type") == "state" && event.optString("state") == "speaking")
+                c.provider.receive(json("serverContent" to json("interrupted" to true)))
+        })
+        try {
+            c.voice.start(); assertTrue(waitFor { c.provider.cues().size == 1 }); c.microphone()
+            c.provider.receive(greetingAudio())
+            admission.complete(json("call_id" to "admitted-call", "conversation_id" to "stored"))
+            assertTrue(waitFor { c.events.any { it.optString("type") == "interrupted" } })
+            assertTrue("Interrupted held audio must not be queued after the interruption", c.audio.isEmpty())
         } finally { c.close() }
     }
 

@@ -86,14 +86,14 @@ internal val settingsDescriptions = mapOf(
 internal val settingsHubSections = linkedMapOf(
     "" to listOf("Connection"),
     "Assistant" to listOf("Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected"),
-    "Hermes" to listOf("Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server"),
+    "Hermes" to listOf("Chat", "Profiles & model", "Skills", "Tools & MCP", "Server"),
     "App" to listOf("Appearance", "App updates", "About & licenses"),
 )
 internal val settingsHubRoutes = settingsHubSections.values.flatten()
 /** Search includes both the hub and its focused destinations. */
-internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten() + "Devices"
+internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten() + listOf("Devices", "Memory")
 // Skills, Memory and Server updates are native Hermes routes; only plugin-backed pages are gated.
-private val pluginSettingsRoutes = setOf("Notifications", "Bots")
+private val pluginSettingsRoutes = setOf("Notifications", "Bots", "Vault")
 internal fun settingsNeedsBeaconPlugin(page: String, pluginStatus: String): Boolean = pluginStatus == "absent" && page in pluginSettingsRoutes
 
 /** The exact `BeaconViewModel.more` argument for a row; categories open their own list, everything else opens its page. */
@@ -102,6 +102,7 @@ internal fun settingsRoute(name: String): String = when (name) {
     "Voice & calls" -> "Beacon"
     "Notifications & Keep connected" -> "Notifications"
     "Devices" -> "Connection"
+    "Memory" -> "Profiles"
     "About & licenses" -> "Licenses"
     "Models & tools" -> "category:Profiles & model"
     else -> if (name in settingsCategories) "category:$name" else name

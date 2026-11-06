@@ -70,7 +70,7 @@ import org.junit.Test
 class BotModeDrawerUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
-    private val tiles = listOf("skills", "memory", "cron", "files", "projects", "kanban", "settings")
+    private val tiles = listOf("skills", "vault", "cron", "files", "projects", "kanban", "settings")
     private val twoBots = listOf(BotModeBot("default", "Default", "Your main assistant"), BotModeBot("coder", "Coder", "Reviews code"))
     private val oneSpace = listOf(BotModeSpace("room-1", "Review room", listOf("default", "coder"), updatedAt = 1_700_000_000L, last = BotModePreview("coder", "Looks good to me")))
 
@@ -147,6 +147,8 @@ class BotModeDrawerUiTest {
         assertTrue("The buttons sit above the bots", newSpace.bottom <= bounds("bot-row-default").top)
         // The same tiles as the normal drawer, under the buttons.
         tiles.forEach { compose.onNodeWithTag("navigation-$it").assertExists() }
+        compose.onNodeWithTag("navigation-vault").assertIsEnabled().assertTextContains("Vault").assertHeightIsAtLeast(48.dp)
+        compose.onAllNodesWithTag("navigation-memory").assertCountEquals(0)
         assertTrue("The tiles sit under the buttons", bounds("navigation-skills").top >= newSpace.bottom)
         // One layout in both modes: the profile pill stays, and New bot and New space take the chat buttons' place.
         compose.onNodeWithTag("navigation-profile").assertExists()

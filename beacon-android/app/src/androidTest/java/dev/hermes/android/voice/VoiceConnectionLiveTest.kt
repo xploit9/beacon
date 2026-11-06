@@ -119,6 +119,8 @@ class VoiceConnectionLiveTest {
             catch (error: TimeoutCancellationException) { throw AssertionError("Connection timing phase=$phase authenticated=${vm.ui.value.authenticated} connected=${vm.ui.value.connected}", error) }
         }
         val samples = JSONArray()
+        var keptScreenOn = false
+        rule.runOnUiThread { keptScreenOn = rule.activity.window.decorView.keepScreenOn; rule.activity.window.decorView.keepScreenOn = true }
         var client: BeaconClient? = null
         var session = ""
         var previousSession = ""
@@ -230,6 +232,7 @@ class VoiceConnectionLiveTest {
                 }
                 File(app.filesDir, "voice-connection-$provider.json").writeText(JSONObject().put("samples", samples).put("phase", phase).put("versions", runCatching { client?.nativeRequest("/api/plugins/beacon/mobile/plugin/version") }.getOrNull()).toString(), Charsets.UTF_8)
                 client?.closeNative()
+                rule.runOnUiThread { rule.activity.window.decorView.keepScreenOn = keptScreenOn }
             }
         }
     }

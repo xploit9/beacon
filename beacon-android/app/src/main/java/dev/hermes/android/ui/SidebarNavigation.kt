@@ -44,9 +44,9 @@ import dev.hermes.android.updates.UpdatePhase
 import org.json.JSONObject
 
 internal data class NavigationRoute(val tab: String, val page: String = "")
-internal val navigationTiles = listOf("Skills", "Memory", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings")
+internal val navigationTiles = listOf("Skills", "Vault", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings")
 internal fun navigationRoute(destination: String): NavigationRoute = when (destination) {
-    "Skills", "Memory", "Bots" -> NavigationRoute("More", destination)
+    "Skills", "Memory", "Vault", "Bots" -> NavigationRoute("More", destination)
     "Cron" -> NavigationRoute("Tasks")
     "Files" -> NavigationRoute("Spaces")
     "Projects", "Kanban" -> NavigationRoute(destination)
@@ -73,6 +73,7 @@ internal fun navigationLabel(name: String): String = if (name == "Cron") "Schedu
 private fun navigationIcon(name: String): ImageVector = when (name) {
     "Skills" -> Icons.Rounded.AutoAwesome
     "Memory" -> Icons.Rounded.Psychology
+    "Vault" -> Icons.Rounded.Lock
     "Cron" -> Icons.Rounded.Schedule
     "Files" -> Icons.Rounded.FolderOpen
     "Projects" -> Icons.Rounded.Workspaces

@@ -64,8 +64,8 @@ def test_long_poll_sees_a_notice_committed_between_its_snapshot_and_its_first_wa
     original = api._notices_after
     state = {'first': True, 'event': None}
 
-    def commit_after_the_snapshot(owner, profile, after):
-        result = original(owner, profile, after)
+    def commit_after_the_snapshot(owner, provider, profile, after, principal):
+        result = original(owner, provider, profile, after, principal)
         if state['first']:
             state['first'] = False
             state['event'] = api.mobile.invitation('owner', 'default', 'native-stored', 'Raced')

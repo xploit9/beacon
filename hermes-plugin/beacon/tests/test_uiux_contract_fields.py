@@ -16,6 +16,23 @@ from test_mobile import harness, load_private, phone, reserve
 BASE = '/api/plugins/beacon/mobile'
 
 
+@pytest.fixture(autouse=True)
+def vault_coordinator_lifecycle(harness, monkeypatch):
+    module = harness[0].vault_attestation
+    # Registration tests must not leave a gateway retrying against later tests' native guards.
+    monkeypatch.setattr(module, '_GATEWAY', None)
+    monkeypatch.setattr(module, '_GATEWAY_USERS', 0)
+    try:
+        yield
+    finally:
+        coordinator = module._GATEWAY
+        if coordinator is not None:
+            coordinator.close()
+            if coordinator._thread is not None:
+                coordinator._thread.join(5)
+                assert not coordinator._thread.is_alive(), 'Vault coordinator survived fixture teardown'
+
+
 # ---- C-A: the FCM data carries the notice's own creation time -------------------------------------------------
 
 def _push_one_notice(harness, monkeypatch, created):

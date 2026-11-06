@@ -32,6 +32,30 @@ import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 
 class KeepConnectedTest {
+    @Test fun retirementRequiresTheCapturedDeliveryGenerationAndStart() {
+        assertTrue(keepConnectedRetirementMatches("old", "old", 7, 7))
+        assertTrue(keepConnectedRetirementMatches("old", "old", 0, 7))
+        assertFalse(keepConnectedRetirementMatches("old", "fresh", 7, 7))
+        assertFalse(keepConnectedRetirementMatches("old", "old", 7, 8))
+        assertFalse(keepConnectedRetirementMatches("", "", 0, 0))
+    }
+
+    @Test fun lifecycleReceiptEnvelopeUsesARealRelayIdentifier() {
+        val scope = Scope("https://ui-fixture.invalid", "lifecycle-owner", "default", nativeProvider = "fixture")
+        fun event(id: String) = JSONObject().put("kind", "incoming_call").put("state", "pending")
+            .put("event_id", id).put("callback_id", id).put("source_ref", "source-lifecycle")
+            .put("conversation_ref", "conversation-lifecycle").put("conversation_id", "chat-a").put("session_id", "chat-a")
+            .put("owner_id", scope.owner).put("profile", scope.profile).put("expires_at", 1_060L)
+        val uuid = java.util.UUID.fromString("00112233-4455-4677-8899-aabbccddeeff")
+        val id = uuid.toString().replace("-", "")
+        assertEquals(32, id.length)
+        assertNull("negative control: opaque event prefix is not a Relay call identifier", prepareKeepConnectedCall(scope, event("event-$uuid"), true, 1_000_000L, 500L))
+        val accepted = prepareKeepConnectedCall(scope, event(id), true, 1_000_000L, 500L)
+        org.junit.Assert.assertNotNull("SETUP_RECEIPT_RELAY", accepted)
+        assertEquals(RelayCallbackPhase.Ringing, accepted!!.call.phase)
+        assertEquals(id, accepted.call.callId)
+    }
+
     @Test fun connectedRequiresARecentValidNotificationResponse() {
         val connected = KeepConnectedService.STATUS_CONNECTED
         val reconnecting = KeepConnectedService.STATUS_RECONNECTING

@@ -47,6 +47,8 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
     val manager = context.getSystemService(NotificationManager::class.java)
     val tag = activityTag(source, activity)
     if (kind == "activity_end") { finishNativeActivity(context,tag); return }
+    // Ordinary starts are already visible in the chat and required connection service notice.
+    if (kind == "working") { manager.cancel(tag, 3); return }
     if (!ongoingNativeKind(kind) || expires <= System.currentTimeMillis() / 1000 || dismissed(context, tag)) return
     ensureActivityChannels(manager)
     val channel = if(kind in setOf("approval","clarify")) promptNotificationChannel(manager) else alertingChannel(manager, notificationChannel(kind))

@@ -258,25 +258,24 @@ class ChatMigrationUiTest {
     }
 
     @Test fun backgroundStripOpensACompactSheetWithSafeCategoryCounts() {
-        val activity = BackgroundActivitySummary(agents = 2, processes = 1, cronJobs = 1, watches = 1)
+        val activity = BackgroundActivitySummary(agents = 2, processes = 1)
         var open by mutableStateOf(false)
         compose.setContent { MaterialTheme {
             ChatActivityStrip(activity) { open = true }
             if (open) ChatActivitySheet(activity, onDismiss = { open = false })
         } }
         compose.waitForIdle()
-        compose.onNodeWithTag("chat-activity-strip").assertTextContains("2 agents · 1 process · 1 schedule running · 1 watch")
+        compose.onNodeWithTag("chat-activity-strip").assertTextContains("2 agents · 1 process")
         val stripBounds = compose.onNodeWithTag("chat-activity-strip").getUnclippedBoundsInRoot()
         assertTrue("The background strip stays compact", stripBounds.bottom - stripBounds.top <= 48.dp)
         compose.onNodeWithTag("chat-activity-sheet").assertDoesNotExist()
         compose.onNodeWithTag("chat-activity-strip").performClick()
         compose.onNodeWithTag("chat-activity-sheet").assertIsDisplayed()
         expandModalSheet()
-        compose.onNodeWithText("Read-only status from this profile").assertIsDisplayed()
+        compose.onNodeWithText("Read-only status from this conversation").assertIsDisplayed()
         compose.onNodeWithText("2 background agents").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("1 background process").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("1 schedule running").performScrollTo().assertIsDisplayed()
-        compose.onNodeWithText("1 active watch").performScrollTo().assertIsDisplayed()
+        compose.onAllNodesWithText("watch", substring = true).assertCountEquals(0)
         compose.onAllNodesWithText("sa-current").assertCountEquals(0)
         compose.onAllNodesWithText("C:\\SyntheticOwner", substring = true).assertCountEquals(0)
         compose.onAllNodesWithText("Stop").assertCountEquals(0)

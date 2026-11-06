@@ -57,6 +57,11 @@ def _authority(cfg,row):
             and cfg.get('owner_provider')==row['provider']
             and ('profiles' not in cfg or isinstance(cfg['profiles'],list) and row['profile'] in cfg['profiles']))
 
+
+def _verify(native,owner,provider,profile,stored,principal=None):
+    if principal: return native.verify(owner,provider,profile,stored,None,True,principal)
+    return native.verify(owner,provider,profile,stored)
+
 def _missed(mobile,native,conn,key,row,now):
     event=key.split(':',1)[1]
     if (not _CALLBACK_EVENT.fullmatch(event) or row.get('delivered')
@@ -64,11 +69,12 @@ def _missed(mobile,native,conn,key,row,now):
     try:
         target=datetime.fromisoformat(row['scheduled_at'])
         if (now-target).total_seconds()<CALLBACK_WINDOW_SECONDS or not _authority(mobile.settings(row['profile']),row): return False
-        native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
+        _verify(native,row['owner'],row['provider'],row['profile'],row['conversation'],row.get('principal'))
         reason=observers.reason_text(row['reason'])
     except (KeyError,TypeError,ValueError,LookupError,RuntimeError): return False  # an unopenable store: try again on the next pass
+    options={'principal':row['principal']} if row.get('principal') else {}
     observers._notice(mobile,row['owner'],row['profile'],row['conversation'],
-                      'Missed scheduled callback: '+reason,'missed-callback:'+event,now,conn=conn)
+                      'Missed scheduled callback: '+reason,'missed-callback:'+event,now,conn=conn,**options)
     row['status']='missed'
     conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(row).encode(),key))
     return True
@@ -159,7 +165,8 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
     if cfg.get('scheduled_callbacks_enabled') is not True: raise ValueError('Scheduled callbacks are disabled on the host')
     if (owner!=cfg.get('owner_id') or provider!=cfg.get('owner_provider')
             or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])): raise LookupError('Callback owner/profile unavailable')
-    native.verify(owner,provider,profile,stored)
+    principal=row.get('principal') or ''
+    _verify(native,owner,provider,profile,stored,principal)
     request=value.get('request_id');reason=value.get('reason')
     if not isinstance(request,str) or not mobile.ID.fullmatch(request): raise ValueError('Stable callback request_id required')
     reason=observers.reason_text(reason)
@@ -175,13 +182,14 @@ def schedule(mobile,native,owner,provider,row,cfg,value,now=None):
                 record=json.loads(existing[0])
                 if (now-datetime.fromisoformat(record['scheduled_at'])).total_seconds()>=CALLBACK_WINDOW_SECONDS:
                     raise ValueError('Callback request expired')
-                if record['fingerprint']!=fingerprint or record['conversation']!=stored: raise ValueError('Callback request_id already used for another request')
+                if (record['fingerprint']!=fingerprint or record['conversation']!=stored or
+                        (record.get('principal') or '')!=principal): raise ValueError('Callback request_id already used for another request')
             else:
                 try: current=mobile.owned(conn,row['id'],owner,profile,True)
                 except (KeyError,LookupError,ValueError): raise ValueError('Call ended before callback request was accepted') from None
-                if current['conversation']!=stored: raise ValueError('Call ended before callback request was accepted')
+                if current['conversation']!=stored or (current.get('principal') or '')!=principal: raise ValueError('Call ended before callback request was accepted')
                 target=target_time(value,now)
-                record={'fingerprint':fingerprint,'conversation':stored,'owner':owner,'provider':provider,'profile':profile,'reason':reason,'scheduled_at':target.isoformat(),'request_id':request,'status':'preparing'}
+                record={'fingerprint':fingerprint,'conversation':stored,'owner':owner,'provider':provider,'profile':profile,'reason':reason,'scheduled_at':target.isoformat(),'request_id':request,'status':'preparing','principal':principal}
                 conn.execute('INSERT INTO meta VALUES(?,?)',(key,json.dumps(record).encode()))
         if record['status']=='scheduled':
             return {k:record[k] for k in ('status','request_id','job_id','scheduled_at')} | {'timezone':timezone_name,'conversation_id':stored}
@@ -228,15 +236,15 @@ def deliver(mobile,native,key,now):
         if age < -CALLBACK_EARLY_TOLERANCE_SECONDS or row.get('status')=='missed': return {'status':'skipped_expired'}
         if row.get('delivered'): return {'status':'duplicate'}
         if not _authority(cfg,row): raise ValueError('Callback authority changed')
-        native.verify(row['owner'],row['provider'],row['profile'],row['conversation'])
+        _verify(native,row['owner'],row['provider'],row['profile'],row['conversation'],row.get('principal'))
         # Exact deterministic notice id makes retry atomic with its delivery marker.
         event=key.split(':')[1][:32]
         if mobile.active_calls(conn,row['owner']):
             if conn.execute('SELECT COUNT(*) FROM deferred').fetchone()[0]>=256: raise RuntimeError('Deferred callback capacity reached')
-            conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason) VALUES(?,?,?,?,?,?)',(event,row['owner'],row['profile'],row['conversation'],now.timestamp(),row['reason']))
+            conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason,principal) VALUES(?,?,?,?,?,?,?)',(event,row['owner'],row['profile'],row['conversation'],now.timestamp(),row['reason'],row.get('principal') or ''))
         else:
             if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification capacity reached')
-            conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(event,row['owner'],row['profile'],'incoming_call',row['conversation'],now.timestamp(),now.timestamp()+CALLBACK_WINDOW_SECONDS,row['reason']))
+            conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason,principal) VALUES(?,?,?,?,?,?,?,?,?)',(event,row['owner'],row['profile'],'incoming_call',row['conversation'],now.timestamp(),now.timestamp()+CALLBACK_WINDOW_SECONDS,row['reason'],row.get('principal') or ''))
         row['delivered']=event
         conn.execute('UPDATE meta SET value=? WHERE key=?',(json.dumps(row).encode(),key))
     return {'status':'pending','event_id':event}

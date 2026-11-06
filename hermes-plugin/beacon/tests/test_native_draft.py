@@ -86,3 +86,16 @@ def test_a_taken_title_stays_queued_for_the_first_turn(state):
     record['pending_title'] = 'Cyber news'
     assert native.reserve_conversation('owner', 'basic', 'academic', 'stored')['user_id'] == 'basic:owner'
     assert 'title' not in rows['stored'] and record['pending_title'] == 'Cyber news'
+
+
+def test_canonical_saved_conversation_requires_the_exact_caller_principal(state):
+    from gateway.session_identity import authenticated_subject
+    _, rows, _, writes = state
+    subject = authenticated_subject({'provider': 'basic', 'issuer': 'first', 'user_id': 'owner'})
+    foreign = authenticated_subject({'provider': 'basic', 'issuer': 'second', 'user_id': 'owner'})
+    rows['stored'] = {'user_id': subject}
+    assert native.reserve_conversation('owner', 'basic', 'academic', 'stored', principal=subject)['user_id'] == subject
+    for principal in (None, foreign):
+        with pytest.raises(LookupError):
+            native.reserve_conversation('owner', 'basic', 'academic', 'stored', principal=principal)
+    assert not writes

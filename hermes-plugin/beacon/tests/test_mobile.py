@@ -125,6 +125,55 @@ def test_history_retention_setting_is_owner_and_profile_scoped(harness):
     assert client.put(path+'?profile=foreign',json={'history_retention_days':30}).status_code==403
     assert not (tmp/'config.yaml').exists()
 
+def test_residency_red_expired_unresolved_payload_is_pruned_without_losing_identity(harness):
+    api,client,_,_,_=harness;call_id=reserve(client);now=time.time()
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE calls SET created=?,ended=?,closed=1,receipt=? WHERE id=?',
+            (now-31*86400,now-31*86400,json.dumps({'transcript_available':True,'preview':'Synthetic expired receipt'}),call_id))
+        conn.execute('INSERT INTO timeline VALUES(?,?,?,?)',(call_id,'synthetic-transcript','digest',
+            json.dumps({'type':'transcript','role':'user','text':'Synthetic expired transcript'})))
+        conn.execute('INSERT INTO jobs(id,call_id,owner,profile,stored,runtime,request,title,callback,epoch,status,history_updated,submission_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ('unresolved',call_id,'owner','default','native-stored','runtime','unresolved','Synthetic',1,'canonical','awaiting_admission',now-31*86400,'digest'))
+        api.mobile._prune_history(conn,'owner',30,now)
+        assert conn.execute('SELECT 1 FROM timeline WHERE call_id=?',(call_id,)).fetchone() is None
+        call=dict(conn.execute('SELECT * FROM calls WHERE id=?',(call_id,)).fetchone())
+        job=dict(conn.execute('SELECT * FROM jobs WHERE id=?',('unresolved',)).fetchone())
+    assert call['closed']==1 and call['conversation']=='native-stored'
+    assert json.loads(call['receipt'])=={'history_pruned':True,'transcript_available':False}
+    assert job['status']=='awaiting_admission' and job['callback']==1 and job['submission_digest']=='digest'
+
+
+@pytest.mark.parametrize('boundary',['zero','recent','open','foreign','pending_notice'])
+def test_residency_payload_retention_keeps_unexpired_or_protected_history(harness,boundary):
+    api,client,_,_,_=harness;call_id=reserve(client);now=time.time()
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE calls SET created=?,closed=1,receipt=? WHERE id=?',
+            (now-(29 if boundary=='recent' else 31)*86400,json.dumps({'preview':'Synthetic retained receipt'}),call_id))
+        if boundary=='open':conn.execute('UPDATE calls SET closed=0 WHERE id=?',(call_id,))
+        if boundary=='foreign':conn.execute("UPDATE calls SET owner='foreign-owner' WHERE id=?",(call_id,))
+        conn.execute('INSERT INTO timeline VALUES(?,?,?,?)',(call_id,'retained','digest',json.dumps({'type':'transcript','text':'Synthetic retained'})))
+        conn.execute('INSERT INTO jobs(id,call_id,owner,profile,status,history_updated) VALUES(?,?,?,?,?,?)',
+            ('unresolved',call_id,'owner','default','unknown',now-31*86400))
+        if boundary=='pending_notice':
+            conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id) VALUES(?,?,?,?,?,?,?,?)",
+                ('pending-callback','owner','default','incoming_call','native-stored',now,now+120,'unresolved'))
+        api.mobile._prune_history(conn,'owner',0 if boundary=='zero' else 30,now)
+        assert conn.execute('SELECT 1 FROM timeline WHERE call_id=?',(call_id,)).fetchone()
+        assert json.loads(conn.execute('SELECT receipt FROM calls WHERE id=?',(call_id,)).fetchone()[0])['preview']=='Synthetic retained receipt'
+
+
+def test_residency_legacy_database_adds_safe_probe_and_residency_defaults(harness):
+    api,_,_,tmp,_=harness;root=tmp/'plugin-data'/'beacon';root.mkdir(parents=True)
+    with api.mobile.sqlite3.connect(root/'mobile.sqlite') as conn:
+        conn.executescript('''CREATE TABLE jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,
+            request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT,UNIQUE(owner,profile,request));
+            INSERT INTO jobs VALUES('legacy','old-call','owner','default','stored','runtime','original','Synthetic',1,'old',17,'unknown');''')
+    with api.mobile.connect() as conn:
+        job=dict(conn.execute('SELECT * FROM jobs WHERE id=?',('legacy',)).fetchone())
+    assert job['parked']==0 and job['native_probe']==0 and job['status']=='unknown'
+    assert job['callback']==1 and job['request']=='original' and job['seq']==17
+
+
 def test_history_retention_zero_preserves_old_closed_call_history(harness):
     api,client,_,_,_=harness
     call_id=reserve(client)
@@ -293,17 +342,18 @@ def test_call_authorization_is_offloaded_from_event_loop(harness,monkeypatch):
     def owned(conn,call_id,owner,profile,writable):
         record('owned')
         return {'profile':'default','conversation':'native','closed':0}
-    def reject(owner,provider,profile,stored): record('conversation-owner')
+    def reject(owner,provider,profile,stored,principal=None): record('conversation-owner')
     monkeypatch.setattr(api,'identity',identity)
     monkeypatch.setattr(api.mobile,'connect',connect)
     monkeypatch.setattr(api.mobile,'owned',owned)
     monkeypatch.setattr(api,'reject_unowned_conversation',reject)
-    request=SimpleNamespace(query_params={})
+    monkeypatch.setattr(api.native,'verify',lambda *args:record('verified-conversation'))
+    request=SimpleNamespace(query_params={},state=SimpleNamespace(session=None))
 
     result=asyncio.run(api.call(request,'call'))
 
     assert result[2]=={'profile':'default','conversation':'native','closed':0}
-    assert [step for step,_ in observed]==['identity-owner','connect','owned','seen','identity-profile','conversation-owner']
+    assert [step for step,_ in observed]==['identity-owner','connect','owned','seen','identity-profile','conversation-owner','verified-conversation']
     assert all(thread_id!=loop_thread for _,thread_id in observed)
 
 def test_visual_tool_and_aggregated_clock_evidence_is_scoped_and_validated(harness):
@@ -337,6 +387,38 @@ def test_gateway_tool_error_codes_are_admitted(harness,code,status):
         rejected=c.post(url,json={'events':[{'event_id':'bad-gateway-diagnostic','turn_id':'tools','type':'media_diagnostic',
             'at_ms':200,'stage':'provider_error','error_code':code}]})
         assert rejected.status_code==409
+
+
+def test_updating_lookup_failure_allows_later_events_and_complete_history(harness,monkeypatch):
+    api,c,_,_,_=harness;cid=reserve(c);path=f'/api/plugins/beacon/mobile/calls/{cid}'
+    monkeypatch.setattr(api.admin,'update_in_progress',lambda:True)
+    lookup=c.get(path+'/tools?query=email')
+    assert lookup.status_code==503 and lookup.json()['detail']=='Hermes is updating'
+    running={'event_id':'lookup-running','turn_id':'tools','type':'tool_receipt','at_ms':1,
+             'request_id':'lookup','tool_name':'discover_tools','status':'running'}
+    failed={**running,'event_id':'lookup-failed','at_ms':2,'status':'failed','error_code':'hermes_updating'}
+    caption={'event_id':'after-lookup','turn_id':'1','type':'transcript','role':'assistant',
+             'text':'The lookup is temporarily unavailable.','final':True,'at_ms':3}
+    for event in (running,failed,caption):
+        result=c.post(path+'/events',json={'events':[event]})
+        assert result.status_code==200,result.text
+    finalized=c.post(path+'/finalize',json={})
+    assert finalized.status_code==200 and finalized.json()['complete'] is True
+    assert finalized.json()['transcript_status']=='saved'
+    with api.mobile.connect() as conn:
+        events=[json.loads(row[0]) for row in conn.execute('SELECT payload FROM timeline WHERE call_id=? ORDER BY rowid',(cid,))]
+    assert events==[running,failed,caption]
+
+
+def test_updating_failure_code_is_closed_and_only_valid_for_tool_receipts(harness):
+    _,c,_,_,_=harness;cid=reserve(c);path=f'/api/plugins/beacon/mobile/calls/{cid}/events'
+    event={'event_id':'bad-update','turn_id':'tools','type':'tool_receipt','at_ms':1,
+           'request_id':'lookup','tool_name':'discover_tools','status':'failed'}
+    for code in ('hermes_updating: private detail','hermes_updating\n','HERMES_UPDATING'):
+        assert c.post(path,json={'events':[{**event,'error_code':code}]}).status_code==409
+    diagnostic={'event_id':'not-transport','turn_id':'connection','type':'media_diagnostic','at_ms':1,
+                'stage':'provider_error','error_code':'hermes_updating'}
+    assert c.post(path,json={'events':[diagnostic]}).status_code==409
 
 
 @pytest.mark.parametrize('failure,code',[
@@ -1307,13 +1389,15 @@ def test_native_task_presets_use_native_cron_contract_and_script_only_fixture_ho
     assert len(jobs)==1
 
 def test_registered_native_completion_and_callback_tools_are_real(harness):
+    started=time.perf_counter()
     plugin=load_private('__init__')
     tools=[];hooks=[]
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
+    assert time.perf_counter()-started<10,'Native registration must remain bounded and nonblocking'
     assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call'}
     # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them).
-    assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_create_proactive_request',
+    assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_continue_call_work','beacon_create_proactive_request',
                                             'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked',
                                             *plugin.phone_tools.NAMES,*plugin.email_drafts.NAMES}
     assert all(callable(handler) for name,handler in hooks)

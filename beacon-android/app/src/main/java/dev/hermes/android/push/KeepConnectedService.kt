@@ -31,6 +31,7 @@ import dev.hermes.android.data.AuthStore
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.NativeAuthExpiredException
+import dev.hermes.android.data.DeviceRemovalAuthority
 import dev.hermes.android.data.authorizesPushSource
 import dev.hermes.android.data.cachedScopeFor
 import dev.hermes.android.data.validNativeProfile
@@ -395,6 +396,9 @@ internal fun keepConnectedLoopNeedsRestart(
     requestedProvider: String? = null,
 ): Boolean = !jobActive || runningOrigin != requestedOrigin || runningOwner != requestedOwner || runningProvider != requestedProvider
 
+internal fun keepConnectedRetirementMatches(expected: String, current: String, expectedStart: Int, currentStart: Int): Boolean =
+    expected.isNotBlank() && expected == current && (expectedStart == 0 || expectedStart == currentStart)
+
 /** A 1.1.1 switch whose owner is still signed in but not yet verified by this version; a signed-out phone keeps the plain stop. */
 internal fun keepConnectedAwaitsVerification(savedProvider: String?, origin: String, owner: String, verified: Scope?, storedOwner: String): Boolean =
     savedProvider.isNullOrEmpty() && origin.isNotBlank() && owner.isNotBlank() && verified == null && storedOwner == owner
@@ -459,6 +463,8 @@ internal fun prepareKeepConnectedCall(
 }
 
 class KeepConnectedService : Service() {
+    @Volatile private var activeGeneration = ""
+    @Volatile private var activeStartId = 0
     private val serviceScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
     private var pollJob: kotlinx.coroutines.Job? = null
     private var pollOrigin: String? = null
@@ -541,9 +547,24 @@ class KeepConnectedService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_RETIRE) {
+            val request = stopRequested.get()?.takeIf { it.id == intent.getStringExtra(EXTRA_RETIREMENT) }
+            if (request != null) {
+                val accepted = acceptsRetirement(request)
+                stopRequested.compareAndSet(request, null)
+                if (accepted) {
+                    cancelSignInNotification(this)
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelfResult(startId)
+                    return START_NOT_STICKY
+                }
+            }
+            // A rejected command may have created this instance; initialize only a never-started service.
+            if (activeStartId != 0 || promoted) return START_STICKY
+        }
         if (intent?.action == ACTION_STOP) {
             if (stopFromNotification(this, intent.getStringExtra(EXTRA_STOP_TOKEN))) {
-                (application as BeaconApplication).push.invalidateKeepConnectedInvitations()
+                (lifecycleContext(this) as BeaconApplication).push.invalidateKeepConnectedInvitations()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelfResult(startId)
                 return START_NOT_STICKY
@@ -551,20 +572,26 @@ class KeepConnectedService : Service() {
             return START_STICKY
         }
         startPending.set(false)
-        if (stopRequested.getAndSet(false) || !isEnabled(this)) {
+        val requestedStop = stopRequested.get()
+        val retire = requestedStop != null && acceptsRetirement(requestedStop)
+        if (requestedStop != null && (!requestedStop.queued || retire)) stopRequested.compareAndSet(requestedStop, null)
+        if (retire || !isEnabled(this)) {
             // A startForegroundService() start must promote before it stops, or Android crashes the app.
             if (promote()) stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
+        activeGeneration = ensureStopToken(this)
+        activeStartId = startId
         if (!promote()) {
             setStatus(this, STATUS_RECONNECTING)
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
         protectBackgroundDelivery()
-        if (updatesJob?.isActive != true) updatesJob = serviceScope.launch {
-            keepConnectedUpdateChecks { (application as BeaconApplication).updates.backgroundCheck() }
+        if (updatesJob?.isActive != true && !(BuildConfig.DEBUG && applicationForTest != null)) {
+            val app = lifecycleContext(this) as BeaconApplication
+            updatesJob = serviceScope.launch { keepConnectedUpdateChecks { app.updates.backgroundCheck() } }
         }
         val prefs = preferences(this)
         val origin = prefs.getString(KEY_ORIGIN, "").orEmpty()
@@ -575,6 +602,16 @@ class KeepConnectedService : Service() {
             restartPoll(origin, owner, provider)
         }
         return START_STICKY
+    }
+
+    private fun acceptsRetirement(request: StopRequest): Boolean {
+        val prefs = preferences(this)
+        return synchronized(deliveryLock) {
+            keepConnectedRetirementMatches(request.generation, prefs.getString(KEY_STOP_TOKEN, "").orEmpty(), request.startId, activeStartId) &&
+                (request.instance == null || request.instance === this) &&
+                (activeGeneration.isEmpty() || activeGeneration == request.generation) &&
+                (request.authority?.ifCurrent {} != false)
+        }
     }
 
     override fun onDestroy() {
@@ -607,7 +644,7 @@ class KeepConnectedService : Service() {
     }
 
     private suspend fun runLoop(origin: String, owner: String, nativeProvider: String) {
-        val app = application as BeaconApplication
+        val app = lifecycleContext(this) as BeaconApplication
         val prefs = preferences(this)
         if (origin.isBlank() || owner.isBlank() || nativeProvider.isBlank()) {
             setStatus(this, STATUS_SIGNED_OUT)
@@ -795,6 +832,7 @@ class KeepConnectedService : Service() {
         const val RELEASE_ROUTE = "/api/plugins/beacon/mobile/release"
         const val KEY_REASON = "reason"
         private const val KEY_STOP_TOKEN = "stop_token"
+        private const val KEY_ADMISSION = "delivery_admission"
         const val STATUS_OFF = "off"
         const val STATUS_STARTING = "starting"
         const val STATUS_CONNECTED = "connected"
@@ -805,12 +843,21 @@ class KeepConnectedService : Service() {
         private const val SIGN_IN_NOTIFICATION_ID = 4083
         private const val ACTION_START = "dev.hermes.android.push.KEEP_CONNECTED_START"
         private const val ACTION_STOP = "dev.hermes.android.push.KEEP_CONNECTED_STOP"
+        private const val ACTION_RETIRE = "dev.hermes.android.push.KEEP_CONNECTED_RETIRE"
         private const val EXTRA_STOP_TOKEN = "stop_token"
+        private const val EXTRA_RETIREMENT = "retirement"
+        private val deliveryLock = Any()
+        private class StopRequest(val generation: String, val authority: DeviceRemovalAuthority?, val instance: KeepConnectedService?, val startId: Int) {
+            val id = UUID.randomUUID().toString()
+            @Volatile var queued = false
+        }
 
         @Volatile internal var clientFactoryForTest: ((AuthContext, AuthStore) -> BeaconClient)? = null
+        @Volatile internal var applicationForTest: BeaconApplication? = null
         @Volatile private var activeInstance: KeepConnectedService? = null
 
-        private fun preferences(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        internal fun lifecycleContext(context: Context): Context = if (BuildConfig.DEBUG) applicationForTest ?: context.applicationContext else context.applicationContext
+        private fun preferences(context: Context) = lifecycleContext(context).getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         fun isEnabled(context: Context): Boolean = preferences(context).getBoolean(KEY_ENABLED, false)
         fun status(context: Context): String {
             val prefs = preferences(context)
@@ -826,18 +873,24 @@ class KeepConnectedService : Service() {
 
         fun setEnabled(context: Context, auth: AuthContext?, enabled: Boolean) {
             if (!enabled) {
-                disablePreference(context)
-                (context.applicationContext as? BeaconApplication)?.push?.invalidateKeepConnectedInvitations()
-                requestStop(context)
+                val request = synchronized(deliveryLock) { stopRequest(preferences(context)).also { disablePreference(context) } }
+                (lifecycleContext(context) as? BeaconApplication)?.push?.invalidateKeepConnectedInvitations()
+                requestStop(context, request)
                 return
             }
             val current = requireNotNull(auth) { "Sign in with Hermes before enabling Keep connected" }
             val authorized = current.cachedScopeFor(current.origin, replacingAccount = false)
             require(authorized != null && authorized.owner == current.owner) { "Sign in with Hermes before enabling Keep connected" }
             val prefs = preferences(context)
-            check(prefs.edit().putBoolean(KEY_ENABLED, true).putString(KEY_ORIGIN, current.origin)
-                .putString(KEY_OWNER, current.owner).putString(KEY_NATIVE_PROVIDER, current.nativeProvider).putString(KEY_STATUS, STATUS_STARTING).putString(KEY_REASON, "")
-                .putString(KEY_STOP_TOKEN, UUID.randomUUID().toString()).commit()) { "Could not enable Keep connected" }
+            val app = lifecycleContext(context) as BeaconApplication
+            val captured = synchronized(app.auth) { app.auth.incidentAdmission(authorized)?.let { it to app.auth.deviceRemovalAuthority(authorized) } }
+            check(captured?.second != null) { "Sign-in changed while enabling Keep connected" }
+            val retained = synchronized(deliveryLock) { captured.second!!.ifCurrent {
+                check(prefs.edit().putBoolean(KEY_ENABLED, true).putString(KEY_ORIGIN, current.origin)
+                    .putString(KEY_OWNER, current.owner).putString(KEY_NATIVE_PROVIDER, current.nativeProvider).putString(KEY_STATUS, STATUS_STARTING).putString(KEY_REASON, "")
+                    .putString(KEY_ADMISSION, captured.first).putString(KEY_STOP_TOKEN, UUID.randomUUID().toString()).commit()) { "Could not enable Keep connected" }
+            } }
+            check(retained) { "Sign-in changed while enabling Keep connected" }
             start(context)
         }
 
@@ -849,9 +902,10 @@ class KeepConnectedService : Service() {
         fun startIfEnabled(context: Context) {
             val prefs = preferences(context)
             if (!prefs.getBoolean(KEY_ENABLED, false)) return
+            val invalidRequest = synchronized(deliveryLock) { stopRequest(prefs) }
             val origin = prefs.getString(KEY_ORIGIN, null).orEmpty()
             val owner = prefs.getString(KEY_OWNER, null).orEmpty()
-            val app = context.applicationContext as? BeaconApplication ?: return
+            val app = lifecycleContext(context) as? BeaconApplication ?: return
             val auth = app.auth.read(origin)
             val scope = auth.cachedScopeFor(origin, replacingAccount = false)
             val savedProvider = prefs.getString(KEY_NATIVE_PROVIDER, null)
@@ -864,23 +918,37 @@ class KeepConnectedService : Service() {
                 if (keepConnectedAwaitsVerification(savedProvider, origin, owner, scope, auth.owner)) {
                     postSignInNotification(context, "Open Beacon", "Open Beacon once to keep receiving calls.", "Open Beacon")
                 } else cancelSignInNotification(context)
-                requestStop(context)
+                requestStop(context, invalidRequest)
                 return
             }
+            val captured = synchronized(app.auth) { app.auth.incidentAdmission(scope)?.let { it to app.auth.deviceRemovalAuthority(scope) } } ?: return
+            val retained = synchronized(deliveryLock) { captured.second?.ifCurrent {
+                if (prefs.getString(KEY_ADMISSION, null) != captured.first) {
+                    check(prefs.edit().putString(KEY_ADMISSION, captured.first).putString(KEY_STOP_TOKEN, UUID.randomUUID().toString()).commit())
+                }
+            } == true }
+            if (!retained) return
             ensureStopToken(context)
             if (status(context) == STATUS_OFF || status(context) == STATUS_SIGNED_OUT) setStatus(context, STATUS_STARTING)
             start(context)
         }
 
-        fun onUserSignedOut(context: Context, origin: String) {
-            // Whoever signs in next is another owner as far as the delivery times go, whether or not Keep connected was on.
-            DeliveryLog.clearAccountTimes(context)
+        internal fun onUserSignedOut(context: Context, authority: DeviceRemovalAuthority) {
+            // Resolve storage before the guard; no lifecycle, protocol or notification callback holds AuthStore.
+            val delivery = DeliveryLog.accountPreferences(context)
             val prefs = preferences(context)
-            if (prefs.getString(KEY_ORIGIN, null) != origin) return
-            setStatus(context, STATUS_SIGNED_OUT)
-            (context.applicationContext as? BeaconApplication)?.push?.invalidateKeepConnectedInvitations()
-            cancelSignInNotification(context)
-            requestStop(context)
+            var request: StopRequest? = null
+            val accepted = synchronized(deliveryLock) { authority.ifCurrent {
+                DeliveryLog.clearAccountTimes(delivery, prefs)
+                if (prefs.getString(KEY_ORIGIN, null) == authority.scope.origin &&
+                    prefs.getString(KEY_OWNER, null) == authority.scope.owner && prefs.getString(KEY_NATIVE_PROVIDER, null) == authority.scope.nativeProvider) {
+                    check(prefs.edit().putString(KEY_STATUS, STATUS_SIGNED_OUT).putString(KEY_REASON, "").commit())
+                    request = stopRequest(prefs, authority)
+                }
+            } }
+            if (!accepted) return
+            (lifecycleContext(context) as? BeaconApplication)?.push?.invalidateKeepConnectedInvitations(authority)
+            request?.let { requestStop(context, it) }
         }
 
         internal fun createClient(app: BeaconApplication, auth: AuthContext): BeaconClient =
@@ -898,17 +966,28 @@ class KeepConnectedService : Service() {
 
         /** A start Android has not delivered yet; stopping the service then crashes the app, because it never promoted. */
         private val startPending = java.util.concurrent.atomic.AtomicBoolean(false)
-        private val stopRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val stopRequested = java.util.concurrent.atomic.AtomicReference<StopRequest?>(null)
 
         /**
          * Stops the service. While a start is still on its way, the stop is left to [onStartCommand], which promotes first
          * and then stops; stopping it from outside before that would make Android kill Beacon.
          */
-        private fun requestStop(context: Context) {
-            stopRequested.set(true)
-            if (!startPending.get()) {
-                stopRequested.set(false)
-                context.applicationContext.stopService(Intent(context.applicationContext, KeepConnectedService::class.java))
+        private fun stopRequest(prefs: android.content.SharedPreferences, authority: DeviceRemovalAuthority? = null): StopRequest {
+            val token = prefs.getString(KEY_STOP_TOKEN, null)?.takeIf(String::isNotBlank) ?: UUID.randomUUID().toString().also {
+                check(prefs.edit().putString(KEY_STOP_TOKEN, it).commit())
+            }
+            val service = activeInstance
+            return StopRequest(token, authority, service, service?.activeStartId ?: 0)
+        }
+        private fun requestStop(context: Context, request: StopRequest = synchronized(deliveryLock) { stopRequest(preferences(context)) }) {
+            stopRequested.set(request)
+            if (activeInstance == null && !startPending.get()) {
+                stopRequested.compareAndSet(request, null)
+                if (request.authority?.ifCurrent {} != false) cancelSignInNotification(context)
+            } else if (!startPending.get()) {
+                val target = lifecycleContext(context)
+                request.queued = true
+                target.startService(Intent(target, KeepConnectedService::class.java).setAction(ACTION_RETIRE).putExtra(EXTRA_RETIREMENT, request.id))
             }
         }
 
@@ -940,9 +1019,10 @@ class KeepConnectedService : Service() {
 
         private fun stopFromNotification(context: Context, token: String?): Boolean {
             val prefs = preferences(context)
-            if (token.isNullOrBlank() || prefs.getString(KEY_STOP_TOKEN, null) != token || !prefs.getBoolean(KEY_ENABLED, false)) return false
-            disablePreference(context)
-            return true
+            return synchronized(deliveryLock) {
+                if (token.isNullOrBlank() || prefs.getString(KEY_STOP_TOKEN, null) != token || !prefs.getBoolean(KEY_ENABLED, false)) false
+                else { disablePreference(context); true }
+            }
         }
 
         private fun postSignInNotification(context: Context, title: String, text: String, action: String) {
@@ -1038,7 +1118,8 @@ internal object DeliveryLog {
     private const val KEY_DROPPED = "dropped_at"
     private const val KEY_STOP_LABEL = "stop_label"
     private const val KEY_STOP_AT = "stop_at"
-    private fun prefs(context: Context) = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private fun prefs(context: Context) = KeepConnectedService.lifecycleContext(context).getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    internal fun accountPreferences(context: Context) = prefs(context)
 
     /** An alert reached this phone on either path; a test also remembers its event id, which is what the Send a test button waits for. */
     fun recordArrival(context: Context, kind: String, event: String, now: Long = System.currentTimeMillis()) {
@@ -1054,7 +1135,7 @@ internal object DeliveryLog {
     fun markHeard(context: Context, now: Long = System.currentTimeMillis()) { prefs(context).edit().putLong(KEY_HEARD, now).apply() }
     /** The newest sign of life from Hermes: a poll answer, a status read or an alert. */
     fun heardAt(context: Context): Long = maxOf(
-        prefs(context).getLong(KEY_HEARD, 0), context.applicationContext.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE).getLong(KeepConnectedService.KEY_HEARD_AT, 0), lastAlertAt(context))
+        prefs(context).getLong(KEY_HEARD, 0), KeepConnectedService.lifecycleContext(context).getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE).getLong(KeepConnectedService.KEY_HEARD_AT, 0), lastAlertAt(context))
     fun setHeld(context: Context, count: Int) { prefs(context).edit().putInt(KEY_HELD, count.coerceAtLeast(0)).apply() }
     fun held(context: Context): Int = prefs(context).getInt(KEY_HELD, 0)
     fun recordDropped(context: Context, now: Long = System.currentTimeMillis()) { prefs(context).edit().putLong(KEY_DROPPED, now).apply() }
@@ -1065,8 +1146,11 @@ internal object DeliveryLog {
      * so the next owner does not read another account's times. Why the previous process stopped belongs to the phone and stays.
      */
     fun clearAccountTimes(context: Context) {
-        prefs(context).edit().remove(KEY_LAST_ALERT).remove(KEY_HEARD).remove(KEY_TEST_EVENT).remove(KEY_TEST_AT).remove(KEY_HELD).remove(KEY_DROPPED).apply()
-        context.applicationContext.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE).edit().remove(KeepConnectedService.KEY_HEARD_AT).apply()
+        clearAccountTimes(prefs(context), KeepConnectedService.lifecycleContext(context).getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE))
+    }
+    internal fun clearAccountTimes(delivery: android.content.SharedPreferences, keep: android.content.SharedPreferences) {
+        delivery.edit().remove(KEY_LAST_ALERT).remove(KEY_HEARD).remove(KEY_TEST_EVENT).remove(KEY_TEST_AT).remove(KEY_HELD).remove(KEY_DROPPED).apply()
+        keep.edit().remove(KeepConnectedService.KEY_HEARD_AT).apply()
     }
 
     /** Remembers why the previous process ended; Android keeps only a few, so this runs at every start. */

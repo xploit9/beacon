@@ -2,6 +2,13 @@
 import threading
 import uuid
 import logging
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
 
 class ReplyTransport:
     def __init__(self, owner,provider):
@@ -27,13 +34,219 @@ def rpc(owner,provider,method,params):
         raise LookupError('Native session unavailable or forbidden')
     return result['result']
 
-def verify(owner,provider,profile,stored,runtime=None,history=True):
+def _principal(owner,provider,principal):
+    if principal is None:
+        return None
+    from gateway.session_identity import parse_authenticated_subject
+    parts=parse_authenticated_subject(principal)
+    if parts is None or parts[0]!=provider or parts[2]!=owner:
+        raise LookupError('Native verified principal unavailable')
+    return principal
+
+
+def home_fingerprint(home):
+    return hashlib.sha256(os.path.normcase(str(Path(home).resolve())).encode('utf-8')).hexdigest()
+
+
+def profile_fingerprint(profile):
     from tui_gateway import server
+    from hermes_constants import get_process_hermes_home
+    return home_fingerprint(server._profile_home(profile) or getattr(server,'_hermes_home',None) or get_process_hermes_home())
+
+
+def _payload_fingerprint(payload):
+    return hashlib.sha256(json.dumps(payload,sort_keys=True,ensure_ascii=False,separators=(',',':'),allow_nan=False).encode('utf-8')).hexdigest()
+
+
+def remote_payload(params):
+    """Use native's pure admission validators; never stage media or create a session."""
+    from gateway.session_finite import admit_finite
+    from gateway.session_surface import admit_surface
+    from gateway.session_display import admit_display
+    from gateway.session_cli_turn import admit_cli_turn
+    allowed={'profile','session_id','text','submission_id','input_id','queued','finite','unattended',
+             'surface','voice_context','interrupted','voice_turn','display_kind','title_preview',
+             'turn_author','api_text','model_override','clarify_batch'}
+    if set(params)-allowed or not isinstance(params.get('text'),str) or params.get('unattended') is True:
+        raise ValueError('Remote admission payload unavailable')
+    # Media capture writes native storage; this read-only proof refuses media-bearing turns.
+    return {'text':params['text'],**admit_finite(params),**admit_surface(params),
+            **admit_display(params),**admit_cli_turn(params)}
+
+
+def confirm_remote_receipt(mobile,pending,receipt):
+    """Record current remote authorization only after its matching native response."""
+    try:
+        from tui_gateway import server
+        from hermes_state_runtime import find_session_admission
+        names={'owner','provider','profile','principal','home','session','request','payload_digest','wire_digest'}
+        if set(pending)!=names or not isinstance(receipt,dict): return False
+        principal=_principal(pending['owner'],pending['provider'],pending['principal'])
+        if profile_fingerprint(pending['profile'])!=pending['home']: return False
+        if not all(isinstance(pending[k],str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',pending[k]) for k in ('session','request')): return False
+        ref=receipt.get('ref')
+        admission=receipt.get('admission_id')
+        epoch=receipt.get('authority_epoch')
+        if (principal is None or not isinstance(ref,dict) or not isinstance(ref.get('profile_id'),str) or
+                ref.get('session_id')!=pending['session'] or
+                home_fingerprint(ref.get('profile_id'))!=pending['home'] or
+                not isinstance(admission,str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,160}',admission) or
+                type(epoch) is not int or epoch<=0 or receipt.get('status') not in ('queued','started','terminal')): return False
+        with server._profile_db({'profile':pending['profile']}) as db:
+            if db is None: return False
+            stored=db.get_session(pending['session'])
+            row=find_session_admission(db,principal_id=principal,session_id=pending['session'],request_id=pending['request'])
+        if (not stored or stored.get('user_id')!=principal or not row or row.get('admission_id')!=admission or
+                row.get('principal_id')!=principal or row.get('target_session_id')!=pending['session'] or
+                row.get('request_id')!=pending['request'] or row.get('owner_epoch')!=epoch or
+                row.get('status') not in ('queued','started','terminal') or not isinstance(row.get('payload'),dict) or
+                _payload_fingerprint(row['payload'])!=pending['payload_digest']): return False
+        value={key:pending[key] for key in ('owner','provider','profile','home','session','request','principal','wire_digest')}
+        value.update(admission_id=admission,epoch=epoch,payload_digest=_payload_fingerprint(row['payload']))
+        if not mobile.confirm_remote_admission(value): return False
+        generation=row.get('generation')
+        if row.get('status')=='started' and type(generation) is int:
+            if not confirm_remote_start(mobile,admission,pending['profile'],pending['session'],epoch,generation): return False
+        # Snapshot an already-authorized job at acceptance, even when no phone polls overnight.
+        continuation=sys.modules.get('beacon_voice_continuation')
+        if continuation is not None:
+            with mobile.connect() as conn:
+                jobs=[dict(r) for r in conn.execute('''SELECT * FROM jobs WHERE owner=? AND provider=? AND profile=?
+                    AND stored=? AND request=? AND principal=? AND epoch='canonical' ''',
+                    (pending['owner'],pending['provider'],pending['profile'],pending['session'],pending['request'],principal))]
+            for job in jobs:
+                try: continuation.native_receipt(job,mobile.remote_admission(admission))
+                except (LookupError,RuntimeError,ValueError): pass
+        return True
+    except Exception:
+        return False
+
+
+def confirm_remote_start(mobile,admission,profile,session,epoch,generation):
+    try:
+        from tui_gateway import server
+        from hermes_state_runtime import find_session_admission
+        binding=mobile.remote_admission(admission)
+        if (not binding or binding['profile']!=profile or binding['session']!=session or
+                binding['home']!=profile_fingerprint(profile) or
+                binding['generation'] and binding['epoch']!=epoch or
+                type(generation) is not int or generation<=0): return False
+        with server._profile_db({'profile':profile}) as db:
+            if db is None: return False
+            stored=db.get_session(session)
+            row=find_session_admission(db,principal_id=binding['principal'],session_id=session,request_id=binding['request'])
+        if (not stored or stored.get('user_id')!=binding['principal'] or not row or row.get('admission_id')!=admission or
+                row.get('principal_id')!=binding['principal'] or row.get('target_session_id')!=session or
+                row.get('status')!='started' or row.get('owner_epoch')!=epoch or row.get('generation')!=generation or
+                _payload_fingerprint(row['payload'])!=binding['payload_digest']): return False
+        return mobile.start_remote_admission(admission,epoch,generation)
+    except Exception:
+        return False
+
+
+def confirmed_admission(mobile,row,owner,provider,profile,stored,binding=None):
+    durable=binding is not None
+    binding=binding if durable else mobile.remote_admission(row['admission_id'])
+    if not binding: raise LookupError('Remote admission provenance unavailable')
+    principal=_principal(owner,provider,binding['principal'])
+    if (not principal or any(binding[key]!=value for key,value in (
+            ('admission_id',row['admission_id']),
+            ('owner',owner),('provider',provider),('profile',profile),('home',profile_fingerprint(profile)),
+            ('session',stored),('request',row['request_id']),('principal',row['principal_id']),
+            ('payload_digest',_payload_fingerprint(row['payload']))))):
+        raise LookupError('Remote admission provenance changed')
+    if row['status'] in ('started','terminal') and type(row.get('generation')) is int:
+        if binding['generation']==0:
+            if (type(row['owner_epoch']) is not int or row['owner_epoch']<binding['epoch'] or
+                    type(row['generation']) is not int or row['generation']<=0):
+                raise LookupError('Remote admission generation unavailable')
+            if durable:
+                binding={**binding,'epoch':row['owner_epoch'],'generation':row['generation']}
+            elif not mobile.start_remote_admission(row['admission_id'],row['owner_epoch'],row['generation']):
+                raise LookupError('Remote admission generation unavailable')
+            else: binding=mobile.remote_admission(row['admission_id'])
+        if (not binding or binding['epoch']!=row['owner_epoch'] or binding['generation']!=row['generation']):
+            raise LookupError('Remote admission generation changed')
+    elif binding['epoch']!=row['owner_epoch'] or binding['generation']!=0:
+        raise LookupError('Remote admission state changed')
+    return binding
+
+
+def remote_admission_active(binding):
+    """Retain expired metadata only for its exact queued/running native input; no activation."""
+    try:
+        from tui_gateway import server
+        from hermes_state_runtime import get_session_admission,_epoch
+        with server._profile_db({'profile':binding['profile']}) as db:
+            if db is None: return None
+            row=get_session_admission(db,admission_id=binding['admission_id'])
+            if row is None or row['status'] not in ('queued','started'): return False
+            stored=db.get_session(binding['session'])
+            if not stored or stored.get('user_id')!=binding['principal']: return False
+            if row['status']=='started':
+                with db._read_ctx() as conn: _epoch(conn,row['owner_epoch'])
+        confirmed_admission(sys.modules['beacon_mobile'],row,binding['owner'],binding['provider'],binding['profile'],
+                            binding['session'],binding)
+        return True
+    except (LookupError,ValueError,KeyError,TypeError):
+        return False
+    except Exception:
+        return None
+
+
+def current_principal(owner,provider,profile,stored):
+    """An executing native row needs this exact remote authorization, never an inferred issuer."""
+    try:
+        from gateway.session_ingress import executing_admission,viewer_turn
+        from gateway.session_authorities import authority_for_home
+        from hermes_cli.profiles import profile_matches_home
+        from hermes_constants import get_hermes_home
+        from hermes_state_runtime import list_session_admissions
+        runner=getattr(sys.modules.get('gateway.run_api'),'_ACTIVE_RUNNER',None)
+        mobile=sys.modules.get('beacon_mobile')
+        home=get_hermes_home()
+        if runner is None or mobile is None or not profile_matches_home(profile,home): return None
+        authority=authority_for_home(runner,home)
+        descriptor=getattr(runner,'session_runtime_descriptor',{})
+        if (authority is None or getattr(runner,'_draining',True) or descriptor.get('state')!='ready' or
+                descriptor.get('instance_id')!=authority.instance_id or
+                getattr(authority,'retiring',False) or getattr(authority,'retired',False) or
+                home_fingerprint(authority.profile_id)!=home_fingerprint(home)):
+            return None
+        live=authority.sessions.get(stored)
+        if live is None or not executing_admission.get() or viewer_turn.get() is not live: return None
+        deadline=time.monotonic()+0.4
+        while True:
+            for row in list_session_admissions(authority.db,session_id=stored):
+                if (row['target_session_id']!=stored or row['status']!='started' or row['owner_epoch']!=authority.epoch or
+                        authority.executing.get(stored)!=row.get('generation')): continue
+                try: binding=confirmed_admission(mobile,row,owner,provider,profile,stored)
+                except LookupError: continue
+                principal=binding['principal']
+                saved=authority.db.get_session(stored)
+                if (saved and saved.get('user_id')==principal and live.source.user_id==principal and
+                        authority.sessions.get(stored) is live and viewer_turn.get() is live and
+                        authority.executing.get(stored)==row['generation']): return principal
+            if time.monotonic()>=deadline: return None
+            time.sleep(0.02)  # The response pump may still be confirming this just-started turn.
+    except Exception:
+        return None
+
+
+def verify(owner,provider,profile,stored,runtime=None,history=True,principal=None):
+    from tui_gateway import server
+    principal=_principal(owner,provider,principal)
     with server._profile_db({'profile':profile}) as db:
         # A store that cannot be opened says nothing about ownership: the caller may try again.
         if db is None: raise RuntimeError('Native conversation store unavailable')
         stored_row=db.get_session(stored)
-        if not stored_row or stored_row.get('user_id')!=provider+':'+owner:
+        if not stored_row:
+            raise LookupError('Native stored conversation not owned')
+        row_owner=stored_row.get('user_id')
+        if principal is not None and row_owner==principal:
+            if runtime: raise LookupError('Canonical runtime proof unavailable')
+            return stored_row
+        if row_owner!=provider+':'+owner:
             raise LookupError('Native stored conversation not owned')
         if not runtime: return stored_row
         requested_home=server._profile_home(profile)
@@ -71,14 +284,14 @@ def verify(owner,provider,profile,stored,runtime=None,history=True):
     return result
 
 
-def reserve_conversation(owner,provider,profile,stored):
+def reserve_conversation(owner,provider,profile,stored,principal=None):
     """Persist an already-owned live draft without changing its conversation identity."""
     from tui_gateway import server
     with server._profile_db({'profile':profile}) as db:
         if db is None: raise RuntimeError('Native conversation store unavailable')
         existing=db.get_session(stored)
     if existing is not None:
-        return verify(owner,provider,profile,stored)
+        return verify(owner,provider,profile,stored,principal=principal)
     requested_home=server._profile_home(profile)
     expected_home=str(requested_home) if requested_home else None
     expected_owner=provider+':'+owner
@@ -102,7 +315,7 @@ def reserve_conversation(owner,provider,profile,stored):
             with server._profile_db({'profile':profile},writer=True) as db:
                 if db is not None and db.set_session_title(stored,title): record['pending_title']=None
         except Exception: pass  # a taken title stays queued; the first turn names the thread as before
-    return verify(owner,provider,profile,stored)
+    return verify(owner,provider,profile,stored,principal=principal)
 
 
 def conversation_snapshot(owner, provider, profile, stored):

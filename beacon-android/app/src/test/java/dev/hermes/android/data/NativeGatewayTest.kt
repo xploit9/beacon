@@ -20,6 +20,12 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 
+private fun stockFixtureTicket(request: Request): Response {
+    val missing = request.url.encodedPath == CANONICAL_TICKET_PATH
+    return Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (missing) 404 else 200).message("Fixture")
+        .body((if (missing) json("detail" to "Not Found") else json("ticket" to "fixture-ticket")).toString().toResponseBody("application/json".toMediaType())).build()
+}
+
 class NativeGatewayTest {
     private class RecoveryFixture : WebSocket.Factory {
         val calls = mutableListOf<Pair<String, JSONObject>>()
@@ -28,8 +34,7 @@ class NativeGatewayTest {
         @Volatile var currentRuntimeId = "runtime-created"
         @Volatile var turnStatus = "working"
         val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
-            builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+            builder.addInterceptor { chain -> stockFixtureTicket(chain.request()) }
         }
 
         override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket {
@@ -125,9 +130,7 @@ class NativeGatewayTest {
                 socket
             }) { builder ->
                 builder.addInterceptor { chain ->
-                    val request=chain.request()
-                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                        .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build()
+                    stockFixtureTicket(chain.request())
                 }
             }
 
@@ -269,8 +272,9 @@ class NativeGatewayTest {
             )
             unsupported.forEachIndexed { index, (method, code) ->
                 fixture.emitServerRequest(method, "unsupported-$index", json("session_id" to binding.runtimeSessionId))
-                assertEquals(code, fixture.serverResponses.last().getJSONObject("error").getInt("code"))
-                assertEquals("unsupported-$index", fixture.serverResponses.last().getString("id"))
+                withTimeout(5_000) { while (fixture.serverResponses.none { it.optString("id") == "unsupported-$index" }) kotlinx.coroutines.delay(10) }
+                val response = fixture.serverResponses.single { it.optString("id") == "unsupported-$index" }
+                assertEquals(code, response.getJSONObject("error").getInt("code"))
             }
             fixture.emitServerRequest("clarify", "foreign-clarify", json("session_id" to "another-runtime", "questions" to JSONArray().put(json("qid" to "q", "question" to "No?"))))
             // A prompt waits in the event queue for its session binding, so the collector rejects it after this suspension.
@@ -361,8 +365,7 @@ class NativeGatewayTest {
 
     @Test fun synchronousSocketFailureDoesNotRetainAConnection() = runBlocking<Unit> {
         val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
-            builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+            builder.addInterceptor { chain -> stockFixtureTicket(chain.request()) }
         }
         val gateway = NativeGateway(client, WebSocket.Factory { _, _ -> throw java.io.IOException("Synthetic socket construction failed") })
         repeat(2) {
@@ -435,9 +438,9 @@ class NativeGatewayTest {
                 val path = chain.request().url.encodedPath
                 httpPaths += path
                 if(path in setOf("/api/mcp/servers","/api/tools/toolsets")) assertEquals("default",chain.request().url.queryParameter("profile"))
-                var status=if(path.endsWith("/files/create")) 409 else 200
+                var status=if(path == CANONICAL_TICKET_PATH) 404 else if(path.endsWith("/files/create")) 409 else 200
                 fun preview() = json("content" to fileText.replace("\r\n", "\n"), "text" to fileText, "path" to "C:/test/file.txt", "byteSize" to fileText.toByteArray().size, "truncated" to false, "binary" to false, "ok" to true)
-                val body = if(path=="/api/plugins/beacon/mobile/files/text") {
+                val body = if(path == CANONICAL_TICKET_PATH) json("detail" to "Not Found") else if(path=="/api/plugins/beacon/mobile/files/text") {
                     if (chain.request().method == "POST") {
                         val sink=okio.Buffer();chain.request().body!!.writeTo(sink)
                         val fields = JSONObject(sink.readUtf8())

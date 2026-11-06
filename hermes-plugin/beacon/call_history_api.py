@@ -38,15 +38,15 @@ def _stored_object(raw):
         return {}
 
 
-def _page(mobile, owner, profile, limit, before):
+def _page(mobile, owner, provider, profile, limit, before, principal, verify):
     mobile.prune_history(owner)
     now = time.time()
     days = mobile.history_retention_days(owner)
     cutoff = now - days * 86400 if days else None
 
     def query(table, columns, extra, args):
-        where = 'owner=? AND profile=?' + extra
-        values = [owner, profile, *args]
+        where = "owner=? AND profile=? AND (principal='' OR principal=?)" + extra
+        values = [owner, profile, principal or '', *args]
         if cutoff is not None:
             where += ' AND created>=?'
             values.append(cutoff)
@@ -62,7 +62,7 @@ def _page(mobile, owner, profile, limit, before):
         mobile.prune_notices(conn)
         calls = query(
             'calls c',
-            "c.id,c.conversation,c.created,c.ended,c.closed,c.status,c.voice_config,c.receipt,"
+            "c.id,c.conversation,c.created,c.ended,c.closed,c.status,c.voice_config,c.receipt,c.principal,"
             "COALESCE(NULLIF(c.callback_context,'{}'),(SELECT json_object('id',n.id,'reason',n.reason) "
             "FROM notices n WHERE n.call_id=c.id AND n.owner=c.owner AND n.profile=c.profile "
             "AND n.state='answered' ORDER BY n.created DESC LIMIT 1),'{}') AS callback_context,"
@@ -73,12 +73,25 @@ def _page(mobile, owner, profile, limit, before):
             '', (),
         )
         call_logs = query(
-            'call_log l', "l.id,l.call_id,l.conversation,l.created,l.expires,l.state,l.reason,"
+            'call_log l', "l.id,l.call_id,l.conversation,l.created,l.expires,l.state,l.reason,l.principal,"
             "CASE WHEN l.feedback_verdict IS NULL THEN NULLIF(l.email_notice_id,'') END AS email_notice_id",
             " AND (l.state!='answered' OR NOT EXISTS (SELECT 1 FROM calls c "
             "WHERE c.id=l.call_id AND c.owner=l.owner AND c.profile=l.profile))", (),
         )
 
+    raw=sorted([(float(row['created']),row['id']) for row in [*calls,*call_logs]
+                if type(row['created']) in (int,float) and math.isfinite(row['created']) and row['created']>=0],reverse=True)
+    selected=set(raw[:limit])
+    has_more=len(raw)>limit
+    def allowed(row):
+        if (row['created'],row['id']) not in selected: return False
+        bound=row['principal'] or ''
+        if bound and bound!=principal: return False
+        try: verify(owner,provider,profile,row['conversation'],bound or None)
+        except Exception: return False
+        return True
+    calls=[row for row in calls if allowed(row)]
+    call_logs=[row for row in call_logs if allowed(row)]
     rows = []
     for row in calls:
         try:
@@ -134,26 +147,26 @@ def _page(mobile, owner, profile, limit, before):
         })
 
     rows.sort(key=lambda item: (item['_created'], item['id']), reverse=True)
-    has_more = len(rows) > limit
     rows = rows[:limit]
-    next_cursor = _write_cursor(rows[-1]['_created'], rows[-1]['id']) if has_more and rows else None
+    next_cursor = _write_cursor(*raw[limit-1]) if has_more else None
     for row in rows:
         row.pop('_created')
     return {'calls': rows, 'next': next_cursor}
 
 
-def build_router(identity, mobile):
+def build_router(identity, mobile, principal_for, verify):
     router = APIRouter()
 
     @router.get('/mobile/calls')
     async def call_history(request: Request):
-        owner, _, profile, _ = identity(request)
+        owner, provider, profile, _ = identity(request)
+        principal=principal_for(request,owner,provider)
         raw_limit = request.query_params.get('limit', '50')
         # ASCII digits only: str.isdigit() also accepts '²', which int() rejects.
         if not (raw_limit.isascii() and raw_limit.isdigit()) or not 1 <= int(raw_limit) <= 50:
             raise HTTPException(400, 'Invalid call history limit')
         before = _read_cursor(request.query_params.get('before'), mobile)
-        result = await asyncio.to_thread(_page, mobile, owner, profile, int(raw_limit), before)
+        result = await asyncio.to_thread(_page, mobile, owner, provider, profile, int(raw_limit), before, principal, verify)
         return JSONResponse(result, headers={'Cache-Control': 'no-store'})
 
     return router

@@ -11,6 +11,7 @@ class RenderedChatStatusTest {
     @Test fun otherRendersKeepTheirRules() {
         assertEquals("An unknown outcome is not an in-flight send", "", renderedChatStatus(ChatState(uncertain = "send-1", status = "Send outcome unknown"), active = null, streamEnded = false))
         assertEquals("Turn status unknown", renderedChatStatus(ChatState(streamId = "runtime-1"), active = null, streamEnded = false))
-        assertEquals("", renderedChatStatus(ChatState(streamId = "runtime-1", status = "Working"), active = "runtime-1", streamEnded = true))
+        assertEquals("Saving one segment cannot end an active native turn", "Working", renderedChatStatus(ChatState(streamId = "runtime-1", status = "Working"), active = "runtime-1", streamEnded = true))
+        assertEquals("A completed turn without an active runtime releases Working", "", renderedChatStatus(ChatState(streamId = "runtime-1", status = "Working"), active = null, streamEnded = true))
     }
 }

@@ -4,6 +4,8 @@ import dev.hermes.android.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import org.json.JSONObject
@@ -17,6 +19,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 internal const val BEACON_THREAD_SOURCE = "android_thread"
 internal val THREAD_SOURCES = listOf(BEACON_THREAD_SOURCE, "phone")
 private val WINDOW_SERVER_REQUESTS = setOf("preview.act", "preview.read", "terminal.read", "window.read", "tour")
+private val SECURE_SERVER_REQUESTS = setOf("vault.save_login", "vault.code", "vault.unlock_prompt", "secret")
+private const val SECURE_PROMPT_LIMIT_MS = 100_000L // A local limit; the server's cancellation remains authoritative.
 
 private data class ParsedNativeRequestId(val key: String, val text: String)
 private data class NativeRequestIdentity(val idKey: String, val method: String, val sessionId: String)
@@ -28,6 +32,7 @@ private data class NativeServerRequest(
     val sessionId: String,
     var params: JSONObject,
     val socket: WebSocket,
+    val expiresAt: Long = Long.MAX_VALUE,
     var delivered: Boolean = false,
 ) {
     val identity get() = NativeRequestIdentity(idKey, method, sessionId)
@@ -52,7 +57,7 @@ internal fun nativeSessionBinding(scope: Scope, result: JSONObject): NativeSessi
 
 /** The ticket rides in a Sec-WebSocket-Protocol header value, so refuse anything but a bounded single token. */
 internal fun nativeConnectionTicket(value: String): String {
-    require(value.length in 1..1024 && value.none { it <= ' ' || it == '\u007f' || it == ',' }) { "Native server did not return a usable connection ticket" }
+    require(value.length in 1..1024 && value.all { it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it in "!#\$%&'*+-.^_`|~" }) { "Native server did not return a usable connection ticket" }
     return value
 }
 
@@ -60,22 +65,37 @@ internal fun nativeConnectionTicket(value: String): String {
 internal const val NATIVE_OUTCOME_UNKNOWN = "Native request outcome may be unknown; reconcile history before resending"
 
 internal class NativeGateway(private val client: BeaconClient, private val socketFactory: WebSocket.Factory = client.http, private val rpcTimeoutMs: Long = 60000) {
-    private class Connection {
+    private class Connection(val identity: BeaconClient.GatewayIdentity, val canonical: Boolean, val device: String?) {
+        val authorityVersion = identity.authority
+        val secureAdmission = identity.admission
         val frames = Channel<JSONObject>(256)
         val pending = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
         val requestLock = Any()
         val serverRequests = linkedMapOf<String, NativeServerRequest>()
         val retiredServerRequests = linkedSetOf<NativeRequestIdentity>()
+        val secureIds = mutableSetOf<String>()
+        var secureExhausted = false
+        val secureConnection = UUID.randomUUID().toString()
         val ready = CompletableDeferred<Unit>()
         val sessionAuthority = CompletableDeferred<Boolean?>()
+        @Volatile var capabilitiesSent = false
         @Volatile var socket: WebSocket? = null
         @Volatile var failure: IOException? = null
     }
     /** A binding names a runtime that lives on the socket that made it: once that socket is gone Hermes may reap the runtime. */
     private class Cursor(val binding: NativeSessionBinding, val connection: Connection?, var sequence: Long = 0, var epoch: String = "")
-    private companion object {
+    companion object {
         // Weak, so a gateway leaves with its client; answers are only routed between gateways of one account and profile.
-        val gateways: MutableSet<NativeGateway> = java.util.Collections.newSetFromMap(java.util.WeakHashMap())
+        private val gateways: MutableSet<NativeGateway> = java.util.Collections.newSetFromMap(java.util.WeakHashMap())
+        private val secureProbes = Semaphore(4)
+
+        /** Live, already-entitled prompts for the open conversation; values are never retained here. */
+        internal fun pendingSecureRequests(scope: Scope, authorityVersion: Long? = null): List<JSONObject> {
+            if (scope.session.isBlank() || authorityVersion == null) return emptyList()
+            // Idle weak-registry entries must not hide a live entitled socket; output stays bounded below.
+            val peers = synchronized(gateways) { gateways.filter { it.client.scope == scope.copy(session = "") && it.client.nativeAuthorityVersion() == authorityVersion } }
+            return peers.asSequence().flatMap { it.secureRequests(scope).asSequence() }.take(8).toList()
+        }
     }
     private val connectLock = Mutex()
     private val sessionLock = Mutex()
@@ -83,34 +103,103 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     private val cursorLock = Any()
     private val consuming = AtomicBoolean()
     private val generation = java.util.concurrent.atomic.AtomicLong()
+    private val canonicalScopes = mutableSetOf<Scope>()
     @Volatile private var connection: Connection? = null
     private var cursor: Cursor? = null
     init { synchronized(gateways) { gateways += this } }
+    private fun connectionIdentityCurrent(mine: Connection): Boolean = client.gatewayIdentityCurrent(mine.identity) &&
+        NativePairing.deviceHeader(CANONICAL_TICKET_PATH, mine.identity.scope) == mine.device
+    private fun secureCurrent(mine: Connection): Boolean = connectionIdentityCurrent(mine) && mine.authorityVersion != null &&
+        mine.authorityVersion == client.nativeAuthorityVersion() && mine.secureAdmission != null && mine.secureAdmission == client.nativeSecureAdmission()
+
+    private fun secureRequests(scope: Scope): List<JSONObject> {
+        val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted && secureCurrent(it) } ?: return emptyList()
+        val active = synchronized(cursorLock) { cursor } ?: return emptyList()
+        if (active.connection !== mine || active.binding.scope != scope.copy(session = "") || active.binding.storedSessionId != scope.session) return emptyList()
+        return synchronized(mine.requestLock) {
+            if (connection !== mine || mine.failure != null) return@synchronized emptyList()
+            val now = System.nanoTime() / 1_000_000
+            mine.serverRequests.values.filter { it.method in SECURE_SERVER_REQUESTS && it.delivered && it.socket === mine.socket && now < it.expiresAt }
+                .map { request -> request.params.copy().put("id", request.id).put("stream_id", request.sessionId)
+                    .put("secure_method", request.method).put("secure_connection", mine.secureConnection).put("secure_expires_ms", request.expiresAt) }
+        }
+    }
     private suspend fun connect(): Connection = connectLock.withLock {
-        connection?.takeIf { it.failure == null && it.ready.isCompleted }?.let { return@withLock it }
+        connection?.let { previous ->
+            if (previous.failure == null && previous.ready.isCompleted && connectionIdentityCurrent(previous) &&
+                (previous.canonical || !client.canonicalRequired(previous.identity))) return@withLock previous
+            terminate(previous, IOException("Native connection authority changed")); previous.socket?.cancel()
+        }
         require(client.auth.backend == "hermes-dashboard" && client.auth.owner.isNotBlank() && client.auth.profile.isNotBlank()) { "Verify native dashboard identity before connecting" }
         val attempt = generation.get()
-        val ticket = nativeConnectionTicket(client.nativeRequest("/api/auth/ws-ticket", "POST", JSONObject()).getString("ticket"))
-        val mine = Connection()
-        synchronized(lifecycle) { check(attempt == generation.get()) { "Native client closed during ticket admission" }; connection = mine }
+        val identity = client.gatewayIdentity()
+        val device = NativePairing.deviceHeader(CANONICAL_TICKET_PATH, identity.scope)
+        fun current(checkAdmission: Boolean = false) = attempt == generation.get() && client.gatewayIdentityCurrent(identity, checkAdmission) &&
+            NativePairing.deviceHeader(CANONICAL_TICKET_PATH, identity.scope) == device
+        check(current(true)) { "Native identity changed during ticket admission" }
+        val started = System.nanoTime()
+        val admission = try {
+            client.nativeRequest(CANONICAL_TICKET_PATH, "POST", JSONObject())
+        } catch (e: CanonicalRouteMissing) {
+            check(current(true)) { "Native identity changed during ticket admission" }
+            if (synchronized(lifecycle) { identity.scope in canonicalScopes } || client.canonicalRequired(identity)) throw e
+            null
+        }
+        currentCoroutineContext().ensureActive()
+        check(current(true)) { "Native identity changed during ticket admission" }
+        val canonical = admission != null
+        val ticket: String
+        val deadline: Long
+        if (admission != null) {
+            require(admission.opt("path") == CANONICAL_SOCKET_PATH && admission.opt("profile") == identity.scope.profile && admission.opt("canonical") == true) { "Canonical gateway admission did not match this profile" }
+            val seconds = when (val value = admission.opt("expires_in")) { is Int -> value.toLong(); is Long -> value; else -> 0L }
+            require(seconds in 1..25 && admission.opt("ticket") is String) { "Invalid canonical gateway admission" }
+            ticket = nativeConnectionTicket(admission.opt("ticket") as String)
+            deadline = started + seconds * 1_000_000_000L
+            check(System.nanoTime() < deadline) { "Canonical gateway ticket expired" }
+            synchronized(lifecycle) {
+                check(current(true)) { "Native identity changed during ticket admission" }
+                canonicalScopes += identity.scope
+            }
+        } else {
+            val stock = client.nativeRequest("/api/auth/ws-ticket", "POST", JSONObject())
+            require(stock.opt("ticket") is String) { "Invalid native gateway ticket" }
+            ticket = nativeConnectionTicket(stock.opt("ticket") as String)
+            deadline = Long.MAX_VALUE
+        }
+        currentCoroutineContext().ensureActive()
+        val mine = Connection(identity, canonical, device)
+        synchronized(lifecycle) { check(current(true)) { "Native identity changed during ticket admission" }; connection = mine }
         try {
-            val request = client.request("/api/ws").header("Sec-WebSocket-Protocol", "hermes-gateway-v1, hermes-gateway-ticket.$ticket").build()
-            val socket = socketFactory.newWebSocket(request, object : WebSocketListener() {
+            val path = if (canonical) CANONICAL_SOCKET_PATH else "/api/ws"
+            val protocols = if (canonical) "beacon-canonical-v1, beacon-ticket.$ticket" else "hermes-gateway-v1, hermes-gateway-ticket.$ticket"
+            check(!canonical || System.nanoTime() < deadline) { "Canonical gateway ticket expired" }
+            val request = client.request(path).removeHeader("Authorization").removeHeader(HERMES_LOOPBACK_SESSION_HEADER)
+                .header("Sec-WebSocket-Protocol", protocols).build()
+            check(!canonical || request.header("X-Beacon-Device-ID") == device) { "Native device changed during ticket admission" }
+            val listener = object : WebSocketListener() {
                 override fun onOpen(ws: WebSocket, response: Response) {
                     HermesReach.answered(client.auth.origin)
                     mine.socket = ws
-                    if (connection !== mine || mine.failure != null) { ws.cancel(); return }
-                    // No acknowledgement is required; a legacy gateway's method-not-found response is dropped below.
-                    if (ws.send(json("jsonrpc" to "2.0", "id" to "capabilities-${UUID.randomUUID()}", "method" to "client.capabilities",
-                            "params" to json("server_requests" to true)).toString()) != true) {
+                    val advertised = runCatching { synchronized(lifecycle) {
+                        if (connection !== mine || mine.failure != null || !current(true) || canonical && System.nanoTime() >= deadline) false
+                        else {
+                            val send = { ws.send(json("jsonrpc" to "2.0", "id" to "capabilities-${UUID.randomUUID()}", "method" to "client.capabilities",
+                                "params" to json("server_requests" to true)).toString()) }
+                            if (canonical) send() else client.withLegacyCanonicalPermit(identity, send)
+                        }
+                    } }.getOrDefault(false)
+                    if (!advertised) {
                         terminate(mine, IOException("Native connection could not advertise server-request support"))
                         ws.cancel()
                         return
                     }
-                    mine.ready.complete(Unit)
+                    mine.capabilitiesSent = true
+                    if (!canonical) mine.ready.complete(Unit)
                 }
                 override fun onMessage(ws: WebSocket, text: String) {
                     if (connection !== mine || mine.failure != null) return
+                    if (!runCatching { current() && (canonical || !client.canonicalRequired(identity)) }.getOrDefault(false)) { terminate(mine, IOException("Native connection identity changed")); ws.cancel(); return }
                     if (text.length > 8 * 1024 * 1024) { terminate(mine, IOException("Native frame exceeds size limit")); ws.cancel(); return }
                     val frame = runCatching { JSONObject(text) }.getOrNull() ?: return
                     val id = frame.optString("id")
@@ -119,15 +208,24 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                     if (method == "event" && event?.optString("type") == "gateway.ready") {
                         val payload = event.optJSONObject("payload")
                         val capability = payload?.opt("session_authority")
+                        if (canonical && (!mine.capabilitiesSent || capability != true)) { terminate(mine, IOException("Canonical gateway did not become ready")); ws.cancel(); return }
+                        if (canonical) {
+                            val retained = runCatching { synchronized(lifecycle) {
+                                connection === mine && mine.failure == null && current(true) && client.rememberCanonical(identity)
+                            } }.getOrDefault(false)
+                            if (!retained) { terminate(mine, IOException("Canonical gateway authority could not be retained")); ws.cancel(); return }
+                        }
                         mine.sessionAuthority.complete(when {
                             payload == null -> null
                             !payload.has("session_authority") -> false
                             capability is Boolean -> capability
                             else -> null
                         })
+                        if (canonical) mine.ready.complete(Unit)
                     }
                     if (!frame.has("method") && id.isNotBlank()) mine.pending.remove(id)?.complete(frame)
-                    else if (method == "approval" || method == "clarify") {
+                    else if (method == "approval" || method == "clarify" || method in SECURE_SERVER_REQUESTS) {
+                        if (method in SECURE_SERVER_REQUESTS) frame.put("_secure_received_ms", System.nanoTime() / 1_000_000)
                         // A prompt can precede the session.resume acknowledgement that installs its owner binding.
                         // Without an id it is a notification: JSON-RPC never answers one, and it cannot be answered.
                         if (frame.has("id") && !mine.frames.trySend(frame).isSuccess) {
@@ -147,11 +245,20 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 }
                 override fun onClosing(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")); ws.close(code, reason) }
                 override fun onClosed(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")) }
-            })
+            }
+            val socket = synchronized(lifecycle) {
+                check(connection === mine && current(true) && (!canonical || System.nanoTime() < deadline)) { "Native identity changed during connection admission" }
+                if (canonical) socketFactory.newWebSocket(request, listener) else {
+                    var opened: WebSocket? = null
+                    check(client.withLegacyCanonicalPermit(identity) { opened = socketFactory.newWebSocket(request, listener); true }) { "Canonical gateway authority is required" }
+                    requireNotNull(opened)
+                }
+            }
             mine.socket = socket
             if (connection !== mine) socket.cancel()
             try { withTimeout(15000) { mine.ready.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw IOException("Native connection admission timed out", e) }
             mine.failure?.let { throw it }
+            check(current(true)) { "Native identity changed during connection admission" }
             mine
         } catch (e: Throwable) { terminate(mine, IOException("Native connection admission ended", e)); mine.socket?.cancel(); throw e }
     }
@@ -166,9 +273,19 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     private fun unknown(cause: Throwable) = IOException(NATIVE_OUTCOME_UNKNOWN, cause)
     suspend fun rpc(method: String, params: JSONObject): JSONObject = rpcOn(connect(), method, params)
 
+    /** Read this connection's protocol without attaching a conversation. */
+    internal suspend fun sessionAuthority(): Boolean {
+        val mine = connect()
+        val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() }
+            ?: throw IOException("Native gateway readiness is unavailable")
+        if (connection !== mine || mine.failure != null || !connectionIdentityCurrent(mine))
+            throw IOException("Native connection authority changed")
+        return authority
+    }
+
     private suspend fun rpcOn(mine: Connection, method: String, params: JSONObject, normalizeLegacyCreateSource: Boolean = false,
         sendGuard: (() -> Unit)? = null, sendLock: Any? = null): JSONObject {
-        if (connection !== mine) {
+        if (connection !== mine || !connectionIdentityCurrent(mine)) {
             if (sendGuard != null) throw NativeTurnNotSent("Native connection changed before the request")
             throw IOException("Native connection changed before request")
         }
@@ -212,10 +329,19 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             }
             currentCoroutineContext().ensureActive()
             val frame = json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()
-            val sent = if (sendGuard == null) mine.socket?.send(frame) else synchronized(lifecycle) {
+            val sent = synchronized(lifecycle) {
                 val guardedSend = {
-                    sendGuard()
-                    try { mine.socket?.send(frame) } catch (e: Exception) { throw unknown(e) }
+                    if (connection !== mine || mine.failure != null || !connectionIdentityCurrent(mine)) throw NativeTurnNotSent("Native connection changed before the request")
+                    sendGuard?.invoke()
+                    try {
+                        if (mine.canonical) mine.socket?.send(frame)
+                        else {
+                            var attempted = false
+                            val sent = client.withLegacyCanonicalPermit(mine.identity) { attempted = true; mine.socket?.send(frame) == true }
+                            if (!attempted) throw NativeTurnNotSent("Canonical gateway authority is required")
+                            sent
+                        }
+                    } catch (e: NativeTurnNotSent) { throw e } catch (e: Exception) { throw unknown(e) }
                 }
                 if (sendLock == null) guardedSend() else synchronized(sendLock) { guardedSend() }
             }
@@ -320,13 +446,15 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     }
 
     /** The live connection of this gateway that received [requestId] for its bound conversation, if any. */
-    private fun openServerRequest(method: String, requestId: String, sessionId: String): Triple<NativeGateway, Connection, NativeServerRequest>? {
+    private fun openServerRequest(method: String, requestId: String, sessionId: String, secureConnection: String = ""): Triple<NativeGateway, Connection, NativeServerRequest>? {
         val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted } ?: return null
+        if (method in SECURE_SERVER_REQUESTS && (secureConnection.isBlank() || secureConnection != mine.secureConnection || !secureCurrent(mine))) return null
         val binding = synchronized(cursorLock) { cursor?.binding }
         if (binding == null || binding.scope != client.scope || binding.runtimeSessionId != sessionId) return null
         val open = synchronized(mine.requestLock) {
             mine.serverRequests.values.filter { request ->
                 request.method == method && request.sessionId == sessionId &&
+                    (method !in SECURE_SERVER_REQUESTS || System.nanoTime() / 1_000_000 < request.expiresAt) &&
                     (if (method == "approval") request.params.string("request_id") == requestId else request.idText == requestId)
             }.singleOrNull()
         } ?: return null
@@ -337,7 +465,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     internal fun answerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject {
         // A chat action answers from its own detached client, but the request stays owned by the stream connection that received it.
         val peers = synchronized(gateways) { gateways.filter { it !== this && it.client.scope == client.scope } }
-        val (owner, mine, open) = (listOf(this) + peers).firstNotNullOfOrNull { it.openServerRequest(method, requestId, sessionId) }
+        val (owner, mine, open) = (listOf(this) + peers).firstNotNullOfOrNull { it.openServerRequest(method, requestId, sessionId, payload.optString("secure_connection")) }
             ?: throw IOException("Native server request is no longer active")
         val result = when (method) {
             "approval" -> {
@@ -364,14 +492,32 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 }
                 JSONObject().put("answers", answers).put("outcome", "submitted")
             }
+            in SECURE_SERVER_REQUESTS -> {
+                if (payload.keys().asSequence().toSet() != setOf("value", "secure_connection")) throw IOException("Invalid secure response")
+                val value = payload.opt("value") as? String ?: throw IOException("Invalid secure response")
+                if (value.length > 8192) throw IOException("Invalid secure response")
+                if (method == "vault.save_login" && value.isNotEmpty()) {
+                    val login = try { JSONObject(value) } catch (_: Exception) { throw IOException("Invalid secure response") }
+                    if (login.keys().asSequence().toSet() != setOf("identifier", "password") ||
+                        login.opt("identifier") !is String || login.opt("password") !is String ||
+                        login.optString("identifier").isBlank() || login.optString("password").isBlank()) throw IOException("Invalid secure response")
+                }
+                JSONObject().put("value", value)
+            }
             else -> throw IOException("Not available on the phone")
         }
         synchronized(mine.requestLock) {
-            if (mine.serverRequests[open.idKey] !== open || owner.connection !== mine || mine.failure != null || open.socket !== mine.socket) {
+            if (mine.serverRequests[open.idKey] !== open || owner.connection !== mine || mine.failure != null || open.socket !== mine.socket ||
+                method in SECURE_SERVER_REQUESTS && (System.nanoTime() / 1_000_000 >= open.expiresAt || !owner.secureCurrent(mine))) {
                 throw IOException("Native server request is no longer active")
             }
             val response = JSONObject().put("jsonrpc", "2.0").put("id", open.id).put("result", result)
-            if (open.socket.send(response.toString()) != true) throw IOException("Native server request response could not be sent")
+            val sent = if (method in SECURE_SERVER_REQUESTS) runCatching { owner.client.enqueueSecureResponse(mine.secureAdmission) { open.socket.send(response.toString()) } }.getOrDefault(false)
+                else open.socket.send(response.toString())
+            if (!sent) {
+                if (method in SECURE_SERVER_REQUESTS) retireServerRequestLocked(mine, open)
+                throw IOException("Native server request response could not be sent")
+            }
             retireServerRequestLocked(mine, open)
         }
         return JSONObject().put("ok", true)
@@ -387,6 +533,64 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             is Number -> id.toString().takeIf(String::isNotBlank)?.let { ParsedNativeRequestId("n:$it", it) }
             else -> null
         }
+    }
+
+    private suspend fun securePromptsAvailable(mine: Connection): Boolean {
+        val scope = client.scope
+        val origin = runCatching { java.net.URI(scope.origin) }.getOrNull() ?: return false
+        val host = origin.host ?: return false
+        if (origin.userInfo != null || !(origin.scheme == "https" || origin.scheme == "http" &&
+                (host.equals("localhost", true) || host in setOf("127.0.0.1", "::1", "[::1]")))) return false
+        return try {
+            withTimeoutOrNull(4000) {
+                secureProbes.withPermit {
+                    if (connection !== mine || mine.failure != null || client.scope != scope || !secureCurrent(mine)) false
+                    else client.nativeRequest("/api/plugins/beacon/mobile/vault/capabilities")
+                        .optJSONObject("capabilities")?.opt("secure_prompts") == true &&
+                        connection === mine && mine.failure == null && client.scope == scope && secureCurrent(mine)
+                }
+            } ?: false
+        } catch (error: CancellationException) { throw error } catch (_: Exception) { false }
+    }
+
+    /** Only the fields needed for the protected form leave the socket reader. */
+    private fun secureRequestParams(method: String, params: JSONObject): JSONObject? {
+        fun text(key: String, limit: Int, required: Boolean = true): String? {
+            val value = params.opt(key)
+            if (value == null || value == JSONObject.NULL) return if (required) null else ""
+            return (value as? String)?.takeIf { it.length <= limit && (!required || it.isNotBlank()) && it.none(Char::isISOControl) }
+        }
+        val session = text("session_id", 256) ?: return null
+        val clean = JSONObject().put("session_id", session)
+        when (method) {
+            "vault.save_login" -> {
+                val origin = text("origin", 2048) ?: return null
+                val uri = runCatching { java.net.URI(origin) }.getOrNull() ?: return null
+                uri.host ?: return null
+                if (uri.scheme != "https" || uri.userInfo != null ||
+                    uri.rawQuery != null || uri.rawFragment != null || uri.rawPath !in setOf("", "/")) return null
+                text("site", 255) ?: return null
+                clean.put("origin", origin)
+            }
+            "vault.code" -> {
+                val site = text("site", 255) ?: return null
+                val uri = runCatching { java.net.URI("https://$site") }.getOrNull() ?: return null
+                if (uri.host.isNullOrBlank() || uri.userInfo != null || uri.rawPath != "" || uri.rawQuery != null || uri.rawFragment != null) return null
+                text("hint", 240, false) ?: return null
+                clean.put("site", site)
+            }
+            "vault.unlock_prompt" -> {
+                val backend = text("backend", 64)?.takeIf { it.matches(Regex("[A-Za-z0-9_.-]+")) } ?: return null
+                clean.put("backend", backend).put("display_name", text("display_name", 120) ?: return null)
+            }
+            "secret" -> {
+                val variable = text("env_var", 128)?.takeIf { it.matches(Regex("[A-Za-z_][A-Za-z0-9_]*")) } ?: return null
+                text("prompt", 240) ?: return null
+                clean.put("env_var", variable)
+            }
+            else -> return null
+        }
+        return clean
     }
 
     private fun prepareServerRequest(mine: Connection, frame: JSONObject): NativeServerRequest? {
@@ -406,7 +610,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             serverRequestError(mine, id, 4404, "This request is not shown on the phone")
             return null
         }
-        if (method != "approval" && method != "clarify") {
+        if (method != "approval" && method != "clarify" && method !in SECURE_SERVER_REQUESTS) {
             serverRequestError(mine, id, -32601, "Not available on the phone")
             return null
         }
@@ -419,6 +623,17 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         val binding = synchronized(cursorLock) { cursor?.binding }
         if (sessionId.isBlank() || binding == null || binding.scope != client.scope || binding.runtimeSessionId != sessionId) {
             serverRequestError(mine, id, -32602, "Request is not owned by this conversation")
+            return null
+        }
+        val secure = method in SECURE_SERVER_REQUESTS
+        if (secure && (idParts.text.length > 160 || !idParts.text.matches(Regex("[A-Za-z0-9_.:-]+")))) {
+            serverRequestError(mine, id, -32600, "Invalid request id")
+            return null
+        }
+        val safeParams = if (secure) secureRequestParams(method, params) else params
+        if (safeParams == null) {
+            if (secure) synchronized(mine.requestLock) { rememberRetiredRequestLocked(mine, NativeRequestIdentity(idParts.key, method, sessionId)) }
+            serverRequestError(mine, id, -32602, "Invalid secure request")
             return null
         }
         if (method == "approval" && params.string("request_id").isBlank()) {
@@ -436,23 +651,51 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             }
         }
         val identity = NativeRequestIdentity(idParts.key, method, sessionId)
+        val now = System.nanoTime() / 1_000_000
+        var expiresAt = if (secure) frame.optLong("_secure_received_ms", now) + SECURE_PROMPT_LIMIT_MS else Long.MAX_VALUE
+        if (secure && params.has("expires_at_ms")) {
+            val raw = params.opt("expires_at_ms")
+            if (raw !is Number || !raw.toDouble().isFinite() || raw.toDouble() != raw.toLong().toDouble() || raw.toLong() <= 0) {
+                synchronized(mine.requestLock) { rememberRetiredRequestLocked(mine, identity) }
+                serverRequestError(mine, id, -32602, "Invalid secure request")
+                return null
+            }
+            val remaining = raw.toLong() - System.currentTimeMillis()
+            expiresAt = minOf(expiresAt, now + remaining.coerceIn(0, SECURE_PROMPT_LIMIT_MS))
+        }
+        if (secure && expiresAt <= now) {
+            synchronized(mine.requestLock) { rememberRetiredRequestLocked(mine, identity) }
+            serverRequestError(mine, id, -32000, "Secure request expired")
+            return null
+        }
         var failure: Pair<Int, String>? = null
         val open = synchronized(mine.requestLock) {
+            mine.serverRequests.values.filter { it.method in SECURE_SERVER_REQUESTS && now >= it.expiresAt }.toList().forEach { retireServerRequestLocked(mine, it) }
             if (identity in mine.retiredServerRequests) return null
             val previous = mine.serverRequests[idParts.key]
             when {
+                secure && previous == null && idParts.key in mine.secureIds -> return null
+                secure && previous == null && (mine.secureExhausted || mine.secureIds.size >= 256) -> {
+                    mine.secureExhausted = true
+                    failure = -32000 to "Secure request capacity reached"
+                    null
+                }
                 previous != null && (previous.method != method || previous.sessionId != sessionId) -> {
                     failure = -32602 to "Request identity changed"
                     null
                 }
                 // A replayed request keeps its identity and takes the latest parameters.
-                previous != null -> previous.also { it.params = params.copy() }
+                previous != null && secure && previous.params.toString() != safeParams.toString() -> {
+                    failure = -32602 to "Request identity changed"
+                    null
+                }
+                previous != null -> previous.also { if (!secure) it.params = safeParams.copy() }
                 mine.serverRequests.size >= 64 -> {
                     failure = -32000 to "Too many open requests"
                     null
                 }
-                else -> NativeServerRequest(id, idParts.text, idParts.key, method, sessionId, params.copy(), mine.socket!!)
-                    .also { mine.serverRequests[idParts.key] = it }
+                else -> NativeServerRequest(id, idParts.text, idParts.key, method, sessionId, safeParams.copy(), mine.socket!!, expiresAt)
+                    .also { if (secure) mine.secureIds.add(idParts.key); mine.serverRequests[idParts.key] = it }
             }
         }
         failure?.let { serverRequestError(mine, id, it.first, it.second) }
@@ -480,6 +723,9 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     }
 
     private fun rememberRetiredRequestLocked(mine: Connection, identity: NativeRequestIdentity) {
+        if (identity.method in SECURE_SERVER_REQUESTS && identity.idKey !in mine.secureIds) {
+            if (mine.secureIds.size >= 256) mine.secureExhausted = true else mine.secureIds.add(identity.idKey)
+        }
         mine.retiredServerRequests += identity
         if (mine.retiredServerRequests.size > 256) mine.retiredServerRequests.remove(mine.retiredServerRequests.first())
     }
@@ -500,7 +746,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         val binding = nativeSessionBinding(scope, result)
         synchronized(lifecycle) {
             check(connection === mine && mine.failure == null && client.scope == scope) { "Native connection or conversation scope changed" }
-            synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(binding, mine) }
+            synchronized(cursorLock) { sessionState = result.copy(); cursor = Cursor(binding, mine, epoch = result.string("replay_epoch")) }
         }
         return binding
     }
@@ -515,7 +761,13 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         synchronized(cursorLock) { cursor }?.takeIf { it.live() && it.binding.scope == client.scope && (stored == it.binding.storedSessionId || stored == it.binding.runtimeSessionId) }?.let { return@withLock it.binding }
         val scope = client.scope
         val mine = connect()
-        val result = rpcOn(mine, if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && !stored.isNullOrBlank()) put("lazy", true) })
+        val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() }
+            ?: throw IOException("Native gateway readiness is unavailable")
+        val legacy = !authority
+        val result = rpcOn(mine, if (stored.isNullOrBlank()) "session.create" else "session.resume", if (stored.isNullOrBlank()) json("source" to "android", "close_on_disconnect" to false) else json("session_id" to stored, "close_on_disconnect" to false, "omit_messages" to false).apply { if (lazy && legacy && !stored.isNullOrBlank()) put("lazy", true) })
+        if (authority) require(result.opt("session_id") is String && result.opt("stored_session_id") == result.opt("session_id")) {
+            "Canonical resume returned conflicting conversation identities"
+        }
         bind(result, mine, scope)
     }
     /** Reattach the original live runtime before replay; replay alone never creates a viewer. */
@@ -601,24 +853,53 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         return rpcOn(mine, method, wire, sendGuard = ::bound)
     }
 
-    private suspend fun reconciliationHistory(binding: NativeSessionBinding): JSONObject {
+    private suspend fun reconciliationHistory(mine: Connection, snapshot: Cursor): JSONObject {
+        val binding = snapshot.binding
         require(binding.scope == client.scope) { "Conversation scope changed" }
         // session.history has no compact-image option; reuse the scoped, bounded REST projection.
-        return NativeOperations(client).passiveHistory(binding.storedSessionId).also {
-            require(binding.scope == client.scope) { "Conversation scope changed" }
+        val history = NativeOperations(client).passiveHistory(binding.storedSessionId)
+        if (mine.sessionAuthority.await() == true) {
+            val fresh = rpcOn(mine, "session.resume", json("session_id" to binding.storedSessionId, "omit_messages" to false), sendGuard = {
+                if (binding.scope != client.scope || synchronized(cursorLock) { cursor !== snapshot }) throw NativeTurnNotSent("Conversation scope changed")
+            })
+            require(nativeSessionBinding(binding.scope, fresh) == binding) { "Conversation identity changed during reconciliation" }
+            val profile = fresh.optJSONObject("info")?.opt("profile_name")
+            require(profile == null || profile == JSONObject.NULL || profile == binding.scope.profile) { "Conversation scope changed" }
+            val rows = fresh.optJSONArray("messages") ?: throw IOException("Native reconciliation history is unavailable")
+            require(!fresh.optBoolean("messages_omitted") && fresh.opt("message_count") is Number &&
+                fresh.optLong("message_count") == rows.length().toLong() && rows.objects().size == rows.length()) { "Native reconciliation history is incomplete" }
+            fun rowId(row: JSONObject) = row.string("row_id", row.string("_row_id", row.string("id")))
+            val saved = history.rows("messages").filter { rowId(it).isNotBlank() }.associateBy(::rowId)
+            val limit = history.optInt("history_limit", 500)
+            // The sequence belongs to this native snapshot; older REST rows must not hide a final committed during the read.
+            history.put("messages", JSONArray(rows.objects().takeLast(limit).map { row ->
+                (saved[rowId(row)]?.copy() ?: JSONObject()).apply { row.keys().forEach { put(it, row.opt(it)) } }
+            })).put("message_count", rows.length()).put("history_truncated", rows.length() > limit)
+            history.remove("_history_metadata_stamp")
+            for (key in listOf("running", "pending", "prompts", "execution_generation", "replay_epoch", "last_sequence")) if (fresh.has(key)) history.put(key, fresh.opt(key))
+            history.put("active_stream_id", if (fresh.opt("running") == true) binding.runtimeSessionId else JSONObject.NULL)
         }
+        require(binding.scope == client.scope) { "Conversation scope changed" }
+        return history
     }
+    private suspend fun replayParams(mine: Connection, snapshot: Cursor, seen: Long): JSONObject =
+        json("session_id" to snapshot.binding.runtimeSessionId, "last_seen" to seen).apply {
+            if (mine.sessionAuthority.await() == true && snapshot.epoch.isNotBlank()) put("replay_epoch", snapshot.epoch)
+        }
     suspend fun prepareReplay(lastId: String = "", beforePrompt: Boolean = false) = sessionLock.withLock {
         if (synchronized(cursorLock) { cursor } == null) return@withLock
         check(!consuming.get()) { "Prepare replay before starting the native event collector" }
         val mine = connect()
         val snapshot = recoverCursorLocked(mine) ?: return@withLock
         val b = snapshot.binding
-        val replay = rpcOn(mine, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to 0))
+        val saved = lastId.takeIf { it.startsWith("${b.runtimeSessionId}:") }?.removePrefix("${b.runtimeSessionId}:")
+        val savedEpoch = saved?.substringBeforeLast(':', "").orEmpty()
+        if (!beforePrompt && savedEpoch.isNotBlank()) synchronized(cursorLock) { if (cursor === snapshot) snapshot.epoch = savedEpoch }
+        val replay = rpcOn(mine, "session.events.since", replayParams(mine, snapshot, 0))
         synchronized(cursorLock) {
             if (cursor === snapshot) {
-                snapshot.epoch = replay.string("epoch")
-                snapshot.sequence = when { beforePrompt -> replay.optLong("latest_seq", 0); lastId.substringBeforeLast(':', "") == b.runtimeSessionId -> lastId.substringAfterLast(':').toLongOrNull() ?: 0; else -> replay.rows("events").lastOrNull { it.string("type") == "message.start" }?.optLong("seq")?.minus(1) ?: replay.optLong("latest_seq", 0) }
+                if (beforePrompt || savedEpoch.isBlank()) snapshot.epoch = replay.string("epoch")
+                snapshot.sequence = when { beforePrompt -> replay.optLong("latest_seq", 0); saved != null -> saved.substringAfterLast(':').toLongOrNull() ?: 0; replay.optBoolean("truncated") -> 0; else -> replay.rows("events").lastOrNull { it.string("type") == "message.start" }?.optLong("seq")?.minus(1) ?: replay.optLong("latest_seq", 0) }
             }
         }
     }
@@ -631,34 +912,60 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             if (snapshot != null) {
                 val b = snapshot.binding
                 val seen = synchronized(cursorLock) { snapshot.sequence }
-                val replay = rpcOn(mine, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to seen))
+                val replay = rpcOn(mine, "session.events.since", replayParams(mine, snapshot, seen))
                 mine.failure?.let { throw it }
-                val nextEpoch = replay.string("epoch")
+                var nextEpoch = replay.string("epoch")
+                var latestSequence = replay.optLong("latest_seq", 0)
                 val reconcile = synchronized(cursorLock) { cursor === snapshot && (replay.optBoolean("truncated") || snapshot.epoch.isNotBlank() && nextEpoch != snapshot.epoch) }
                 if (reconcile) {
-                    val history = reconciliationHistory(b)
-                    if (synchronized(cursorLock) { cursor === snapshot }) onEvent(json("method" to "reconciliation.required", "params" to json("session_id" to b.runtimeSessionId, "history" to history, "epoch" to nextEpoch)))
+                    val history = reconciliationHistory(mine, snapshot)
+                    nextEpoch = history.string("replay_epoch", nextEpoch)
+                    latestSequence = history.optLong("last_sequence", latestSequence)
+                    if (synchronized(cursorLock) { cursor === snapshot }) onEvent(json("method" to "reconciliation.required", "params" to json("session_id" to b.runtimeSessionId, "history" to history, "epoch" to nextEpoch,
+                        "replay_reset" to (snapshot.epoch.isNotBlank() && snapshot.epoch != nextEpoch))))
                 }
-                synchronized(cursorLock) { if (cursor === snapshot) { if (reconcile) snapshot.sequence = replay.optLong("latest_seq", 0); snapshot.epoch = nextEpoch } }
-                if (synchronized(cursorLock) { cursor === snapshot }) {
+                synchronized(cursorLock) { if (cursor === snapshot) { if (reconcile) snapshot.sequence = latestSequence; snapshot.epoch = nextEpoch } }
+                if (synchronized(cursorLock) { cursor === snapshot } && replay.string("epoch") == nextEpoch) {
                     val events = replay.rows("events")
                     events.forEach { retireCancelledServerRequest(mine, it) }
                     // Hermes replays open requests as {id, method, params}, without the JSON-RPC envelope field.
-                    replay.rows("open_requests").forEach { deliver(mine, it.put("jsonrpc", "2.0"), onEvent) }
+                    replay.rows("open_requests").forEach {
+                        it.put("jsonrpc", "2.0")
+                        if (it.optString("method") in SECURE_SERVER_REQUESTS) it.put("_secure_received_ms", System.nanoTime() / 1_000_000)
+                        deliver(mine, it, onEvent)
+                    }
                     events.forEach { deliver(mine, json("method" to "event", "params" to it), onEvent) }
                 }
             }
             for (frame in mine.frames) { mine.failure?.let { throw it }; deliver(mine, frame, onEvent) }
-        } finally { consuming.set(false); if (mine?.failure != null) mine.frames.cancel() }
+        } finally {
+            consuming.set(false)
+            mine?.let { current -> synchronized(current.requestLock) {
+                current.serverRequests.values.filter { it.method in SECURE_SERVER_REQUESTS }.toList().forEach { retireServerRequestLocked(current, it) }
+            } }
+            if (mine?.failure != null) mine.frames.cancel()
+        }
     }
     private suspend fun deliver(mine: Connection, frame: JSONObject, callback: suspend (JSONObject) -> Unit) {
         if (isServerRequest(frame)) {
+            val secure = frame.optString("method") in SECURE_SERVER_REQUESTS
+            if (secure && !securePromptsAvailable(mine)) {
+                val parts = requestId(frame)
+                val session = frame.optJSONObject("params")?.string("session_id").orEmpty()
+                if (parts != null && session.isNotBlank()) synchronized(mine.requestLock) {
+                    rememberRetiredRequestLocked(mine, NativeRequestIdentity(parts.key, frame.optString("method"), session))
+                }
+                serverRequestError(mine, frame.opt("id") ?: JSONObject.NULL, -32601, "Secure input unavailable")
+                return
+            }
             val request = sessionLock.withLock { prepareServerRequest(mine, frame) } ?: return
             val shouldDeliver = synchronized(mine.requestLock) {
-                if (mine.serverRequests[request.idKey] !== request || request.delivered) false
+                if (mine.serverRequests[request.idKey] !== request || request.delivered || connection !== mine || mine.failure != null ||
+                    secure && System.nanoTime() / 1_000_000 >= request.expiresAt) false
                 else { request.delivered = true; true }
             }
-            if (shouldDeliver) callback(frame)
+            if (shouldDeliver) callback(if (secure) json("jsonrpc" to "2.0", "id" to request.id, "method" to request.method,
+                "params" to request.params.copy().put("secure_method", request.method).put("secure_connection", mine.secureConnection).put("secure_expires_ms", request.expiresAt)) else frame)
             return
         }
         retireCancelledServerRequest(mine, frame)
@@ -666,17 +973,37 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         val snapshot = synchronized(cursorLock) { cursor }
         val b = snapshot?.binding
         if (b != null && p.string("session_id").isNotBlank() && p.string("session_id") != b.runtimeSessionId) return
+        val epoch = p.string("replay_epoch")
+        if (snapshot != null && epoch.isNotBlank() && snapshot.epoch.isNotBlank() && epoch != snapshot.epoch) {
+            val history = reconciliationHistory(mine, snapshot)
+            if (synchronized(cursorLock) { cursor !== snapshot }) return
+            val currentEpoch = history.string("replay_epoch", epoch)
+            callback(json("method" to "reconciliation.required", "params" to json("session_id" to b?.runtimeSessionId,
+                "history" to history, "epoch" to currentEpoch, "replay_reset" to true)))
+            synchronized(cursorLock) { if (cursor === snapshot) { snapshot.epoch = currentEpoch; snapshot.sequence = history.optLong("last_sequence") } }
+            if (epoch != currentEpoch) return
+        }
         val seq = p.optLong("seq", frame.optLong("seq", 0))
         val seen = synchronized(cursorLock) { snapshot?.sequence ?: 0 }
         if (b != null && seq > 0 && seq <= seen) return
         if (b != null && seq > 0 && seen > 0 && seq != seen + 1) {
-            val history = reconciliationHistory(b)
+            val history = reconciliationHistory(mine, snapshot)
             if (synchronized(cursorLock) { cursor !== snapshot }) return
-            callback(json("method" to "reconciliation.required", "params" to json("session_id" to b.runtimeSessionId, "gap" to true, "history" to history)))
+            val currentEpoch = history.string("replay_epoch", snapshot.epoch)
+            val reset = currentEpoch != snapshot.epoch
+            callback(json("method" to "reconciliation.required", "params" to json("session_id" to b.runtimeSessionId, "gap" to true,
+                "history" to history, "epoch" to currentEpoch, "replay_reset" to reset)))
+            synchronized(cursorLock) {
+                if (cursor === snapshot) {
+                    snapshot.sequence = if (reset) history.optLong("last_sequence") else maxOf(snapshot.sequence, history.optLong("last_sequence", snapshot.sequence))
+                    snapshot.epoch = currentEpoch
+                }
+            }
+            if (reset || seq <= synchronized(cursorLock) { snapshot.sequence }) return
         }
         if (synchronized(cursorLock) { cursor !== snapshot }) return
         callback(frame)
         synchronized(cursorLock) { if (snapshot != null && cursor === snapshot && seq > 0) snapshot.sequence = seq }
     }
-    fun close() { generation.incrementAndGet(); val mine = synchronized(lifecycle) { connection.also { connection = null } } ?: return; terminate(mine, IOException("Native client connection closed")); mine.socket?.cancel() }
+    fun close() { val mine = synchronized(lifecycle) { generation.incrementAndGet(); connection.also { connection = null } } ?: return; terminate(mine, IOException("Native client connection closed")); mine.socket?.cancel() }
 }

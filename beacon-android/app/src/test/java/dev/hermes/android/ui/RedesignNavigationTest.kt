@@ -5,8 +5,9 @@ import org.junit.Test
 
 class RedesignNavigationTest {
     @Test fun everyShortcutHasAnHonestNativeDestination() {
-        assertEquals(listOf("Skills", "Memory", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings"), navigationTiles)
+        assertEquals(listOf("Skills", "Vault", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings"), navigationTiles)
         assertEquals(NavigationRoute("More", "Skills"), navigationRoute("Skills"))
+        assertEquals(NavigationRoute("More", "Vault"), navigationRoute("Vault"))
         assertEquals(NavigationRoute("More", "Memory"), navigationRoute("Memory"))
         assertEquals(NavigationRoute("Tasks"), navigationRoute("Cron"))
         assertEquals(NavigationRoute("Spaces"), navigationRoute("Files"))
@@ -33,7 +34,7 @@ class RedesignNavigationTest {
         assertFalse(navigationCompact(1.1f))
         assertTrue(navigationCompact(1.15f))
         assertEquals(listOf(listOf("Cron", "Files"), listOf("Projects", "Settings")), navigationRows(navigationColumns(320f, 1.3f), 1.3f))
-        assertEquals(listOf("Skills", "Memory", "Bots", "Kanban"), navigationMore(1.3f))
+        assertEquals(listOf("Skills", "Vault", "Bots", "Kanban"), navigationMore(1.3f))
         assertEquals(navigationTiles.sorted(), (navigationShown(1.3f) + navigationMore(1.3f)).sorted())
         // At a normal size nothing sits under More.
         assertEquals(navigationTiles, navigationShown(1f))

@@ -85,6 +85,12 @@ async def test_phone_delivery_keeps_cron_title_and_rejects_unwrapped_standalone(
     api,client,cfg,_,_=harness
     cfg['scheduled_callback_conversation_id']='assistant-chat'
     phone=load_private('phone_delivery')
+    from types import SimpleNamespace
+    from gateway import platform_registry as registry_module
+    registry = registry_module.PlatformRegistry()
+    monkeypatch.setattr(registry_module, 'platform_registry', registry)
+    monkeypatch.delenv('PHONE_HOME_CHANNEL', raising=False)
+    phone.register(SimpleNamespace(register_platform=lambda **values: registry.register(registry_module.PlatformEntry(**values))))
     monkeypatch.setattr(phone,'_modules',lambda:(api.mobile,api.native,api.proactive))
     monkeypatch.setattr(phone,'_profile_state',lambda:(api.mobile,cfg,'default'))
     monkeypatch.setattr(api.native,'verify',lambda *args:{'messages':[]})

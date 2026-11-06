@@ -6,6 +6,19 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class GrokWireTest {
+    @Test fun typedInputWaitsForTheResponseBoundaryWithoutBeingConsumed() {
+        val wire=GrokWire()
+        val input=JSONObject().put("clientContent",JSONObject().put("turns",JSONArray().put(JSONObject().put("role","user")
+            .put("parts",JSONArray().put(JSONObject().put("text","Synthetic typed request"))))).put("turnComplete",true))
+        wire.inbound(JSONObject().put("type","response.created"))
+        assertNull(wire.outboundTyped(input))
+        wire.inbound(JSONObject().put("type","response.done"))
+        assertNull("A rejected typed input did not queue a hidden response",wire.continueResponse())
+        val sent=wire.outboundTyped(input)!!
+        assertEquals(listOf("conversation.item.create","response.create"),sent.map { it.getString("type") })
+        assertEquals("Synthetic typed request",sent.first().getJSONObject("item").getJSONArray("content").getJSONObject(0).getString("text"))
+        assertNull(wire.outboundTyped(input))
+    }
     private fun input(type:String,item:String)=JSONObject().put("type",type).put("item_id",item)
     private fun transcription(item:String,text:String,status:String?="completed",index:Int=0):JSONObject =
         input("conversation.item.input_audio_transcription.completed",item).put("content_index",index).put("transcript",text)
@@ -96,6 +109,120 @@ class GrokWireTest {
             .put("call_id","call-1").put("name","invoke_tool"))!!.getJSONObject("toolCall").getJSONArray("functionCalls").getJSONObject(0)
         assertEquals("hello world",call.getJSONObject("args").getString("query"))
     }
+
+    private fun toolItem(item:String="item-1",id:String="call-1",name:String="discover_tools",arguments:String="{\"query\":\"mail\"}") =
+        JSONObject().put("id",item).put("type","function_call").put("status","completed").put("call_id",id).put("name",name).put("arguments",arguments)
+    private fun itemEvent(type:String,response:String,item:JSONObject,index:Int=0) =
+        JSONObject().put("type",type).put("response_id",response).put("output_index",index).put("item",item)
+    private fun done(response:String,status:String="completed",items:JSONArray=JSONArray()) =
+        JSONObject().put("type","response.done").put("response",JSONObject().put("id",response).put("status",status).put("output",items))
+    private fun calls(frame:JSONObject?) = frame?.optJSONObject("toolCall")?.optJSONArray("functionCalls") ?: JSONArray()
+    private fun startResponse(wire:GrokWire,id:String) { wire.inbound(JSONObject().put("type","response.created").put("response",JSONObject().put("id",id))) }
+
+    // Defensive shapes: the current xAI and OpenAI Realtime examples include both fields; neither proves what the owner's call sent.
+    @Test fun partialArgumentDoneWaitsForACompleteItemAndDispatchesExactlyOnce() {
+        for(missing in listOf(listOf("name"),listOf("call_id"),listOf("name","call_id"))) {
+            val wire=GrokWire();startResponse(wire,"response-1")
+            wire.inbound(itemEvent("response.output_item.added","response-1",toolItem().put("status","in_progress").put("arguments","")))
+            val partial=JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1")
+                .put("item_id","item-1").put("output_index",0).put("call_id","call-1").put("name","discover_tools")
+                .put("arguments","{\"query\":\"mail\"}")
+            missing.forEach { partial.remove(it) }
+            assertEquals("A partial envelope cannot authorize a tool before response completion",0,calls(wire.inbound(partial)).length())
+            val completed=done("response-1",items=JSONArray().put(toolItem()))
+            val found=calls(wire.inbound(completed))
+            assertEquals(1,found.length());assertEquals("call-1",found.getJSONObject(0).getString("id"))
+            assertEquals("discover_tools",found.getJSONObject(0).getString("name"));assertEquals("mail",found.getJSONObject(0).getJSONObject("args").getString("query"))
+            assertEquals(0,calls(wire.inbound(completed)).length())
+            val answer=wire.outbound(GeminiWire.tool("call-1","discover_tools",JSONObject().put("tools",JSONArray())))
+            assertEquals("function_call_output",answer.first().getJSONObject("item").getString("type"))
+            assertEquals("call-1",answer.first().getJSONObject("item").getString("call_id"))
+        }
+    }
+
+    @Test fun completedItemIsRetainedWhenTheCompletedResponseHasNoOutputItems() {
+        val wire=GrokWire();startResponse(wire,"response-1")
+        wire.inbound(itemEvent("response.output_item.added","response-1",toolItem().put("status","in_progress").put("arguments","")))
+        assertEquals(0,calls(wire.inbound(JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1")
+            .put("item_id","item-1").put("output_index",0).put("arguments","{\"query\":\"mail\"}"))).length())
+        assertEquals(0,calls(wire.inbound(itemEvent("response.output_item.done","response-1",toolItem()))).length())
+        val found=calls(wire.inbound(done("response-1")))
+        assertEquals(1,found.length());assertEquals("call-1",found.getJSONObject(0).getString("id"))
+        assertEquals("mail",found.getJSONObject(0).getJSONObject("args").getString("query"))
+        assertEquals(0,calls(wire.inbound(done("response-1",items=JSONArray().put(toolItem())))).length())
+    }
+
+    @Test fun cancelledPartialResponseDoesNotDispatchOrLeakIntoTheNextResponse() {
+        val wire=GrokWire();startResponse(wire,"response-1")
+        wire.inbound(itemEvent("response.output_item.added","response-1",toolItem().put("status","in_progress")))
+        assertEquals(0,calls(wire.inbound(JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1")
+            .put("item_id","item-1").put("arguments","{\"query\":\"mail\"}"))).length())
+        assertEquals(0,calls(wire.inbound(itemEvent("response.output_item.done","response-1",toolItem()))).length())
+        val cancelled=wire.inbound(done("response-1","cancelled"))
+        assertEquals(0,calls(cancelled).length());assertTrue(cancelled!!.getJSONObject("serverContent").getBoolean("interrupted"))
+        startResponse(wire,"response-2")
+        assertEquals(0,calls(wire.inbound(done("response-2"))).length())
+        startResponse(wire,"response-3")
+        val fresh=calls(wire.inbound(done("response-3",items=JSONArray().put(toolItem("item-2","call-2",arguments="{\"query\":\"files\"}")))))
+        assertEquals(1,fresh.length());assertEquals("call-2",fresh.getJSONObject(0).getString("id"))
+        assertEquals("files",fresh.getJSONObject(0).getJSONObject("args").getString("query"))
+    }
+
+    @Test fun mismatchedResponseOrCallIdentityCannotBorrowAnEarlierItem() {
+        val wire=GrokWire();startResponse(wire,"response-1")
+        wire.inbound(itemEvent("response.output_item.added","response-1",toolItem().put("status","in_progress")))
+        val wrongResponse=JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-2")
+            .put("item_id","item-1").put("arguments","{\"query\":\"private\"}")
+        assertEquals(0,calls(wire.inbound(wrongResponse)).length())
+        val wrongCall=JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1")
+            .put("item_id","item-1").put("call_id","call-2").put("name","discover_tools").put("arguments","{\"query\":\"private\"}")
+        assertEquals(0,calls(wire.inbound(wrongCall)).length())
+        assertEquals(0,calls(wire.inbound(itemEvent("response.output_item.done","response-2",toolItem()))).length())
+        assertEquals(0,calls(wire.inbound(done("response-1"))).length())
+    }
+
+    @Test fun malformedPartialArgumentsNeverBecomeAnExecutableCall() {
+        for(bad in listOf("{","[1]")) {
+            val wire=GrokWire();startResponse(wire,"response-1")
+            wire.inbound(itemEvent("response.output_item.added","response-1",toolItem().put("status","in_progress")))
+            val partial=JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1").put("item_id","item-1").put("arguments",bad)
+            assertEquals(0,calls(wire.inbound(partial)).length())
+            assertEquals(0,calls(wire.inbound(itemEvent("response.output_item.done","response-1",toolItem(arguments=bad)))).length())
+            assertEquals(0,calls(wire.inbound(done("response-1"))).length())
+            startResponse(wire,"response-2")
+            assertEquals(1,calls(wire.inbound(done("response-2",items=JSONArray().put(toolItem("item-2","call-2"))))).length())
+        }
+    }
+
+    @Test fun parallelPartialCallsWaitForBothResultsBeforeContinuing() {
+        val wire=GrokWire();startResponse(wire,"response-1")
+        listOf(Triple("item-1","call-1","mail"),Triple("item-2","call-2","files")).forEachIndexed { index,(item,id,query) ->
+            wire.inbound(itemEvent("response.output_item.added","response-1",toolItem(item,id).put("status","in_progress"),index))
+            val partial=JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1")
+                .put("item_id",item).put("output_index",index).put("arguments",JSONObject().put("query",query).toString())
+            assertEquals(0,calls(wire.inbound(partial)).length())
+            assertEquals(0,calls(wire.inbound(itemEvent("response.output_item.done","response-1",toolItem(item,id,arguments=JSONObject().put("query",query).toString()),index))).length())
+        }
+        val found=calls(wire.inbound(done("response-1")))
+        assertEquals(2,found.length())
+        assertEquals(setOf("call-1","call-2"),(0 until found.length()).map { found.getJSONObject(it).getString("id") }.toSet())
+        val first=wire.outbound(GeminiWire.tool("call-1","discover_tools",JSONObject().put("tools",JSONArray())))
+        assertEquals(listOf("conversation.item.create"),first.map { it.getString("type") });assertNull(wire.continueResponse())
+        val second=wire.outbound(GeminiWire.tool("call-2","discover_tools",JSONObject().put("tools",JSONArray())))
+        assertEquals(listOf("conversation.item.create","response.create"),second.map { it.getString("type") })
+    }
+
+    @Test fun replacementProviderSessionCannotInheritAnUnfinishedPartialCall() {
+        val old=GrokWire();startResponse(old,"response-1")
+        old.inbound(itemEvent("response.output_item.added","response-1",toolItem().put("status","in_progress")))
+        val partial=JSONObject().put("type","response.function_call_arguments.done").put("response_id","response-1")
+            .put("item_id","item-1").put("arguments","{\"query\":\"mail\"}")
+        assertEquals(0,calls(old.inbound(partial)).length())
+        assertEquals(0,calls(old.inbound(itemEvent("response.output_item.done","response-1",toolItem()))).length())
+        val replacement=GrokWire();startResponse(replacement,"response-1")
+        assertEquals(0,calls(replacement.inbound(done("response-1"))).length())
+    }
+
     @Test fun assistantTranscriptDoneDoesNotRepeatTextAlreadyStreamedForTheItem() {
         val wire=GrokWire()
         val delta=JSONObject().put("type","response.output_audio_transcript.delta").put("item_id","item-1").put("delta","Hello ")

@@ -102,6 +102,107 @@ def settled(gateway,request='r1'):
     pytest.fail('receipt never settled')
 
 
+def _owner_followup_receipt_producer():
+    """A real second process performs one bounded synthetic operation against a shared receipt DB."""
+    root=Path(sys.argv[2]);release=root/'release'
+    class Producer(Backend):
+        def execute(self,*args,**kwargs):
+            with (root/'executions').open('a',encoding='utf-8') as log:log.write(str(os.getpid())+'\n')
+            (root/'started').write_text(str(os.getpid()),encoding='utf-8')
+            deadline=time.monotonic()+20
+            while not release.exists() and time.monotonic()<deadline:time.sleep(.01)
+            return json.dumps({'result':'synthetic producer result'})
+    api=g.Gateway(Mobile(root/'producer.sqlite'),lambda profile,fn:fn(root),Producer())
+    invoke(api)
+    (root/('viewer-'+str(os.getpid()))).write_text('observing',encoding='utf-8')
+    deadline=time.monotonic()+25
+    while api.status(SCOPE,'r1')['status']=='running' and time.monotonic()<deadline:time.sleep(.01)
+
+
+@pytest.fixture
+def owner_followup_producer(tmp_path):
+    import subprocess
+    script="import sys;sys.path.insert(0,sys.argv[1]);from test_gateway_tools import _owner_followup_receipt_producer;_owner_followup_receipt_producer()"
+    process=subprocess.Popen([sys.executable,'-X','utf8','-c',script,str(Path(__file__).parent),str(tmp_path)],
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try:
+        deadline=time.monotonic()+10
+        while not (tmp_path/'started').exists() and process.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+        assert (tmp_path/'started').exists(),process.communicate(timeout=3)
+        # Windows' venv launcher owns another PID than the interpreter running the operation.
+        process.producer_pid=int((tmp_path/'started').read_text())
+        assert process.producer_pid!=os.getpid()
+        api=g.Gateway(Mobile(tmp_path/'producer.sqlite'),lambda profile,fn:fn(tmp_path),Backend())
+        yield api,process,tmp_path
+    finally:
+        (tmp_path/'release').write_text('release',encoding='utf-8')
+        try:process.communicate(timeout=10)
+        except subprocess.TimeoutExpired:process.kill();process.communicate(timeout=5)
+
+
+def test_owner_followup_red_foreign_running_producer_is_observed_without_poisoning(owner_followup_producer):
+    api,process,root=owner_followup_producer
+    observed=api.status(SCOPE,'r1')
+    assert observed['status']=='running',observed
+    assert 'result' not in observed
+    (root/'release').write_text('release',encoding='utf-8')
+    process.wait(timeout=10)
+    assert api.status(SCOPE,'r1')['status']=='completed'
+    assert api.status(SCOPE,'r1')['result']=={'result':'synthetic producer result'}
+
+
+@pytest.mark.parametrize('boundary',['created','pid','boot','missing'])
+def test_owner_followup_replaced_or_unknown_producer_stays_uncertain(owner_followup_producer,boundary):
+    api,process,root=owner_followup_producer
+    with api.db() as conn:
+        value=json.loads(api._row(conn,SCOPE,'r1')['payload'])
+        if boundary=='missing':value.pop('_producer')
+        elif boundary=='created':value['_producer']['created']+=1
+        elif boundary=='pid':value['_producer']['pid']=os.getpid()
+        else:value['_producer']['boot']='different-generation'
+        api._save(conn,SCOPE,'r1',value)
+    assert api.status(SCOPE,'r1')['status']=='uncertain'
+    (root/'release').write_text('release',encoding='utf-8');process.wait(timeout=10)
+    assert api.status(SCOPE,'r1')['status']=='uncertain'
+    assert 'result' not in api.status(SCOPE,'r1')
+    assert invoke(api)['status']=='uncertain'
+    assert len((root/'executions').read_text().splitlines())==1
+
+
+def test_owner_followup_dead_producer_cannot_be_replayed(owner_followup_producer):
+    import psutil
+    api,process,root=owner_followup_producer
+    with api.db() as conn:value=json.loads(api._row(conn,SCOPE,'r1')['payload'])
+    producer=psutil.Process(process.producer_pid)
+    assert producer.pid==value['_producer']['pid'] and producer.create_time()==value['_producer']['created']
+    producer.terminate();producer.wait(timeout=5);process.wait(timeout=5)
+    assert api.status(SCOPE,'r1')['status']=='uncertain'
+    assert invoke(api)['status']=='uncertain'
+    assert len((root/'executions').read_text().splitlines())==1
+
+
+def test_owner_followup_second_process_observes_same_receipt_without_dispatch(owner_followup_producer):
+    import subprocess
+    api,_,root=owner_followup_producer
+    script="import sys;sys.path.insert(0,sys.argv[1]);from test_gateway_tools import _owner_followup_receipt_producer;_owner_followup_receipt_producer()"
+    second=subprocess.Popen([sys.executable,'-X','utf8','-c',script,str(Path(__file__).parent),str(root)],
+        stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    try:
+        deadline=time.monotonic()+6
+        while len(list(root.glob('viewer-*')))<2 and second.poll() is None and time.monotonic()<deadline:time.sleep(.01)
+        assert len(list(root.glob('viewer-*')))==2, (
+            'Synthetic second viewer did not become ready',
+            second.communicate(timeout=3) if second.poll() is not None else 'viewer process still starting')
+        assert api.status(SCOPE,'r1')['status']=='running'
+        assert len((root/'executions').read_text().splitlines())==1
+        (root/'release').write_text('release',encoding='utf-8');second.communicate(timeout=10)
+        assert api.status(SCOPE,'r1')['status']=='completed'
+    finally:
+        (root/'release').write_text('release',encoding='utf-8')
+        try:second.communicate(timeout=10)
+        except subprocess.TimeoutExpired:second.kill();second.communicate(timeout=5)
+
+
 def test_direct_read_and_exact_idempotency(gateway):
     api,backend,_=gateway
     invoke(api)
@@ -1116,7 +1217,7 @@ def test_read_only_gateway_tools_are_stopped_by_hermes_pre_tool_hook(tmp_path,mo
         return original(name,args,**kwargs)
     monkeypatch.setattr(model_tools,'handle_function_call',handle)
     monkeypatch.setattr(plugins,'_dispatch_pre_tool_call_hooks',lambda *args,**kwargs:('Blocked by owner policy',None))
-    monkeypatch.setattr(registry,'dispatch',lambda *args,**kwargs:dispatched.append((args,kwargs)) or {'ok':True})
+    monkeypatch.setattr(type(registry),'dispatch',lambda self,*args,**kwargs:dispatched.append((args,kwargs)) or {'ok':True})
     session_context=SimpleNamespace(set_session_vars=lambda **kwargs:session.update(kwargs) or kwargs,
                                     clear_session_vars=lambda _:session.clear())
     monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=session_context))
@@ -1528,21 +1629,25 @@ def test_discover_lookup_preserves_context_and_never_borrows_another_profiles_ro
             if worker is not threading.current_thread(): worker.join(2)
 
 
-def test_discover_without_a_last_list_waits_and_propagates_lookup_errors(tmp_path,monkeypatch):
+def test_cold_discovery_has_a_deadline_and_does_not_invent_a_tool_list(tmp_path,monkeypatch):
     profile='cold-wait-'+str(time.time_ns());release=threading.Event();entered=threading.Event();finished=threading.Event()
     api=g.Gateway(Mobile(tmp_path/'cold.sqlite'),lambda p,fn:fn(tmp_path),Backend())
     def blocked(profile): entered.set();release.wait(2);return []
     monkeypatch.setattr(api,'_pending',blocked)
     monkeypatch.setattr(g,'DISCOVER_LIST_WAIT',.04,raising=False)
-    result=[]
+    result=[];errors=[]
     def discover():
         try: result.append(api.discover(profile,'search'))
+        except HTTPException as error: errors.append(error)
         finally: finished.set()
     worker=threading.Thread(target=discover);worker.start()
     try:
-        assert entered.wait(1) and not finished.wait(.12), 'a cold lookup cannot invent an empty or foreign list'
-    finally: release.set();worker.join(2)
-    assert finished.is_set() and result[0]['tools'][0]['name']=='configured_search'
+        assert entered.wait(1) and finished.wait(.5), 'a cold metadata lookup must release its request admission at the deadline'
+        assert not result and len(errors)==1 and errors[0].status_code==504
+    finally:
+        release.set();worker.join(2)
+        g.DISCOVER_LOOKUPS[profile][0].join(2)
+    assert api.discover(profile,'search')['tools'][0]['name']=='configured_search'
     def failed(*args,**kwargs): raise HTTPException(409,'Synthetic lookup failure')
     monkeypatch.setattr(api,'catalog',failed)
     with pytest.raises(HTTPException) as error: api.discover(profile,'search')
@@ -1593,3 +1698,236 @@ def test_router_timeout_logs_worker_locations_and_holds_admission_until_worker_f
         await asyncio.sleep(.08)
         assert await endpoint('synthetic',None,'')=={'tools':[]}
     asyncio.run(exercise())
+
+
+@pytest.fixture
+def current_future_native(tmp_path, monkeypatch):
+    """Real Hermes registration, refresh, dispatch and approvals; only the MCP session is synthetic."""
+    import asyncio
+    import contextvars
+    import copy
+    import yaml
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_DISABLE_LAZY_INSTALLS', '1')
+    monkeypatch.syspath_prepend(str(_hermes_agent_source()))
+    from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+    token = set_hermes_home_override(str(tmp_path))
+    from tools import mcp_tool as core, mcp_tool_registration as registration, mcp_tool_discovery as discovery
+    from tools.registry import registry
+    import model_tools  # public source, warmed before measuring the call catalogue
+    assert get_hermes_home() == tmp_path
+    monkeypatch.setattr(registry, '_scoped_tools', {})
+    for name in ('CATALOG_CACHE', 'CATALOG_FIRST_WARM', 'LAST_CATALOG', 'DISCOVER_LOOKUPS',
+                 'MCP_CACHE_FILES', 'MCP_REGISTERED'):
+        monkeypatch.setattr(g, name, {})
+    for name in ('CATALOG_SETTLED', 'CATALOG_WARMING', 'MCP_REFRESHED', 'MCP_SCANNING'):
+        monkeypatch.setattr(g, name, set())
+    # Any accidental connection attempt fails before a process or network transport exists.
+    async def no_connect(*args, **kwargs):
+        raise AssertionError('Synthetic session must never open a transport')
+    monkeypatch.setattr(discovery, '_connect_server', no_connect)
+    loop = asyncio.new_event_loop()
+    worker = threading.Thread(target=contextvars.copy_context().run, args=(loop.run_forever,), daemon=True)
+    monkeypatch.setattr(core, '_mcp_loop', loop)
+    worker.start()
+    server_name = 'synthetic_catalogue'
+    cfg = {'command': 'synthetic-in-process-only', 'trust': 'untrusted'}
+    config = {'platform_toolsets': {'api_server': ['file', 'mcp-' + server_name]}, 'mcp_servers': {server_name: cfg}}
+    def write_config():
+        (tmp_path / 'config.yaml').write_text(yaml.safe_dump(config), encoding='utf-8')
+    write_config()
+    def tool(name, fields, read_only=True):
+        return SimpleNamespace(name=name, description=name.replace('_', ' '),
+            inputSchema={'type': 'object', 'properties': {field: {'type': kind} for field, kind in fields.items()},
+                         'required': list(fields), 'additionalProperties': False},
+            annotations=SimpleNamespace(readOnlyHint=read_only))
+    class Session:
+        def __init__(self):
+            self.tools = [tool('search_products', {'query': 'string'}), tool('purchase', {'sku': 'string'}, False),
+                          tool('contact_seller', {'message': 'string'}, False)]
+            self.calls = []
+            self.results = {'search_products': {'products': [{'sku': 'fixture-42', 'price': 24, 'currency': 'AED'}]},
+                            'add_cart_item': {'cart': [{'sku': 'fixture-42', 'quantity': 2}], 'purchased': False},
+                            'get_browser_product': {'sku': 'fixture-42', 'available': True}}
+        async def list_tools(self):
+            return SimpleNamespace(tools=self.tools, nextCursor=None)
+        async def call_tool(self, name, arguments, **kwargs):
+            from gateway.session_context import get_session_env
+            self.calls.append((name, arguments.copy(), get_session_env('HERMES_SESSION_ID'),
+                               get_session_env('HERMES_SESSION_PROFILE'), get_session_env('HERMES_SESSION_USER_ID')))
+            assert name in self.results, 'Purchase and external contact are never authorized by these tests'
+            return SimpleNamespace(content=[], structuredContent=copy.deepcopy(self.results[name]), isError=False)
+    session = Session()
+    server = core.MCPServerTask(server_name)
+    server._config = cfg
+    server.session = session
+    server._ever_connected = True
+    server._tools = session.tools
+    from tools.mcp_tool_scope import _server_key
+    key = _server_key(server_name)
+    monkeypatch.setitem(core._servers, key, server)
+    server._registered_tool_names = registration._register_server_tools(server_name, server, cfg)
+    profile_homes = {'profile': tmp_path}
+    def scoped(profile, fn):
+        bound = set_hermes_home_override(str(profile_homes[profile]))
+        try: return fn(profile_homes[profile])
+        finally: reset_hermes_home_override(bound)
+    api = g.Gateway(Mobile(tmp_path / 'synthetic-receipts.sqlite'), scoped)
+    def refresh():
+        asyncio.run_coroutine_threadsafe(server._refresh_tools(), loop).result(timeout=5)
+    try:
+        yield SimpleNamespace(api=api, registry=registry, home=tmp_path, config=config, write_config=write_config,
+                              server=server, session=session, tool=tool, refresh=refresh, profile_homes=profile_homes)
+    finally:
+        for thread in list(g.DISCOVER_LOOKUPS.values()): thread[0].join(5)
+        loop.call_soon_threadsafe(loop.stop)
+        worker.join(5)
+        assert not worker.is_alive()
+        loop.close()
+        reset_hermes_home_override(token)
+
+
+def test_current_future_native_registry_changes_invalidate_a_settled_cache(current_future_native):
+    env = current_future_native
+    api, registry = env.api, env.registry
+    api.prefetch('profile')
+    key = api._catalog_key('profile')
+    assert key in g.CATALOG_SETTLED
+    original = next(row for row in api.catalog('profile', discover=False) if row['name'] == 'read_file')
+    # A generation-only bump is not a changed catalogue and keeps the settled cache.
+    registry._generation += 1
+    assert api._catalog_key('profile') == key
+    name = 'search_future_inventory'
+    schema = {'name': name, 'description': 'Search future inventory', 'parameters':
+              {'type': 'object', 'properties': {'query': {'type': 'string'}}, 'required': ['query']}}
+    registry.register(name, 'file', schema, lambda args, **kwargs: json.dumps({'items': ['fixture-42']}), scope=str(env.home))
+    found = api.discover('profile', name)['tools']
+    assert any(row['name'] == name for row in found), 'a real new registry tool must appear during the settled call'
+    added = next(row for row in found if row['name'] == name)
+    assert api._catalog_key('profile') != key
+    assert next(row for row in api.catalog('profile', discover=False) if row['name'] == 'read_file')['tool_id'] == original['tool_id']
+    schema = {**schema, 'parameters': {'type': 'object', 'properties': {'category': {'type': 'string'}}, 'required': ['category']}}
+    registry.register(name, 'file', schema, lambda args, **kwargs: '{}', scope=str(env.home))
+    with pytest.raises(HTTPException) as error:
+        api.invoke(SCOPE, {'request_id': 'old-schema', 'tool_id': added['tool_id'], 'arguments': {'query': 'desk'}})
+    assert error.value.status_code == 409
+    current = next(row for row in api.discover('profile', name)['tools'] if row['name'] == name)
+    assert current['tool_id'] != added['tool_id'] and 'category' in current['parameters']['required']
+    registry.deregister(name, scope=str(env.home))
+    assert all(row['name'] != name for row in api.discover('profile', name)['tools'])
+    with pytest.raises(HTTPException) as error:
+        api.invoke(SCOPE, {'request_id': 'removed', 'tool_id': current['tool_id'], 'arguments': {'category': 'desk'}})
+    assert error.value.status_code == 409 and not env.session.calls
+
+
+def test_current_future_mcp_shopping_refresh_receipts_and_write_approval(current_future_native):
+    env = current_future_native
+    api = env.api
+    initial = api.discover('profile', 'search_products')['tools'][0]
+    assert api._catalog_key('profile') in g.CATALOG_SETTLED
+    def invoke_tool(row, request, arguments):
+        return api.invoke(SCOPE, {'request_id': request, 'tool_id': row['tool_id'], 'arguments': arguments}, session_id='native-conversation')
+    invoke_tool(initial, 'products', {'query': 'desk lamp'})
+    result = settled(api, 'products')
+    assert result['status'] == 'completed' and result['result'] == {'result': env.session.results['search_products']}
+    # Hermes' real list-changed refresh rewrites both registry and schema file while this same call remains warm.
+    env.session.tools += [env.tool('get_browser_product', {'sku': 'string'}),
+                          env.tool('add_cart_item', {'sku': 'string', 'quantity': 'integer'}, False)]
+    env.refresh()
+    browser = api.discover('profile', 'get_browser_product')['tools'][0]
+    cart = api.discover('profile', 'add_cart_item')['tools'][0]
+    assert browser['name'].endswith('get_browser_product') and cart['read_only'] is False
+    assert api.discover('profile', 'search_products')['tools'][0]['tool_id'] == initial['tool_id']
+    invoke_tool(browser, 'inspect', {'sku': 'fixture-42'})
+    assert settled(api, 'inspect')['result'] == {'result': env.session.results['get_browser_product']}
+    proposal = invoke_tool(cart, 'cart', {'sku': 'fixture-42', 'quantity': '2'})
+    assert proposal['status'] == 'needs_approval' and len(env.session.calls) == 2
+    assert proposal['proposal']['arguments'] == {'sku': 'fixture-42', 'quantity': 2}
+    api.decide(SCOPE, 'cart', {'proposal_id': proposal['proposal']['id'], 'decision': 'approve'})
+    cart_result = settled(api, 'cart')
+    assert cart_result['status'] == 'completed' and cart_result['result'] == {'result': env.session.results['add_cart_item']}
+    assert invoke_tool(cart, 'cart', {'sku': 'fixture-42', 'quantity': '2'}) == cart_result
+    for raw in ('purchase', 'contact_seller'):
+        row = api.discover('profile', raw)['tools'][0]
+        arguments = {'sku': 'fixture-42'} if raw == 'purchase' else {'message': 'synthetic inquiry'}
+        refused = invoke_tool(row, raw, arguments)
+        assert refused['status'] == 'needs_approval'
+        assert api.decide(SCOPE, raw, {'proposal_id': refused['proposal']['id'], 'decision': 'deny'})['status'] == 'denied'
+    assert [call[0] for call in env.session.calls] == ['search_products', 'get_browser_product', 'add_cart_item']
+    assert all(call[2:] == ('native-conversation', 'profile', 'password:owner') for call in env.session.calls)
+
+
+@pytest.mark.parametrize('change', ['removed', 'disabled', 'filtered', 'schema'])
+def test_current_future_warm_mcp_changes_reject_stale_handles_and_proposals(current_future_native, change):
+    env = current_future_native
+    env.session.tools.append(env.tool('add_cart_item', {'sku': 'string'}, False))
+    env.refresh()
+    api = env.api
+    tool = api.discover('profile', 'add_cart_item')['tools'][0]
+    key = api._catalog_key('profile')
+    assert key in g.CATALOG_SETTLED
+    proposal = api.invoke(SCOPE, {'request_id': 'pending-cart', 'tool_id': tool['tool_id'], 'arguments': {'sku': 'fixture-42'}})
+    assert proposal['status'] == 'needs_approval'
+    if change == 'removed':
+        env.session.tools = [row for row in env.session.tools if row.name != 'add_cart_item']
+        env.refresh()
+    elif change in ('disabled', 'filtered'):
+        config = env.config['mcp_servers'][env.server.name]
+        config.update({'enabled': False} if change == 'disabled' else {'tools': {'exclude': ['add_cart_item']}})
+        env.write_config()
+    else:
+        env.session.tools = [env.tool('add_cart_item', {'sku': 'string', 'quantity': 'integer'}, False)
+                             if row.name == 'add_cart_item' else row for row in env.session.tools]
+        env.refresh()
+    assert api._catalog_key('profile') != key
+    with pytest.raises(HTTPException) as error:
+        api.invoke(SCOPE, {'request_id': 'stale-cart', 'tool_id': tool['tool_id'], 'arguments': {'sku': 'fixture-42'}})
+    assert error.value.status_code == 409
+    assert api.decide(SCOPE, 'pending-cart', {'proposal_id': proposal['proposal']['id'], 'decision': 'approve'})['status'] == 'failed'
+    assert not env.session.calls
+    if change == 'schema':
+        current = api.discover('profile', 'add_cart_item')['tools'][0]
+        assert current['tool_id'] != tool['tool_id'] and current['parameters']['required'] == ['sku', 'quantity']
+        with pytest.raises(HTTPException) as error:
+            api.invoke(SCOPE, {'request_id': 'missing-field', 'tool_id': current['tool_id'], 'arguments': {'sku': 'fixture-42'}})
+        assert error.value.status_code == 400
+
+
+def test_current_future_native_browser_and_agent_state_stays_out_of_direct_dispatch(current_future_native):
+    env = current_future_native
+    for name, toolset in [('browser_fixture', 'browser'), ('phone_fixture', 'beacon-phone'), ('todo_list', 'todo')]:
+        env.registry.register(name, toolset, {'name': name, 'description': 'Canonical agent state',
+                              'parameters': {'type': 'object'}}, lambda args, **kwargs: pytest.fail('needs native agent'),
+                              scope=str(env.home))
+    env.config['platform_toolsets']['api_server'] += ['browser', 'beacon-phone', 'todo']
+    env.write_config()
+    names = {row['name'] for row in env.api.catalog('profile', discover=False)}
+    assert 'read_file' in names
+    assert not names & {'browser_fixture', 'phone_fixture', 'todo_list'}
+
+
+def test_current_future_catalogues_and_admission_keep_profile_and_owner_authority(current_future_native, monkeypatch):
+    import yaml
+    env = current_future_native
+    name = 'search_private_inventory'
+    env.registry.register(name, 'file', {'name': name, 'description': 'Private inventory',
+                          'parameters': {'type': 'object', 'properties': {}}},
+                          lambda args, **kwargs: pytest.fail('Revoked owner must not dispatch'), scope=str(env.home))
+    own = next(row for row in env.api.discover('profile', name)['tools'] if row['name'] == name)
+    other = env.home / 'other-profile'
+    other.mkdir()
+    (other / 'config.yaml').write_text(yaml.safe_dump({'platform_toolsets': {'api_server': ['file']}}), encoding='utf-8')
+    env.profile_homes['other'] = other
+    rows = env.api.catalog('other', discover=False)
+    assert all(row['name'] != name for row in rows), 'real native registry overlays belong to their profile home'
+    foreign_handle = next(row['tool_id'] for row in rows if row['name'] == 'read_file')
+    with pytest.raises(HTTPException) as error:
+        env.api.invoke(SCOPE, {'request_id': 'foreign-handle', 'tool_id': foreign_handle, 'arguments': {}})
+    assert error.value.status_code == 409
+    proposal = env.api.invoke(SCOPE, {'request_id': 'owner-revoked', 'tool_id': own['tool_id'], 'arguments': {}})
+    assert proposal['status'] == 'needs_approval'
+    monkeypatch.setattr(env.api.mobile, 'settings', lambda: {'owner_id': 'replacement', 'owner_provider': 'password'})
+    env.api.decide(SCOPE, 'owner-revoked', {'proposal_id': proposal['proposal']['id'], 'decision': 'approve'})
+    result = settled(env.api, 'owner-revoked')
+    assert result['status'] == 'failed' and result['error_code'] == 'admission_rejected' and result['http_status'] == 403
+    assert not env.session.calls

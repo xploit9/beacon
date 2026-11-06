@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -221,6 +222,7 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS call_log(id TEXT PRIMARY KEY, owner TEXT, profile TEXT, conversation TEXT, created REAL, expires REAL, state TEXT DEFAULT 'pending', call_id TEXT, reason TEXT DEFAULT '', email_notice_id TEXT DEFAULT '', feedback_verdict TEXT);
     CREATE TABLE IF NOT EXISTS timeline(call_id TEXT,event_id TEXT,digest TEXT,payload TEXT,PRIMARY KEY(call_id,event_id));
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
+    CREATE TABLE IF NOT EXISTS remote_admissions(admission_id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,home TEXT NOT NULL,session TEXT NOT NULL,request TEXT NOT NULL,principal TEXT NOT NULL,epoch INTEGER NOT NULL,generation INTEGER NOT NULL DEFAULT 0,wire_digest TEXT NOT NULL,payload_digest TEXT NOT NULL,confirmed REAL NOT NULL,expires REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
     CREATE TABLE IF NOT EXISTS beacon_devices(id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,created REAL NOT NULL,last_seen REAL NOT NULL,removed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS deferred(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL);
@@ -252,6 +254,7 @@ def _initialize_schema(conn):
     call_columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
     if 'callback_context' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN callback_context TEXT NOT NULL DEFAULT '{}'")
+    if 'principal' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN principal TEXT NOT NULL DEFAULT ''")
     if 'ended' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN ended REAL')
     if 'seen' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN seen REAL')
     # Only unfinished calls are ever counted or swept, so the index holds just those rows.
@@ -259,20 +262,44 @@ def _initialize_schema(conn):
     columns={r[1] for r in conn.execute('PRAGMA table_info(jobs)')}
     for name in ('result','error'):
         if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+" TEXT DEFAULT ''")
+    for name in ('admission','submission_digest','provider','principal','remote_authorization'):
+        if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+" TEXT NOT NULL DEFAULT ''")
+    if 'intent_callback' not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN intent_callback INTEGER NOT NULL DEFAULT 0')
+    if 'tool_request' not in columns: conn.execute("ALTER TABLE jobs ADD COLUMN tool_request TEXT NOT NULL DEFAULT ''")
+    if 'transfer' not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN transfer INTEGER NOT NULL DEFAULT 0')
+    if 'callback_consent' not in columns: conn.execute("ALTER TABLE jobs ADD COLUMN callback_consent TEXT NOT NULL DEFAULT ''")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS voice_tool_follow ON jobs(owner,provider,profile,call_id,tool_request) WHERE tool_request<>''")
     if 'history_updated' not in columns:
         conn.execute('ALTER TABLE jobs ADD COLUMN history_updated REAL NOT NULL DEFAULT 0')
         # Legacy jobs have no change time; preserve them until their age is known.
         conn.execute('UPDATE jobs SET history_updated=?',(time.time(),))
+    for name in ('parked','native_probe'):
+        if name not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN '+name+' INTEGER NOT NULL DEFAULT 0')
+    conn.execute('CREATE INDEX IF NOT EXISTS voice_job_probe ON jobs(owner,provider,profile,epoch,native_probe)')
+    conn.execute('CREATE INDEX IF NOT EXISTS voice_job_parked ON jobs(owner,profile,parked)')
+    conn.execute('''CREATE TRIGGER IF NOT EXISTS voice_job_reactivate AFTER UPDATE OF status,admission,seq ON jobs
+        WHEN NEW.parked=1 AND (NEW.status!='awaiting_admission' OR NEW.admission!='' OR NEW.seq IS NOT NULL)
+        BEGIN UPDATE jobs SET parked=0 WHERE id=NEW.id; END;''')
     notice_columns={r[1] for r in conn.execute('PRAGMA table_info(notices)')}
     call_log_columns={r[1] for r in conn.execute('PRAGMA table_info(call_log)')}
     if 'email_notice_id' not in call_log_columns: conn.execute("ALTER TABLE call_log ADD COLUMN email_notice_id TEXT DEFAULT ''")
     if 'feedback_verdict' not in call_log_columns: conn.execute('ALTER TABLE call_log ADD COLUMN feedback_verdict TEXT')
+    if 'principal' not in call_log_columns: conn.execute("ALTER TABLE call_log ADD COLUMN principal TEXT NOT NULL DEFAULT ''")
     conn.execute('CREATE INDEX IF NOT EXISTS call_log_email_notice ON call_log(email_notice_id)')
     if 'release_version' not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN release_version INTEGER NOT NULL DEFAULT 0')
     if 'reason' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN reason TEXT DEFAULT ''")
     if 'job_id' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN job_id TEXT DEFAULT ''")
+    if 'principal' not in notice_columns: conn.execute("ALTER TABLE notices ADD COLUMN principal TEXT NOT NULL DEFAULT ''")
     for name in ('activity_key','runtime','request_id'):
         if name not in notice_columns: conn.execute('ALTER TABLE notices ADD COLUMN '+name+" TEXT DEFAULT ''")
+    conn.execute('''
+    CREATE TRIGGER IF NOT EXISTS beacon_call_log_principal_insert BEFORE INSERT ON notices
+    WHEN NEW.kind='incoming_call'
+    BEGIN
+        INSERT OR IGNORE INTO call_log(id,owner,profile,conversation,created,expires,state,call_id,reason,principal)
+        VALUES(NEW.id,NEW.owner,NEW.profile,NEW.conversation,NEW.created,NEW.expires,NEW.state,NEW.call_id,NEW.reason,NEW.principal);
+    END;
+    ''')
     conn.execute('''
     CREATE TRIGGER IF NOT EXISTS beacon_call_log_notice_insert AFTER INSERT ON notices
     WHEN NEW.kind='incoming_call'
@@ -298,6 +325,7 @@ def _initialize_schema(conn):
                  "(SELECT 1 FROM meta WHERE key='proactive-email-notice:'||call_log.id)")
     deferred_columns={r[1] for r in conn.execute('PRAGMA table_info(deferred)')}
     if 'reason' not in deferred_columns: conn.execute("ALTER TABLE deferred ADD COLUMN reason TEXT DEFAULT ''")
+    if 'principal' not in deferred_columns: conn.execute("ALTER TABLE deferred ADD COLUMN principal TEXT NOT NULL DEFAULT ''")
 
 class _Connection(sqlite3.Connection):
     """sqlite3's own `with` only commits; closing here as well keeps `with connect() as conn` from leaking the handle."""
@@ -599,15 +627,17 @@ def _active_history_notice(conn,call_id,owner,profile,now):
 def _prune_history(conn,owner,days,now):
     if days<=0: return 0
     cutoff=now-days*86400
-    removed_events=removed_calls=0
+    removed_events=removed_calls=compacted=0
     removed_logs=conn.execute("""DELETE FROM call_log WHERE rowid IN
         (SELECT rowid FROM call_log WHERE owner=? AND created<? ORDER BY created,id LIMIT ?)""",
         (owner,cutoff,HISTORY_RETENTION_CALLS_PER_BATCH)).rowcount
-    while removed_events<HISTORY_RETENTION_EVENTS_PER_BATCH and removed_calls<HISTORY_RETENTION_CALLS_PER_BATCH:
+    while removed_events<HISTORY_RETENTION_EVENTS_PER_BATCH and removed_calls+compacted<HISTORY_RETENTION_CALLS_PER_BATCH:
         call=conn.execute("""SELECT c.id,c.profile FROM calls c
             WHERE c.owner=? AND c.closed=1 AND c.created<?
-              AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.call_id=c.id AND j.owner=c.owner AND j.profile=c.profile
-                AND (j.status IS NULL OR j.status NOT IN ('completed','callback_pending','failed','cancelled') OR j.history_updated>=?))
+              AND ((CASE WHEN json_valid(c.receipt) THEN COALESCE(json_extract(c.receipt,'$.history_pruned'),0) ELSE 0 END)!=1
+                OR EXISTS (SELECT 1 FROM timeline t WHERE t.call_id=c.id)
+                OR NOT EXISTS (SELECT 1 FROM jobs j WHERE j.call_id=c.id AND j.owner=c.owner AND j.profile=c.profile
+                  AND (j.status IS NULL OR j.status NOT IN ('completed','callback_pending','failed','cancelled') OR j.history_updated>=?)))
               AND NOT EXISTS (SELECT 1 FROM notices n WHERE n.owner=c.owner AND n.profile=c.profile
                 AND n.kind='incoming_call' AND n.state='pending' AND n.expires>?
                 AND (n.call_id=c.id OR n.job_id IN (SELECT id FROM jobs WHERE call_id=c.id AND owner=c.owner AND profile=c.profile)))
@@ -618,6 +648,14 @@ def _prune_history(conn,owner,days,now):
         deleted=conn.execute('DELETE FROM timeline WHERE rowid IN (SELECT rowid FROM timeline WHERE call_id=? LIMIT ?)',(call_id,budget)).rowcount
         removed_events+=deleted
         if conn.execute('SELECT 1 FROM timeline WHERE call_id=? LIMIT 1',(call_id,)).fetchone(): break
+        if conn.execute("""SELECT 1 FROM jobs WHERE call_id=? AND owner=? AND profile=?
+            AND (status IS NULL OR status NOT IN ('completed','callback_pending','failed','cancelled') OR history_updated>=?) LIMIT 1""",
+            (call_id,owner,profile,cutoff)).fetchone():
+            # Payload retention does not settle work or discard its closed-call/ownership identity.
+            conn.execute('UPDATE calls SET receipt=? WHERE id=? AND owner=? AND profile=?',
+                (json.dumps({'history_pruned':True,'transcript_available':False}),call_id,owner,profile))
+            compacted+=1
+            continue
         conn.execute("DELETE FROM jobs WHERE call_id=? AND owner=? AND profile=? AND history_updated<? AND status IN ('completed','callback_pending','failed','cancelled')",
                      (call_id,owner,profile,cutoff))
         if _active_history_notice(conn,call_id,owner,profile,now): break
@@ -627,7 +665,7 @@ def _prune_history(conn,owner,days,now):
         conn.execute('DELETE FROM tool_receipts WHERE call_id=? AND owner=? AND profile=?',(call_id,owner,profile))
         conn.execute('DELETE FROM call_tool_allowances WHERE call_id=? AND owner=? AND profile=?',(call_id,owner,profile))
         removed_calls+=deleted
-    return removed_events+removed_calls+removed_logs
+    return removed_events+removed_calls+compacted+removed_logs
 
 def prune_history(owner):
     now=time.time()
@@ -713,21 +751,70 @@ def owned(conn, call_id, owner, profile=None, writable=False):
         raise ValueError('Call is closed')
     return dict(row)
 
-def reserve(owner, profile, conversation, voice=None):
+def reserve(owner, profile, conversation, voice=None, principal=''):
+    if not isinstance(principal,str) or len(principal)>4096 or '\x00' in principal:
+        raise ValueError('Invalid call principal')
     call_id = uuid.uuid4().hex
     with LOCK, connect() as conn:
         active=active_calls(conn,owner)
         if active>=MAX_ACTIVE_CALLS: raise ValueError('Active call limit reached')
         config={**(voice or {}),'client_key':True}
-        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config) VALUES(?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config)))
+        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config,principal) VALUES(?,?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config),principal))
     return {'call_id':call_id,'conversation_id':conversation,'profile':profile,'transport':'gemini_live_direct','recording_status':'disabled','transcript_status':'pending',**(voice or {})}
+
+
+def confirm_remote_admission(value):
+    names=('admission_id','owner','provider','profile','home','session','request','principal','epoch','wire_digest','payload_digest')
+    if set(value)!=set(names) or type(value['epoch']) is not int or value['epoch']<=0:
+        raise ValueError('Invalid admission binding')
+    if any(not isinstance(value[name],str) or not value[name] or len(value[name])>4096 for name in names if name!='epoch'):
+        raise ValueError('Invalid admission binding')
+    if any(not re.fullmatch(r'[0-9a-f]{64}',value[name]) for name in ('home','wire_digest','payload_digest')):
+        raise ValueError('Invalid admission binding')
+    now=time.time()
+    with LOCK,connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        native=sys.modules.get('beacon_native')
+        for row in conn.execute('SELECT * FROM remote_admissions WHERE expires<=?',(now,)).fetchall():
+            if native is not None and native.remote_admission_active(dict(row)) is False:
+                conn.execute('DELETE FROM remote_admissions WHERE admission_id=?',(row['admission_id'],))
+        old=conn.execute('SELECT * FROM remote_admissions WHERE admission_id=?',(value['admission_id'],)).fetchone()
+        if old:
+            if any(old[name]!=value[name] for name in names if name!='wire_digest'): return False
+            conn.execute('UPDATE remote_admissions SET wire_digest=?,confirmed=?,expires=? WHERE admission_id=?',
+                         (value['wire_digest'],now,now+4*3600,value['admission_id']))
+            return True  # Only a newly matched original-submit response can refresh this exact input.
+        if conn.execute('SELECT COUNT(*) FROM remote_admissions').fetchone()[0]>=512: return False
+        conn.execute('INSERT INTO remote_admissions('+','.join(names)+',confirmed,expires) VALUES('+','.join('?' for _ in names)+',?,?)',
+                     (*[value[name] for name in names],now,now+4*3600))
+    return True
+
+
+def remote_admission(admission_id):
+    with connect() as conn:
+        row=conn.execute('SELECT * FROM remote_admissions WHERE admission_id=?',(admission_id,)).fetchone()
+    value=dict(row) if row else None
+    if value and value['expires']<=time.time():
+        native=sys.modules.get('beacon_native')
+        if native is None or native.remote_admission_active(value) is not True: return None
+    return value
+
+
+def start_remote_admission(admission_id,epoch,generation):
+    if type(epoch) is not int or type(generation) is not int or epoch<=0 or generation<=0: return False
+    with LOCK,connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row=conn.execute('SELECT epoch,generation FROM remote_admissions WHERE admission_id=?',(admission_id,)).fetchone()
+        if not row or row['generation']!=0 and (row['epoch']!=epoch or row['generation']!=generation): return False
+        conn.execute('UPDATE remote_admissions SET epoch=?,generation=? WHERE admission_id=?',(epoch,generation,admission_id))
+    return True
 
 def status(row):
     return {'call_id':row['id'],'conversation_id':row['conversation'],'profile':row['profile'],'closed':bool(row['closed']),'recording_status':'disabled','transcript_status':row['status'],**json.loads(row['receipt']),'audio_available':False}
 
 # The call-start stages the phone reports, in order: a failed call names the one that did not finish.
 CALL_STAGES = ('grant_sent','grant_ok','context_sent','context_ok','provider_open','provider_setup_ok','mic_streaming','first_model_audio')
-DIAGNOSTIC_STAGES = ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','transport_started','transport_open','audio_ready','transport_timeout','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error')+CALL_STAGES
+DIAGNOSTIC_STAGES = ('capture_started','capture_stopped','playout_started','playout_stopped','capture_error','playout_error','media_timeout','timestamp_overlap_corrected','transport_started','transport_open','audio_ready','transport_timeout','voice_connecting','context_ready','token_ready','token_error','provider_key_ready','provider_ready','provider_error','voice_error','provider_setup_sent','provider_setup_failed')+CALL_STAGES
 EVENT_TYPES = {'transcript','interruption','capture_started','capture_stopped','playout_started','playout_stopped','upload_gap','state','media_diagnostic','job_link','visual_state','tool_receipt'}
 def events(call_id,owner,body):
     rows=body.get('events')
@@ -765,12 +852,12 @@ def events(call_id,owner,body):
         if row['type']=='tool_receipt':
             ident(row.get('request_id'))
             if not isinstance(row.get('tool_name'),str) or not 1<=len(row['tool_name'])<=200: raise ValueError('Invalid tool name')
-            if row.get('status') not in ('ready','running','needs_approval','completed','failed','denied','expired','uncertain','cancelled','unavailable','not_sent','submission_unconfirmed'): raise ValueError('Invalid tool receipt status')
+            if row.get('status') not in ('ready','running','needs_approval','transferred','completed','failed','denied','expired','uncertain','cancelled','unavailable','not_sent','submission_unconfirmed'): raise ValueError('Invalid tool receipt status')
         elif any(k in row for k in ('request_id','tool_name','status')): raise ValueError('Unexpected tool evidence')
         if 'stage' in row and row['stage'] not in DIAGNOSTIC_STAGES: raise ValueError('Invalid stage')
         if 'error_code' in row:
             codes=r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response'
-            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed'
+            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating'
             if row['type'] not in ('tool_receipt','media_diagnostic') or not isinstance(row['error_code'],str) or not re.fullmatch(codes,row['error_code']): raise ValueError('Invalid diagnostic code')
         if 'elapsed_ms' in row: finite(row['elapsed_ms'])
         for field,limit in (('count',1000000),('total_corrected_ms',9007199254740991)):
@@ -819,7 +906,7 @@ def finalize(call_id,owner,body):
         call.update(status=state,closed=1,ended=call['ended'] or ended,receipt=json.dumps(receipt))
         return status(call)
 
-def invitation(owner,profile,conversation,reason=None,*,deduplicate=False,conn=None):
+def invitation(owner,profile,conversation,reason=None,*,deduplicate=False,conn=None,principal=''):
     from contextlib import nullcontext
     nid=uuid.uuid4().hex
     reason=str(reason or '')[:240]
@@ -828,19 +915,19 @@ def invitation(owner,profile,conversation,reason=None,*,deduplicate=False,conn=N
         prune_notices(conn)
         if deduplicate:
             # Same chat only: another chat's ringing call carries another reason.
-            existing=conn.execute("SELECT id FROM notices WHERE owner=? AND profile=? AND conversation=? AND kind='incoming_call' AND state='pending' AND expires>? ORDER BY created,id LIMIT 1",
-                                  (owner,profile,ident(conversation),time.time())).fetchone()
+            existing=conn.execute("SELECT id FROM notices WHERE owner=? AND profile=? AND conversation=? AND principal=? AND kind='incoming_call' AND state='pending' AND expires>? ORDER BY created,id LIMIT 1",
+                                  (owner,profile,ident(conversation),principal,time.time())).fetchone()
             if existing: return existing['id']
-            existing=conn.execute('SELECT id FROM deferred WHERE owner=? AND profile=? AND conversation=? ORDER BY created,id LIMIT 1',
-                                  (owner,profile,ident(conversation))).fetchone()
+            existing=conn.execute('SELECT id FROM deferred WHERE owner=? AND profile=? AND conversation=? AND principal=? ORDER BY created,id LIMIT 1',
+                                  (owner,profile,ident(conversation),principal)).fetchone()
             if existing: return existing['id']
         active=active_calls(conn,owner)
         if active:
             if conn.execute('SELECT COUNT(*) FROM deferred').fetchone()[0]>=256: raise RuntimeError('Deferred callback capacity reached')
-            conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason) VALUES(?,?,?,?,?,?)',(nid,owner,profile,ident(conversation),time.time(),reason))
+            conn.execute('INSERT INTO deferred(id,owner,profile,conversation,created,reason,principal) VALUES(?,?,?,?,?,?,?)',(nid,owner,profile,ident(conversation),time.time(),reason,principal))
             return nid
         if conn.execute('SELECT COUNT(*) FROM notices').fetchone()[0]>=10000: raise RuntimeError('Notification outbox capacity reached')
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason) VALUES(?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',ident(conversation),time.time(),time.time()+120,reason))
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,reason,principal) VALUES(?,?,?,?,?,?,?,?,?)',(nid,owner,profile,'incoming_call',ident(conversation),time.time(),time.time()+120,reason,principal))
     return nid
 
 
@@ -1013,7 +1100,7 @@ def refs(owner,profile,conversation=None,key=None):
     return result
 
 
-def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024,call_id=None):
+def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024,call_id=None,principal=None):
     # One call's own transcript (the memory hand-over) may be read up to 2000 events; a call is admitted for four hours at most.
     limit=max(1,min(int(limit),2000 if call_id else 200));remaining=max(1,min(int(text_budget),1024*1024))
     output=[];truncated=False
@@ -1021,7 +1108,7 @@ def voice_history(owner,profile,stored,limit=200,text_budget=1024*1024,call_id=N
     with connect() as conn:
         # Keep metadata and rowid payload reads in one WAL snapshot while retention can delete/reuse rows.
         conn.execute('BEGIN')
-        calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND (? IS NULL OR id=?) AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,call_id,call_id,limit+1)).fetchall()
+        calls=conn.execute("SELECT id,created FROM calls c WHERE owner=? AND profile=? AND conversation=? AND (? IS NULL OR id=?) AND (? IS NULL OR principal=?) AND EXISTS(SELECT 1 FROM timeline t WHERE t.call_id=c.id AND json_extract(t.payload,'$.type')='transcript') ORDER BY created DESC,id DESC LIMIT ?",(owner,profile,stored,call_id,call_id,principal,principal,limit+1)).fetchall()
         for call_index,call in enumerate(calls):
             # Item updates retain their original turn/time, even when a late correction arrives in a new turn.
             # Rank metadata only; fetch bounded selected payloads by rowid instead of rescanning every item.

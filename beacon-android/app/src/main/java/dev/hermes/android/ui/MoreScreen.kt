@@ -290,9 +290,9 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
         SettingsStatePage(vm, page) { item { SettingsSection(testTag = "settings-plugin-missing") { MissingBeaconPluginState(compact = true) } } }
         return
     }
-    val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Beacon", "Notifications", "Bots", "Profiles", "Commands", "Session usage")) && page !in setOf("Beacon", "App updates")
+    val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Vault", "Beacon", "Notifications", "Bots", "Profiles", "Commands", "Session usage")) && page !in setOf("Beacon", "App updates")
     if (remotePage && vm.client == null && !ui.loading) {
-        SettingsStatePage(vm, page, back = page !in setOf("Skills", "Memory", "Bots")) {
+        SettingsStatePage(vm, page, back = page !in setOf("Skills", "Bots")) {
             item {
                 SettingsStatusHero(SettingsStatus.Error, uiText("Reconnect to Hermes"), line = uiText("Check your network"),
                     primary = SettingsAction(uiText("Reconnect"), { vm.connect(ui.origin) }, testTag = "settings-reconnect"))
@@ -316,6 +316,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
     LaunchedEffect(page) { if (page.startsWith("category:") && page.removePrefix("category:") !in settingsCategories.keys && page != "category:Advanced") vm.tab("More") }
     when {
         page in setOf("Skills", "Memory") -> NativePhonePreferences(vm, page)
+        page == "Vault" -> NativeVaultPage(vm)
         page == "Bots" -> NativeBotModeScreen(vm)
         page == "Profiles" -> NativeProfilesPage(vm)
         page in setOf("Health", "Logs", "Server updates", "Session checkpoints") -> NativeServerPage(vm, page)

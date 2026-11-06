@@ -38,13 +38,13 @@ class NativeVoiceReadTest {
         val gemini=GeminiWire.setup("model","",null,context).getJSONObject("setup")
         fun names(rows:JSONArray)=(0 until rows.length()).associate { rows.getJSONObject(it).getString("name") to rows.getJSONObject(it) }
         val declared=names(gemini.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations"))
-        assertEquals(setOf("text","callback"),declared.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
+        assertEquals(setOf("text","callback","mode"),declared.getValue("hermes_work").getJSONObject("parameters").getJSONObject("properties").keys().asSequence().toSet())
         val grok=names(GrokWire.setup(gemini,"eve").getJSONObject("session").getJSONArray("tools"))
         assertEquals("object",grok.getValue("hermes_work").getJSONObject("parameters").getString("type"))
         assertEquals(declared.keys,grok.keys)
         assertTrue(grok.keys.containsAll(listOf("discover_tools","invoke_tool","tool_status","hermes_work","hermes_callback","hermes_cancel","get_visual_state","hermes_skills","hermes_context")))
         val instruction=gemini.getJSONObject("systemInstruction").getJSONArray("parts").getJSONObject(0).getString("text")
-        for(text in listOf("You answer the owner yourself, in your own voice","Use hermes_work only for long, multi-step work","never approve your own request")) assertTrue(text,instruction.contains(text))
+        for(text in listOf("You answer the owner yourself, in your own voice","Use hermes_work mode inline for quick protected canonical-state actions","never approve your own request")) assertTrue(text,instruction.contains(text))
         val unavailable=names(GeminiWire.setup("model","",null,JSONObject().put("capabilities",JSONObject().put("skills",false).put("profile_context",false))).getJSONObject("setup").getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations"))
         assertFalse("hermes_skills" in unavailable);assertFalse("hermes_context" in unavailable)
     }

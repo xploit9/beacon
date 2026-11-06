@@ -108,11 +108,22 @@ class DeliveryLogGapsDeviceTest {
         assertEquals("Why the process stopped belongs to the phone, not the account", "Closed by Android" to 6_000L, DeliveryLog.lastStop(context))
     }
 
-    @Test fun signingOutClearsThemEvenWhenKeepConnectedWasNeverOn() {
+    @Test fun signingOutClearsThemEvenWhenKeepConnectedWasNeverOn() = kotlinx.coroutines.runBlocking {
         DeliveryLog.recordArrival(context, "alert", "event-10", now = 3_000)
         DeliveryLog.markHeard(context, now = 4_000)
         // An origin Keep connected never ran for: it stops nothing, but the next account must not read this account's times.
-        KeepConnectedService.onUserSignedOut(context, "https://gaps.example.com")
+        val name = "retirement-${java.util.UUID.randomUUID()}"
+        val scoped = object : android.content.ContextWrapper(context) {
+            override fun getSharedPreferences(ignored: String, mode: Int) = context.getSharedPreferences(name, mode)
+        }
+        val auth = dev.hermes.android.data.AuthContext("https://gaps.example.com", emptyList(), "synthetic-owner", backend = "hermes-dashboard",
+            bearer = dev.hermes.android.data.NativeBearerRecord("synthetic-access", "synthetic-refresh", 4_000_000_000, "https://gaps.example.com", "synthetic-owner", "default", "fixture"))
+        try {
+            val store = dev.hermes.android.data.AuthStore(scoped, dev.hermes.android.data.AppCipher())
+            store.write(auth)
+            val retired = store.retireIfUnchanged(auth.scope(), store.authorityEpoch.readVersion())
+            KeepConnectedService.onUserSignedOut(context, requireNotNull(retired.authority))
+        } finally { context.deleteSharedPreferences(name) }
         assertEquals(0L, DeliveryLog.lastAlertAt(context))
         assertEquals(0L, DeliveryLog.heardAt(context))
     }

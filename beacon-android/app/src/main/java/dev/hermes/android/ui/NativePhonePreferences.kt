@@ -42,7 +42,7 @@ import dev.hermes.android.BeaconViewModel
         if (page == "Skills") editor.loadSkills(force = false) else editor.loadMemory(force = false)
     }
     Column(Modifier.fillMaxSize()) {
-        Header(uiText(settingsLabel(page)), subtitle = if (profileName.isBlank()) "" else "${uiText("Profile")} · $profileName", back = if (page == "Memory" || page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
+        Header(uiText(settingsLabel(page)), subtitle = if (profileName.isBlank()) "" else "${uiText("Profile")} · $profileName", back = if (page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
             if (page == "Memory") SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh memory"), { editor.loadMemory() }, enabled = profileClient != null && !memory.loading && !memory.saving && memory.editing.isBlank())
             else SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh skills"), { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = profileClient != null && !skills.loading && !skills.saving && !skills.editing)
         }
@@ -130,7 +130,7 @@ import dev.hermes.android.BeaconViewModel
         Header(uiText("Profiles"), back = back, menu = LocalOpenNavigationMenu.current)
         NativeBotSettings(if (selecting) state.copy(loading = true) else state, { vm.inspectSettingsProfile(it) }, { leave(vm::closeSettingsProfile) }, { vm.phoneSettings.editBot(true) },
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
-            onSettings = { profile, page -> leave { if (state.editing) vm.phoneSettings.editBot(false); vm.openSettingsProfileTool(profile, settingsRoute(page)) } },
+            onSettings = { profile, page -> leave { if (state.editing) vm.phoneSettings.editBot(false); vm.openSettingsProfileTool(profile, page) } },
             onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
             onEditDescription = { vm.profileAdmin.clearError(); describing = true }, onEditInstructions = { vm.profileAdmin.clearError(); instructing = true },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },

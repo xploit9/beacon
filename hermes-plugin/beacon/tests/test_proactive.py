@@ -750,11 +750,17 @@ def test_connected_watch_uses_native_discovery_and_source_aware_rules(harness):
     assert "Beacon importance: " not in watch["prompt"] and "Beacon email importance: " not in watch["prompt"]
     assert "<sender name or domain> / <short subject>" in watch["prompt"]
     assert "importance rules" not in watch["prompt"]  # none saved: nothing to quote
+    assert all(term in watch["prompt"] for term in (
+        "owner's enabled rules", "consequences", "deadlines", "relevance", "novelty",
+        "action or decision", "confidence and freshness", "current source evidence",
+        "Do not repeat", "scheduled checks", "unavailable or stale sources",
+    ))
     assert "Beacon email importance: " in nightly["prompt"]
     assert "enabled_toolsets" not in watch
 
 
-def test_upgrade_updates_old_watch_in_place_and_preserves_rules_cursor_and_notes(harness, monkeypatch):
+@pytest.mark.parametrize("previous_version", ["4.3.0", "5.1.0"])
+def test_upgrade_updates_old_watch_in_place_and_preserves_rules_cursor_and_notes(harness, monkeypatch, previous_version):
     api, _, _, home, _ = harness
     jobs, calls = _fake_cron(api, monkeypatch, home, [
         {"id": "old-watch", "name": "Beacon: important emails", "enabled": True}])
@@ -763,7 +769,7 @@ def test_upgrade_updates_old_watch_in_place_and_preserves_rules_cursor_and_notes
     rules = [{"id": "c" * 32, "text": "Client needs a decision", "action": "call",
               "signal": "email", "night": False, "enabled": True}]
     for key, value in (("enabled", "1"), ("setup_complete", "1"), ("setup", json.dumps(setup)),
-                       ("requests", json.dumps(rules)), ("jobs-version", "4.3.0")):
+                       ("requests", json.dumps(rules)), ("jobs-version", previous_version)):
         proactive._meta_set(api.mobile, proactive._key("owner", "default", key), value)
     proactive._set_managed_id(api.mobile, "owner", "default", "watch_email", "old-watch")
     old_note = "Beacon email importance: Client decisions matter."
@@ -781,6 +787,7 @@ def test_upgrade_updates_old_watch_in_place_and_preserves_rules_cursor_and_notes
     assert proactive._managed_id(api.mobile, "owner", "default", "watch_email") == "old-watch"
     watch = next(job for job in jobs if job["id"] == "old-watch")
     assert watch["name"] == "Beacon: what needs you" and watch["schedule"] == "*/30 7-21 * * *"
+    assert "confidence and freshness" in watch["prompt"]
     assert calls == {"create": 1, "update": 1, "remove": 0, "resume": 1}
     assert proactive.list_requests(api.mobile, "owner", "default") == rules
     assert proactive._setup(api.mobile, "owner", "default") == setup

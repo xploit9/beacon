@@ -275,6 +275,8 @@ class NativeSpeechBackendTest {
         val contextRequests = java.util.concurrent.atomic.AtomicInteger()
         val uploads = CopyOnWriteArrayList<JSONObject>()
         val jobPosts = CopyOnWriteArrayList<JSONObject>()
+        val workPosts = CopyOnWriteArrayList<JSONObject>()
+        val callbackPosts = CopyOnWriteArrayList<JSONObject>()
         val executedPrompts = CopyOnWriteArrayList<JSONObject>()
         val rejectedPrompts = CopyOnWriteArrayList<JSONObject>()
         @Volatile var strictPromptContract = false
@@ -290,6 +292,7 @@ class NativeSpeechBackendTest {
         @Volatile var autoPlay = true
         @Volatile var fileUnavailable = false
         @Volatile var onStage: () -> Unit = {}
+        @Volatile var onInterrupt: (JSONObject) -> Unit = {}
         @Volatile var holdStage = false
         @Volatile var dropStageResponse = false
         @Volatile var holdPrompt = false
@@ -313,6 +316,7 @@ class NativeSpeechBackendTest {
                     nativeFrames += frame
                     val method = frame.getString("method")
                     val params = frame.getJSONObject("params")
+                    if(method=="session.interrupt") onInterrupt(params)
                     // These closed sets match the installed legacy prompt and canonical resume contracts.
                     if (authority && strictCanonicalResume && method == "session.resume" &&
                         params.keys().asSequence().any { it !in setOf("session_id","profile","source","omit_messages") }) {
@@ -389,19 +393,35 @@ class NativeSpeechBackendTest {
                 val request = chain.request()
                 val path = request.url.encodedPath
                 if (path.endsWith("/context")) contextRequests.incrementAndGet()
-                if (path == "/api/files/upload" || path.endsWith("/jobs")) {
+                if (path == "/api/files/upload" || path.endsWith("/jobs") || path.endsWith("/work") || path.endsWith("/callback")) {
                     val buffer = okio.Buffer(); request.body!!.writeTo(buffer)
                     val body = JSONObject(buffer.readUtf8())
-                    if(path.endsWith("/jobs")) jobPosts += body else uploads += body
+                    when {
+                        path.endsWith("/jobs") -> jobPosts += body
+                        path.endsWith("/work") -> workPosts += body
+                        path.endsWith("/callback") -> callbackPosts += body
+                        else -> uploads += body
+                    }
                 }
                 val body = when {
+                    path == "/api/plugins/beacon/mobile/gateway-ticket" -> json("detail" to "Not Found")
                     path.endsWith("/context") -> json("profile" to "default", "selected_session_id" to "stored")
                     path.endsWith("/ws-ticket") -> json("ticket" to "fixture-ticket")
                     path.endsWith("/jobs") -> json("job_id" to "job-${nativeFrames.count { it.optString("method") == "prompt.submit" }}")
-                    path.endsWith("/calls/call") -> json("jobs" to jobs).apply { if(rowBound) put("job_linkage","row_bound") }
+                    path.endsWith("/work") -> json("job_id" to "job-${workPosts.size}","status" to "prepared","continuation" to true,"submit" to true)
+                    path.endsWith("/callback") -> json("subscribed" to true,"job_ids" to JSONArray().put("job-${workPosts.size}"))
+                    path.endsWith("/calls/call") -> {
+                        val rows=if(authority&&admission.optString("status")=="terminal") JSONArray().apply {
+                            workPosts.forEachIndexed { i,work -> put(json("job_id" to "job-${i+1}","request_id" to work.getString("request_id"),
+                                "stored_session_id" to "stored","runtime_session_id" to runtime,"admission_id" to "admission-1",
+                                "status" to if(admission.optString("outcome")=="completed") "done" else "failed",
+                                "result" to admission.optJSONObject("result")?.optString("final_response").orEmpty())) }
+                        } else jobs
+                        json("jobs" to rows).apply { if(rowBound) put("job_linkage","row_bound") }
+                    }
                     else -> json("ok" to true)
                 }
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (path == "/api/plugins/beacon/mobile/gateway-ticket") 404 else 200).message("Fixture")
                     .body(body.toString().toResponseBody("application/json".toMediaType())).build()
             }
         }
@@ -586,12 +606,25 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test(timeout = 8000) fun canonicalLazyRecoveryRefusesBeforeResume() = runBlocking {
+    @Test(timeout = 8000) fun canonicalRecoveryMountsReadOnlyWithoutLegacyLazyFieldsOrAdmission() = runBlocking {
         val f = Fixture(authority = true)
         try {
-            assertTrue("The authority has no equivalent lazy recovery parameter",
-                runCatching { f.client.nativeSession("stored", lazy = true) }.isFailure)
-            assertTrue(f.nativeFrames.none { it.optString("method") == "session.resume" })
+            f.strictCanonicalResume = true
+            val binding = f.client.nativeSession("stored", lazy = true)
+            assertEquals("stored", binding.storedSessionId)
+            assertEquals("stored", binding.runtimeSessionId)
+            assertEquals(binding, f.client.nativeSession("stored", lazy = true))
+            val params = f.nativeFrames.single { it.optString("method") == "session.resume" }.getJSONObject("params")
+            assertEquals(setOf("session_id", "profile", "source", "omit_messages"), params.keys().asSequence().toSet())
+            assertEquals("stored", params.getString("session_id")); assertEquals("default", params.getString("profile"))
+            assertEquals("android", params.getString("source")); assertEquals(false, params.opt("omit_messages"))
+            val unsupported = runCatching { f.client.nativeRpc("session.resume", json("session_id" to "stored", "lazy" to true)) }.exceptionOrNull()
+            assertTrue("The unsupported wire field still fails before resume", unsupported is java.io.IOException && unsupported.message.orEmpty().contains("does not offer lazy"))
+            assertEquals(1, f.nativeFrames.count { it.optString("method") == "session.resume" })
+            assertTrue("Mounting and cached recovery cannot submit, admit, create or rerun work",
+                f.nativeFrames.all { it.optString("method") in setOf("client.capabilities", "session.resume") })
+            assertTrue(f.executedPrompts.isEmpty()); assertTrue(f.jobPosts.isEmpty()); assertTrue(f.workPosts.isEmpty())
+            assertTrue(f.providerFrames.isEmpty()); assertEquals(0, f.contextRequests.get())
         } finally { f.close() }
     }
 
@@ -1036,9 +1069,10 @@ class NativeSpeechBackendTest {
         try {
             f.rowBound=true;f.canonicalAlsoRow=true
             f.start();f.call("hermes_work",json("text" to "Draft the reply to Carlos","callback" to true))
-            assertTrue("The admitted work is linked with its callback on",waitFor { f.jobPosts.size==1 })
-            assertTrue(f.jobPosts.single().getBoolean("callback"))
-            assertEquals(101,f.jobPosts.single().getInt("user_row_id"))
+            assertTrue("Callback intent is durable before native admission",waitFor { f.workPosts.size==1 && f.prompts().size==1 })
+            assertTrue(f.workPosts.single().getBoolean("callback"))
+            assertEquals(f.workPosts.single().getString("request_id"),f.prompts().single().getJSONObject("params").getString("submission_id"))
+            assertTrue("Canonical admission requires no later user-row linkage",f.jobPosts.isEmpty())
         } finally { f.close() }
     }
 
@@ -1050,10 +1084,10 @@ class NativeSpeechBackendTest {
             @Suppress("UNCHECKED_CAST")
             val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(f.voice) as Map<String,JSONObject>
             assertTrue(waitFor { synchronized(receipts) { receipts.values.any { it.optString("admission_id")=="admission-1" } } })
-            assertTrue("No job without a callback",f.jobPosts.isEmpty())
+            assertTrue("Canonical admission needs no legacy row link",f.jobPosts.isEmpty())
             f.call("hermes_callback",json("scope" to "latest"))
-            assertTrue(waitFor { f.jobPosts.size==1 })
-            assertTrue(f.jobPosts.single().getBoolean("callback"))
+            assertTrue(waitFor { f.callbackPosts.size==1 })
+            assertEquals("latest",f.callbackPosts.single().getString("scope"))
             assertEquals("Hermes got the work once",1,f.prompts().size)
         } finally { f.close() }
     }
@@ -1222,18 +1256,38 @@ class NativeSpeechBackendTest {
         } finally { f.close() }
     }
 
-    @Test(timeout = 8000) fun cancellingAnActiveJobInterruptsItsRuntimeOnceAndAnswersTheModel() = runBlocking {
+    @Test(timeout = 8000) fun cachedLegacyJobCannotInterruptANewerGeneration() = runBlocking {
+        val f=Fixture()
+        var newerGenerationRunning=true
+        val currentGeneration=2
+        try {
+            f.start()
+            f.jobs=JSONArray().put(json("job_id" to "old-generation","status" to "working","runtime_session_id" to "runtime",
+                "stored_session_id" to "stored","user_row_id" to 101))
+            f.onInterrupt={ params ->
+                if(!params.has("execution_generation")||params.optInt("execution_generation")==currentGeneration) newerGenerationRunning=false
+            }
+            f.call("hermes_cancel",json("job_id" to "old-generation"))
+            assertTrue(waitFor { f.responses().isNotEmpty() })
+            assertTrue("The current runtime is generation2; a cached row101 from generation1 has no authority to stop it",newerGenerationRunning)
+            assertTrue(f.nativeFrames.none { it.optString("method")=="session.interrupt" })
+            assertEquals("not_sent",f.responses().last().getString("status"))
+        } finally { f.close() }
+    }
+
+    @Test(timeout = 8000) fun legacyCancellationWithoutExactAuthorityIsNotSentAndNotRetried() = runBlocking {
         val f = Fixture()
         try {
             f.start()
             f.jobs = JSONArray().put(json("job_id" to "new", "status" to "watching", "runtime_session_id" to "runtime"))
             f.call("hermes_cancel", json("job_id" to "new"), "cancel-1")
-            assertTrue(waitFor { f.nativeFrames.any { it.optString("method") == "session.interrupt" } })
+            assertTrue(waitFor { f.responses().isNotEmpty() })
+            assertEquals("not_sent",f.responses().last().getString("status"))
+            assertEquals("exact_cancel_unavailable",f.responses().last().getString("reason"))
             f.call("hermes_cancel", json("job_id" to "new"), "cancel-1")
             assertTrue("The model gets the outcome", waitFor { f.providerFrames.any { it.optJSONObject("toolResponse")?.toString()?.contains("cancel-1") == true } })
             delay(200)
-            assertEquals("A replayed call never interrupts twice", 1, f.nativeFrames.count { it.optString("method") == "session.interrupt" })
-            assertEquals("runtime", f.nativeFrames.single { it.optString("method") == "session.interrupt" }.getJSONObject("params").getString("session_id"))
+            assertEquals("Neither the original nor a replay may send an unscoped runtime interrupt",0,f.nativeFrames.count { it.optString("method") == "session.interrupt" })
         } finally { f.close() }
     }
 }

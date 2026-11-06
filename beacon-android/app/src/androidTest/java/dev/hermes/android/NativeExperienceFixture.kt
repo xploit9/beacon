@@ -22,6 +22,7 @@ internal suspend fun loginLiveTest(app: BeaconApplication, origin: String, crede
 internal class NativeExperienceFixture(private val ownerName: String = "synthetic-owner") : WebSocket.Factory {
     private class FixtureRpcFailure(val code: Int, message: String) : RuntimeException(message)
     val requests = CopyOnWriteArrayList<JSONObject>()
+    val rejectedRequests = CopyOnWriteArrayList<JSONObject>()
     val sessions = ConcurrentHashMap<String, JSONObject>()
     private val unpromptedShells = ConcurrentHashMap<String, JSONObject>()
     val jobs = ConcurrentHashMap<String, JSONObject>()
@@ -60,6 +61,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     val sessionReasoning = ConcurrentHashMap<String, String>()
     @Volatile var updateApplied = false
     @Volatile var voiceProvider = "gemini"
+    @Volatile var historyRetentionDays = 0
     val proactiveEnabled = ConcurrentHashMap(mapOf("default" to false, "coder" to false))
     val proactiveDelivery = ConcurrentHashMap(mapOf("default" to "notify", "coder" to "notify"))
     val proactiveCheckMinutes = ConcurrentHashMap(mapOf("default" to 15, "coder" to 15))
@@ -415,6 +417,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 else if (outage != null) outage to json("detail" to "Synthetic optional plugin outage")
                 else if (profileIsolationBots && profile in rejectedProfiles && request.url.encodedPath != "/api/profiles") 403 to json("detail" to "Synthetic profile access denied")
                 else http(request.url.encodedPath, request.method, body, profile, request.url.queryParameter("path").orEmpty(), request.url.queryParameter("include_archived") == "1" || request.url.queryParameter("archived") == "only", request.url)
+            if (status >= 400) rejectedRequests += json("method" to request.method, "path" to request.url.encodedPath, "status" to status)
             Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Synthetic fixture")
                 .body(result.toString().toResponseBody("application/json".toMediaType())).build()
         }
@@ -619,6 +622,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             proactiveProposal[profile]?.clear()
             200 to json("ok" to true, "saved" to rules.length())
         }
+        path == "/api/plugins/beacon/mobile/history-retention" -> {
+            if (method == "PUT") {
+                val days=body.optInt("history_retention_days",-1)
+                if (days !in setOf(0,30,90,365)) return 400 to json("detail" to "Invalid retention")
+                historyRetentionDays=days
+            }
+            200 to json("history_retention_days" to historyRetentionDays)
+        }
         path == "/api/plugins/beacon/mobile/calls" -> if (callHistoryRouteMissing) 404 to json("detail" to "Unknown route") else 200 to callHistoryResponse.copy()
         path == "/api/plugins/beacon/mobile/notifications/events" -> {
             val after = url?.queryParameter("after")?.toLongOrNull() ?: 0L
@@ -738,6 +749,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             else { info.put("pinned", body.getBoolean("pinned")).put("runtime_revision", info.optInt("runtime_revision") + 1); 200 to json("ok" to true, "session_id" to id) }
         }
         path.startsWith("/api/sessions/") -> stockSession(path, profile, url)
+        path == "/api/plugins/beacon/mobile/gateway-ticket" -> 404 to json("detail" to "Not Found")
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
         path == "/auth/native/authorize" -> 200 to json("ready" to true)
         path == "/auth/native/token" -> if (body.string("code").isBlank() || body.string("code_verifier").isBlank()) 400 to json("detail" to "Invalid code or verifier") else { currentRefreshToken = "synthetic-refresh"; 200 to json("access_token" to "synthetic-access", "refresh_token" to currentRefreshToken, "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner) }

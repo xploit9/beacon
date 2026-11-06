@@ -13,25 +13,43 @@ import org.junit.Test
 
 class NativeOperationsTest {
     /** A Hermes whose chat has no agent until `approval.pending` starts it, like a lazily resumed runtime. */
-    private class Fixture(val refuseBuild: Boolean = false, val canonical: Boolean = false) : WebSocket.Factory {
+    internal class Fixture(val refuseBuild: Boolean = false, val canonical: Boolean = false) : WebSocket.Factory {
         val methods = java.util.concurrent.CopyOnWriteArrayList<String>()
         val calls = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        val httpRequests = java.util.concurrent.CopyOnWriteArrayList<Request>()
         private lateinit var listener: WebSocketListener
         private lateinit var socket: WebSocket
         var agentBuilt = false
         var builtAtWrite: Boolean? = null
         var model = "old-model"
+        var profileModel = "old-model"
         var yolo = true
+        var running = true
+        var refuseRuntimeResume = false
+        var messages = JSONArray()
+        var revision: Any = 4
+        var generation: Any = 7
+        var reasoning = "medium"
+        var pending = JSONArray()
+        var prompts = JSONArray()
+        var snapshotOverride: JSONObject? = null
+        var modelInventoryOverride: JSONObject? = null
+        var mutationOverride: JSONObject? = null
+        var disconnectMutation = false
+        var responseOverride: JSONObject? = null
         var steerResult = json("status" to "queued")
         var steerErrorCode: Int? = null
         private fun reply(id: String, result: JSONObject) = json("jsonrpc" to "2.0", "id" to id, "result" to result).toString()
         val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
             builder.addInterceptor { chain ->
+                httpRequests += chain.request()
                 val path = chain.request().url.encodedPath
-                val found = !path.endsWith("/voice-history")
+                val found = path != CANONICAL_TICKET_PATH && !path.endsWith("/voice-history")
                 val body = when {
                     path == "/api/auth/ws-ticket" -> json("ticket" to "fixture-ticket")
+                    path == "/api/model/options" -> modelInventoryOverride?.copy() ?: json("model" to profileModel, "provider" to "fixture", "providers" to JSONArray())
                     path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "default", "title" to "Fixture", "message_count" to 0)
+                    path == "/api/sessions/branch-a" -> json("id" to "branch-a", "profile" to "default", "title" to "Branch", "message_count" to 0)
                     path == "/api/sessions/stored-a/messages" -> json("session_id" to "stored-a", "profile" to "default", "messages" to JSONArray(), "pagination" to json("returned" to 0))
                     else -> json("detail" to "Not Found")
                 }
@@ -53,15 +71,38 @@ class NativeOperationsTest {
                     val method = frame.getString("method")
                     methods += method
                     val params = frame.getJSONObject("params")
+                    // Closed owner schemas: gateway/session_{mutations,tui_config,busy_controls}.py at bf0203a7.
+                    val legacyOnly = method in setOf("session.title", "session.set_hidden", "session.archive", "session.branch", "session.delete", "session.close", "session.compress", "session.undo", "session.usage", "session.cwd.set", "image.attach", "image.detach")
+                    val invalidSet = method == "config.set" && (params.string("key") == "model" ||
+                        params.keys().asSequence().any { it !in setOf("session_id", "profile", "key", "value") + (if (params.string("key") == "reasoning") setOf("scope") else emptySet()) })
+                    val invalidMutation = method == "session.mutate" && params.keys().asSequence().toSet() !=
+                        setOf("session_id", "profile", "request_id", "expected_revision", "expected_generation", "operation", "payload")
+                    val invalidResponse = method in setOf("approval.respond", "clarify.respond") && params.keys().asSequence().toSet() !=
+                        setOf("session_id", "profile", "execution_generation", "prompt_id", if (method == "approval.respond") "choice" else "answer")
+                    if (canonical && (legacyOnly || invalidSet || invalidMutation || invalidResponse)) {
+                        listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to 4001, "message" to "invalid_params")).toString())
+                        return true
+                    }
+                    if (method == "session.mutate" && disconnectMutation) {
+                        listener.onFailure(this, java.io.IOException("Synthetic disconnect after mutation delivery"), null)
+                        return true
+                    }
+                    if (method == "session.resume" && refuseRuntimeResume && params.string("session_id") == "runtime-a") {
+                        listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to if (canonical) 4001 else 4007, "message" to if (canonical) "not_found" else "session not found")).toString())
+                        return true
+                    }
                     if (method == "session.steer" && steerErrorCode != null) {
                         listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to steerErrorCode, "message" to "Synthetic steer refusal")).toString())
                         return true
                     }
                     val result = when (method) {
-                        "session.resume" -> json("session_id" to if (canonical) "stored-a" else "runtime-a", "session_key" to "stored-a", "stored_session_id" to "stored-a", "message_count" to 0, "messages" to JSONArray(),
+                        "session.resume" -> snapshotOverride?.copy() ?: json("session_id" to if (canonical) "stored-a" else "runtime-a", "session_key" to "stored-a", "stored_session_id" to "stored-a", "message_count" to messages.length(), "messages" to JSONArray(messages.toString()),
                             // Hermes reports the chat's YOLO state only from a built agent.
-                            "info" to json("model" to model, "provider" to "fixture", "lazy" to !agentBuilt).apply { if (agentBuilt) put("yolo", yolo) }).apply {
-                                if (canonical) put("execution_generation", 7).put("running", true)
+                            "info" to json("model" to model, "provider" to "fixture", "lazy" to !agentBuilt).apply {
+                                if (canonical) put("profile_name", "default").put("profile_id", "synthetic-profile")
+                                if (agentBuilt) put("yolo", yolo)
+                            }).apply {
+                                if (canonical) put("revision", revision).put("execution_generation", generation).put("running", running).put("pending", pending).put("prompts", prompts)
                             }
                         "approval.pending" -> {
                             if (refuseBuild) {
@@ -76,12 +117,36 @@ class NativeOperationsTest {
                             if (params.getString("key") == "yolo") {
                                 yolo = params.getString("value") == "1"
                                 json("key" to "yolo", "value" to params.getString("value"))
+                            } else if (params.getString("key") == "fast") {
+                                json("key" to "fast", "value" to params.getString("value"))
+                            } else if (params.getString("key") == "reasoning") {
+                                reasoning = params.getString("value")
+                                json("key" to "reasoning", "value" to reasoning)
                             } else {
                                 model = params.getString("value").substringBefore(" --provider ")
                                 json("key" to "model", "value" to model, "confirm_required" to false)
                             }
                         }
-                        "config.get" -> json("key" to params.getString("key"), "value" to "smart")
+                        "config.get" -> {
+                            if (canonical && params.string("key") == "provider") {
+                                listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to 4001, "message" to "invalid_params")).toString())
+                                return true
+                            }
+                            json("key" to params.getString("key"), "value" to if (params.string("key") == "reasoning") reasoning else "smart")
+                        }
+                        "model.options" -> json("model" to model, "provider" to "fixture", "providers" to JSONArray())
+                        "session.title" -> json("session_id" to "runtime-a", "title" to params.string("title"))
+                        "session.mutate" -> (mutationOverride?.copy() ?: json("session_id" to "stored-a", "operation" to params.string("operation"),
+                            "revision" to 5, "execution_generation" to 7).apply {
+                                params.optJSONObject("payload")?.let { payload -> payload.keys().forEach { key -> put(key, payload.opt(key)) } }
+                                if (params.string("operation") == "delete") put("deleted_ids", JSONArray().put("stored-a"))
+                                if (params.string("operation") == "compress") put("target_session_id", "stored-a").put("message_count", 2)
+                                if (params.string("operation") == "branch") put("branched_session_id", "branch-a")
+                                if (params.string("operation") == "rewind") put("rewound_count", 2).put("target_message", json("id" to params.getJSONObject("payload").getLong("target_message_id"), "role" to "user"))
+                            }).also { result -> if (params.string("operation") == "model" && result.string("status").isBlank()) model = result.string("model") }
+                        "session.stats" -> json("input_tokens" to 12, "output_tokens" to 3)
+                        "session.interrupt" -> json("ref" to json("session_id" to "stored-a", "profile_id" to "synthetic-profile"), "execution_generation" to 7)
+                        "approval.respond", "clarify.respond" -> responseOverride?.copy() ?: json("status" to "resolved", "prompt_id" to params.string("prompt_id"))
                         "session.events.since" -> json("epoch" to "fixture", "latest_seq" to 0, "events" to JSONArray())
                         "session.steer" -> steerResult.copy()
                         "image.attach_bytes" -> json("attached" to true, "path" to "/synthetic/image.png", "mime" to "image/png")

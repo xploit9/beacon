@@ -661,3 +661,513 @@ def test_the_contract_check_names_what_a_later_hermes_changes(tmp_path):
     problems = schema_cache_contract(tmp_path)
     assert 'mcp_schema_cache.config_fingerprint is missing' in problems
     assert '_register_from_cache_sync(name, config, entry) changed' in problems
+
+
+@pytest.fixture
+def loop_readiness_env(hermes, monkeypatch):
+    """Real native loop startup with only run_forever entry held; all created threads are owned here."""
+    from tools import mcp_tool as core, mcp_tool_loop as plumbing
+    import model_tools
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+    release, started, queued, dispatched, schedule_attempted = (threading.Event() for _ in range(5))
+    loops, background, calls, ensures, expected_startup_errors = [], [], [], [], []
+    real_new_loop, real_start, real_ensure = asyncio.new_event_loop, threading.Thread.start, plumbing._ensure_mcp_loop
+    real_schedule = plumbing._run_on_mcp_loop
+    lock = threading.Lock()
+    class StartupPool(ThreadPoolExecutor):
+        def __init__(self):
+            super().__init__(max_workers=1, thread_name_prefix='beacon-mcp-start-test')
+            self.submissions = 0
+            self.futures = []
+        def submit(self, fn, *args, **kwargs):
+            self.submissions += 1
+            future = super().submit(fn, *args, **kwargs)
+            self.futures.append(future)
+            return future
+    startup_pool = StartupPool()
+    monkeypatch.setattr(g, 'MCP_LOOP_START_LOCK', lock, raising=False)
+    monkeypatch.setattr(g, 'MCP_LOOP_START_WAIT', 2.0, raising=False)
+    monkeypatch.setattr(g, 'MCP_LOOP_START_POOL', startup_pool, raising=False)
+    monkeypatch.setattr(core, '_mcp_loop', None)
+    monkeypatch.setattr(core, '_mcp_thread', None)
+    def factory():
+        loop = real_new_loop()
+        entry = {'loop': loop, 'thread': None, 'ready': threading.Event()}
+        loops.append(entry)
+        run, schedule = loop.run_forever, loop.call_soon_threadsafe
+        def gated_run():
+            entry['thread'] = threading.current_thread()
+            started.set()
+            assert release.wait(5), 'The test must explicitly release native startup'
+            run()
+        def scheduled(callback, *args, **kwargs):
+            result = schedule(callback, *args, **kwargs)
+            queued.set()
+            return result
+        monkeypatch.setattr(loop, 'run_forever', gated_run)
+        monkeypatch.setattr(loop, 'call_soon_threadsafe', scheduled)
+        return loop
+    def start_thread(thread):
+        if thread.name == 'beacon-mcp-refresh': background.append(thread)
+        return real_start(thread)
+    def ensure():
+        ensures.append(True)
+        return real_ensure()
+    def schedule(*args, **kwargs):
+        schedule_attempted.set()
+        return real_schedule(*args, **kwargs)
+    def handler(name, arguments, **kwargs):
+        from gateway.session_context import get_session_env
+        calls.append((name, arguments, kwargs, get_session_env('HERMES_SESSION_ID'), get_session_env('HERMES_SESSION_PROFILE')))
+        dispatched.set()
+        return json.dumps({'result': 'synthetic native result'})
+    monkeypatch.setattr(plumbing.asyncio, 'new_event_loop', factory)
+    monkeypatch.setattr(plumbing, '_ensure_mcp_loop', ensure)
+    monkeypatch.setattr(plumbing, '_run_on_mcp_loop', schedule)
+    monkeypatch.setattr(threading.Thread, 'start', start_thread)
+    monkeypatch.setattr(model_tools, 'handle_function_call', handler)
+    tool = {'name': 'synthetic_search', '_raw': 'search', '_server': 'synthetic', '_trust': 'full', 'read_only': True}
+    def execute():
+        return g.NativeMcp().execute(tool, {'q': 'synthetic'}, SCOPE, False, session_id='native-conversation')
+    def submit(pool):
+        return pool.submit(contextvars.copy_context().run, execute)
+    def start():
+        ensure()
+        assert started.wait(1)
+    def release_start():
+        for entry in loops:
+            if not entry['loop'].is_closed(): entry['loop'].call_soon_threadsafe(entry['ready'].set)
+        release.set()
+        for entry in loops:
+            if entry['thread'] is not None and entry['thread'].is_alive(): assert entry['ready'].wait(2)
+    try:
+        yield SimpleNamespace(core=core, plumbing=plumbing, loops=loops, calls=calls, ensures=ensures,
+            started=started, queued=queued, dispatched=dispatched, release=release, lock=lock,
+            schedule_attempted=schedule_attempted,
+            startup_pool=startup_pool,
+            expected_startup_errors=expected_startup_errors,
+            start=start, submit=submit, execute=execute, release_start=release_start,
+            background=background, new_plain_loop=real_new_loop)
+    finally:
+        release_start()
+        for startup in startup_pool.futures:
+            try: startup.result(timeout=2)
+            except RuntimeError:
+                if startup not in expected_startup_errors: raise
+        release_start()
+        startup_pool.shutdown(wait=True)
+        for thread in background:
+            thread.join(3)
+            assert not thread.is_alive()
+        for entry in loops:
+            loop, thread = entry['loop'], entry['thread']
+            if loop.is_running(): loop.call_soon_threadsafe(loop.stop)
+            if thread is not None:
+                thread.join(3)
+                assert not thread.is_alive()
+            assert not loop.is_running()
+            loop.close()
+
+
+def test_loop_readiness_waits_for_existing_startup_before_handler(loop_readiness_env):
+    from concurrent.futures import ThreadPoolExecutor
+    env = loop_readiness_env
+    env.start()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = env.submit(pool)
+        try:
+            assert not env.dispatched.wait(.05), 'The actual tool must not dispatch while the native loop is starting'
+            assert not future.done()
+        finally:
+            env.release_start()
+        assert json.loads(future.result(timeout=2)) == {'result': 'synthetic native result'}
+    assert len(env.loops) == 1 and len(env.ensures) == 1
+    assert len(env.calls) == 1 and env.calls[0][3:] == ('native-conversation', 'profile')
+
+
+def test_loop_readiness_expiry_never_dispatches_and_cleans_native_context(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    from gateway.session_context import get_session_env
+    env = loop_readiness_env
+    monkeypatch.setattr(g, 'MCP_LOOP_START_WAIT', .05)
+    env.start()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            with pytest.raises(HTTPException) as error: env.submit(pool).result(timeout=1)
+            assert error.value.status_code == 503
+            assert not env.calls and env.lock.acquire(blocking=False)
+            env.lock.release()
+            assert pool.submit(get_session_env, 'HERMES_SESSION_ID').result(timeout=1) == ''
+        finally:
+            env.release_start()
+    assert not env.calls
+
+
+def test_loop_readiness_warm_loop_does_not_wait_for_startup_lock(loop_readiness_env, monkeypatch):
+    env = loop_readiness_env
+    env.start(); env.release_start()
+    monkeypatch.setattr(g, 'MCP_LOOP_START_WAIT', .05)
+    env.lock.acquire()
+    try: result = env.execute()
+    finally: env.lock.release()
+    assert json.loads(result)['result'] == 'synthetic native result'
+    assert len(env.loops) == len(env.ensures) == len(env.calls) == 1
+
+
+def test_loop_readiness_cold_concurrent_calls_start_one_loop(loop_readiness_env):
+    from concurrent.futures import ThreadPoolExecutor
+    env = loop_readiness_env
+    barrier = threading.Barrier(5)
+    def execute():
+        barrier.wait(timeout=1)
+        return env.execute()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(execute) for _ in range(4)]
+        try:
+            barrier.wait(timeout=1)
+            assert env.started.wait(1), 'Cold native MCP invocation must start its loop'
+            assert not env.dispatched.is_set()
+        finally:
+            env.release_start()
+        assert all(json.loads(future.result(timeout=2))['result'] == 'synthetic native result' for future in futures)
+    assert len(env.loops) == len(env.ensures) == 1 and len(env.calls) == 4
+
+
+def test_loop_readiness_lock_wait_is_bounded(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    env = loop_readiness_env
+    monkeypatch.setattr(g, 'MCP_LOOP_START_WAIT', .05)
+    env.lock.acquire()
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with pytest.raises(HTTPException) as error: env.submit(pool).result(timeout=1)
+        assert error.value.status_code == 503 and not env.calls and not env.loops
+    finally:
+        env.lock.release()
+
+
+def test_loop_readiness_lock_wait_consumes_same_deadline(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    env = loop_readiness_env
+    clock = [0.0]
+    class SpentBudget:
+        def acquire(self, **kwargs):
+            accepted = env.lock.acquire(**kwargs)
+            if accepted: clock[0] = 1.95
+            return accepted
+        def release(self): env.lock.release()
+    monkeypatch.setattr(g, 'MCP_LOOP_START_LOCK', SpentBudget())
+    monkeypatch.setattr(g, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            with pytest.raises(HTTPException) as error: env.submit(pool).result(timeout=.5)
+            assert error.value.status_code == 503 and not env.calls
+        finally:
+            env.release_start()
+
+
+def test_loop_readiness_replaced_loop_refuses_before_handler(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    env = loop_readiness_env
+    env.start()
+    replacement = env.new_plain_loop()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = env.submit(pool)
+        try:
+            assert env.queued.wait(1), 'Admission must request an actual loop readiness callback'
+            monkeypatch.setattr(env.core, '_mcp_loop', replacement)
+            env.release_start()
+            with pytest.raises(HTTPException) as error: future.result(timeout=2)
+            assert error.value.status_code == 503 and not env.calls
+        finally:
+            env.release_start()
+            replacement.close()
+
+
+@pytest.mark.parametrize('legacy', [False, True], ids=['pending-server', 'cache-api-fallback'])
+def test_loop_readiness_live_catalogue_waits_for_startup(loop_readiness_env, hermes, monkeypatch, legacy):
+    from concurrent.futures import ThreadPoolExecutor
+    env = loop_readiness_env
+    hermes.servers['newcomer'] = server_config('newcomer')
+    hermes.write_config()
+    hermes.connections.tools['newcomer'] = tool_entries('newcomer', 2)
+    hermes.connections.release.set()
+    if legacy: monkeypatch.setattr(g, 'hermes_schema_cache', lambda: None)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(g.NativeMcp().catalog)
+        try:
+            assert env.started.wait(1)
+            assert not env.schedule_attempted.wait(.05), 'Native discovery cannot schedule before loop readiness'
+            assert not future.done() and hermes.connections.log == []
+        finally:
+            env.release_start()
+        rows = future.result(timeout=3)
+    assert any(row.get('_server') == 'newcomer' for row in rows)
+    expected = sorted(hermes.servers) if legacy else ['newcomer']
+    assert sorted(hermes.connections.log) == expected and len(hermes.connections.log) == len(expected)
+
+
+def test_loop_readiness_stale_refresh_stays_background_and_connects_once(loop_readiness_env, hermes):
+    env = loop_readiness_env
+    hermes.cache('server4', ttl_ms=1000)
+    path = hermes.home / 'cache/mcp_schema_cache.json'
+    data = json.loads(path.read_text(encoding='utf-8'))
+    data['server4']['written_at'] = time.time() - 3600
+    path.write_text(json.dumps(data), encoding='utf-8')
+    hermes.connections.release.set()
+    begin = time.perf_counter()
+    rows = g.NativeMcp().catalog(discover=False)
+    assert rows and time.perf_counter() - begin < INSTANT
+    try:
+        assert env.started.wait(1) and hermes.connections.log == []
+        assert not env.schedule_attempted.wait(.05), 'Background refresh cannot schedule before loop readiness'
+    finally:
+        env.release_start()
+    assert len(env.background) == 1
+    env.background[0].join(2)
+    assert not env.background[0].is_alive() and hermes.connections.log == ['server4']
+
+
+def test_loop_readiness_fully_cached_catalogue_starts_nothing(loop_readiness_env):
+    env = loop_readiness_env
+    native = g.NativeMcp()
+    assert len(native.catalog(discover=False)) == SERVERS * TOOLS_PER_SERVER
+    assert len(native.catalog()) == SERVERS * TOOLS_PER_SERVER
+    assert not env.loops and not env.ensures and not env.calls
+
+
+@pytest.mark.parametrize('mode', ['empty', 'disabled', 'already-lazy'])
+def test_loop_readiness_legacy_catalogue_without_live_candidates_starts_nothing(loop_readiness_env, hermes, monkeypatch, mode):
+    env = loop_readiness_env
+    native = g.NativeMcp()
+    if mode == 'already-lazy':
+        native.catalog(discover=False)
+    else:
+        servers = {} if mode == 'empty' else {name: {**config, 'enabled': False} for name, config in hermes.servers.items()}
+        hermes.write_config(servers)
+    monkeypatch.setattr(g, 'hermes_schema_cache', lambda: None)
+    monkeypatch.setattr(g, 'MCP_LOOP_START_WAIT', .05)
+    native.catalog()
+    assert not env.loops and not env.ensures and not hermes.connections.log
+
+
+def test_loop_readiness_native_lock_handoff_obeys_total_budget(loop_readiness_env, monkeypatch, record_property):
+    """A distinct native thread acquires the real Lock after the final snapshot, before real ensure."""
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    env = loop_readiness_env
+    ensure_entry, holder_owns, release_holder, real_entry, returned = (threading.Event() for _ in range(5))
+    observation = {}
+    original_ensure = env.plumbing._ensure_mcp_loop
+    def handoff_ensure():
+        ensure_entry.set()
+        assert holder_owns.wait(2)
+        real_entry.set()
+        return original_ensure()
+    monkeypatch.setattr(env.plumbing, '_ensure_mcp_loop', handoff_ensure)
+    def holder():
+        assert ensure_entry.wait(2)
+        with env.core._lock:
+            observation['holder_thread'] = threading.get_ident()
+            holder_owns.set()
+            assert release_holder.wait(6), 'The real native lock holder must be released in finally'
+    def caller():
+        observation['caller_thread'] = threading.get_ident()
+        observation['start'] = time.perf_counter()
+        try:
+            env.execute()
+            observation['status'] = 'dispatched'
+        except HTTPException as error:
+            observation['status'] = error.status_code
+        finally:
+            observation['elapsed'] = time.perf_counter() - observation['start']
+            returned.set()
+    owner = threading.Thread(target=holder, name='synthetic-native-lock-holder')
+    owner.start()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(caller)
+        try:
+            assert real_entry.wait(2) and holder_owns.is_set()
+            budget = g.MCP_LOOP_START_WAIT
+            within = returned.wait(budget + .25)
+            measured = observation.get('elapsed', time.perf_counter() - observation['start'])
+            record_property('declared_budget_seconds', budget)
+            record_property('observed_seconds', measured)
+            record_property('returned_while_other_thread_holds_native_lock', within and not release_holder.is_set())
+            record_property('distinct_lock_holder_thread', observation['holder_thread'] != observation['caller_thread'])
+            record_property('handler_dispatches', len(env.calls))
+            assert observation['holder_thread'] != observation['caller_thread']
+            assert not release_holder.is_set() and env.core._lock.locked()
+            assert within and measured <= budget + .2, f'Admission exceeded {budget}s while native lock remained held: returned={within}, observed={measured:.3f}s'
+            assert observation['status'] == 503 and not env.calls
+        finally:
+            release_holder.set()
+            owner.join(2)
+            assert not owner.is_alive()
+            future.result(timeout=2)
+            for startup in env.startup_pool.futures: startup.result(timeout=2)
+            env.release_start()
+    assert not env.calls, 'Late native startup must not dispatch the timed-out tool'
+
+
+def test_loop_readiness_owned_startup_capacity_survives_caller_expiry(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    from gateway.session_context import get_session_env
+    env = loop_readiness_env
+    entered, resume = threading.Event(), threading.Event()
+    startup_context = []
+    original_ensure = env.plumbing._ensure_mcp_loop
+    def paused_ensure():
+        startup_context.append(get_session_env('HERMES_SESSION_ID'))
+        entered.set()
+        assert resume.wait(5), 'The single owned startup worker must be released in finally'
+        return original_ensure()
+    monkeypatch.setattr(env.plumbing, '_ensure_mcp_loop', paused_ensure)
+    monkeypatch.setattr(g, 'MCP_LOOP_START_WAIT', .05)
+    futures = []
+    with ThreadPoolExecutor(max_workers=4) as callers:
+        try:
+            first = env.submit(callers)
+            futures.append(first)
+            assert entered.wait(1)
+            with pytest.raises(HTTPException) as error: first.result(timeout=1)
+            assert error.value.status_code == 503 and not env.calls
+            assert not env.lock.acquire(blocking=False), 'The still-running starter retains startup capacity'
+            futures.extend(env.submit(callers) for _ in range(6))
+            for future in futures[1:]:
+                with pytest.raises(HTTPException) as error: future.result(timeout=1)
+                assert error.value.status_code == 503
+            assert env.startup_pool.submissions == 1 and not env.loops and not env.calls
+            assert callers.submit(get_session_env, 'HERMES_SESSION_ID').result(timeout=1) == ''
+        finally:
+            resume.set()
+            for future in futures:
+                try: future.result(timeout=2)
+                except HTTPException: pass
+            for startup in env.startup_pool.futures: startup.result(timeout=2)
+            env.release_start()
+    assert startup_context == [''] and not env.calls
+    assert env.lock.acquire(blocking=False)
+    env.lock.release()
+    assert len(env.loops) == 1 and env.startup_pool.submissions == 1
+
+
+@pytest.mark.parametrize('mode', ['blocked-exit', 'released-control'])
+def test_loop_readiness_startup_does_not_block_interpreter_exit(tmp_path, mode):
+    import os
+    import queue
+    import subprocess
+    script = r'''
+import importlib.util,json,sys,threading,time
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('isolated_startup_gateway',sys.argv[1])
+g=importlib.util.module_from_spec(spec);spec.loader.exec_module(g)
+from tools import mcp_tool as core,mcp_tool_loop as plumbing
+from fastapi import HTTPException
+entered,held,release=(threading.Event() for _ in range(3))
+original=plumbing._ensure_mcp_loop
+def handoff():
+    entered.set()
+    assert held.wait(2)
+    return original()
+plumbing._ensure_mcp_loop=handoff
+def holder():
+    assert entered.wait(2)
+    with core._lock:
+        held.set()
+        release.wait()
+owner=threading.Thread(target=holder,daemon=True);owner.start()
+def release_command():
+    if sys.stdin.readline():release.set()
+threading.Thread(target=release_command,daemon=True).start()
+g.MCP_LOOP_START_WAIT=.05
+started=time.perf_counter()
+try:g._ready_mcp_loop();status='unexpected-ready'
+except HTTPException as error:status=error.status_code
+assert status==503 and held.is_set() and not release.is_set()
+if sys.argv[2]=='released-control':
+    release.set();owner.join(2);assert not owner.is_alive()
+    assert g.MCP_LOOP_START_LOCK.acquire(timeout=2);g.MCP_LOOP_START_LOCK.release()
+    loop,worker=core._mcp_loop,core._mcp_thread
+    ready=threading.Event();loop.call_soon_threadsafe(ready.set);assert ready.wait(2)
+    loop.call_soon_threadsafe(loop.stop);worker.join(2);assert not worker.is_alive();loop.close()
+g.MCP_LOOP_START_POOL.shutdown(wait=False)
+print(json.dumps({'status':status,'held_at_shutdown':not release.is_set(),'elapsed':time.perf_counter()-started}),flush=True)
+'''
+    env = os.environ.copy()
+    env.update(HERMES_HOME=str(tmp_path), HERMES_DISABLE_LAZY_INSTALLS='1', HERMES_AGENT_SOURCE=str(_hermes_agent_source()),
+               PYTHONPATH=str(_hermes_agent_source()), PYTHONUTF8='1')
+    process = subprocess.Popen([sys.executable, '-X', 'utf8', '-c', script, str(ROOT / 'gateway_tools.py'), mode],
+        cwd=tmp_path, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+    output = queue.Queue()
+    reader = threading.Thread(target=lambda: output.put(process.stdout.readline()), daemon=True)
+    reader.start()
+    exited = False
+    try:
+        marker = json.loads(output.get(timeout=8))
+        assert marker['status'] == 503 and marker['held_at_shutdown'] is (mode == 'blocked-exit')
+        try:
+            process.wait(timeout=1)
+            exited = True
+        except subprocess.TimeoutExpired:
+            pass
+    finally:
+        if process.poll() is None:
+            process.stdin.write('release\n'); process.stdin.flush()
+        stdout, stderr = process.communicate(timeout=4)
+        reader.join(2)
+        assert not reader.is_alive()
+    assert exited and process.returncode == 0, f'Startup ownership delayed interpreter exit after the marker: exited={exited}; {stderr}'
+
+
+def test_loop_readiness_queued_startup_rejects_changed_generation(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    env = loop_readiness_env
+    queued, resume = threading.Event(), threading.Event()
+    original_submit = env.startup_pool.submit
+    def delayed_submit(fn, *args, **kwargs):
+        def delayed():
+            queued.set()
+            assert resume.wait(2)
+            return fn(*args, **kwargs)
+        return original_submit(delayed)
+    monkeypatch.setattr(env.startup_pool, 'submit', delayed_submit)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = env.submit(pool)
+        try:
+            assert queued.wait(1)
+            monkeypatch.setattr(g, 'BOOT', 'different-synthetic-generation')
+            resume.set()
+            with pytest.raises(HTTPException) as error: future.result(timeout=2)
+            assert error.value.status_code == 503 and not env.ensures and not env.calls
+            startup = env.startup_pool.futures[0]
+            assert isinstance(startup.exception(timeout=1), RuntimeError)
+            assert str(startup.exception()) == 'MCP startup scope changed'
+            env.expected_startup_errors.append(startup)
+        finally:
+            resume.set()
+            env.release_start()
+
+
+def test_loop_readiness_callback_rejects_changed_generation(loop_readiness_env, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from fastapi import HTTPException
+    env = loop_readiness_env
+    env.start()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = env.submit(pool)
+        try:
+            assert env.queued.wait(1)
+            monkeypatch.setattr(g, 'BOOT', 'different-synthetic-generation')
+            env.release_start()
+            with pytest.raises(HTTPException) as error: future.result(timeout=2)
+            assert error.value.status_code == 503 and not env.calls
+        finally:
+            env.release_start()

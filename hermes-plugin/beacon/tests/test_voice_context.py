@@ -132,6 +132,26 @@ def test_admission_defers_optional_discovery_and_keeps_authoritative_context(har
     assert result['capability_details']['memory_recall']['reason'] == 'verify_on_use'
 
 
+def test_current_future_tool_parity_brief_preserves_native_state_and_result_truth(harness, monkeypatch):
+    api, client, _, root, _ = harness
+    call_id = reserve(client)
+    voice = api.voice_context
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
+    monkeypatch.setattr(voice, 'config', lambda root: {})
+    monkeypatch.setattr(voice, 'personality', lambda root: '')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: '')
+    monkeypatch.setattr(voice, 'owner_name_in_memory', lambda *args: '')
+    monkeypatch.setattr(voice, 'ready_tools', lambda profile: 'Synthetic current catalogue')
+    result = voice.context('owner', 'basic', 'default', 'native-stored', call_id)
+    brief = result['system_instruction']
+    assert 'discover_tools' in brief and 'current schema' in brief
+    assert 'hermes_work' in brief and 'same conversation' in brief
+    assert 'browser' in brief and 'Vault' in brief and 'phone' in brief
+    assert 'approval' in brief and 'result receipts' in brief
+    assert result['profile'] == 'default' and result['selected_session_id'] == 'native-stored'
+    assert result['tool_catalogue'] == 'Synthetic current catalogue'
+
+
 def test_unowned_history_blocks_profile_reads(harness, monkeypatch):
     api, client, _, _, _ = harness
     call_id = reserve(client)

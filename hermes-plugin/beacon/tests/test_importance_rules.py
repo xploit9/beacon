@@ -220,8 +220,10 @@ def test_watch_prompt_quotes_importance_rules_and_keeps_them_apart_from_delivery
     assert 'not important, source=email: "Sent by \\"Acme\\" Promotions"' in prompt
     assert 'important, source=email: "Sent by Daniel Reyes"' in prompt
     assert "Switched Off" not in prompt and ("b" * 32) not in prompt and ("c" * 32) not in prompt
-    assert "An event matching a 'not important' rule never gets a notice" in prompt
-    assert "'important' rule is important to the owner even when it looks routine" in prompt
+    assert "the more specific one wins, and 'not important' wins a tie" in prompt
+    assert "Apply the winning rule before your own judgment" in prompt
+    assert "'not important' suppresses a notice" in prompt
+    assert "'important' makes the event important even when it looks routine" in prompt
     assert "never pass one as request_id" in prompt
     # Importance rules do not turn on night checks or change when the watch runs.
     only_importance, _ = api.proactive._specs(api.proactive.default_setup(), rules[1:3])

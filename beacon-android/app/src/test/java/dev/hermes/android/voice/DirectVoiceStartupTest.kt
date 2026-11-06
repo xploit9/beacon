@@ -28,6 +28,26 @@ import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 
 class DirectVoiceStartupTest {
+    @Test(timeout=8000) fun setupSenderExceptionEndsAttemptWithSafeMetadata()=runBlocking {
+        val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+        val uncaught=java.util.concurrent.CopyOnWriteArrayList<Throwable>()
+        val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default+CoroutineExceptionHandler { _,error -> uncaught+=error })
+        val client=client("stored")
+        val factory=providerFactory(true,onSetup={_,_,_->throw IllegalStateException("synthetic-private-setup-marker")})
+        val voice=DirectVoice(client,"call","stored",scope,{}, { events+=it }, {},credentials=credentials(),providerSocketFactory=factory)
+        try {
+            voice.start()
+            assertTrue("A sender exception must settle the setup attempt instead of stranding its waiter",withTimeoutOrNull(2500) {
+                while(events.none { it.optString("stage")=="provider_setup_failed" }) delay(10);true
+            }==true)
+            assertTrue(events.none { it.optString("stage") in setOf("provider_setup_ok","provider_ready","mic_streaming") })
+            assertFalse(voice.pcm(ByteArray(640)) { true })
+            assertTrue(uncaught.isEmpty())
+            val failure=events.first { it.optString("stage")=="provider_setup_failed" }
+            assertFalse(failure.toString().contains("synthetic-private-setup-marker"))
+            assertFalse(failure.has("text"));assertFalse(failure.has("payload"));assertFalse(failure.has("provider"))
+        } finally { voice.close();scope.cancel();client.closeNative() }
+    }
 
     @Test fun onlyUnsentNativeStagingMayBeCancelledAtCallEnd() {
         assertTrue(directToolMayCancel("staging_native"))
@@ -42,7 +62,7 @@ class DirectVoiceStartupTest {
                 val path = chain.request().url.encodedPath
                 paths += path
                 if (chain.request().method == "POST") posts += path
-                if (path.endsWith("/ws-ticket")) tickets.incrementAndGet()
+                if (path.endsWith("/ws-ticket") || path == "/api/plugins/beacon/mobile/gateway-ticket") tickets.incrementAndGet()
                 val body = when {
                     path.endsWith("/context") -> json("profile" to "default", "selected_session_id" to "stored")
                     path.endsWith("/tools") -> json("tools" to JSONArray().put(json("name" to "get_weather", "tool_id" to "a".repeat(64), "description" to "Weather")))
@@ -277,8 +297,8 @@ class DirectVoiceStartupTest {
                 builder.addInterceptor { chain ->
                     paths.add(chain.request().url.encodedPath)
                     val path=chain.request().url.encodedPath
-                    val value=if(path.endsWith("/jobs")) json("job_id" to "native-job") else if(path.endsWith("/calls/call")) json("jobs" to JSONArray()) else json("ticket" to "fixture-ticket")
-                    Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    val value=if(path=="/api/plugins/beacon/mobile/gateway-ticket") json("detail" to "Not Found") else if(path.endsWith("/work")) json("job_id" to "native-job","continuation" to true,"submit" to true) else if(path.endsWith("/jobs")) json("job_id" to "native-job") else if(path.endsWith("/calls/call")) json("jobs" to JSONArray()) else json("ticket" to "fixture-ticket")
+                    Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(if(path=="/api/plugins/beacon/mobile/gateway-ticket") 404 else 200).message("Fixture")
                         .body(value.toString().toResponseBody("application/json".toMediaType())).build()
                 }
             }
@@ -328,8 +348,11 @@ class DirectVoiceStartupTest {
             socket
         }
         val client=BeaconClient(AuthContext("https://voice-fixture.invalid",emptyList(),"owner","default",backend="hermes-dashboard"),null,factory) { builder ->
-            builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+            builder.addInterceptor { chain ->
+                val missing=chain.request().url.encodedPath=="/api/plugins/beacon/mobile/gateway-ticket"
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(if(missing) 404 else 200).message("Fixture")
+                    .body((if(missing) json("detail" to "Not Found") else json("ticket" to "fixture-ticket")).toString().toResponseBody("application/json".toMediaType())).build()
+            }
         }
         val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
         val voice=DirectVoice(client,"call","stored",scope,{}, {}, {},credentials=credentials())
@@ -502,7 +525,7 @@ class DirectVoiceStartupTest {
                 check(request.url.host == "voice-fixture.invalid")
                 val context = request.url.encodedPath.endsWith("/context")
                 if(context) contextRead()
-                if(request.url.encodedPath.endsWith("/ws-ticket")) nativeAdmission()
+                if(request.url.encodedPath.endsWith("/ws-ticket") || request.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket") nativeAdmission()
                 check(!request.url.encodedPath.endsWith("/token")) { "Phone-held provider keys must not request a Hermes token" }
                 val body = if (context) json("profile" to "default", "selected_session_id" to session) else json("detail" to "Synthetic native runtime unavailable")
                 Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (context) 200 else 503)

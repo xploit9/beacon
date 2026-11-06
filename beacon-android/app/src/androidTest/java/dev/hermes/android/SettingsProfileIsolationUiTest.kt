@@ -102,6 +102,25 @@ class SettingsProfileIsolationUiTest {
         assertEquals("manual", vm.data.value["picker:approvals"]?.string("profile_mode"))
     }
 
+    @Test fun openingAnotherProfilesMemoryKeepsTheSelectedSettingsProfileAndChat() = withFixture { vm, fixture, _, _ ->
+        await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
+        scrollTo(hasTestTag("profile-open:coder"))
+        compose.onNodeWithTag("profile-open:coder").performClick()
+        await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
+        scrollTo(hasTestTag("profile-memory"))
+        compose.onNodeWithTag("profile-memory").performClick()
+        await { vm.ui.value.morePage == "Memory" && !vm.phoneSettings.memory.value.loading && vm.phoneSettings.memory.value.documents.isNotEmpty() }
+        assertEquals("coder", vm.settingsProfile.value)
+        assertEquals("coder notes", vm.phoneSettings.memory.value.documents.first { it.target == "memory" }.content)
+        assertEquals("default", vm.ui.value.profile)
+        assertSame(fixture.client, vm.client)
+        assertEquals("chat-a", vm.chat.value.sessionId)
+        assertEquals("chat-model", vm.chat.value.raw.string("model"))
+        assertEquals("Unsent chat draft", vm.composer.value.text)
+        val reads = fixture.requests.filter { it.string("method") == "GET" && it.string("path") == "/api/plugins/beacon/memory/documents" }
+        assertEquals("coder", reads.last().string("profile"))
+    }
+
     @Test fun twoInspectedProfilesKeepTheirSettingsAndLeaveTheChatUntouched() = withFixture { vm, fixture, navigation, _ ->
         val assistantProfile = vm.preferences.value.assistantProfile
         await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }

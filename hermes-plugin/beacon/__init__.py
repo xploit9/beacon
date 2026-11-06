@@ -13,7 +13,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools','email_drafts')
+_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools','email_drafts','vault_attestation','voice_context','gateway_tools','voice_continuation')
 # Only purge the siblings loaded here; dashboard-only modules may still serve live routes.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -26,6 +26,7 @@ for name in _MODULE_NAMES:
 mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];observers=sys.modules['beacon_observers']
 proactive=sys.modules['beacon_proactive'];phone_delivery=sys.modules['beacon_phone_delivery']
 live_context=sys.modules['beacon_live_context'];phone_tools=sys.modules['beacon_phone_tools'];email_drafts=sys.modules['beacon_email_drafts']
+vault_attestation=sys.modules['beacon_vault_attestation']
 
 def _cron_fallback_allowed(cfg,row):
     if row.get('source')!='cron' or cfg.get('scheduled_callbacks_enabled') is not True: return False
@@ -52,11 +53,16 @@ def call_user(args,session_id=None,**kwargs):
         with server._profile_db({'profile':profile}) as db:
             row=db.get_session(stored) if db else None
         if not row: raise LookupError('Native session unavailable')
-        if row.get('user_id')!=provider+':'+owner:
+        principal=native.current_principal(owner,provider,profile,stored)
+        if principal and row.get('user_id')==principal:
+            native.verify(owner,provider,profile,stored,None,True,principal)
+        elif row.get('user_id')!=provider+':'+owner:
             if not _cron_fallback_allowed(cfg,row):
                 return json.dumps({'error':'This chat is not linked to your Hermes sign-in, so Beacon cannot ring from it. Start a new chat in Beacon and ask again.','reason':'conversation_not_owned'})
             stored=cfg.get('scheduled_callback_conversation_id')
-        native.verify(owner,provider,profile,stored)
+            native.verify(owner,provider,profile,stored)
+        else:
+            native.verify(owner,provider,profile,stored)
         provided_reason=isinstance(args,dict) and args.get('reason') is not None
         reason=args.get('reason',row.get('title','')) if isinstance(args,dict) else row.get('title','')
         if reason is None: reason=''
@@ -66,7 +72,7 @@ def call_user(args,session_id=None,**kwargs):
             if provided_reason: return json.dumps({'error':str(exc)})
             reason=''
         # Only an in-chat call dedupes: cron fallbacks share one conversation but carry different reasons.
-        event_id=mobile.invitation(owner,profile,stored,reason,deduplicate=stored==session_id)
+        event_id=mobile.invitation(owner,profile,stored,reason,deduplicate=stored==session_id,principal=principal or '')
         # The durable outbox is the authority. FCM is asynchronous wake-up only.
         return json.dumps({'event_id':event_id,'status':'pending','expires_in_seconds':120,'conversation_id':stored})
     except Exception:
@@ -115,6 +121,10 @@ _VERIFY_REUSE_SECONDS=1.0
 def _verify_owned(owner,provider,profile,session_id):
     """The pre_llm_call hooks of one turn run back to back on the same chat: a passed ownership check is reused for a
     second instead of asked again. A refusal is never kept."""
+    principal=native.current_principal(owner,provider,profile,session_id)
+    if principal:
+        native.verify(owner,provider,profile,session_id,None,True,principal)
+        return  # Canonical execution authorization is checked each time, never cached across generations.
     key=(owner,provider,profile,session_id);now=time.monotonic()
     if _RECENT_VERIFIED.get(key,0)>now: return
     native.verify(owner,provider,profile,session_id)
@@ -155,6 +165,7 @@ def _watch_context(cfg,profile,session_id):
             or job_id!=proactive._managed_id(mobile,owner,profile,'watch_email')):
         raise LookupError('Session is not an owned Proactive watch')
     stored=cfg.get('scheduled_callback_conversation_id')
+    # A watch has no affirmative remote input for the delivery chat; retain its legacy proof only.
     native.verify(owner,provider,profile,stored)
     return {'id':'watch_email','job_id':job_id}
 
@@ -220,9 +231,11 @@ def create_proactive_request(args,session_id=None,**kwargs):
         owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
         if not owner or not provider or not session_id: raise LookupError('Owned interactive conversation required')
         row=_cron_row(profile,session_id)
-        if not row or row.get('source')=='cron' or row.get('user_id')!=provider+':'+owner:
+        principal=native.current_principal(owner,provider,profile,session_id)
+        if not row or row.get('source')=='cron' or row.get('user_id') not in (provider+':'+owner,principal):
             raise LookupError('Proactive requests can only be created in the owner chat')
-        native.verify(owner,provider,profile,session_id)
+        if principal: native.verify(owner,provider,profile,session_id,None,True,principal)
+        else: native.verify(owner,provider,profile,session_id)
         action=args.get('action')
         if action is None:
             action=proactive._setup(mobile,owner,profile)['delivery']
@@ -714,8 +727,12 @@ def _restart_stale_dashboard():
     except Exception: pass
 
 def register(ctx):
-    global _ctx
+    global _ctx,_vault_coordinator
     _ctx=ctx
+    sys.modules['beacon_voice_continuation'].register(ctx,mobile,native)
+    _vault_coordinator=vault_attestation.acquire_gateway(mobile,register)
+    vault_coordinator=_vault_coordinator
+    gateway_process=_is_gateway_process()
     ctx.register_tool(name='beacon_call_user',toolset='beacon',description='Ring the owner through Beacon Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
         schema={'name':'beacon_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
 
@@ -762,14 +779,22 @@ def register(ctx):
     ctx.register_hook('on_session_end',native_completion)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
+    ctx.register_hook('pre_tool_call',vault_coordinator.guard)
     # Cleanup runs before the guard is removed because native registrations unwind in reverse order.
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
+    if callable(getattr(ctx,'on_unload',None)):
+        ctx.on_unload(lambda coordinator=vault_coordinator,owner=vault_attestation: owner.release_gateway(coordinator))
     phone_delivery.register(ctx)
     phone_tools.register(ctx)
     email_drafts.register(ctx)
-    _after_load(_record_gateway_plugin_version,_restart_stale_dashboard)
+    def start_vault(coordinator=vault_coordinator,gateway=gateway_process,owner_mobile=mobile,root=ROOT):
+        if gateway:
+            if not coordinator.version: coordinator.version=owner_mobile.read_plugin_version(root/'plugin.yaml')
+            coordinator.start()
+    _after_load(start_vault,_record_gateway_plugin_version,_restart_stale_dashboard)
 
 _after_load_thread=None
+_vault_coordinator=None
 
 def _after_load(*steps):
     # Hermes gives a plugin 10 s to import and register, then loads Hermes without it: these steps read the database and the

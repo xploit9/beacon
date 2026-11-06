@@ -110,7 +110,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.util.Locale
-import dev.hermes.android.tasks.scheduleState
 
 internal suspend fun voiceKeyConfiguredOnIo(store: () -> VoiceKeyStore): Boolean = withContext(Dispatchers.IO) {
     val keyStore = store()
@@ -118,50 +117,49 @@ internal suspend fun voiceKeyConfiguredOnIo(store: () -> VoiceKeyStore): Boolean
 }
 
 private suspend fun optionalBackgroundRead(read: suspend () -> JSONObject): JSONObject? = try {
-    read()
+    withTimeoutOrNull(8_000L) { read() }
 } catch (error: Exception) {
     if (error is CancellationException) throw error
     null
 }
 
-private suspend fun fetchBackgroundActivity(source: BeaconClient, profile: String, storedSessionId: String, pluginAvailable: Boolean): BackgroundActivitySummary = try {
+internal suspend fun fetchBackgroundActivity(source: BeaconClient, profile: String, storedSessionId: String): BackgroundActivitySummary = try {
     withTimeoutOrNull(15_000L) {
         if (source.scope.profile != profile || storedSessionId.isBlank()) return@withTimeoutOrNull BackgroundActivitySummary(available = false)
-        val snapshot = source.nativeSessionSnapshot()
-        val runtimeSessionId = snapshot.string("session_id")
-        val boundStoredSessionId = snapshot.string("stored_session_id").ifBlank { snapshot.string("session_key") }
-        if (runtimeSessionId.isBlank() || storedSessionId !in setOf(boundStoredSessionId, runtimeSessionId))
+        val scope = source.scope
+        // Inventory resolves the viewed chat without resuming a turn or moving the shared client's binding.
+        val inventory = optionalBackgroundRead { source.nativeRpc("session.active_list", JSONObject()) }
+        val runtimeSessionId = backgroundActivityRuntime(inventory, storedSessionId)
+        if (runtimeSessionId == null || source.scope != scope)
             return@withTimeoutOrNull BackgroundActivitySummary(available = false)
         coroutineScope {
             val session = json("session_id" to runtimeSessionId, "profile" to profile)
-            // shortcut: prompt.background only starts tasks and exposes no read-only roster; a gateway status API is out of scope here.
             val roster = async { optionalBackgroundRead { source.nativeRpc("subagent.list", session.copy()) } }
-            val delegation = async { optionalBackgroundRead { source.nativeRpc("delegation.status", json("profile" to profile)) } }
             val processes = async { optionalBackgroundRead { source.nativeRpc("process.list", session.copy()) } }
-            val cron = async { optionalBackgroundRead { source.nativeRequest("/api/cron/jobs", params = mapOf("profile" to profile)) } }
-            val proactive = async { if (pluginAvailable) optionalBackgroundRead { fetchProactiveSettings(source, profile) } else null }
-            val sessionRoster = roster.await()
-            val delegationStatus = delegation.await()
-            val processStatus = processes.await()
-            val cronStatus = cron.await()
-            val proactiveStatus = proactive.await()
-            val runningWatches = proactiveStatus?.rows("jobs").orEmpty()
-                .filter { it.string("cadence") == "watch" && it.optBoolean("active") }
-            val watchIds = runningWatches.mapNotNull { it.string("job_id").takeIf(String::isNotBlank) }.toSet()
-            val cronRows = cronStatus?.let { it.rows("items").ifEmpty { it.rows("jobs") } }.orEmpty()
-            val runningCron = cronRows.count { it.string("id") !in watchIds && scheduleState(it) == "Running" }
-            BackgroundActivitySummary(
-                agents = sessionScopedSubagentCount(sessionRoster ?: JSONObject(), delegationStatus),
-                processes = processStatus?.rows("processes")?.count { it.string("status") == "running" } ?: 0,
-                cronJobs = runningCron,
-                watches = runningWatches.size,
-                available = sessionRoster != null && processStatus != null && cronStatus != null && (!pluginAvailable || proactiveStatus != null),
-            )
+            val current = conversationBackgroundActivity(roster.await(), processes.await())
+            if (source.scope == scope) current else BackgroundActivitySummary(available = false)
         }
     } ?: BackgroundActivitySummary(available = false)
 } catch (error: Exception) {
     if (error is CancellationException) throw error
     BackgroundActivitySummary(available = false)
+}
+
+internal suspend fun pollBackgroundActivity(
+    profile: String,
+    storedSessionId: String,
+    client: () -> BeaconClient?,
+    isCurrent: () -> Boolean,
+    update: (BackgroundActivitySummary) -> Unit,
+    pause: suspend () -> Unit,
+) {
+    while (true) {
+        val source = client()
+        val current = source?.let { fetchBackgroundActivity(it, profile, storedSessionId) } ?: BackgroundActivitySummary(available = false)
+        // A replaced or temporarily missing client leaves earlier work unconfirmed.
+        update(if (source != null && client() === source && isCurrent()) current else BackgroundActivitySummary(available = false))
+        pause()
+    }
 }
 
 private val toolNamePattern = Regex("[A-Za-z0-9_.:-]{1,80}")
@@ -642,6 +640,9 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val profileDefaults by vm.data.collectAsStateWithLifecycle()
     val preferences by vm.preferences.collectAsStateWithLifecycle()
     val chatState by vm.chat.collectAsStateWithLifecycle()
+    val securePrompt by vm.securePrompt.collectAsStateWithLifecycle()
+    securePrompt?.takeIf { it.scope.session == chatState.sessionId && it.scope.copy(session = "") == vm.client?.scope && ui.connected }
+        ?.let { NativeServerSecurePrompt(vm, it) }
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
     // Saved call turns and alerts sit among the messages by the time they happened.
     val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId, chatState.queued) {
@@ -792,20 +793,32 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     var activitySheet by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(false) }
     var backgroundActivity by remember(ui.origin, ui.owner, ui.profile, chat.sessionId) { mutableStateOf(BackgroundActivitySummary()) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, chat.sessionId, lifecycle) {
+        if (ui.connected && chat.sessionId.isNotBlank()) lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            while (true) { vm.refreshSecurePrompt(); delay(1000) }
+        }
+    }
     LaunchedEffect(chat.streamId, ui.notice) {
         if (chat.streamId.isBlank() && ui.notice == "Stopping the current turn") vm.notice("")
     }
-    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, chat.sessionId, lifecycle, pluginStatus) {
-        if (!ui.connected) return@LaunchedEffect
-        val source = vm.client?.takeIf { it.scope.origin == ui.origin && it.scope.owner == ui.owner && it.scope.profile == ui.profile } ?: return@LaunchedEffect
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, chat.sessionId, chat.streamId, call.active, activitySheet, lifecycle) {
+        if (!ui.connected) {
+            backgroundActivity = reconcileBackgroundActivity(backgroundActivity, BackgroundActivitySummary(available = false))
+            return@LaunchedEffect
+        }
         val profile = ui.profile
         val sessionId = chat.sessionId.takeIf(String::isNotBlank) ?: return@LaunchedEffect
-        lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            while (true) {
-                val current = fetchBackgroundActivity(source, profile, sessionId, pluginStatus == "available")
-                if (vm.client === source && vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.client?.scope?.profile == profile && vm.chat.value.sessionId == sessionId)
-                    backgroundActivity = current
-                delay(30_000L)
+        lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
+            try {
+                pollBackgroundActivity(
+                    profile, sessionId,
+                    client = { vm.client?.takeIf { it.scope.origin == ui.origin && it.scope.owner == ui.owner && it.scope.profile == profile } },
+                    isCurrent = { vm.chat.value.sessionId == sessionId },
+                    update = { current -> backgroundActivity = reconcileBackgroundActivity(backgroundActivity, current) },
+                    pause = { delay(if (backgroundActivity.active || activitySheet) 3_000L else 10_000L) },
+                )
+            } finally {
+                backgroundActivity = reconcileBackgroundActivity(backgroundActivity, BackgroundActivitySummary(available = false))
             }
         }
     }
@@ -1321,7 +1334,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     }
     side?.takeIf { ready }?.let { question -> AlertDialog(onDismissRequest = vm::closeSideQuestion, title = { Text(uiText("Side question")) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) { Text(question.question, style = MaterialTheme.typography.titleMedium); Text(question.status, color = MaterialTheme.colorScheme.onSurfaceVariant); Markdown(question.text, vm, question.scope.session(question.sessionId), interactive = false) } }, confirmButton = { TextButton(onClick = vm::closeSideQuestion) { Text(uiText("Close")) } }, dismissButton = { TextButton(onClick = vm::resumeSideQuestion) { Text(uiText("Reconnect")) } }) }
     if (canonical) NativeCatalog(vm)
-    if (activitySheet && ready && (backgroundActivity.active || !backgroundActivity.available)) ChatActivitySheet(backgroundActivity) { activitySheet = false }
+    if (activitySheet && ready) ChatActivitySheet(backgroundActivity) { activitySheet = false }
     if (threadPosts && chat.sessionId.isNotBlank()) ThreadSchedulesSheet(vm, chat.sessionId, chat.title) { threadPosts = false }
     if (showCallHistorySheet && beacon) CallHistorySheet(vm, onOpenCall = { conversationId, callId ->
         showCallHistorySheet = false
@@ -1827,6 +1840,20 @@ internal fun findRanges(text: String, query: String): List<IntRange> {
     }
 }
 
+internal fun branchRowIds(rows: List<JSONObject>): org.json.JSONArray = org.json.JSONArray(rows.map {
+    it.string("row_id", it.string("_row_id")).toLongOrNull()?.takeIf { id -> id > 0 } ?: JSONObject.NULL
+})
+internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONObject>, before: Boolean): JSONObject {
+    val result = json("keep_count" to if (before) index else index + 1)
+    val row = rows.getOrNull(index)
+    if (row != null && Message.from(row, index, message.sessionId).let { it.id == message.id && it.role == message.role }) {
+        row.string("row_id", row.string("_row_id")).toLongOrNull()?.takeIf { it > 0 }?.let {
+            result.put(if (before) "before_message_id" else "through_message_id", it).put("selected_role", row.string("role"))
+        }
+    }
+    return result
+}
+
 @Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, group: BubbleGroup, bubbleMax: Dp, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), resultTitle: String = "", confirmedLocalId: String? = null, onToolExpanded: (Boolean) -> Unit = {}, find: String = "", findHit: FindHit = FindHit.None) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
@@ -1864,8 +1891,8 @@ internal fun findRanges(text: String, query: String): List<IntRange> {
             DropdownMenuItem({ Text(uiText(if (reading) "Stop read aloud" else "Read aloud")) }, { actions = false; readAloud() }, leadingIcon = { Icon(if (reading) Icons.Rounded.Stop else Icons.AutoMirrored.Rounded.VolumeUp, null) }, enabled = reading || displayText.isNotBlank(), modifier = Modifier.testTag("message-read-aloud:${message.id}"))
             HorizontalDivider()
             DropdownMenuItem({ Text(uiText("Copy source")) }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
-            DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index + 1)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.CallSplit, null) })
-            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; vm.sessionAction("/api/session/branch", json("keep_count" to index)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
+            DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = false)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new conversation") } } }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.CallSplit, null) })
+            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = true)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, message.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
             if (confirmedLocalId != null) DropdownMenuItem({ Text(uiText("Remove saved local copy")) }, { actions = false; vm.removeConfirmedLocalCopy(confirmedLocalId) })
         }
     }
@@ -2407,7 +2434,7 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
 
 /** Compact summary of background work, separate from the current reply's transcript activity. */
 @Composable internal fun ChatActivityStrip(activity: BackgroundActivitySummary, onClick: () -> Unit) {
-    if (!activity.active) return  // owner: hidden unless something runs in the background; an unknown status hides too
+    if (!activity.active) return
     val texts = BackgroundActivityStrings.associateWith { uiText(it) }
     val status = backgroundActivityStatus(activity) { texts.getValue(it) }
     val title = uiText("Background activity")
@@ -2421,7 +2448,7 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
         color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .28f),
     ) {
         Row(Modifier.padding(horizontal = 10.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
-            // A spinner only while something really runs: a watch that is merely on would otherwise spin all day.
+            // A lost connection keeps the last known work visible without implying it is still running.
             if (activity.working) CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 1.5.dp)
             else Icon(Icons.Rounded.Visibility, null, Modifier.size(15.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.width(8.dp))
@@ -2434,27 +2461,33 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
 
 @Composable internal fun ChatActivitySheet(activity: BackgroundActivitySummary, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(Modifier.fillMaxWidth().testTag("chat-activity-sheet").heightIn(max = 560.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
+        Column(Modifier.fillMaxWidth().testTag("chat-activity-sheet").heightIn(max = 560.dp).imePadding().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(uiText("Background activity"), style = MaterialTheme.typography.titleLarge)
-                    Text(uiText("Read-only status from this profile"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(uiText("Read-only status from this conversation"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp).testTag("chat-activity-close")) { Icon(Icons.Rounded.Close, uiText("Close background activity")) }
             }
-            if (!activity.active) Text(
-                uiText(if (activity.available) "No active background work." else "Background status unavailable."),
+            if (activity.items.isNotEmpty()) {
+                ActivitySection(uiText("Background"), activity.items.size)
+                activity.items.forEach { item ->
+                    val detail = listOfNotNull(uiText(item.status), item.elapsedSeconds?.let { uiText("{0}s elapsed").replace("{0}", "$it") }).joinToString(" · ")
+                    ActivityRow(item.title.ifBlank { uiText(item.kind) }, detail, item.running)
+                }
+                if (!activity.available) Text(uiText("More background work may be active."), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else if (!activity.active) Text(
+                uiText(if (activity.available) "No listed background work." else "Background status unavailable."),
                 Modifier.padding(horizontal = 20.dp, vertical = 16.dp).testTag("chat-activity-empty"),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             ) else {
-                val total = activity.agents + activity.processes + activity.cronJobs + activity.watches
+                val total = activity.agents + activity.processes
                 ActivitySection(uiText("Background"), total)
                 if (activity.agents > 0) ActivityRow(uiText(if (activity.agents == 1) "1 background agent" else "{0} background agents").replace("{0}", "${activity.agents}"), uiText("Running"), true)
                 if (activity.processes > 0) ActivityRow(uiText(if (activity.processes == 1) "1 background process" else "{0} background processes").replace("{0}", "${activity.processes}"), uiText("Running"), true)
-                if (activity.cronJobs > 0) ActivityRow(uiText(if (activity.cronJobs == 1) "1 schedule running" else "{0} schedules running").replace("{0}", "${activity.cronJobs}"), uiText("Running"), true)
-                if (activity.watches > 0) ActivityRow(uiText(if (activity.watches == 1) "1 active watch" else "{0} active watches").replace("{0}", "${activity.watches}"), uiText("Watching"), false, Icons.Rounded.Visibility)
                 if (!activity.available) Text(uiText("More background work may be active."), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+            Text(uiText("Some background tasks may not be listed."), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }
@@ -2467,7 +2500,7 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 20.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(30.dp), contentAlignment = Alignment.Center) { if (spinning) CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp) else Icon(icon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
         Column(Modifier.weight(1f).padding(start = 10.dp)) {
-            Text(title.replaceFirstChar(Char::titlecase), style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+            Text(title, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
             Text(detail, style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
         }
     }
@@ -2586,7 +2619,7 @@ private fun chatAction(vm: BeaconViewModel, title: String) {
         "Model & provider", "Reasoning", "Toolsets" -> vm.openCatalog(title)
         "Archive" -> vm.sessionAction("/api/session/archive", json("archived" to !chat.raw.optBoolean("archived")))
         "Pin" -> openChatPinned(vm.ui.value.sessions, chat, vm.ui.value.profile).let { pinned -> vm.conversationAction(chat.sessionId, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned") }
-        "Branch" -> vm.openForm(ActionForm(title, "/api/session/branch", listOf(Field("title", "Branch title"), Field("keep_count", "Messages to keep", FieldType.INTEGER)), seed.put("keep_count", chat.messages.size), onResult = result))
+        "Branch" -> vm.openForm(ActionForm(title, "/api/session/branch", listOf(Field("title", "Branch title"), Field("keep_count", "Messages to keep", FieldType.INTEGER)), seed.put("keep_count", chat.messages.size).put("branch_row_ids", branchRowIds(chat.raw.rows("messages"))), onResult = result))
         // "Shorten history" is the user-facing name the menu lists may give the same action.
         "Compress context", "Shorten history" -> vm.sessionAction("/api/session/compress") { response ->
             vm.notice(when (response.string("status")) { "compressed" -> "Context compressed"; "aborted" -> "Compression was not needed or was cancelled."; "pending", "lock_held" -> "${dev.hermes.android.data.currentAssistantName} is still working. Refresh the conversation to check progress."; else -> "Compression result is not confirmed. Refresh the conversation." })

@@ -14,8 +14,10 @@ import org.junit.Test
 
 /** A conversation binding names a runtime that lives on the socket that made it; Hermes reaps the runtime once that socket is gone. */
 class NativeGatewayBindingTest {
-    private class Wire : WebSocket.Factory {
+    private class Wire(initial: AuthContext = AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), store: AuthStore? = null) : WebSocket.Factory {
         val methods = mutableListOf<String>()
+        val httpRequests = java.util.Collections.synchronizedList(mutableListOf<Request>())
+        val socketRequests = mutableListOf<Request>()
         val connectionMethods = mutableListOf<MutableList<String>>()
         val connectionFrames = mutableListOf<MutableList<JSONObject>>()
         val responses = mutableListOf<Pair<Int, JSONObject>>()
@@ -23,6 +25,9 @@ class NativeGatewayBindingTest {
         lateinit var socket: WebSocket
         lateinit var listener: WebSocketListener
         var canonical = false
+        var relayStatus = 404
+        var relayBody = """{"detail":"Not Found"}"""
+        var onTicket: (() -> Unit)? = null
         var advertiseReady = true
         var strictCanonicalCreate = false
         var canonicalCreateResult: JSONObject? = null
@@ -38,12 +43,19 @@ class NativeGatewayBindingTest {
         @Volatile var reaped: String? = null
         /** Hermes' text for the 4001: "session not found" when the runtime is gone; other 4001s (a session not owned by this transport) keep the binding. */
         @Volatile var refusal = "session not found"
-        val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
-            builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
-                .body(json("ticket" to "fixture-ticket").toString().toResponseBody("application/json".toMediaType())).build() }
+        val client = BeaconClient(initial, store, this) { builder ->
+            builder.addInterceptor { chain ->
+                val request = chain.request()
+                httpRequests += request
+                val relay = request.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket"
+                if (relay) onTicket?.invoke()
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (relay) relayStatus else 200).message("Fixture")
+                    .body((if (relay) relayBody else json("ticket" to "fixture-ticket").toString()).toResponseBody("application/json".toMediaType())).build()
+            }
         }
 
         override fun newWebSocket(request: Request, listener: WebSocketListener): WebSocket {
+            socketRequests += request
             val connectionCalls = mutableListOf<String>()
             connectionMethods += connectionCalls
             val connectionIndex = connectionMethods.lastIndex
@@ -103,6 +115,238 @@ class NativeGatewayBindingTest {
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
             if (advertiseReady) listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to if (canonical) json("session_authority" to true) else json())).toString())
             return socket
+        }
+    }
+
+    private fun relayTicket(profile: String = "default") = json(
+        "ticket" to "fixture-relay-ticket", "path" to "/api/plugins/beacon/gateway/ws",
+        "profile" to profile, "canonical" to true, "expires_in" to 25,
+    )
+
+    @Test(timeout = 15_000) fun relayTicketBindsProfileAndDeviceWithoutSendingNativeCredentialsOnSocket() = runBlocking {
+        val origin = "https://native.example"
+        val auths = listOf(
+            AuthContext(origin, emptyList(), "owner", "default", backend = "hermes-dashboard",
+                bearer = NativeBearerRecord("fixture-access", "fixture-refresh", 4_000_000_000, origin, "owner", "default", "basic")),
+            AuthContext(origin, emptyList(), "local", "default", backend = "hermes-dashboard",
+                loopbackSession = LoopbackSessionRecord("fixture-loopback", origin, "local", verified = true)),
+        )
+        val field = NativePairing::class.java.getDeclaredField("store").apply { isAccessible = true }
+        val previous = field.get(NativePairing)
+        var deviceId = "phone-1"
+        val prefs = java.lang.reflect.Proxy.newProxyInstance(android.content.SharedPreferences::class.java.classLoader,
+            arrayOf(android.content.SharedPreferences::class.java)) { _, method, _ ->
+            if (method.name == "getString") deviceId else error("Unexpected preference operation")
+        } as android.content.SharedPreferences
+        field.set(NativePairing, prefs)
+        try {
+            for (auth in auths) {
+                val wire = Wire(auth).apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true }
+                try {
+                    wire.client.nativeRpc("status")
+                    val admission = wire.httpRequests.single { it.url.encodedPath.endsWith("/gateway-ticket") }
+                    assertEquals("POST", admission.method)
+                    assertEquals("default", admission.url.queryParameter("beacon_profile"))
+                    assertEquals("phone-1", admission.header("X-Beacon-Device-ID"))
+                    assertTrue(admission.header("Authorization") != null || admission.header(HERMES_LOOPBACK_SESSION_HEADER) != null)
+                    val socket = wire.socketRequests.single()
+                    assertEquals("/api/plugins/beacon/gateway/ws", socket.url.encodedPath)
+                    assertNull(socket.url.query)
+                    assertEquals("beacon-canonical-v1, beacon-ticket.fixture-relay-ticket", socket.header("Sec-WebSocket-Protocol"))
+                    assertEquals("phone-1", socket.header("X-Beacon-Device-ID"))
+                    assertNull(socket.header("Authorization"))
+                    assertNull(socket.header(HERMES_LOOPBACK_SESSION_HEADER))
+                    val capabilities = wire.connectionFrames.single().first().getJSONObject("params")
+                    assertEquals(setOf("server_requests"), capabilities.keys().asSequence().toSet())
+                    assertEquals(true, capabilities.opt("server_requests"))
+                    assertEquals("default", wire.connectionFrames.single().last().getJSONObject("params").getString("profile"))
+                } finally { wire.client.closeNative() }
+            }
+            val changed = Wire(auths.first()).apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true }
+            changed.onTicket = { deviceId = "phone-2" }
+            try {
+                assertTrue(runCatching { changed.client.nativeRpc("status") }.isFailure)
+                assertTrue(changed.socketRequests.isEmpty())
+            } finally { changed.client.closeNative() }
+        } finally { field.set(NativePairing, previous) }
+    }
+
+    @Test(timeout = 15_000) fun malformedRelayTicketsNeverOpenAnySocketOrFallBack() = runBlocking {
+        val invalid = listOf(
+            relayTicket().put("path", "https://other.example/api/plugins/beacon/gateway/ws"),
+            relayTicket().put("path", "/api/plugins/beacon/gateway/ws?other=1"),
+            relayTicket().put("profile", "other"), relayTicket().put("profile", 1),
+            relayTicket().put("canonical", "true"), relayTicket().put("canonical", false),
+            relayTicket().put("expires_in", 0), relayTicket().put("expires_in", 26),
+            relayTicket().put("expires_in", "25"), relayTicket().put("expires_in", 1.5),
+            relayTicket().put("ticket", "bad ticket"), relayTicket().put("ticket", "x".repeat(1025)),
+            relayTicket().put("ticket", JSONObject.NULL),
+        )
+        for (ticket in invalid) {
+            val wire = Wire().apply { relayStatus = 200; relayBody = ticket.toString() }
+            try {
+                assertTrue(ticket.toString(), runCatching { wire.client.nativeRpc("status") }.isFailure)
+                assertTrue(wire.socketRequests.isEmpty())
+                assertEquals(listOf("/api/plugins/beacon/mobile/gateway-ticket"), wire.httpRequests.map { it.url.encodedPath })
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    @Test(timeout = 15_000) fun canonicalReadinessPersistsAcrossDetachedAndRecreatedClients() = runBlocking {
+        val origin = "https://native.example"
+        val auth = AuthContext(origin, emptyList(), "owner", "default", backend = "hermes-dashboard",
+            bearer = NativeBearerRecord("fixture-access", "fixture-refresh", 4_000_000_000, origin, "owner", "default", "basic"))
+        val storage = CanonicalStoreFixture()
+        val first = Wire(auth, storage.newStore()).apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true }
+        try {
+            first.client.nativeRpc("status")
+            first.relayStatus = 404; first.relayBody = """{"detail":"Not Found"}"""
+            val detached = first.client.detached()
+            try { assertTrue(runCatching { detached.nativeRpc("status") }.isFailure) } finally { detached.closeNative() }
+            assertEquals(1, first.socketRequests.size)
+            val recreated = Wire(auth, storage.newStore())
+            try {
+                assertTrue(runCatching { recreated.client.nativeRpc("status") }.isFailure)
+                assertTrue(recreated.socketRequests.isEmpty())
+                assertEquals(0, recreated.httpRequests.count { it.url.encodedPath == "/api/auth/ws-ticket" })
+            } finally { recreated.client.closeNative() }
+        } finally { first.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun unsuccessfulRelayAdmissionNeverPersistsCanonicalRequirement() = runBlocking {
+        val storage = CanonicalStoreFixture()
+        val wire = Wire(store = storage.newStore()).apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = false }
+        try {
+            assertTrue(runCatching { wire.client.nativeRpc("status") }.isFailure)
+            assertFalse(storage.newStore().canonicalRequired(wire.client.scope))
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun detachedTransientClientKeepsItsVerifiedCanonicalRequirement() = runBlocking {
+        val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true }
+        try {
+            wire.client.nativeRpc("status")
+            wire.relayStatus = 404; wire.relayBody = """{"detail":"Not Found"}"""
+            val detached = wire.client.detached()
+            try { assertTrue(runCatching { detached.nativeRpc("status") }.isFailure) } finally { detached.closeNative() }
+            assertEquals(1, wire.socketRequests.size)
+            assertEquals(0, wire.httpRequests.count { it.url.encodedPath == "/api/auth/ws-ticket" })
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun anotherClientCannotKeepUsingStockAfterCanonicalReadiness() = runBlocking {
+        val wire = Wire()
+        val canonical = wire.client.detached()
+        try {
+            wire.client.nativeRpc("status")
+            wire.relayStatus = 200; wire.relayBody = relayTicket().toString(); wire.canonical = true
+            canonical.nativeRpc("status")
+            wire.relayStatus = 404; wire.relayBody = """{"detail":"Not Found"}"""
+            assertTrue(runCatching { wire.client.nativeRpc("status") }.isFailure)
+            assertEquals(listOf("/api/ws", "/api/plugins/beacon/gateway/ws"), wire.socketRequests.map { it.url.encodedPath })
+            assertEquals(1, wire.httpRequests.count { it.url.encodedPath == "/api/auth/ws-ticket" })
+        } finally { canonical.closeNative(); wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun relayUsesTheExactlySelectedNonDefaultProfile() = runBlocking {
+        val auth = AuthContext("https://native.example", emptyList(), "owner", "work", backend = "hermes-dashboard")
+        val wire = Wire(auth).apply { relayStatus = 200; relayBody = relayTicket("work").toString(); canonical = true }
+        try {
+            wire.client.nativeRpc("status")
+            assertEquals("work", wire.httpRequests.single().url.queryParameter("beacon_profile"))
+            val frames = wire.connectionFrames.single()
+            assertEquals(listOf("client.capabilities", "status"), frames.map { it.getString("method") })
+            assertEquals(setOf("server_requests"), frames.first().getJSONObject("params").keys().asSequence().toSet())
+            assertEquals("work", frames.last().getJSONObject("params").getString("profile"))
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun expiredAndInterruptedTicketRequestsNeverOpenAStockOrRelaySocket() = runBlocking {
+        for (interrupted in listOf(false, true)) {
+            val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().put("expires_in", 1).toString() }
+            wire.onTicket = { if (interrupted) throw java.net.SocketTimeoutException("fixture timeout") else Thread.sleep(1100) }
+            try {
+                assertTrue(runCatching { wire.client.nativeRpc("status") }.isFailure)
+                assertTrue(wire.socketRequests.isEmpty())
+                assertEquals(1, wire.httpRequests.size)
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    @Test(timeout = 15_000) fun onlyInitialExplicitJsonRouteAbsenceUsesStockTransport() = runBlocking {
+        val legacy = Wire()
+        try {
+            legacy.client.nativeRpc("status")
+            assertEquals(listOf("/api/plugins/beacon/mobile/gateway-ticket", "/api/auth/ws-ticket"), legacy.httpRequests.map { it.url.encodedPath })
+            assertEquals("/api/ws", legacy.socketRequests.single().url.encodedPath)
+        } finally { legacy.client.closeNative() }
+        for ((status, body) in listOf(401 to """{"detail":"Unauthorized"}""", 403 to """{"detail":"device_removed"}""",
+            404 to "not json", 404 to """{'detail':'Not Found'}""", 404 to """{"detail":"Not Found"} trailing""",
+            404 to """{"detail":"device_removed"}""", 405 to """{"detail":"Method Not Allowed"}""",
+            501 to """{"detail":"Not Implemented"}""", 503 to """{"detail":"runtime_draining"}""",
+            200 to "not json", 200 to relayTicket().toString().replace("\"", "'"),
+            200 to (relayTicket().toString() + " trailing"))) {
+            val wire = Wire().apply { relayStatus = status; relayBody = body }
+            try {
+                assertTrue("$status $body", runCatching { wire.client.nativeRpc("status") }.isFailure)
+                assertTrue(wire.socketRequests.isEmpty())
+                assertEquals(1, wire.httpRequests.size)
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    @Test(timeout = 15_000) fun reconnectObtainsANewTicketAndRetainsCookieRotation() = runBlocking {
+        val origin = "https://native.example"
+        val auth = AuthContext(origin, listOf("__Host-hermes_session_rt=before; Path=/; Secure; HttpOnly"), "owner", "default", backend = "hermes-dashboard", nativeProvider = "basic")
+        val wire = Wire(auth).apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true }
+        wire.onTicket = {
+            val rotated = requireNotNull(Cookie.parse(wire.client.url("/"), "__Host-hermes_session_rt=after; Path=/; Secure; HttpOnly"))
+            wire.client.http.cookieJar.saveFromResponse(wire.client.url("/"), listOf(rotated))
+        }
+        try {
+            wire.client.nativeRpc("status")
+            assertTrue(wire.client.auth.cookies.any { it.contains("=after") })
+            wire.listener.onFailure(wire.socket, java.io.IOException("fixture lost connection"), null)
+            wire.relayBody = relayTicket().put("ticket", "second-ticket").toString()
+            wire.client.nativeRpc("status")
+            assertEquals(2, wire.httpRequests.count { it.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket" })
+            assertTrue(wire.socketRequests[0].header("Sec-WebSocket-Protocol")!!.endsWith("fixture-relay-ticket"))
+            assertTrue(wire.socketRequests[1].header("Sec-WebSocket-Protocol")!!.endsWith("second-ticket"))
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun relayWaitsForCanonicalReadyAndNeverDowngradesAfterIt() = runBlocking {
+        val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true; advertiseReady = false }
+        val request = async { runCatching { wire.client.nativeRpc("status") } }
+        try {
+            withTimeout(2_000) { while (wire.socketRequests.isEmpty()) yield() }
+            assertEquals(listOf("client.capabilities"), wire.methods)
+            wire.listener.onMessage(wire.socket, json("method" to "event", "params" to json("type" to "gateway.ready", "payload" to json("session_authority" to true))).toString())
+            request.await().getOrThrow()
+            wire.listener.onFailure(wire.socket, java.io.IOException("fixture lost connection"), null)
+            wire.relayStatus = 404; wire.relayBody = """{"detail":"Not Found"}"""
+            assertTrue(runCatching { wire.client.nativeRpc("status") }.isFailure)
+            assertEquals(1, wire.socketRequests.size)
+            assertEquals(0, wire.httpRequests.count { it.url.encodedPath == "/api/auth/ws-ticket" })
+        } finally { request.cancelAndJoin(); wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun relayRejectsNonCanonicalReadyAndAdmissionIdentityChanges() = runBlocking {
+        val wrongReady = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = false }
+        try {
+            assertTrue(runCatching { wrongReady.client.nativeRpc("status") }.isFailure)
+            assertEquals(listOf("client.capabilities"), wrongReady.methods)
+        } finally { wrongReady.client.closeNative() }
+        for (mode in listOf("close", "profile", "aba")) {
+            val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true }
+            wire.onTicket = {
+                if (mode == "close") wire.client.closeNative()
+                else runBlocking { wire.client.bindProfile("other"); if (mode == "aba") wire.client.bindProfile("default") }
+            }
+            try {
+                assertTrue(mode, runCatching { wire.client.nativeRpc("status") }.isFailure)
+                assertTrue(mode, wire.socketRequests.isEmpty())
+            } finally { wire.client.closeNative() }
         }
     }
 
@@ -425,6 +669,19 @@ class NativeGatewayBindingTest {
         }
     }
 
+
+    @Test fun canonicalResumeRejectsConflictingIdentitiesBeforeBindingOrAnyMutation() = runBlocking {
+        for (result in listOf(json("session_id" to "foreign", "stored_session_id" to "stored-a"),
+            json("session_id" to "stored-a", "stored_session_id" to "foreign"),
+            json("session_id" to 123, "stored_session_id" to 123))) {
+            val wire = Wire().apply { canonical = true; canonicalResumeResult = result }
+            try {
+                assertTrue(runCatching { wire.client.nativeSession("stored-a") }.isFailure)
+                assertEquals(listOf("client.capabilities", "session.resume"), wire.methods)
+                assertEquals(0, wire.client.nativeSessionSnapshot().length())
+            } finally { wire.client.closeNative() }
+        }
+    }
 
     @Test(timeout = 15_000) fun leasedSteerKeepsTheLiveCollectorAndUsesActualCanonicalGeneration() = runBlocking {
         for (canonical in listOf(false, true)) {

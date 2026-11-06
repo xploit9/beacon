@@ -603,7 +603,8 @@ class BeaconCallService : Service() {
                 },::directEvent,::failure,voiceSettings,ownerName=ownerName,ownerFence=closed,ownerActive={ !closed.get() },
                     clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true,
                     recentSpeech={ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },
-                    phone=PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust),trust=spec.trust)
+                    phone=PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust),trust=spec.trust,
+                    microphoneMuted={ microphoneGate.snapshot().muted })
                 directVoice=direct;direct.start()
             } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
             }
@@ -644,12 +645,12 @@ class BeaconCallService : Service() {
             "transcript" -> {
                 val pendingItem=spec?:return
                 providerTranscript(JSONObject(value.toString()).put("turn_id",transcriptTurn.toString()),pendingItem.grant.string("call_id"),pendingItem.grant.string("conversation_id"),pcm?.clock()?:0)?.let { item ->
-                    transcriptSync?.event(item);handleControl(item);return
+                    syncEvent(item);handleControl(item);return
                 }
                 val role=value.string("role");val text=accumulatedCaption(transcriptText[role].orEmpty(),value.string("text"));transcriptText[role]=text
                 val pending=spec?:return
                 val transcript=directCaption(value,pending.grant.string("call_id"),pending.grant.string("conversation_id"),transcriptTurn,text)
-                transcriptSync?.event(JSONObject(transcript.toString()).put("at_ms",pcm?.clock()?:0))
+                syncEvent(JSONObject(transcript.toString()).put("at_ms",pcm?.clock()?:0))
                 handleControl(transcript)
             }
             "turn_complete" -> {
@@ -680,12 +681,12 @@ class BeaconCallService : Service() {
                 updateToolNotification()
                 val receipt=JSONObject().put("type","tool_receipt").put("event_id",java.util.UUID.randomUUID().toString()).put("turn_id","tools").put("at_ms",pcm?.clock()?:0)
                 for(key in listOf("request_id","tool_name","status","error_code")) if(value.has(key)) receipt.put(key,value.get(key))
-                transcriptSync?.event(receipt)
+                syncEvent(receipt)
             }
             "visual_state" -> {
                 val receipt=JSONObject().put("type","visual_state").put("event_id",java.util.UUID.randomUUID().toString()).put("turn_id","visual").put("at_ms",pcm?.clock()?:0)
                 for(key in listOf("source","state","frames_sent")) if(value.has(key)) receipt.put(key,value.get(key))
-                transcriptSync?.event(receipt)
+                syncEvent(receipt)
             }
         }
     }
@@ -716,9 +717,9 @@ class BeaconCallService : Service() {
         val turn=transcriptTurn
         val cut=interruptsReply(interrupted,transcriptText)
         transcriptTurn=finishDirectTranscriptTurn(pending.grant.string("call_id"),pending.grant.string("conversation_id"),turn,transcriptText,pcm?.clock()?:0,cut) {
-            deliver(it);transcriptSync?.event(it)
+            deliver(it);syncEvent(it)
         }
-        if(cut) transcriptSync?.event(json("event_id" to "${pending.grant.string("call_id")}:assistant:interrupt:$turn","turn_id" to turn.toString(),"type" to "interrupted","interrupted" to true,"at_ms" to (pcm?.clock()?:0)))
+        if(cut) syncEvent(json("event_id" to "${pending.grant.string("call_id")}:assistant:interrupt:$turn","turn_id" to turn.toString(),"type" to "interrupted","interrupted" to true,"at_ms" to (pcm?.clock()?:0)))
     }
     fun camera(value:Boolean) { if(value&&!app.calls.state.value.visionAvailable) return;updateCamera(value,app.calls.state.value.cameraRear) }
     internal fun previewFailed(expectedCall:String) { if(app.calls.state.value.callId==expectedCall) camera(false) }
@@ -864,6 +865,7 @@ class BeaconCallService : Service() {
         val intent=microphoneGate.request(muted,held)
         this.muted=intent.muted;this.held=intent.held
         pcm?.mute(!intent.enabled)
+        directVoice?.microphoneModeChanged()
         if(!intent.enabled) directVoice?.send(GeminiWire.endAudio())
         app.calls.updateFrom(this) { it.copy(muted=intent.muted,held=intent.held,userSpeaking=false) }
     }
@@ -922,6 +924,7 @@ class BeaconCallService : Service() {
                         val failure=java.io.IOException("Host cleanup receipt unconfirmed")
                         app.calls.updateFrom(this@BeaconCallService) { it.afterOwnedCleanupFailure(failure,app.calls.service===this@BeaconCallService) }
                     }
+                    endingGemini?.settleAcceptedWork()
                     pending.client.closeNative()
                 }
             } finally {

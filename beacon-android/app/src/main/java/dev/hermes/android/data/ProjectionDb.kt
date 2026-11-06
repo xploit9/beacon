@@ -20,6 +20,7 @@ data class ProjectionMetadata(val key: String, val scope: String, val updated: L
     @Query("SELECT substr(encrypted, :start, :count) FROM projections WHERE `key`=:key") suspend fun encryptedChunk(key: String, start: Int, count: Int): ByteArray?
     @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun put(row: Projection)
     @Query("DELETE FROM projections WHERE `key`=:key") suspend fun delete(key: String)
+    @Query("DELETE FROM projections WHERE `key`=:key OR `key`=:legacyKey") fun deleteCurrent(key: String, legacyKey: String)
     @Query("DELETE FROM projections WHERE protected=0 AND updated<:before") suspend fun expire(before: Long)
     @Query("SELECT COALESCE(SUM(length(encrypted)),0) FROM projections") suspend fun total(): Long
     @Query("SELECT `key`, scope, updated, protected, bytes, length(encrypted) AS encryptedSize FROM projections WHERE protected=0 ORDER BY updated ASC LIMIT 1") suspend fun oldest(): ProjectionMetadata?
@@ -133,6 +134,13 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
         }
     }
     suspend fun delete(scope: Scope, kind: String) { delete(scope, kind, null) }
+    internal suspend fun deleteIfCurrent(scope: Scope, kind: String, removal: DeviceRemovalAuthority): Boolean = withContext(Dispatchers.IO) {
+        require(scope.sameAccount(removal.scope)) { "Removal belongs to another account" }
+        lock.withLock { db.withTransaction {
+            // Room has acquired its transaction before AuthStore is held; the guarded DAO call cannot suspend.
+            removal.ifCurrent { db.rows().deleteCurrent(key(scope, kind), legacyKey(scope, kind)) }
+        } }
+    }
     suspend fun delete(scope: Scope, kind: String, expected: String?): Boolean = withContext(Dispatchers.IO) { lock.withLock { db.withTransaction {
         val rows = db.rows()
         if (expected != null) {

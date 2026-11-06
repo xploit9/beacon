@@ -52,8 +52,8 @@ class SettingsSearchTest {
     }
     @Test fun everyDestinationAndSearchAliasStaysSearchableInOrder() {
         assertEquals(
-            listOf("Connection", "Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Memory", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
-                "Profiles", "Providers & models", "Tools & commands", "MCP servers", "Health", "Logs", "Server updates", "Session checkpoints", "Devices"),
+            listOf("Connection", "Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
+                "Profiles", "Providers & models", "Tools & commands", "MCP servers", "Health", "Logs", "Server updates", "Session checkpoints", "Devices", "Memory"),
             settingsSearchRoutes,
         )
         for (route in settingsSearchRoutes) {
@@ -64,14 +64,15 @@ class SettingsSearchTest {
         }
         assertEquals("Each destination appears once", settingsSearchRoutes.size, settingsSearchRoutes.toSet().size)
         assertEquals("Devices is a search shortcut to Connection", "Connection", settingsRoute("Devices"))
-        assertEquals(settingsSearchRoutes.size - 1, settingsSearchRoutes.map(::settingsRoute).toSet().size)
+        assertEquals("Memory opens the profile settings", "Profiles", settingsRoute("Memory"))
+        assertEquals(settingsSearchRoutes.size - 2, settingsSearchRoutes.map(::settingsRoute).toSet().size)
         // Description-only words still find the row whose label does not contain them.
         assertTrue(settingsSearchMatches(settingsLabel("Session checkpoints"), settingsDescriptions.getValue("Session checkpoints"), "versions"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), settingsDescriptions.getValue("Chat"), "sending"))
     }
     @Test fun rowsOpenTheIncumbentRouteArguments() {
         assertEquals(
-            listOf("Connection", "Assistant", "Beacon", "Phone access", "Notifications", "Settings", "category:Profiles & model", "Skills", "Memory", "category:Tools & MCP", "category:Server", "Appearance", "App updates", "Licenses"),
+            listOf("Connection", "Assistant", "Beacon", "Phone access", "Notifications", "Settings", "category:Profiles & model", "Skills", "category:Tools & MCP", "category:Server", "Appearance", "App updates", "Licenses"),
             settingsHubRoutes.map(::settingsRoute),
         )
         assertEquals("Sections in Relay's order with the assistant up front", listOf("", "Assistant", "Hermes", "App"), settingsHubSections.keys.toList())

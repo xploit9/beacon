@@ -2,12 +2,15 @@ package dev.hermes.android.data
 
 import android.content.ContextWrapper
 import android.content.SharedPreferences
+import dev.hermes.android.core.Scope
 import kotlinx.coroutines.runBlocking
 import okhttp3.Cookie
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okhttp3.mockwebserver.MockResponse
@@ -16,12 +19,163 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import okio.Buffer
+import okio.BufferedSource
+import okio.ForwardingSource
+import okio.buffer
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.IOException
 import java.lang.reflect.Proxy
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class BeaconClientAuthTest {
+    private fun emptyAuthStore(): AuthStore {
+        val prefs = Proxy.newProxyInstance(SharedPreferences::class.java.classLoader, arrayOf(SharedPreferences::class.java)) { _, method, args ->
+            if (method.name == "getString") args!![1] else error("Unexpected preference operation")
+        } as SharedPreferences
+        return AuthStore(object : ContextWrapper(null) {
+            override fun getSharedPreferences(ignored: String, mode: Int) = prefs
+        }, AppCipher())
+    }
+
+    private fun trackedBody(closed: AtomicBoolean): ResponseBody {
+        val source = object : ForwardingSource(Buffer().writeUtf8("{}")) {
+            override fun close() { closed.set(true); super.close() }
+        }.buffer()
+        return object : ResponseBody() {
+            override fun contentType(): MediaType = "application/json".toMediaType()
+            override fun contentLength(): Long = 2
+            override fun source(): BufferedSource = source
+        }
+    }
+
+    @Test fun rejectedCookieRotationCannotBecomeTheNextRequestCredential() = runBlocking {
+        val origin = "https://native.example"
+        val old = "__Host-hermes_session_rt=before; Path=/; Secure; HttpOnly"
+        val initial = AuthContext(origin, listOf(old), "alice", backend = "hermes-dashboard", nativeProvider = "basic")
+        val store = emptyAuthStore()
+        val observed = mutableListOf<String>()
+        lateinit var client: BeaconClient
+        client = BeaconClient(initial, store, persistContext = false) { builder ->
+            builder.addInterceptor { chain ->
+                observed += client.http.cookieJar.loadForRequest(chain.request().url).joinToString(";") { it.value }
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body("{}".toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        try {
+            val rotated = requireNotNull(Cookie.parse(origin.toHttpUrl(), "__Host-hermes_session_rt=after; Path=/; Secure; HttpOnly"))
+            client.jar.saveFromResponse(origin.toHttpUrl(), listOf(rotated))
+            val retained = runCatching { client.retainCookieRotation() }
+            runCatching { client.nativeRequest("/api/files") }
+            assertTrue(retained.isFailure || client.auth.cookies.none { it.contains("=after") })
+            assertTrue(observed.none { it.contains("after") })
+        } finally { client.closeNative() }
+    }
+
+    @Test fun concurrentRequestCannotUseACookieBeforeItsRejectedPersistence() = runBlocking {
+        val origin = "https://native.example"
+        val initial = AuthContext(origin, listOf("__Host-hermes_session_rt=before; Path=/; Secure; HttpOnly"), "alice", backend = "hermes-dashboard", nativeProvider = "basic")
+        val store = emptyAuthStore()
+        val observed = mutableListOf<String>()
+        val entered = AtomicBoolean()
+        lateinit var client: BeaconClient
+        client = BeaconClient(initial, store, persistContext = false) { builder ->
+            builder.addInterceptor { chain ->
+                if (chain.request().url.encodedPath == "/api/status") {
+                    entered.set(true)
+                    val rotated = requireNotNull(Cookie.parse(origin.toHttpUrl(), "__Host-hermes_session_rt=after; Path=/; Secure; HttpOnly"))
+                    client.http.cookieJar.saveFromResponse(chain.request().url, listOf(rotated))
+                    runCatching { runBlocking { client.nativeRequest("/api/files") } }
+                } else {
+                    observed += client.http.cookieJar.loadForRequest(chain.request().url).joinToString(";") { it.value }
+                }
+                Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                    .body("{}".toResponseBody("application/json".toMediaType())).build()
+            }
+        }
+        try {
+            runCatching { client.nativeRequest("/api/status") }
+            assertTrue(entered.get())
+            assertTrue(observed.none { it.contains("after") })
+        } finally { client.closeNative() }
+    }
+
+    @Test fun originalUnauthorizedResponseClosesWhenRefreshThrows() = runBlocking {
+        for (failure in listOf(IOException("synthetic-io"), IllegalStateException("synthetic-runtime"))) {
+            val origin = "https://native.example"
+            val bearer = NativeBearerRecord("old-access", "old-refresh", 100, origin, "alice", "default", "basic")
+            val closed = AtomicBoolean()
+            val client = BeaconClient(AuthContext(origin, emptyList(), "alice", backend = "hermes-dashboard", bearer = bearer), null, persistContext = false) { builder ->
+                builder.addInterceptor { chain ->
+                    val request = chain.request()
+                    if (request.url.encodedPath == "/auth/native/refresh") throw failure
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(401).message("Fixture").body(trackedBody(closed)).build()
+                }
+            }
+            try {
+                assertTrue(runCatching { client.nativeRequest("/api/files") }.isFailure)
+                assertTrue("The original 401 body must be closed for ${failure.javaClass.simpleName}", closed.get())
+            } finally { client.closeNative() }
+        }
+    }
+
+    @Test fun lateDeviceRemovedRejectionNeverForgetsANewOrRevisitedProfile() = runBlocking {
+        for (mode in listOf("same", "changed", "aba")) {
+            val origin = "https://native.example"
+            val initial = AuthContext(origin, listOf("__Host-hermes_session_rt=fixture; Path=/; Secure; HttpOnly"), "alice", backend = "hermes-dashboard", nativeProvider = "basic")
+            val removed = mutableListOf<Scope>()
+            val previousRemoved = NativeDeviceRemoval.onRemoved; val previousForget = NativeDeviceRemoval.onForgetScreens
+            NativeDeviceRemoval.onRemoved = { removed += it.scope }; NativeDeviceRemoval.onForgetScreens = null
+            lateinit var client: BeaconClient
+            client = BeaconClient(initial, null, persistContext = false) { builder ->
+                builder.addInterceptor { chain ->
+                    if (mode != "same") runBlocking { client.bindProfile("work"); if (mode == "aba") client.bindProfile("default") }
+                    Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(403).message("Fixture")
+                        .body("""{"code":"device_removed"}""".toResponseBody("application/json".toMediaType())).build()
+                }
+            }
+            try {
+                assertEquals(403, (runCatching { client.nativeRequest("/api/plugins/beacon/mobile/health") }.exceptionOrNull() as ApiFailure).status)
+                assertEquals(mode, if (mode == "same") listOf(initial.scope()) else emptyList(), removed)
+            } finally {
+                client.closeNative(); NativeDeviceRemoval.onRemoved = previousRemoved; NativeDeviceRemoval.onForgetScreens = previousForget
+            }
+        }
+    }
+
+    @Test fun lateSuccessfulDeviceRemovalNeverForgetsANewOrRevisitedProfile() = runBlocking {
+        val field = NativePairing::class.java.getDeclaredField("store").apply { isAccessible = true }
+        val previousStore = field.get(NativePairing)
+        val prefs = Proxy.newProxyInstance(SharedPreferences::class.java.classLoader, arrayOf(SharedPreferences::class.java)) { _, method, _ ->
+            if (method.name == "getString") "phone-1" else error("Unexpected preference operation")
+        } as SharedPreferences
+        val previousRemoved = NativeDeviceRemoval.onRemoved; val previousForget = NativeDeviceRemoval.onForgetScreens
+        field.set(NativePairing, prefs)
+        try {
+            for (mode in listOf("same", "changed", "aba")) {
+                val removed = mutableListOf<Scope>()
+                NativeDeviceRemoval.onRemoved = { removed += it.scope }; NativeDeviceRemoval.onForgetScreens = null
+                val initial = AuthContext("https://native.example", listOf("__Host-hermes_session_rt=fixture; Path=/; Secure; HttpOnly"), "alice", backend = "hermes-dashboard", nativeProvider = "basic")
+                lateinit var client: BeaconClient
+                client = BeaconClient(initial, null, persistContext = false) { builder ->
+                    builder.addInterceptor { chain ->
+                        if (mode != "same") runBlocking { client.bindProfile("work"); if (mode == "aba") client.bindProfile("default") }
+                        Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                            .body("""{"ok":true}""".toResponseBody("application/json".toMediaType())).build()
+                    }
+                }
+                try {
+                    assertTrue(client.nativeRequest("/api/plugins/beacon/devices/phone-1", "DELETE").getBoolean("ok"))
+                    assertEquals(mode, if (mode == "same") listOf(initial.scope()) else emptyList(), removed)
+                } finally { client.closeNative() }
+            }
+        } finally {
+            field.set(NativePairing, previousStore); NativeDeviceRemoval.onRemoved = previousRemoved; NativeDeviceRemoval.onForgetScreens = previousForget
+        }
+    }
     @Test fun devicesReadKeepsHermesCookieRotation() = runBlocking {
         val origin = "https://native.example"
         val old = Cookie.Builder().name("__Host-hermes_session_rt").value("before").hostOnlyDomain("native.example").path("/").secure().httpOnly().build()

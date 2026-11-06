@@ -191,7 +191,8 @@ def test_event_poll_recovers_skipped_callback_in_its_original_profile(harness,mo
     assert len(notices)==1 and notices[0]['kind']=='task_result'
     assert (notices[0]['owner_id'],notices[0]['profile'],notices[0]['conversation_id'])==('owner','work','work-owned-chat')
     assert notices[0]['body']=='Missed scheduled callback: Requested reminder'
-    assert verified==[('owner','basic','work','work-owned-chat')]
+    # Creation and delivery each recheck the same conversation's ownership.
+    assert verified==[('owner','basic','work','work-owned-chat')]*2
 
 
 def test_event_long_poll_does_not_rescan_native_activity(harness, monkeypatch):

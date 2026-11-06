@@ -25,6 +25,8 @@ internal fun pinMutationIdentity(snapshot: JSONObject, requestId: String): JSONO
 /** Projects existing Compose contracts onto native operations; never proxies the WebUI. */
 private class NativeTurnEnded : Exception()
 internal class NativeModelConfirmation(message: String) : IllegalStateException(message)
+private data class CanonicalModelGuard(val version: Long, val model: String, val provider: String, val token: String)
+private val canonicalModelGuards = linkedMapOf<String, CanonicalModelGuard>()
 internal val nativeApprovalModes = listOf("manual", "smart", "off")
 /** Session detail keeps SQLite 0/1 flags; session lists expose booleans. */
 internal fun nativeSessionFlag(row: JSONObject, key: String): Boolean = row.optBoolean(key) || (row.opt(key) as? Number)?.toDouble() == 1.0
@@ -36,6 +38,70 @@ internal fun nativeHistoryNeedsRefresh(observed: List<String>?, stamp: List<Stri
     observed == null || stamp == null || stamp != observed
 internal fun displayedNativeHistoryStamp(projection: JSONObject): List<String>? =
     projection.optJSONArray("_history_metadata_stamp")?.strings()?.takeIf { it.size == 10 }
+
+private fun nativeReplayNumber(value: Any?): Long? = when (value) { is Int -> value.toLong(); is Long -> value; else -> null }
+
+/** Canonical replay suppresses a truncated response; find its retained suffix without resubmitting. */
+internal suspend fun nativeRetainedReplay(epoch: String, fetch: suspend (Long) -> JSONObject): Pair<Long, JSONObject>? {
+    fun latest(reply: JSONObject, after: Long): Long? {
+        val value = nativeReplayNumber(reply.opt("latest_seq")) ?: return null
+        return value.takeIf { epoch.isNotBlank() && reply.string("epoch") == epoch && reply.opt("truncated") is Boolean &&
+            (reply.opt("truncated") == true || reply.opt("snapshot_required") != true) && it >= after }
+    }
+    val first = fetch(0)
+    val upper = latest(first, 0) ?: return null
+    if (first.opt("truncated") == false) return 0L to first
+    if (upper == 0L) return null
+    // The native ring retains at most 512 events, so the eviction boundary lies in this window.
+    var low = maxOf(0L, upper - 512L)
+    var high = upper
+    if (low > 0) {
+        val earliest = fetch(low)
+        if ((latest(earliest, low) ?: return null) < upper) return null
+        if (earliest.opt("truncated") == false) return low to earliest
+    }
+    low++
+    while (low < high) {
+        val mid = low + (high - low) / 2
+        val probe = fetch(mid)
+        if ((latest(probe, mid) ?: return null) < upper) return null
+        if (probe.opt("truncated") == true) low = mid + 1 else high = mid
+    }
+    val retained = fetch(low)
+    if ((latest(retained, low) ?: return null) < upper || retained.opt("truncated") != false) return null
+    return low to retained
+}
+
+/** A retained completion can identify one input even when earlier replay events have expired. */
+internal fun nativeCompletedTurn(replay: JSONObject, runtime: String, epoch: String, receipt: JSONObject, submission: String, after: Long): JSONObject? {
+    val admission = receipt.string("admission_id")
+    if (runtime.isBlank() || epoch.isBlank() || admission.isBlank() || submission.isBlank() ||
+        receipt.string("status") != "terminal" || receipt.string("outcome") != "completed" ||
+        receipt.has("input_id") && receipt.opt("input_id") != submission ||
+        replay.opt("truncated") != false || replay.opt("snapshot_required") == true || replay.string("epoch") != epoch) return null
+    val array = replay.optJSONArray("events") ?: return null
+    val events = replay.rows("events")
+    val latest = nativeReplayNumber(replay.opt("latest_seq")) ?: return null
+    if (after < 0 || latest < after || latest - after != events.size.toLong() || events.size != array.length() ||
+        events.withIndex().any { (index, event) -> nativeReplayNumber(event.opt("seq")) != after + index + 1 ||
+            event.string("session_id") != runtime || event.has("replay_epoch") && event.string("replay_epoch") != epoch }) return null
+    val event = events.filter {
+        it.string("type") == "message.complete" && it.optJSONObject("payload")?.string("admission_id") == admission
+    }.singleOrNull() ?: return null
+    if (event.has("admission_id") && event.opt("admission_id") != admission) return null
+    for (key in listOf("authority_epoch", "execution_generation")) {
+        val fromReceipt = receipt.opt(key); val fromEvent = event.opt(key)
+        if (fromReceipt != null && fromReceipt != JSONObject.NULL || fromEvent != null && fromEvent != JSONObject.NULL) {
+            val expected = nativeReplayNumber(fromReceipt) ?: return null
+            if (nativeReplayNumber(fromEvent) != expected) return null
+        }
+    }
+    val payload = event.optJSONObject("payload") ?: return null
+    if (payload.string("status") in setOf("error", "failed", "failure", "interrupted", "cancelled", "canceled", "rejected") ||
+        payload.string("outcome").let { it.isNotBlank() && it != "completed" } ||
+        payload.string("error").isNotBlank() || payload.string("failure_reason").isNotBlank()) return null
+    return payload.optJSONObject("persisted_turn")?.takeIf { it.opt("complete") == true && it.string("submission_id") == submission }
+}
 
 internal fun storedSessionSettings(snapshot: JSONObject): JSONObject {
     val raw = snapshot.opt("model_config")
@@ -68,7 +134,21 @@ internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<Strin
     // Lazy: a stored conversation resumes as usual; one Hermes no longer holds answers 4007 (unknown) instead of a new ownerless row.
     val binding = nativeSession(id, lazy = true)
     if (binding.scope != scope || binding.storedSessionId != id) return null
-    return binding.runtimeSessionId to nativeSessionStatus(id, binding.runtimeSessionId)
+    val lease = nativeTurnLease(id, binding.runtimeSessionId)
+    val status = if (!lease.authority) nativeSessionStatus(id, binding.runtimeSessionId) else {
+        // Canonical active_list omits internal task sources; the attached conversation's own snapshot is authoritative.
+        val fresh = nativeTurnRpc(lease, "session.resume", json("session_id" to binding.runtimeSessionId, "omit_messages" to true))
+        require(nativeSessionBinding(scope, fresh) == binding) { "Conversation identity changed during recovery" }
+        val profile = fresh.optJSONObject("info")?.opt("profile_name")
+        require(profile == null || profile == JSONObject.NULL || profile == scope.profile) { "Conversation scope changed during recovery" }
+        when {
+            fresh.rows("pending").any { it.string("status") == "unknown" } -> null
+            fresh.opt("running") == true -> if (fresh.rows("prompts").isEmpty()) "working" else "waiting"
+            fresh.opt("running") == false && fresh.rows("pending").none { it.string("status") in setOf("queued", "started") } -> "idle"
+            else -> null
+        }
+    }
+    return binding.runtimeSessionId to status
 }
 
 internal suspend fun BeaconClient.recoveredNativeSessionStatus(id: String): String? = recoveredNativeSession(id)?.second
@@ -99,8 +179,55 @@ internal class NativeOperations(private val c: BeaconClient) {
     /** Adapts Hermes Relay's session-scoped GatewayChatClient.setYolo wire contract. */
     private suspend fun setSessionYolo(target: NativeSessionBinding, enabled: Boolean) {
         val value = if (enabled) "1" else "0"
-        val result = c.nativeRpc("config.set", json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to value, "scope" to "session"))
+        val lease = c.nativeTurnLease(target.storedSessionId, target.runtimeSessionId)
+        val params = json("session_id" to target.runtimeSessionId, "key" to "yolo", "value" to value).apply { if (!lease.authority) put("scope", "session") }
+        val result = c.nativeTurnRpc(lease, "config.set", params)
         require(result.string("value") == value) { "Hermes did not confirm this chat's approval setting. Refresh before trying again." }
+    }
+    private suspend fun canonicalSnapshot(lease: NativeTurnLease, messages: Boolean = false): JSONObject {
+        require(lease.authority) { "Native gateway authority changed. Refresh before continuing." }
+        val b = lease.binding
+        val snapshot = c.nativeTurnRpc(lease, "session.resume", json("session_id" to b.runtimeSessionId, "omit_messages" to !messages))
+        require(nativeSessionBinding(c.scope, snapshot) == b) { "Conversation identity changed. Refresh before continuing." }
+        snapshot.optJSONObject("info")?.let { info ->
+            if (info.has("profile_name") && !info.isNull("profile_name")) require(info.opt("profile_name") == c.scope.profile) { "Conversation profile changed." }
+        }
+        if (messages) {
+            val rows = snapshot.optJSONArray("messages") ?: error("Refresh the conversation before changing its history.")
+            require(snapshot.opt("messages_omitted") != true && nativeReplayNumber(snapshot.opt("message_count")) == rows.length().toLong() &&
+                snapshot.rows("messages").size == rows.length()) { "Conversation history could not be confirmed." }
+        }
+        return snapshot
+    }
+    private suspend fun canonicalMutation(lease: NativeTurnLease, snapshot: JSONObject, operation: String, payload: JSONObject): JSONObject {
+        val revision = nativeReplayNumber(snapshot.opt("revision"))?.takeIf { it >= 0 }
+        val generation = nativeReplayNumber(snapshot.opt("execution_generation"))?.takeIf { it >= 0 }
+        require(lease.authority && nativeSessionBinding(c.scope, snapshot) == lease.binding && revision != null && generation != null) { "Conversation changed. Refresh before continuing." }
+        val result = c.nativeTurnRpc(lease, "session.mutate", json("session_id" to lease.binding.runtimeSessionId,
+            "request_id" to java.util.UUID.randomUUID().toString(), "expected_revision" to revision, "expected_generation" to generation,
+            "operation" to operation, "payload" to payload))
+        require(result.string("session_id") == lease.binding.runtimeSessionId && result.string("operation") == operation) { "Conversation change was not confirmed." }
+        val status = result.string("status")
+        when (status) {
+            "confirmation_required" -> require(operation == "model" && result.opt("confirm_required") == true && result.string("confirm").isNotBlank() && result.string("confirm_message").isNotBlank()) { "Model confirmation was not supplied." }
+            "noop", "preview" -> require(operation == "compress") { "Conversation change was not confirmed." }
+            else -> {
+                require(status.isBlank() || status == "deferred" && operation == "model") { "Conversation change was not confirmed." }
+                require(nativeReplayNumber(result.opt("revision"))?.let { it >= revision } == true &&
+                    nativeReplayNumber(result.opt("execution_generation"))?.let { it >= generation } == true) { "Conversation change was not confirmed." }
+            }
+        }
+        return result
+    }
+    private fun canonicalPrompts(snapshot: JSONObject, kind: String): List<JSONObject> {
+        val array = snapshot.optJSONArray("prompts") ?: error("Refresh this conversation before answering a request.")
+        val rows = snapshot.rows("prompts")
+        val generation = nativeReplayNumber(snapshot.opt("execution_generation"))?.takeIf { it >= 0 }
+        require(rows.size == array.length() && generation != null) { "Request status could not be confirmed." }
+        return rows.filter { it.string("kind") == kind }.also { prompts ->
+            require(prompts.all { it.opt("prompt_id") is String && it.string("prompt_id").isNotBlank() &&
+                nativeReplayNumber(it.opt("execution_generation")) == generation } && prompts.map { it.string("prompt_id") }.distinct().size == prompts.size) { "The active request changed. Refresh before answering." }
+        }
     }
     private suspend fun dispatch(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
         require(q["profile"] == null || q["profile"] == c.auth.profile) { "Native request belongs to another profile" }
@@ -128,14 +255,21 @@ internal class NativeOperations(private val c: BeaconClient) {
                         "reasoning" -> argument in setOf("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
                         else -> argument in setOf("normal", "fast", "auto", "cold", "ultrafast")
                     }) { "Use the chat's settings picker for this choice." }
-                    val result = c.nativeRpc("config.set", json("session_id" to binding().runtimeSessionId, "key" to name, "value" to argument, "scope" to "session"))
+                    val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                    val params = json("session_id" to b.runtimeSessionId, "key" to name, "value" to argument).apply { if (name != "fast" || !lease.authority) put("scope", "session") }
+                    val result = c.nativeTurnRpc(lease, "config.set", params)
+                    require(result.string("value").isNotBlank()) { "The chat setting was not confirmed." }
                     return result.put("type", "local").put("output", "Updated for this chat")
                 }
                 return c.nativeRpc("command.dispatch", json("session_id" to binding().runtimeSessionId, "name" to name, "arg" to argument))
             }
             // What Hermes starts a new chat with in this profile, for the composer of a chat with no messages yet.
-            "/api/profile/defaults" -> return json("profile" to c.auth.profile, "scope_key" to c.scope.key, "session_id" to sid(), "model" to c.nativeRpc("config.get", json("key" to "provider")).string("model"),
-                "reasoning_effort" to c.nativeRpc("config.get", json("key" to "reasoning")).string("value"))
+            "/api/profile/defaults" -> {
+                val models = c.nativeGet("/api/model/options", mapOf("profile" to c.auth.profile, "include_unconfigured" to "false"))
+                val reasoning = c.nativeRpc("config.get", json("key" to "reasoning"))
+                require(models.opt("model") is String && reasoning.opt("value") is String && reasoning.string("value").isNotBlank()) { "Profile defaults are unavailable. Refresh and try again." }
+                return json("profile" to c.auth.profile, "scope_key" to c.scope.key, "session_id" to sid(), "model" to models.string("model"), "reasoning_effort" to reasoning.string("value"))
+            }
             "/api/profile/approval-mode" -> {
                 require(method in setOf("GET", "POST")) { "Unsupported profile approval operation" }
                 if (method == "POST") {
@@ -263,14 +397,29 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/chat/cancel" -> {
                 val runtime = d.string("stream_id").ifBlank { require(sid().isNotBlank()) { "Choose a native session before stopping" }; binding().runtimeSessionId }
-                return c.nativeRpc("session.interrupt", json("session_id" to runtime))
+                if (!c.nativeSessionAuthority()) return c.nativeRpc("session.interrupt", json("session_id" to runtime))
+                val b = c.nativeSession(runtime)
+                val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                require(b.runtimeSessionId == runtime) { "The active reply changed. Refresh before stopping." }
+                val snapshot = canonicalSnapshot(lease)
+                val generation = nativeReplayNumber(snapshot.opt("execution_generation"))?.takeIf { it >= 0 }
+                require(snapshot.opt("running") == true && generation != null) { "The active reply could not be confirmed." }
+                val result = c.nativeTurnRpc(lease, "session.interrupt", json("session_id" to runtime, "execution_generation" to generation))
+                val ref = result.optJSONObject("ref")
+                val profile = snapshot.optJSONObject("info")?.string("profile_id").orEmpty()
+                require(ref?.string("session_id") == b.storedSessionId && (profile.isBlank() || ref?.string("profile_id") == profile) &&
+                    nativeReplayNumber(result.opt("execution_generation")) == generation) { "Stop was not confirmed. Refresh before trying again." }
+                return result
             }
             "/api/approval/pending" -> {
-                val result = c.nativeRpc("approval.pending", json("session_id" to binding().runtimeSessionId))
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                if (lease.authority) return json("pending" to canonicalPrompts(canonicalSnapshot(lease), "approval").firstOrNull()?.let { it.copy().put("approval_id", it.getString("prompt_id")) })
+                val result = c.nativeRpc("approval.pending", json("session_id" to b.runtimeSessionId))
                 return json("pending" to result.rows("approvals").firstOrNull()?.let { it.copy().put("approval_id", it.string("request_id")) })
             }
             "/api/clarify/pending" -> {
-                val b = binding()
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                if (lease.authority) return json("pending" to canonicalPrompts(canonicalSnapshot(lease), "clarify").firstOrNull()?.let { it.copy().put("clarify_id", it.getString("prompt_id")) })
                 val result = c.nativeRpc("session.resume", json("session_id" to b.storedSessionId, "omit_messages" to true, "close_on_disconnect" to false))
                 val requests = result.rows("open_requests")
                 return json("pending" to requests.firstOrNull { it.string("method").contains("clarify") }?.let { (it.optJSONObject("params") ?: it).copy().put("clarify_id", it.string("id")) })
@@ -312,7 +461,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val result = c.nativeRpc("config.get", json("key" to "approvals.mode"))
                 require(result.string("value") in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
                 // Lazy reads never construct an agent merely to paint the shield in a browsed conversation.
-                val fresh = c.nativeRpc("session.resume", json("session_id" to sid(), "omit_messages" to true, "lazy" to true, "close_on_disconnect" to false))
+                val fresh = if (c.nativeSessionAuthority()) {
+                    val target = c.nativeSession(sid(), lazy = true)
+                    canonicalSnapshot(c.nativeTurnLease(target.storedSessionId, target.runtimeSessionId))
+                } else c.nativeRpc("session.resume", json("session_id" to sid(), "lazy" to true, "omit_messages" to true))
                 require(nativeSessionBinding(c.scope, fresh).storedSessionId == sid()) { "Approval status belongs to another conversation" }
                 val reported = fresh.optJSONObject("info")?.opt("yolo") as? Boolean
                 val savedBypass = if (reported == null) storedYolo(sid()) else null
@@ -330,15 +482,79 @@ internal class NativeOperations(private val c: BeaconClient) {
             "/api/approval/respond", "/api/clarify/respond" -> {
                 require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen this request in its original conversation." }
                 val target = binding()
+                val lease = c.nativeTurnLease(target.storedSessionId, target.runtimeSessionId)
+                val kind = if (path == "/api/approval/respond") "approval" else "clarify"
+                val id = d.getString("${kind}_id")
+                if (lease.authority) {
+                    val prompt = canonicalPrompts(canonicalSnapshot(lease), kind).singleOrNull { it.string("prompt_id") == id }
+                    if (prompt != null) {
+                        val params = json("session_id" to target.runtimeSessionId, "prompt_id" to id, "execution_generation" to prompt.getLong("execution_generation"))
+                        if (kind == "approval") {
+                            require(d.opt("choice") is String && prompt.optJSONArray("choices")?.strings()?.contains(d.string("choice")) == true && !d.optBoolean("all")) { "Choose an approval Hermes offered for this request." }
+                            params.put("choice", d.getString("choice"))
+                        } else {
+                            require(d.opt("response") is String) { "Answer this request before continuing." }
+                            params.put("answer", d.getString("response"))
+                        }
+                        val result = c.nativeTurnRpc(lease, "$kind.respond", params)
+                        require(result.string("prompt_id") == id && result.string("status") in setOf("resolved", "already_resolved")) { "The request response was not confirmed. Refresh before continuing." }
+                        return result
+                    }
+                }
                 return if (path == "/api/approval/respond") c.nativeAnswerServerRequest("approval", d.getString("approval_id"), target.runtimeSessionId, d)
                 else c.nativeAnswerServerRequest("clarify", d.getString("clarify_id"), target.runtimeSessionId, d)
             }
             "/api/session/branch" -> {
-                val result = c.nativeRpc("session.branch", json("session_id" to binding().runtimeSessionId, "name" to d.string("title").ifBlank { null }, "count" to if (d.has("keep_count")) d.getInt("keep_count") else null))
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                if (lease.authority) {
+                    val snapshot = canonicalSnapshot(lease, messages = true)
+                    val rows = snapshot.rows("messages")
+                    fun rowId(row: JSONObject) = nativeReplayNumber(row.opt("row_id"))?.takeIf { it > 0 }
+                    val before = d.has("before_message_id")
+                    val boundary = when {
+                        before -> nativeReplayNumber(d.opt("before_message_id"))
+                        d.has("through_message_id") -> nativeReplayNumber(d.opt("through_message_id"))
+                        d.has("branch_row_ids") -> {
+                            val captured = d.optJSONArray("branch_row_ids") ?: error("Reopen the branch form.")
+                            val count = nativeReplayNumber(d.opt("keep_count")) ?: error("Choose messages to keep.")
+                            require(count in 1..captured.length().toLong()) { "An empty branch is unavailable in native Hermes." }
+                            nativeReplayNumber(captured.opt((count - 1).toInt()))
+                        }
+                        d.has("keep_count") -> error("Reopen the branch action to identify the selected message.")
+                        else -> null
+                    }
+                    if (d.has("before_message_id") || d.has("through_message_id") || d.has("branch_row_ids")) require(boundary != null && boundary > 0) { "The selected message has no durable identity." }
+                    val payload = JSONObject().apply { d.string("title").takeIf(String::isNotBlank)?.let { put("title", it) } }
+                    if (boundary != null) {
+                        val matches = rows.withIndex().filter { rowId(it.value) == boundary }
+                        require(matches.size == 1 && matches.single().value.opt("archived") != true &&
+                            (d.string("selected_role").isBlank() || matches.single().value.string("role") == d.string("selected_role"))) { "The selected message changed. Reopen the branch action." }
+                        val index = matches.single().index
+                        if (before) {
+                            require(matches.single().value.string("role") == "user" && index > 0) { "An empty branch is unavailable in native Hermes." }
+                            val previous = rows.take(index).lastOrNull { it.opt("archived") != true } ?: error("An empty branch is unavailable in native Hermes.")
+                            payload.put("through_message_id", rowId(previous) ?: error("The previous message has no durable identity."))
+                        } else payload.put("through_message_id", boundary)
+                    }
+                    val result = canonicalMutation(lease, snapshot, "branch", payload)
+                    val child = result.string("branched_session_id")
+                    require(child.matches(storedSessionId) && child != b.storedSessionId) { "Branch creation was not confirmed." }
+                    val meta = c.nativeGet("/api/sessions/$child", mapOf("profile" to c.auth.profile))
+                    require(meta.string("id", meta.string("session_id")) == child && ownedByProfile(meta)) { "Branch belongs to another conversation." }
+                    return json("session" to meta.copy().put("session_id", child))
+                }
+                val result = c.nativeRpc("session.branch", json("session_id" to b.runtimeSessionId, "name" to d.string("title").ifBlank { null }, "count" to if (d.has("keep_count")) d.getInt("keep_count") else null))
                 return sessionProjection(result, NativeSessionBinding(c.scope, result.getString("stored_session_id"), result.getString("session_id")))
             }
             "/api/session/pin" -> {
                 require(method == "POST" && sid().matches(storedSessionId) && d.opt("pinned") is Boolean) { "Choose a conversation to pin" }
+                if (c.nativeSessionAuthority()) {
+                    val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                    val pinned = d.getBoolean("pinned")
+                    val result = canonicalMutation(lease, canonicalSnapshot(lease), "sidebar", json("pinned" to pinned))
+                    require(result.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
+                    return result
+                }
                 try {
                     return c.nativeRequest("/api/plugins/beacon/sessions/pin", "POST", json("session_id" to sid(), "pinned" to d.getBoolean("pinned"), "profile" to c.auth.profile)).also {
                         require(it.string("session_id") == sid() && it.opt("pinned") == d.getBoolean("pinned")) { "Pin change was not confirmed. Try again." }
@@ -352,10 +568,24 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val identity = pinMutationIdentity(snapshot, java.util.UUID.randomUUID().toString())
                 return c.nativeRequest("/api/sessions/${sid()}", "PATCH", identity.put("pinned", d.getBoolean("pinned")).put("profile", c.auth.profile))
             }
-            "/api/session/rename" -> return c.nativeRpc("session.title", json("session_id" to binding().runtimeSessionId, "title" to d.getString("title")))
+            "/api/session/rename" -> {
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                val title = d.getString("title")
+                if (!lease.authority) return c.nativeRpc("session.title", json("session_id" to b.runtimeSessionId, "title" to title))
+                val result = canonicalMutation(lease, canonicalSnapshot(lease), "rename", json("title" to title))
+                require(result.opt("title") is String && result.string("title").isNotBlank()) { "Rename was not confirmed. Refresh before trying again." }
+                return result
+            }
             "/api/session/archive" -> {
                 require(sid().matches(storedSessionId) && d.opt("archived") is Boolean) { "Choose a conversation to archive" }
                 val hidden = d.getBoolean("archived")
+                if (c.nativeSessionAuthority()) {
+                    val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                    val payload = json("hidden" to hidden).apply { if (!hidden) put("archived", false) }
+                    val result = canonicalMutation(lease, canonicalSnapshot(lease), "sidebar", payload)
+                    require(result.opt("hidden") == hidden && (hidden || result.opt("archived") == false)) { "Archive change was not confirmed. Refresh before trying again." }
+                    return result
+                }
                 if (!hidden) {
                     val meta = c.nativeGet("/api/sessions/${sid()}", mapOf("profile" to c.auth.profile))
                     if (nativeSessionFlag(meta, "archived")) c.nativeRpc("session.archive", json("session_id" to sid(), "archived" to false)).also {
@@ -367,6 +597,14 @@ internal class NativeOperations(private val c: BeaconClient) {
                 }
             }
             "/api/session/delete" -> {
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                if (lease.authority) {
+                    val snapshot = canonicalSnapshot(lease)
+                    require(snapshot.opt("running") == false && snapshot.opt("pending") is JSONArray && snapshot.rows("pending").isEmpty()) { "Stop the current reply before deleting this conversation." }
+                    val result = canonicalMutation(lease, snapshot, "delete", JSONObject())
+                    require(result.optJSONArray("deleted_ids")?.strings()?.contains(b.storedSessionId) == true) { "Deletion was not confirmed. Refresh before trying again." }
+                    return result.put("deleted", b.storedSessionId)
+                }
                 val fresh = c.nativeRpc("session.resume", json("session_id" to sid(), "omit_messages" to true, "close_on_disconnect" to false))
                 val target = nativeSessionBinding(c.scope, fresh)
                 require(target.storedSessionId == sid()) { "Conversation identity changed. Reopen before deleting." }
@@ -383,12 +621,68 @@ internal class NativeOperations(private val c: BeaconClient) {
                     require(it.string("deleted") == target.storedSessionId) { "Deletion was not confirmed. Refresh before trying again." }
                 }
             }
-            "/api/session/undo" -> return c.nativeRpc("session.undo", json("session_id" to binding().runtimeSessionId))
-            "/api/session/compress" -> return c.nativeRpc("session.compress", json("session_id" to binding().runtimeSessionId, "focus_topic" to d.string("focus_topic")))
-            "/api/session/usage" -> return c.nativeRpc("session.usage", json("session_id" to binding().runtimeSessionId))
+            "/api/session/undo" -> {
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                if (!lease.authority) return c.nativeRpc("session.undo", json("session_id" to b.runtimeSessionId))
+                val snapshot = canonicalSnapshot(lease, messages = true)
+                val rows = snapshot.rows("messages")
+                val target = rows.lastOrNull { it.string("role") == "user" && it.opt("archived") != true }
+                    ?: error("There is no active turn to undo.")
+                val id = nativeReplayNumber(target.opt("row_id"))?.takeIf { it > 0 } ?: error("The last turn has no durable identity.")
+                require(rows.count { nativeReplayNumber(it.opt("row_id")) == id } == 1) { "The last turn has an ambiguous identity." }
+                val result = canonicalMutation(lease, snapshot, "rewind", json("target_message_id" to id))
+                val message = result.optJSONObject("target_message")
+                val removed = nativeReplayNumber(result.opt("rewound_count"))?.takeIf { it > 0 }
+                require(message?.string("role") == "user" && nativeReplayNumber(message?.opt("id")) == id && removed != null) { "Undo was not confirmed. Refresh before trying again." }
+                return result.put("removed", removed)
+            }
+            "/api/session/compress" -> {
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                if (!lease.authority) return c.nativeRpc("session.compress", json("session_id" to b.runtimeSessionId, "focus_topic" to d.string("focus_topic")))
+                val payload = JSONObject().apply { d.string("focus_topic").takeIf(String::isNotBlank)?.let { put("focus", it) } }
+                val result = canonicalMutation(lease, canonicalSnapshot(lease), "compress", payload)
+                if (result.string("status") == "noop") return result.put("status", "aborted")
+                require(result.string("status").isBlank() && result.string("target_session_id").matches(storedSessionId) && nativeReplayNumber(result.opt("message_count"))?.let { it >= 0 } == true) { "Compression was not confirmed. Refresh before trying again." }
+                return result.put("status", "compressed")
+            }
+            "/api/session/usage" -> {
+                val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                return c.nativeTurnRpc(lease, if (lease.authority) "session.stats" else "session.usage", json("session_id" to b.runtimeSessionId))
+            }
             "/api/session/update" -> {
                 val b = binding()
                 if (d.has("model")) {
+                    val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                    if (lease.authority) {
+                        val model = d.getString("model"); val provider = d.string("model_provider")
+                        require(model.isNotBlank() && (!d.has("scope_key") || d.string("scope_key") == c.scope.session(b.storedSessionId).key)) { "Reopen the model picker in its original chat." }
+                        val version = c.nativeAuthorityVersion() ?: error("Sign-in changed. Reopen the model picker.")
+                        val key = c.scope.session(b.storedSessionId).key
+                        val payload = json("model" to model).apply { if (provider.isNotBlank()) put("provider", provider) }
+                        val confirmed = d.optBoolean("confirm_expensive_model")
+                        val guard = synchronized(canonicalModelGuards) { canonicalModelGuards.remove(key) }
+                        if (confirmed) {
+                            require(guard != null && guard.version == version && guard.model == model && guard.provider == provider) { "Model confirmation expired. Reopen the picker." }
+                            payload.put("confirm", guard.token)
+                        }
+                        val result = canonicalMutation(lease, canonicalSnapshot(lease), "model", payload)
+                        if (result.string("status") == "confirmation_required") {
+                            val message = result.string("confirm_message")
+                            require(!confirmed) { message }
+                            synchronized(canonicalModelGuards) {
+                                canonicalModelGuards[key] = CanonicalModelGuard(version, model, provider, result.getString("confirm"))
+                                if (canonicalModelGuards.size > 16) canonicalModelGuards.remove(canonicalModelGuards.keys.first())
+                            }
+                            throw NativeModelConfirmation(message)
+                        }
+                        require(result.opt("model") is String && result.string("model").isNotBlank()) { "Model change was not confirmed." }
+                        val fresh = canonicalSnapshot(lease, messages = true)
+                        val updated = nativeSessionBinding(c.scope, fresh)
+                        require(updated == b) { "Model change returned another conversation. Refresh before sending." }
+                        val history = passiveHistory(updated.storedSessionId, fresh)
+                        sessionProjection(fresh, updated).let { live -> live.keys().forEach { key -> if (key != "messages") history.put(key, live.opt(key)) } }
+                        return json("session" to history, "deferred" to (result.string("status") == "deferred"))
+                    }
                     // Hermes keeps a pick that names its provider only on a built agent; a chat still resuming would lose it when this socket closes.
                     // A live lazy runtime ignores eager_build, so this scoped read is what starts the agent and waits for it (as in awaitNativeVoiceAgent).
                     // A failed build (5032) is left to config.set, which repairs it.
@@ -407,7 +701,13 @@ internal class NativeOperations(private val c: BeaconClient) {
                     sessionProjection(fresh, updated).let { live -> live.keys().forEach { key -> if (key != "messages") history.put(key, live.opt(key)) } }
                     return json("session" to history, "deferred" to result.optBoolean("deferred"))
                 }
-                if (d.has("workspace")) return c.nativeRpc("session.cwd.set", json("session_id" to b.runtimeSessionId, "cwd" to d.getString("workspace")))
+                if (d.has("workspace")) {
+                    val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                    if (!lease.authority) return c.nativeRpc("session.cwd.set", json("session_id" to b.runtimeSessionId, "cwd" to d.getString("workspace")))
+                    val result = canonicalMutation(lease, canonicalSnapshot(lease), "workspace", json("cwd" to d.getString("workspace")))
+                    require(result.string("cwd").isNotBlank()) { "Workspace change was not confirmed." }
+                    return result
+                }
                 throw ApiFailure(501, "These conversation settings are unavailable in native Hermes")
             }
             "/api/reasoning", "/api/mobile/beacon/reasoning" -> {
@@ -464,9 +764,62 @@ internal class NativeOperations(private val c: BeaconClient) {
                 return saveTextFile(d.copy().put("path", path))
             }
         }
-        if (path.startsWith("/api/mobile/receipts/")) throw ApiFailure(501, "Native Hermes has no prompt receipt lookup. Refresh conversation history before deciding whether to resend; your draft is retained.")
+        if (path.startsWith("/api/mobile/receipts/")) {
+            require(method == "GET") { "Receipt checks are read-only" }
+            return submissionReceipt(d.string("session_id"), path.removePrefix("/api/mobile/receipts/"), d.string("admission_id"), d.string("completed_proof") == "1")
+        }
         if (NativeOperationPolicy.direct(path, method)) return c.nativeGet(path, q + ("profile" to c.auth.profile), method, body, maxBytes)
         throw ApiFailure(501, "This operation is unavailable in native Hermes: ${path.removePrefix("/api/")}")
+    }
+
+    /** Resolve an uncertain send by native identity only; absence never authorizes another submission. */
+    private suspend fun submissionReceipt(stored: String, input: String, knownAdmission: String, completedProof: Boolean): JSONObject {
+        require(stored.matches(storedSessionId) && input.matches(storedSessionId)) { "Choose a saved send receipt" }
+        val b = c.nativeSession(stored)
+        require(b.scope == c.scope && b.storedSessionId == stored) { "The admission belongs to another conversation" }
+        val lease = c.nativeTurnLease(stored, b.runtimeSessionId)
+        if (!lease.authority) throw ApiFailure(501, "Native Hermes has no prompt receipt lookup. Refresh conversation history before deciding whether to resend; your draft is retained.")
+        val snapshot = c.nativeSessionSnapshot()
+        fun profileId(info: JSONObject?): String? {
+            if (info == null) return null
+            if (info.has("profile_name") && !info.isNull("profile_name")) require(info.opt("profile_name") == c.scope.profile) { "The admission belongs to another conversation" }
+            if (info.has("session_id") && !info.isNull("session_id")) require(info.opt("session_id") == b.runtimeSessionId) { "The admission belongs to another conversation" }
+            if (!info.has("profile_id") || info.isNull("profile_id")) return null
+            return (info.opt("profile_id") as? String)?.takeIf(String::isNotBlank) ?: error("The admission belongs to another conversation")
+        }
+        val profile = profileId(snapshot.optJSONObject("info"))
+            ?: profileId(c.nativeTurnRpc(lease, "session.info", json("session_id" to b.runtimeSessionId)))
+            ?: return json("status" to "unknown")
+        var admission = knownAdmission
+        if (admission.isBlank()) {
+            val candidates = snapshot.rows("pending").toMutableList()
+            if (candidates.none { it.string("input_id") == input }) {
+                val replay = c.nativeTurnRpc(lease, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to 0).apply {
+                    snapshot.string("replay_epoch").takeIf(String::isNotBlank)?.let { put("replay_epoch", it) }
+                })
+                replay.rows("events").filter { it.string("session_id") == b.runtimeSessionId && it.string("type") == "session.info" }
+                    .forEach { candidates += it.optJSONObject("payload")?.rows("pending").orEmpty() }
+            }
+            val matches = candidates.filter { it.string("input_id") == input }
+            matches.forEach { require(it.optJSONObject("ref")?.string("session_id") == stored && it.optJSONObject("ref")?.opt("profile_id") == profile) { "The admission belongs to another conversation" } }
+            val ids = matches.map { it.string("admission_id") }.distinct()
+            require(ids.size <= 1 && ids.none(String::isBlank)) { "The saved submission identity is ambiguous" }
+            admission = ids.singleOrNull().orEmpty()
+        }
+        if (admission.isBlank()) return json("status" to "unknown")
+        val receipt = c.nativeTurnRpc(lease, "prompt.receipt", json("session_id" to b.runtimeSessionId, "admission_id" to admission))
+        val ref = receipt.optJSONObject("ref")
+        require(receipt.string("admission_id") == admission && ref?.string("session_id") == stored && ref.opt("profile_id") == profile) { "The admission belongs to another conversation" }
+        receipt.remove("_confirmed_persisted_turn")
+        val epoch = snapshot.string("replay_epoch")
+        if (completedProof && receipt.string("status") == "terminal" && receipt.string("outcome") == "completed" && epoch.isNotBlank()) {
+            val retained = nativeRetainedReplay(epoch) { after ->
+                c.nativeTurnRpc(lease, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to after, "replay_epoch" to epoch))
+            }
+            retained?.let { (after, replay) -> nativeCompletedTurn(replay, b.runtimeSessionId, epoch, receipt, input, after) }
+                ?.let { receipt.put("_confirmed_persisted_turn", it) }
+        }
+        return receipt.put("session_id", stored).put("stream_id", b.runtimeSessionId)
     }
 
     private suspend fun nativeTextFile(path: String): JSONObject =
@@ -741,7 +1094,8 @@ internal class NativeOperations(private val c: BeaconClient) {
                 payload.put("id", raw.opt("id")).put("approval_id", params.string("request_id", raw.string("id"))).put("clarify_id", raw.opt("id"))
             }
             payload.put("stream_id", b.runtimeSessionId)
-            callback(SseEvent(type, payload.toString(), if (params.has("seq")) "${b.runtimeSessionId}:${params.optLong("seq")}" else ""))
+            val epoch = params.string("replay_epoch")
+            callback(SseEvent(type, payload.toString(), if (params.has("seq")) "${b.runtimeSessionId}:${if (epoch.isBlank()) "" else "$epoch:"}${params.optLong("seq")}" else ""))
             if (path == "/api/chat/stream" && type in setOf("done", "error")) throw NativeTurnEnded()
         } } catch (_: NativeTurnEnded) { } finally { c.closeNative() }
     }

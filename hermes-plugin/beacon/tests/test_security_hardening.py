@@ -183,9 +183,9 @@ def test_plugin_unload_on_disable_pauses_only_its_managed_jobs(harness, monkeypa
     plugin.register(SimpleNamespace(register_tool=lambda **kwargs: None,
         register_hook=lambda name, handler: hooks.append((name, handler)), on_unload=cleanups.append))
     assert ('pre_llm_call', plugin.native_watch_guard_context) in hooks
-    assert len(cleanups) == 1
+    assert cleanups.count(plugin.pause_proactive_jobs) == 1
     harness[2].clear()  # Native settings no longer expose the owner after disabling the plugin.
-    cleanups[0]()
+    for cleanup in reversed(cleanups): cleanup()
     assert set(paused) == {(profile, 'pause_job', owner + '-' + profile + '-' + kind)
         for owner in ('owner', 'previous-owner') for profile in ('default', 'work')
         for kind in ('watch_email', 'nightly_memory')}
@@ -274,6 +274,7 @@ def invoke_call_user(env, monkeypatch, args, title='Plain conversation'):
     monkeypatch.setattr(plugin, 'current_profile', lambda cfg:'default')
     plugin.mobile = mobile
     plugin.native = native
+    monkeypatch.setattr(native, 'current_principal', lambda *values: None, raising=False)
     cfg.update(callback_tool_enabled=True)
     monkeypatch.setattr(mobile, 'settings', lambda profile=None: cfg)
     monkeypatch.setattr(mobile, 'home', lambda: tmp_path)
@@ -407,7 +408,7 @@ def test_pre_tool_read_only_guard_blocks_mcp_writes_only_in_owned_watch_runs(har
     # The guard reads each server's trust from the profile config and treats an unlisted server as untrusted; these are trusted ones.
     _mcp_trust(monkeypatch, mail=None, github=None, tool_gateway_research=None, db=None)
     monkeypatch.setitem(sys.modules, "tools.registry", SimpleNamespace(
-        registry=SimpleNamespace(get_toolset_for_tool=lambda name:
+        registry=SimpleNamespace(get_entry=lambda *args, **kwargs: None, get_toolset_for_tool=lambda name:
                                  "cronjob" if name == "cronjob" else
                                  "skills" if name in {"skills", "skills_list"} else
                                  "memory" if name in {"memory", "hindsight_recall", "hindsight_reflect",

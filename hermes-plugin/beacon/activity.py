@@ -75,6 +75,9 @@ def sync(mobile, native, owner, provider, profile):
         previous = conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND kind IN ('working','approval','clarify') AND activity_key!='' AND state='pending'", (owner, profile)).fetchall()
         for row in previous:
             if row['id'] not in active:
+                if row['principal']: continue
+                try: native.verify(owner,provider,profile,row['conversation'])
+                except (LookupError,RuntimeError,ValueError,ImportError,AttributeError): continue
                 conn.execute("UPDATE notices SET state='settled' WHERE id=?", (row['id'],))
                 # A new outbox row makes cancellation observable to cursor polling as well as FCM.
                 conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key) VALUES(?,?,?,?,?,?,?,?)',

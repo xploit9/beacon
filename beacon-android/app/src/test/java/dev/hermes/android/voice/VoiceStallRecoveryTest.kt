@@ -19,6 +19,8 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class VoiceStallRecoveryTest {
@@ -100,6 +102,30 @@ class VoiceStallRecoveryTest {
             // The plugin accepts only known diagnostic stages and codes.
             assertTrue(events.any { it.optString("type") == "media_diagnostic" && it.optString("stage") == "provider_error" && it.optString("error_code") == "timeout" && it.optString("cause_class") == "socket_timeout" })
         } finally { voice.close(); scope.cancel(); client.closeNative() }
+    }
+
+    @Test(timeout = 120000) fun replacementWaitsForStallBookkeepingAndReplaysEachOwedResultOnce() = runBlocking<Unit> {
+        val provider = Provider(); val events = CopyOnWriteArrayList<JSONObject>()
+        val entered = CountDownLatch(1); val release = CountDownLatch(1); val stalls = AtomicInteger()
+        val failed = CompletableDeferred<String>(); val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val client = client()
+        val voice = DirectVoice(client, "call", "stored", scope, {}, { event ->
+            events += event
+            if (event.optString("stage") == "provider_error" && stalls.incrementAndGet() == 1) {
+                entered.countDown(); check(release.await(30, TimeUnit.SECONDS))
+            }
+        }, { failed.complete(it) }, credentials = credentials("gemini"), providerSocketFactory = provider.factory, stallAfterMs = 400)
+        try {
+            voice.start(); await { events.any { it.optString("state") == "listening" } }
+            val (first, listener) = provider.sockets.first()
+            listener.onMessage(first, json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "held-result", "name" to "get_visual_state", "args" to json())))).toString())
+            await { entered.count == 0L }
+            assertEquals("The previous session owns recovery until its bookkeeping finishes", 1, provider.sockets.size)
+            release.countDown()
+            assertEquals(CALL_VOICE_STOPPED, withTimeout(30_000) { failed.await() })
+            for (index in 2..3) assertEquals(1, provider.sent(index).count { it.toString().contains("Verified earlier get_visual_state tool outcome") })
+            assertEquals(1, provider.sent(1).count { it.has("toolResponse") })
+        } finally { release.countDown(); voice.close(); scope.cancel(); client.closeNative() }
     }
 
     @Test(timeout = 120000) fun speechTheProviderNeverAnswersReplacesTheSessionOnEveryWire() = runBlocking<Unit> {

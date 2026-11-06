@@ -114,8 +114,14 @@ def test_every_native_method_the_app_calls_exists(hermes, app_source):
 
 def test_every_http_address_the_app_calls_exists(hermes, app_source):
     called = set(re.findall(r'\b(?:nativeGet|nativeRequest|get|post|request)\(\s*"(/api/[^"(]+)"', app_source))
-    # Addresses the app dispatches to native methods itself (a `when` branch) never reach Hermes over HTTP.
+    # Addresses dispatched by the app's native adapter never reach Hermes over HTTP.
     virtual = set(re.findall(r'"(/api/[^"]+)"(?=(?:\s*,\s*"[^"]+")*\s*->)', app_source))
+    native = APP.joinpath('dev/hermes/android/data/NativeOperations.kt').read_text(encoding='utf-8')
+    handlers = set(re.findall(r'\bprivate\s+suspend\s+fun\s+(\w+)\s*\(', native))
+    # A guarded prefix must return an adapter-local handler; HTTP forwards remain checked.
+    prefixes = re.findall(r'\bif\s*\(path\.startsWith\("(/api/[^"]+)"\)\)\s*\{\s*'
+                          r'require\(method\s*==\s*"GET"\)\s*\{[^}]*\}\s*return\s+(\w+)\(', native)
+    virtual |= {path for path in called for prefix, handler in prefixes if handler in handlers and path.startswith(prefix)}
     hermes_routes = _routes(list(hermes.joinpath('hermes_cli').rglob('*.py')))
     beacon_routes = _beacon_routes()
     gone = []
@@ -132,6 +138,12 @@ def test_every_http_address_the_app_calls_exists(hermes, app_source):
     assert len(called) > 30, 'the app call pattern changed; update this test'
     assert not _matches('/api/cron/jobs-renamed-in-a-later-hermes', hermes_routes)
     assert gone == []
+
+
+def test_native_prefix_dispatch_does_not_hide_a_missing_http_address(hermes, app_source):
+    missing = '/api/mobile/receipts-renamed/$submission'
+    with pytest.raises(AssertionError, match=re.escape(missing)):
+        test_every_http_address_the_app_calls_exists(hermes, app_source + f'\nc.get("{missing}")')
 
 
 def _needs_of(source):

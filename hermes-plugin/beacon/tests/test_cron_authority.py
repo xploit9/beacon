@@ -80,3 +80,43 @@ def test_call_user_rejects_foreign_owned_cron_and_allows_unowned_cron(harness, m
     assert allowed_principal['status'] == 'pending' and allowed_principal['conversation_id'] == 'owned-chat'
     # Two cron jobs share the fallback chat but carry their own reasons, so neither swallows the other.
     assert allowed_principal['event_id'] != allowed['event_id']
+
+
+def test_canonical_call_user_requires_current_verified_principal(harness,monkeypatch):
+    from gateway.session_identity import authenticated_subject
+    api,_,cfg,tmp,_=harness
+    principal=authenticated_subject({'provider':'basic','issuer':'issuer-one','user_id':'owner'})
+    other=authenticated_subject({'provider':'basic','issuer':'issuer-two','user_id':'owner'})
+    plugin=install_cron_context(api,cfg,tmp,monkeypatch,{'canonical':{'user_id':principal,'source':'local','title':'Owned'}})
+    monkeypatch.setattr(plugin,'current_profile',lambda cfg:'default')
+    active=[principal]
+    monkeypatch.setattr(api.native,'current_principal',lambda *args:active[0])
+    def verify(*args):
+        if len(args)!=7 or args[-1]!=principal: raise LookupError('unverified')
+        return {'user_id':principal}
+    monkeypatch.setattr(api.native,'verify',verify)
+    accepted=json.loads(plugin.call_user({'reason':'synthetic'},session_id='canonical'))
+    assert accepted['status']=='pending'
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT principal FROM notices WHERE id=?',(accepted['event_id'],)).fetchone()[0]==principal
+    for value in (None,other):
+        active[0]=value
+        assert 'error' in json.loads(plugin.call_user({'reason':'synthetic'},session_id='canonical'))
+
+
+def test_canonical_proactive_request_needs_verified_viewer_principal(harness,monkeypatch):
+    from gateway.session_identity import authenticated_subject
+    api,_,cfg,tmp,_=harness
+    principal=authenticated_subject({'provider':'basic','issuer':'issuer-one','user_id':'owner'})
+    other=authenticated_subject({'provider':'basic','issuer':'issuer-two','user_id':'owner'})
+    plugin=install_cron_context(api,cfg,tmp,monkeypatch,{})
+    monkeypatch.setattr(plugin,'current_profile',lambda cfg:'default')
+    monkeypatch.setattr(plugin,'_cron_row',lambda profile,session:{'user_id':principal,'source':'local'})
+    monkeypatch.setattr(plugin.proactive,'create_request',lambda *args:{'id':'synthetic'})
+    active=[principal]
+    monkeypatch.setattr(api.native,'current_principal',lambda *args:active[0])
+    monkeypatch.setattr(api.native,'verify',lambda *args: {'user_id':principal} if len(args)==7 and args[-1]==principal else (_ for _ in ()).throw(LookupError('unverified')))
+    assert json.loads(plugin.create_proactive_request({'text':'test','action':'notify'},session_id='canonical'))['saved'] is True
+    for value in (None,other):
+        active[0]=value
+        assert 'error' in json.loads(plugin.create_proactive_request({'text':'test','action':'notify'},session_id='canonical'))

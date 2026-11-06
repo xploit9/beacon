@@ -126,12 +126,21 @@ class ScreenCache(
         if (synchronized(this) { rows[account.key]?.remove("${scope.profile}\u0000$key\u0000$request") != null }) schedule(account)
     }
     /** Sign-out, account change and device removal: the row and the in-memory copy go together; a pending flush cannot bring it back. */
-    suspend fun clear(scope: Scope) {
+    suspend fun clear(scope: Scope) = clear(scope, { remove -> remove(); true }, drop)
+    internal suspend fun clear(removal: DeviceRemovalAuthority, dropCurrent: suspend (Scope) -> Unit) =
+        clear(removal.scope, removal::ifCurrent, dropCurrent)
+    private suspend fun clear(scope: Scope, removeIfCurrent: (() -> Unit) -> Boolean, dropCurrent: suspend (Scope) -> Unit) {
         val account = account(scope)
         // One step under the row's lock: an open() either finished before it (and is removed here) or reads the empty store.
         io.withLock {
-            synchronized(this) { rows.remove(account.key); epochs[account.key] = epoch(account) + 1; flushes.remove(account.key)?.cancel() }
-            try { drop(account) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next open reads whatever remains */ }
+            var pendingFlush: Job? = null
+            if (!removeIfCurrent {
+                synchronized(this) { rows.remove(account.key); epochs[account.key] = epoch(account) + 1; pendingFlush = flushes.remove(account.key) }
+            }) return@withLock
+            // Cancel the captured old job outside AuthStore; cancellation may invoke handlers immediately.
+            pendingFlush?.cancel()
+            // The disk target rechecks inside its transaction; this call may suspend after re-admission.
+            try { dropCurrent(account) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next open reads whatever remains */ }
         }
     }
     suspend fun flush(scope: Scope) {

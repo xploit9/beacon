@@ -8,7 +8,9 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import dev.hermes.android.data.AppCipher
 import dev.hermes.android.data.AuthStore
+import dev.hermes.android.data.NativeIncidents
 import dev.hermes.android.data.ProjectionCache
+import dev.hermes.android.data.incidentCrashHandler
 import dev.hermes.android.voice.CallController
 import kotlinx.coroutines.*
 
@@ -18,6 +20,8 @@ class BeaconApplication : Application() {
     val cipher by lazy { AppCipher() }
     val auth by lazy { AuthStore(this, cipher) }
     val cache by lazy { ProjectionCache(this, cipher) }
+    private val incidentHolder = lazy { NativeIncidents(this, cipher) }
+    val incidents get() = incidentHolder.value
     val calls by lazy { CallController(this) }
     val push by lazy { dev.hermes.android.push.PushManager(this) }
     val updates by lazy { dev.hermes.android.updates.UpdateManager(this) }
@@ -27,6 +31,14 @@ class BeaconApplication : Application() {
     var firebaseConfigured = false; private set
     override fun onCreate() {
         super.onCreate()
+        runCatching {
+            Thread.getDefaultUncaughtExceptionHandler()?.let { previous ->
+                Thread.setDefaultUncaughtExceptionHandler(incidentCrashHandler(previous) {
+                    if (incidentHolder.isInitialized()) incidentHolder.value.recordCrash()
+                })
+            }
+        }
+        auth.incidentSink = { client, component, operation, error -> incidents.record(client, component, operation, error) }
         // Test builds log main-thread disk and network IO to logcat while developing; it is never fatal.
         if (BuildConfig.DEBUG) android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder().detectDiskReads().detectDiskWrites().detectNetwork().penaltyLog().build())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -46,6 +58,11 @@ class BeaconApplication : Application() {
             runCatching { push.reconcileIncomingDeadlines() }
             // Why the last process ended (Android keeps only a few), then Keep connected back on if the owner wants it and Android stopped it.
             runCatching { dev.hermes.android.push.DeliveryLog.recordProcessExit(this@BeaconApplication) }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) runCatching {
+                getSystemService(android.app.ActivityManager::class.java)
+                    ?.getHistoricalProcessExitReasons(packageName, 0, 1)?.firstOrNull()
+                    ?.let { incidents.noteProcessExit(it.reason, it.timestamp) }
+            }
             runCatching { dev.hermes.android.push.KeepConnectedService.startIfEnabled(this@BeaconApplication) }
             runCatching { cache.trim() }
             runCatching { java.io.File(cacheDir, "camera").listFiles()?.filter { it.isFile && it.lastModified() < staleBefore }?.forEach { it.delete() } }

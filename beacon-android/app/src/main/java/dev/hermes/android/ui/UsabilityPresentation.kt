@@ -80,18 +80,16 @@ internal fun imageMimeType(value: String): Boolean = value.substringBefore(';').
 internal data class BackgroundActivitySummary(
     val agents: Int = 0,
     val processes: Int = 0,
-    val cronJobs: Int = 0,
-    val watches: Int = 0,
     val available: Boolean = true,
+    val items: List<BackgroundActivityItem> = emptyList(),
 ) {
-    val active get() = agents > 0 || processes > 0 || cronJobs > 0 || watches > 0
-    /** Work running right now; an enabled watch on its own only waits for its next look. */
-    val working get() = agents > 0 || processes > 0 || cronJobs > 0
+    val active get() = agents > 0 || processes > 0 || items.any { it.status == "Status unknown" }
+    val working get() = agents > 0 || processes > 0
 }
 
 /** The background line's fixed texts, which reach uiText through [backgroundActivityStatus]. Each count sits inside its own template as {0}. */
 internal val BackgroundActivityStrings = listOf(
-    "1 agent", "{0} agents", "1 process", "{0} processes", "1 schedule running", "{0} schedules running", "1 watch", "{0} watches",
+    "1 agent", "{0} agents", "1 process", "{0} processes",
     "More may be active", "Background status unavailable",
 )
 
@@ -101,8 +99,6 @@ internal fun backgroundActivityStatus(activity: BackgroundActivitySummary, text:
     val counts = listOfNotNull(
         count(activity.agents, "1 agent", "{0} agents"),
         count(activity.processes, "1 process", "{0} processes"),
-        count(activity.cronJobs, "1 schedule running", "{0} schedules running"),
-        count(activity.watches, "1 watch", "{0} watches"),
     )
     return when {
         counts.isNotEmpty() && !activity.available -> counts.joinToString(" · ") + " · " + text("More may be active")
@@ -112,11 +108,73 @@ internal fun backgroundActivityStatus(activity: BackgroundActivitySummary, text:
     }
 }
 
-internal fun sessionScopedSubagentCount(sessionRoster: JSONObject, profileStatus: JSONObject?): Int {
-    val sessionIds = sessionRoster.rows("subagents").mapNotNull { it.string("subagent_id").takeIf(String::isNotBlank) }.toSet()
-    if (profileStatus == null) return sessionIds.size
-    val activeIds = profileStatus.rows("active").mapNotNull { it.string("subagent_id").takeIf(String::isNotBlank) }.toSet()
-    return sessionIds.intersect(activeIds).size
+internal fun sessionScopedSubagentCount(sessionRoster: JSONObject): Int =
+    sessionRoster.rows("subagents").filter { it.string("status") in setOf("running", "queued") }
+        .map { it.string("subagent_id") }.filter(String::isNotBlank).distinct().size
+
+internal data class BackgroundActivityItem(val id: String, val kind: String, val title: String, val status: String, val elapsedSeconds: Long? = null) {
+    val running get() = status in setOf("Running", "Queued")
+}
+
+/** Both legacy runtimes and canonical owners publish the stored key in this read-only inventory. */
+internal fun backgroundActivityRuntime(inventory: JSONObject?, storedSessionId: String): String? {
+    if (storedSessionId.isBlank() || inventory?.optJSONArray("sessions") == null) return null
+    val matches = inventory.rows("sessions").filter { it.opt("session_key") == storedSessionId }
+    val row = matches.singleOrNull() ?: return null
+    val runtime = (row.opt("id") as? String)?.takeIf(String::isNotBlank) ?: return null
+    if (inventory.rows("sessions").count { it.opt("id") == runtime } != 1) return null
+    return runtime
+}
+
+internal fun conversationBackgroundActivity(roster: JSONObject?, processes: JSONObject?, nowSeconds: Long = System.currentTimeMillis() / 1000): BackgroundActivitySummary {
+    fun elapsed(row: JSONObject, startField: String, endField: String, running: Boolean): Long? {
+        val start = (row.opt(startField) as? Number)?.toDouble()?.takeIf { it.isFinite() && it > 0 } ?: return null
+        val end = if (running) nowSeconds.toDouble() else (row.opt(endField) as? Number)?.toDouble()?.takeIf { it.isFinite() && it > 0 } ?: return null
+        return (end - start).takeIf { it >= 0 && it < Long.MAX_VALUE.toDouble() }?.toLong()
+    }
+    fun status(value: String) = when (value) {
+        "queued" -> "Queued"
+        "running" -> "Running"
+        "completed" -> "Completed"
+        "failed", "error", "timeout" -> "Failed"
+        "interrupted", "cancelled", "killed" -> "Cancelled"
+        else -> "Status unknown"
+    }
+    val agents = roster?.rows("subagents").orEmpty().mapNotNull { row ->
+        val id = row.string("subagent_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+        val state = status(row.string("status"))
+        BackgroundActivityItem("agent:$id", "Background agent", row.string("goal"), state, elapsed(row, "started_at", "completed_at", state in setOf("Running", "Queued")))
+    }.distinctBy { it.id }
+    val delegations = roster?.rows("delegations").orEmpty().mapNotNull { row ->
+        val id = row.string("delegation_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+        val state = status(row.string("status"))
+        BackgroundActivityItem("delegation:$id:${row.optInt("task_index")}", "Delegation", row.string("goal"), state, elapsed(row, "dispatched_at", "completed_at", state in setOf("Running", "Queued")))
+    }.distinctBy { it.id }
+    val jobs = processes?.rows("processes").orEmpty().mapNotNull { row ->
+        val id = row.string("session_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
+        val state = if (row.string("status") == "exited") when {
+            row.string("completion_reason") in setOf("killed", "cancelled", "interrupted", "stopped") -> "Cancelled"
+            row.opt("exit_code") is Number -> if (row.optInt("exit_code") == 0) "Completed" else "Failed"
+            else -> "Status unknown"
+        } else status(row.string("status"))
+        val duration = elapsed(row, "started_epoch", "exited_at", state in setOf("Running", "Queued"))
+            ?: (row.opt("uptime_seconds") as? Number)?.toLong()?.takeIf { it >= 0 }
+        BackgroundActivityItem("process:$id", "Background process", row.string("command"), state, duration)
+    }.distinctBy { it.id }
+    val items = agents + delegations + jobs
+    val valid = roster?.optJSONArray("subagents") != null && processes?.optJSONArray("processes") != null && items.none { it.status == "Status unknown" } &&
+        agents.size == roster.getJSONArray("subagents").length() && jobs.size == processes.getJSONArray("processes").length() &&
+        delegations.size == (roster.optJSONArray("delegations")?.length() ?: 0)
+    return BackgroundActivitySummary(agents = sessionScopedSubagentCount(roster ?: JSONObject()) + delegations.count { it.running }, processes = jobs.count { it.running }, available = valid, items = items)
+}
+
+/** A missing row proves only that it is no longer listed; a failed read proves no completion. */
+internal fun reconcileBackgroundActivity(previous: BackgroundActivitySummary, current: BackgroundActivitySummary): BackgroundActivitySummary {
+    val knownIds = current.items.mapTo(mutableSetOf()) { it.id }
+    val previousItems = previous.items.filter { it.id !in knownIds }.map { item ->
+        if (item.running || item.status == "Status unknown") item.copy(status = if (current.available) "No longer listed" else "Status unknown") else item
+    }
+    return current.copy(items = current.items + previousItems.takeLast(20))
 }
 
 internal fun conversationActionLabel(action: String, pinned: Boolean, archived: Boolean): String = when {

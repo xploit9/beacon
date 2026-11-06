@@ -63,6 +63,7 @@ class AuditR8aGatewayTest {
                 val request = chain.request()
                 val path = request.url.encodedPath
                 val body = when {
+                    path == CANONICAL_TICKET_PATH -> json("detail" to "Not Found")
                     path == "/api/auth/ws-ticket" -> json("ticket" to "fixture-ticket")
                     path == "/api/sessions" -> json("sessions" to JSONArray())
                     path.startsWith("/api/sessions/hidden-") -> {
@@ -75,7 +76,7 @@ class AuditR8aGatewayTest {
                     }
                     else -> error("Unexpected fixture route")
                 }
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (path == CANONICAL_TICKET_PATH) 404 else 200).message("Fixture")
                     .body(body.toString().toResponseBody("application/json".toMediaType())).build()
             }
         }

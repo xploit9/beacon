@@ -89,6 +89,7 @@ class NativeStockHistoryTest {
             override(request)?.let { return it }
             val url = request.url
             val path = url.encodedPath
+            if (path == CANONICAL_TICKET_PATH) return 404 to json("detail" to "Not Found").toString()
             if (path == "/api/auth/ws-ticket") return 200 to json("ticket" to "fixture-ticket").toString()
             if (path.startsWith("/api/plugins/")) return pluginStatus to json("detail" to "fixture optional plugin failure").toString()
             val profile = url.queryParameter("profile")

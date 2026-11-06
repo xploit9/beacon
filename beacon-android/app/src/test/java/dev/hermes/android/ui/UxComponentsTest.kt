@@ -7,7 +7,7 @@ import org.junit.Test
 class UxComponentsTest {
     @Test fun tilesFillTwoColumnsInFourPairs() {
         assertEquals(
-            listOf(listOf("Skills", "Memory"), listOf("Cron", "Files"), listOf("Projects", "Bots"), listOf("Kanban", "Settings")),
+            listOf(listOf("Skills", "Vault"), listOf("Cron", "Files"), listOf("Projects", "Bots"), listOf("Kanban", "Settings")),
             navigationRows(2),
         )
         assertEquals(2, navigationRows(4).size)

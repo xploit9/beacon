@@ -1,0 +1,26 @@
+import groovy.json.JsonOutput
+import org.gradle.api.tasks.testing.Test
+
+def taskStarts = new java.util.concurrent.ConcurrentHashMap<String, Long>()
+gradle.taskGraph.beforeTask { task -> taskStarts.put(task.path, System.nanoTime()) }
+gradle.taskGraph.afterTask { task, state ->
+    def start = taskStarts.remove(task.path)
+    println('BEACON_GRADLE_TASK=' + JsonOutput.toJson([path: task.path,
+        elapsed_ms: start == null ? null : (System.nanoTime() - start) / 1000000,
+        failed: state.failure != null, skipped: state.skipped, up_to_date: state.upToDate]))
+}
+
+// The listener runs in Gradle, outside the candidate's test worker JVM.
+gradle.beforeProject { project ->
+    def name = project.path == ':' ? 'root' : project.path.substring(1).replace(':', '_')
+    project.layout.buildDirectory.set(new File('/scratch/build', name))
+    project.tasks.withType(Test).configureEach { task ->
+        if (task.path == ':app:testDebugUnitTest') {
+            def events = Collections.synchronizedList([])
+            task.afterTest { descriptor, result ->
+                events.add([descriptor.className ?: '', descriptor.name, result.resultType.name()])
+            }
+            task.doLast { println('BEACON_GRADLE_TESTS=' + JsonOutput.toJson(events)) }
+        }
+    }
+}

@@ -73,6 +73,7 @@ class ProactiveUiTest {
         compose.onNodeWithText("coder", substring = false).assertDoesNotExist()
 
         // The section names the profile it watches for in a badge beside its heading.
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("settings-section:What needs you"))
         compose.onNode(hasText("Code profile") and hasAnyAncestor(hasTestTag("settings-section:What needs you"))).assertExists()
         compose.onNodeWithText("Beacon tells you what needs your attention.").assertDoesNotExist()
         compose.onNodeWithTag("assistant-proactive-toggle").performScrollTo().assertIsOff().assertTextContains("Watch for me").performClick()

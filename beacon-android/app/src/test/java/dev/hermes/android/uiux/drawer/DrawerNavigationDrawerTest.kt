@@ -24,7 +24,7 @@ import org.junit.Test
 class DrawerNavigationDrawerTest {
     @Test fun theBotsTileKeepsItsPlaceAndLabel() {
         // Same eight tiles and routes as before; Bots is also the one switch for Bot Mode.
-        assertEquals(listOf("Skills", "Memory", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings"), navigationTiles)
+        assertEquals(listOf("Skills", "Vault", "Cron", "Files", "Projects", "Bots", "Kanban", "Settings"), navigationTiles)
         assertEquals("Bots", navigationLabel("Bots"))
         assertEquals("Schedules", navigationLabel("Cron"))
         assertTrue("Bots" in NavigationStrings && "Schedules" in NavigationStrings)
@@ -40,7 +40,7 @@ class DrawerNavigationDrawerTest {
             assertEquals(emptyList<String>(), navigationMore(fontScale))
         }
         assertEquals(4, navigationColumns(320f, 1.1f))
-        assertEquals(listOf(listOf("Skills", "Memory", "Cron", "Files"), listOf("Projects", "Bots", "Kanban", "Settings")), navigationRows(4, 1f))
+        assertEquals(listOf(listOf("Skills", "Vault", "Cron", "Files"), listOf("Projects", "Bots", "Kanban", "Settings")), navigationRows(4, 1f))
     }
 
     @Test fun aboveOnePointOneTheGridKeepsFourTilesAndMoreHoldsTheRest() {
@@ -49,7 +49,7 @@ class DrawerNavigationDrawerTest {
             val columns = navigationColumns(320f, fontScale)
             assertEquals(2, columns)
             assertEquals(listOf(listOf("Cron", "Files"), listOf("Projects", "Settings")), navigationRows(columns, fontScale))
-            assertEquals(listOf("Skills", "Memory", "Bots", "Kanban"), navigationMore(fontScale))
+            assertEquals(listOf("Skills", "Vault", "Bots", "Kanban"), navigationMore(fontScale))
             // Nothing is lost: every destination is in the grid or under More, exactly once.
             assertEquals(navigationTiles.sorted(), (navigationShown(fontScale) + navigationMore(fontScale)).sorted())
         }

@@ -12,6 +12,11 @@ internal class GrokWire(private val providerName: String = "Grok") {
     private val outputTranscriptItems=linkedSetOf<String>()
     private val argumentDeltas=linkedMapOf<String,String>()
     private val emittedCalls=linkedSetOf<String>()
+    private data class ToolItem(val callId:String,val name:String,val index:Int?,var completed:JSONObject?=null,var invalid:Boolean=false)
+    private val responseItems=linkedMapOf<String,ToolItem>()
+    private var responseId=""
+    private var responseItemsFull=false
+    private val endedResponses=linkedSetOf<String>()
     private val delivered=linkedMapOf<String,String>()
     // DirectVoice admits at most 64 mutations; unfinished receipts outlive the recent read cache.
     private val pendingDelivered=mutableMapOf<String,String>()
@@ -98,6 +103,9 @@ internal class GrokWire(private val providerName: String = "Grok") {
             .put("content",JSONArray().put(JSONObject().put("type","input_text").put("text",value))))
     }
 
+    @Synchronized fun outboundTyped(frame:JSONObject):List<JSONObject>? =
+        if(responding||responsePending||awaiting.isNotEmpty()) null else outbound(frame)
+
     // Serialise state with socket callbacks: a result arriving mid-response is spoken after response.done.
     @Synchronized fun outbound(frame:JSONObject):List<JSONObject> {
         frame.optJSONObject("setup")?.let { setup ->
@@ -148,7 +156,12 @@ internal class GrokWire(private val providerName: String = "Grok") {
         val functionCalls=JSONArray()
         when(frame.optString("type")) {
             "session.updated" -> return JSONObject().put("setupComplete",JSONObject())
-            "response.created" -> { responding=true;return null }
+            "response.created" -> {
+                val id=(frame.optJSONObject("response")?.opt("id") as? String)?.takeIf { it.length<=200 }.orEmpty()
+                if(id.isNotBlank()&&id in endedResponses) return null
+                responseId=id
+                responseItems.clear();argumentDeltas.clear();responseItemsFull=false;responding=true;return null
+            }
             // The owner speaking starts a new turn, so no reply waits on an older call any more.
             "input_audio_buffer.speech_started" -> { awaiting.clear();content.put("interrupted",true) }
             "response.output_audio.delta","response.audio.delta" -> content.put("modelTurn",JSONObject().put("parts",JSONArray().put(JSONObject().put("inlineData",JSONObject().put("mimeType","audio/pcm;rate=24000").put("data",frame.getString("delta"))))))
@@ -174,12 +187,16 @@ internal class GrokWire(private val providerName: String = "Grok") {
             "response.output_item.added" -> {
                 val item=frame.optJSONObject("item")
                 if(item?.optString("type")=="function_call") {
+                    if(otherResponse(frame)) return null
                     val id=item.optString("call_id")
                     if(id.isNotBlank()) calls[id]=item.optString("name")
+                    rememberItem(frame,false)
                 }
                 return null
             }
+            "response.output_item.done" -> { rememberItem(frame,true);return null }
             "response.function_call_arguments.delta" -> {
+                if(otherResponse(frame)||responseItemsFull) return null
                 val item=frame.opt("item_id") as? String ?: return null
                 val delta=frame.opt("delta") as? String ?: return null
                 if(item.isBlank()||item.length>200||delta.isEmpty()) return null
@@ -193,20 +210,39 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 return null
             }
             "response.function_call_arguments.done" -> {
+                if(otherResponse(frame)||responseItemsFull) return null
+                responseItems[frame.optString("item_id")]?.let { item ->
+                    if(item.invalid||!matchesItem(item,frame)) { item.invalid=true;return null }
+                }
+                // Some compatible envelopes omit identity; only a completed response may supply the missing authority.
+                if(frame.optString("call_id").isBlank()||frame.optString("name").isBlank()) return null
                 decodeCall(frame)?.let(functionCalls::put)
             }
             "response.done" -> {
-                responding=false
                 val response=frame.optJSONObject("response")
+                val endedId=(response?.opt("id") as? String)?.takeIf { it.length<=200 }.orEmpty()
+                if(endedId.isNotBlank()&&endedId in endedResponses) return null
+                if(responseId.isNotBlank()&&endedId.isNotBlank()&&responseId!=endedId) return null
+                responding=false
                 val status=response?.optString("status")
                 if(status=="failed") error("$providerName response failed")
                 val output=response?.takeIf { status=="completed" }?.optJSONArray("output")
-                if(output!=null) for(i in 0 until output.length()) {
-                    val item=output.optJSONObject(i)?:continue
-                    if(item.optString("type")=="function_call") try {
-                        decodeCall(item)?.let(functionCalls::put)
-                    } catch (_: Exception) { }
+                if(status=="completed"&&!responseItemsFull) {
+                    val items=mutableListOf<JSONObject>()
+                    if(output!=null) for(i in 0 until output.length()) output.optJSONObject(i)?.let(items::add)
+                    val present=items.mapNotNull { it.opt("id") as? String }.toSet()
+                    if(responseId.isNotBlank()&&responseId==endedId)
+                        responseItems.forEach { (id,item) -> if(id !in present&&!item.invalid) item.completed?.let(items::add) }
+                    for(item in items) {
+                        val tracked=responseItems[item.optString("id")]
+                        if(tracked!=null&&(tracked.invalid||!matchesItem(tracked,item))) continue
+                        if(item.optString("type")=="function_call"&&item.optString("status").let { it.isBlank()||it=="completed" }) try {
+                            decodeCall(item)?.let(functionCalls::put)
+                        } catch (_: Exception) { }
+                    }
                 }
+                if(endedId.isNotBlank()) { endedResponses.add(endedId);if(endedResponses.size>128) endedResponses.remove(endedResponses.first()) }
+                responseItems.clear();argumentDeltas.clear();responseItemsFull=false;responseId=""
                 content.put("turnComplete",true)
                 if(status=="cancelled") content.put("interrupted",true)
             }
@@ -215,6 +251,42 @@ internal class GrokWire(private val providerName: String = "Grok") {
         }
         return JSONObject().put("serverContent",content).apply {
             if(functionCalls.length()>0) put("toolCall",JSONObject().put("functionCalls",functionCalls))
+        }
+    }
+
+    private fun otherResponse(frame:JSONObject):Boolean {
+        val incoming=(frame.opt("response_id") as? String).orEmpty()
+        return incoming.isNotBlank()&&(incoming in endedResponses||responseId.isNotBlank()&&incoming!=responseId)
+    }
+
+    private fun matchesItem(item:ToolItem,frame:JSONObject):Boolean {
+        if(frame.has("call_id")&&frame.opt("call_id")!=item.callId) return false
+        if(frame.has("name")&&frame.opt("name")!=item.name) return false
+        if(frame.has("output_index")&&item.index!=null&&frame.opt("output_index")!=item.index) return false
+        return true
+    }
+
+    private fun rememberItem(frame:JSONObject,completed:Boolean) {
+        if(responseId.isBlank()||frame.opt("response_id")!=responseId||responseItemsFull) return
+        val value=frame.optJSONObject("item")?:return
+        if(value.optString("type")!="function_call") return
+        val id=(value.opt("id") as? String)?.takeIf { it.isNotBlank()&&it.length<=200 }?:return
+        val call=(value.opt("call_id") as? String)?.takeIf { it.isNotBlank()&&it.length<=200 }?:return
+        val name=(value.opt("name") as? String)?.takeIf { it.isNotBlank()&&it.length<=128 }?:return
+        val index=if(frame.has("output_index")) {
+            (frame.opt("output_index") as? Int)?.takeIf { it>=0 } ?: return
+        } else null
+        val item=responseItems[id]?:run {
+            if(responseItems.size>=128) { responseItems.clear();responseItemsFull=true;return }
+            ToolItem(call,name,index).also { responseItems[id]=it }
+        }
+        if(item.invalid||item.callId!=call||item.name!=name||item.index!=null&&index!=null&&item.index!=index) { item.invalid=true;return }
+        if(completed) {
+            val status=value.optString("status")
+            if(status.isNotBlank()&&status!="completed") { item.invalid=true;return }
+            val arguments=(value.opt("arguments") as? String)?.takeIf { it.isNotBlank()&&it.length<=20000 }?:return
+            if(runCatching { JSONObject(arguments) }.isFailure) return
+            item.completed=JSONObject().put("id",id).put("type","function_call").put("call_id",call).put("name",name).put("arguments",arguments)
         }
     }
 

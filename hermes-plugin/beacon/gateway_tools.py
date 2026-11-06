@@ -5,7 +5,9 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 from pathlib import Path
+import queue
 import re
 import secrets
 import sys
@@ -39,10 +41,10 @@ DEADLINE = 90
 # A list built while some server still waits for its first live scan is rebuilt after this long.
 CATALOG_TTL = 15
 # An older list is still served at once (and refreshed behind it) for this long, so a call never waits for a scan; the cache
-# key already changes with Hermes' config, MCP config and schema cache file, so an added or removed server is never missed.
-# A list with nothing left to scan is current for this whole time: nothing a rescan could find changes the key first.
+# key follows Hermes' config, MCP config, schema cache file and registered definitions.
 CATALOG_STALE_TTL = 600
 BOOT = uuid.uuid4().hex
+LOADED_SHA = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='beacon-mcp')
 SLOTS = threading.BoundedSemaphore(4)
 CATALOG_LOCK = threading.RLock()
@@ -60,8 +62,33 @@ MCP_CACHE_FILES = {}  # scope -> (file signature, parsed file, entry digests)
 MCP_REGISTERED = {}   # (scope, server) -> (config fingerprint, entry digest, tools registered)
 MCP_REFRESHED = set() # (scope, server, entry digest) whose out-of-date list has had its refresh started
 MCP_SCANNING = set()  # scopes with a live scan running
+MCP_LOOP_START_WAIT = 2.0
+MCP_LOOP_START_LOCK = threading.Lock()
 # A cache file larger than this is not read: Hermes' own is a few hundred kilobytes for hundreds of tools.
 MAX_SCHEMA_CACHE_BYTES = 32 * 1024 * 1024
+
+
+def producer_identity():
+    import psutil
+    process=psutil.Process(os.getpid())
+    return {'pid':process.pid,'created':process.create_time(),'boot':BOOT}
+
+
+def producer_running(value):
+    producer=value.get('_producer')
+    if producer is None: return value.get('_boot')==BOOT  # Legacy receipts are observable only in their original process.
+    if (not isinstance(producer,dict) or set(producer)!={'pid','created','boot'} or
+            type(producer['pid']) is not int or producer['pid']<=0 or
+            type(producer['created']) not in (int,float) or producer['created']<=0 or
+            producer['boot']!=value.get('_boot')): return False
+    try:
+        import psutil
+        if producer['pid']==os.getpid(): return value.get('_boot')==BOOT and producer==producer_identity()
+        process=psutil.Process(producer['pid'])
+        return process.is_running() and process.status()!=psutil.STATUS_ZOMBIE and process.create_time()==producer['created']
+    except (psutil.Error,OSError): return False
+
+
 NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view','session_search'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
 # Hermes runs these in its agent loop, where their state lives; voice_context gives a call the same state.
@@ -73,6 +100,7 @@ CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mc
 PHONE_TOOLS = frozenset({'phone_calendars','phone_calendar_list','phone_contacts_search','phone_calendar_create','phone_calendar_update',
                          'phone_calendar_delete','phone_reminder_create','phone_alarm_set','phone_timer_set','phone_call','phone_message_draft'})
 NATIVE_EXCLUDED_TOOLS = frozenset({'clarify','delegate_task','todo_list',
+                                   'beacon_continue_call_work',
                                    'beacon_create_proactive_request','beacon_event_notice','beacon_events_checked',
                                    'beacon_email_notice','beacon_email_checked'}) | CALL_EXCLUDED_TOOLS | PHONE_TOOLS
 NATIVE_EXCLUDED_TOOLSETS = frozenset({'browser','connectors','beacon-interactive','beacon-mailbox','beacon-phone'})
@@ -137,6 +165,13 @@ def encoded(value):
 def digest(value):
     # A server's metadata may carry a lone surrogate; hashing must not fail on it.
     return hashlib.sha256(encoded(value).encode('utf-8', 'surrogatepass')).hexdigest()
+
+
+def request_principal(request,owner,provider):
+    from gateway.session_identity import authenticated_subject
+    identity=getattr(request.state,'native_http_principal',None)
+    return authenticated_subject(identity or {'user_id':owner,'provider':provider,
+        'issuer':getattr(getattr(request.state,'session',None),'issuer','')})
 
 
 def outcome(value, read_only, depth=0, own=False):
@@ -588,6 +623,96 @@ def schema_entry_expired(entry):
     return (type(ttl) in (int,float) and type(written) in (int,float)) and (time.time()-written)*1000.0>=float(ttl)
 
 
+class _McpLoopStarter:
+    """One tracked daemon and one queued future; blocked native startup cannot hold interpreter exit."""
+    def __init__(self):
+        self._jobs=queue.Queue(maxsize=1)
+        self._thread=None
+        self._closed=False
+
+    def submit(self,fn):
+        if self._closed: raise RuntimeError('MCP startup is closed')
+        if self._thread is None:
+            self._thread=threading.Thread(target=contextvars.Context().run,args=(self._run,),name='beacon-mcp-start',daemon=True)
+            self._thread.start()
+        future=concurrent.futures.Future()
+        self._jobs.put_nowait((future,fn))
+        return future
+
+    def _run(self):
+        while True:
+            job=self._jobs.get()
+            if job is None: return
+            future,fn=job
+            if self._closed:
+                future.set_exception(RuntimeError('MCP startup is closed'))
+                return
+            if future.set_running_or_notify_cancel():
+                try: future.set_result(fn())
+                except BaseException as error: future.set_exception(error)
+            if self._closed: return
+
+    def shutdown(self,wait=False):
+        self._closed=True
+        try: self._jobs.put_nowait(None)
+        except queue.Full: pass
+        if wait and self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(timeout=MCP_LOOP_START_WAIT)
+
+
+MCP_LOOP_START_POOL = _McpLoopStarter()
+
+
+def _ready_mcp_loop():
+    """Native startup publishes its loop before it runs; admit no connection/tool until a callback proves readiness."""
+    from tools import mcp_tool as core
+    from tools.mcp_tool_loop import _ensure_mcp_loop
+    deadline=time.monotonic()+MCP_LOOP_START_WAIT
+    admitted=False
+    generation,owner,native_lock=BOOT,sys.modules.get(__name__),core._lock
+    starter=MCP_LOOP_START_POOL
+    def valid():
+        return (BOOT==generation and sys.modules.get(__name__) is owner and
+                sys.modules.get('tools.mcp_tool') is core and core._lock is native_lock and
+                MCP_LOOP_START_POOL is starter and not getattr(starter,'_closed',False))
+    def current():
+        remaining=deadline-time.monotonic()
+        if not valid() or remaining<=0 or not native_lock.acquire(timeout=remaining): raise TimeoutError()
+        try:
+            if not valid(): raise RuntimeError()
+            return core._mcp_loop,core._mcp_thread
+        finally: native_lock.release()
+    try:
+        loop,thread=current()
+        if loop is None or not loop.is_running():
+            admitted=MCP_LOOP_START_LOCK.acquire(timeout=max(0,deadline-time.monotonic()))
+            if not admitted: raise TimeoutError()
+            loop,thread=current()
+            # Reuse a native thread that is still starting instead of replacing its published loop.
+            if loop is None or loop.is_closed() or thread is None or not thread.is_alive():
+                release=MCP_LOOP_START_LOCK.release
+                def start():
+                    if not valid(): raise RuntimeError('MCP startup scope changed')
+                    _ensure_mcp_loop()
+                    if not valid(): raise RuntimeError('MCP startup scope changed')
+                # The starter owns capacity until native ensure finishes, even after this caller expires.
+                task=starter.submit(start)
+                admitted=False
+                task.add_done_callback(lambda done: release())
+                task.result(timeout=max(0,deadline-time.monotonic()))
+                loop,thread=current()
+        ready=threading.Event()
+        loop.call_soon_threadsafe(ready.set)
+        remaining=deadline-time.monotonic()
+        if remaining<=0 or not ready.wait(remaining): raise TimeoutError()
+        active,_=current()
+        if active is not loop or not loop.is_running(): raise RuntimeError()
+    except Exception:
+        raise HTTPException(503,'MCP event loop is still starting; operation was not started') from None
+    finally:
+        if admitted: MCP_LOOP_START_LOCK.release()
+
+
 class NativeMcp:
     """Direct MCP and Hermes registry tool catalog and dispatch for the active profile."""
     _seen = threading.local()  # what this thread's last catalog() found, read once by settled()
@@ -634,15 +759,16 @@ class NativeMcp:
         return None
 
     def cache_key(self):
-        """What the tool list depends on: this profile, its config and MCP config, and Hermes' schema cache file (Hermes rewrites it
-        itself when a server connects or its tools change, so its modification time is the only signal needed). Without a usable
-        schema cache the list follows the tool registry instead, as it always did."""
+        """Follow this profile's config, schema cache and actual registry definitions, including tools registered after a call starts.
+        Generation-only bumps keep a settled list; an added, removed or changed definition invalidates it."""
         try:
             from hermes_cli.config import load_config_readonly
             from tools.mcp_tool_config import _load_mcp_config
             from tools.registry import registry
             usable=hermes_schema_cache() is not None
+            definitions=digest(sorted((entry.name,entry.toolset,entry.schema) for entry in registry.get_all_entries()))
             return (registry.current_scope_key(),digest(load_config_readonly()),digest(_load_mcp_config()),
+                    definitions,
                     schema_file_signature() if usable else ('registry',registry._generation))
         except Exception:
             return None
@@ -738,7 +864,9 @@ class NativeMcp:
         if not names: return
         def run():
             for name in names:
-                try: _ensure_lazy_server_connected(name)
+                try:
+                    _ready_mcp_loop()
+                    _ensure_lazy_server_connected(name)
                 except Exception: logger.warning('An out-of-date MCP tool list could not be refreshed: %r',name[:80])
         try: threading.Thread(target=contextvars.copy_context().run,args=(run,),name='beacon-mcp-refresh',daemon=True).start()
         except Exception: pass
@@ -757,7 +885,12 @@ class NativeMcp:
         # The cached lists come first, with or without discovery: they cost one stat and start nothing.
         state=self._register(config)
         if discover:
-            if state is None: discover_mcp_tools()
+            if state is None:
+                # Native discovery skips connected/lazy servers; metadata-only fallback needs no loop.
+                if any(mcp_server_enabled(cfg) and _resolve_server_key(name) not in core._servers
+                       and _resolve_server_key(name) not in core._lazy_server_configs for name,cfg in config.items()):
+                    _ready_mcp_loop()
+                discover_mcp_tools()
             else:
                 pending=state[0]
                 scope=registry.current_scope_key()
@@ -766,7 +899,9 @@ class NativeMcp:
                     if pending and not scanning: MCP_SCANNING.add(scope)
                 if pending and not scanning:
                     # Only the servers Hermes has no list for; a server registered from its cache is skipped by discovery itself.
-                    try: discover_mcp_tools(allowed_mcp_names=pending)
+                    try:
+                        _ready_mcp_loop()
+                        discover_mcp_tools(allowed_mcp_names=pending)
                     finally:
                         with MCP_CACHE_LOCK: MCP_SCANNING.discard(scope)
                     state=self._register(config)
@@ -903,6 +1038,7 @@ class NativeMcp:
             approval.resolve_gateway_approval(key, 'once' if accept else 'deny', request_id=request)
         approval.register_gateway_notify(key, notify)
         try:
+            _ready_mcp_loop()
             from model_tools import handle_function_call
             result = handle_function_call(tool['name'],arguments,task_id=scope[3],tool_call_id=key,session_id=session_id,
                                           enabled_tools=tool.get('_enabled_tools'))
@@ -949,7 +1085,7 @@ class Gateway:
     @staticmethod
     def _fresh_for(key):
         """How long a stored list is current without a rescan. A list with nothing left to scan lasts: its key already follows the
-        config, the MCP config and Hermes' schema cache file, so there is nothing a periodic rescan would find."""
+        config, the MCP config, registered definitions and Hermes' schema cache file."""
         return CATALOG_STALE_TTL if key in CATALOG_SETTLED else CATALOG_TTL
 
     def _cached_catalog(self, profile):
@@ -1115,7 +1251,9 @@ class Gateway:
         if future.done(): rows,starting=future.result()
         else:
             with CATALOG_LOCK: rows=LAST_CATALOG.get(profile)
-            if rows is None: rows,starting=future.result()
+            if rows is None:
+                logger.warning('Beacon cold discover metadata deadline; worker_stack=%s',worker_stack(thread))
+                raise HTTPException(504,'Tool catalogue is still starting; retry this read or use the native conversation')
             else:
                 starting=[]
                 logger.warning('Beacon call discover using last tool list after metadata wait; worker_stack=%s',worker_stack(thread))
@@ -1160,11 +1298,11 @@ class Gateway:
             if not row: raise HTTPException(404, 'Tool request unavailable')
             value = json.loads(row['payload'])
             value.setdefault('approved_by',None)
-            if value['status']=='running' and (value.get('_boot')!=BOOT or
+            if value['status']=='running' and (not producer_running(value) or
                     time.time()-value['_started']>value.get('_deadline_seconds',DEADLINE)):
                 value.update(status='uncertain', reason='Execution may have completed; do not retry automatically')
                 self._save(conn,scope,request,value)
-            if value['status']=='needs_approval' and time.time()>value['_expires']:
+            if value['status'] in ('needs_approval','transferred') and time.time()>value['_expires']:
                 value.update(status='expired', reason='Approval proposal expired')
                 self._save(conn,scope,request,value)
             if value['status']=='ready' and time.time()-row['updated']>DEADLINE:
@@ -1188,7 +1326,7 @@ class Gateway:
         except Exception:
             return None  # Missing/malformed state or a failed guardian always asks the phone.
 
-    def invoke(self, scope, value, session_id=None):
+    def invoke(self, scope, value, session_id=None, principal=None):
         # approval is the owner's Ask for approval choice in the app: ask (Manual), changes (Auto) or owner (Full access).
         if set(value)-{'approval'}!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
         choice=value.get('approval','changes')
@@ -1201,6 +1339,7 @@ class Gateway:
         with self.db() as conn:
             previous=self._row(conn,scope,request)
             if previous:
+                if json.loads(previous['payload']).get('_principal')!=principal: raise HTTPException(409,'Original request principal mismatch')
                 if previous['signature']!=signature: raise HTTPException(409, 'Request identity conflicts with its original arguments')
                 return self.status(scope,request)
         tools=self.catalog(scope[2],discover=False);tool=next((t for t in tools if t['tool_id']==value['tool_id']),None)
@@ -1223,7 +1362,7 @@ class Gateway:
         shown_name=plain_line(tool['name'],MAX_TOOL_NAME)
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':shown_name,
                 'status':'needs_approval' if needs_approval else 'ready','approved_by':approved_by,
-                '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,
+                '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,'_principal':principal,
                 '_expires':time.time()+120}
         if '_timeout' in tool:
             result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+float(tool.get('_connect_timeout') or 0)+30)
@@ -1240,6 +1379,7 @@ class Gateway:
         with self.db() as conn:
             previous=self._row(conn,scope,request)
             if previous:
+                if json.loads(previous['payload']).get('_principal')!=principal: raise HTTPException(409,'Original request principal mismatch')
                 if previous['signature']!=signature: raise HTTPException(409,'Request identity conflicts')
                 return self.status(scope,request)
             if conn.execute('SELECT COUNT(*) FROM tool_receipts WHERE owner=? AND profile=? AND call_id=?', (scope[0],scope[2],scope[3])).fetchone()[0]>=128:
@@ -1250,6 +1390,7 @@ class Gateway:
                     LEFT JOIN calls c ON c.id=r.call_id AND c.owner=r.owner AND c.profile=r.profile
                     WHERE (c.id IS NULL OR c.closed=1 OR c.created<?)
                     AND json_extract(r.payload,'$.status')!='running'
+                    AND COALESCE(json_extract(r.payload,'$._follow_job'),'')=''
                     ORDER BY r.updated LIMIT ?''',(time.time()-4*3600,total-MAX_RECEIPTS+1)).fetchall()
                 conn.executemany('DELETE FROM tool_receipts WHERE rowid=?',expired)
                 remaining=conn.execute('SELECT COUNT(*) FROM tool_receipts').fetchone()[0]
@@ -1289,14 +1430,16 @@ class Gateway:
         self.status(scope,request)
         with self.db() as conn:
             value=json.loads(self._row(conn,scope,request)['payload'])
-            if value['status'] in ('ready','needs_approval'):
+            if value['status'] in ('ready','needs_approval','transferred'):
                 value.update(status='cancelled',reason='Cancelled before execution')
             elif value['status']=='running':
                 value.update(status='uncertain',reason='Cancelled after execution started; inspect external state before retrying')
             self._save(conn,scope,request,value)
         return self.status(scope,request)
 
-    def _start(self, scope, request, tool, approved, allow_call=False):
+    def _start(self, scope, request, tool, approved, allow_call=False, transfer_job=None):
+        if transfer_job:
+            sys.modules['beacon_voice_continuation'].native_binding(self.mobile,transfer_job)
         if not SLOTS.acquire(blocking=False):
             with self.db() as conn:
                 value=json.loads(self._row(conn,scope,request)['payload'])
@@ -1307,9 +1450,11 @@ class Gateway:
         submitted = False
         try:
             with self.db() as conn:
+                conn.execute('BEGIN IMMEDIATE')
                 value=json.loads(self._row(conn,scope,request)['payload'])
-                expected='needs_approval' if approved else 'ready'
+                expected='transferred' if transfer_job else 'needs_approval' if approved else 'ready'
                 if value['status']!=expected: return
+                if transfer_job and value.get('_follow_job')!=transfer_job: raise HTTPException(409,'Continuation identity changed')
                 if approved and time.time()>value['_expires']:
                     value['status']='expired';self._save(conn,scope,request,value);return
                 if allow_call:
@@ -1330,7 +1475,7 @@ class Gateway:
                     conn.execute('INSERT OR REPLACE INTO call_tool_allowances VALUES(?,?,?,?,?,?,?)',
                         (*scope,tool['tool_id'],tool['name'],time.time()))
                 if approved: value['approved_by']='owner'
-                value.update(status='running',_started=time.time(),_boot=BOOT)
+                value.update(status='running',_started=time.time(),_boot=BOOT,_producer=producer_identity())
                 self._save(conn,scope,request,value)
             context=contextvars.copy_context()
             try:
@@ -1359,7 +1504,15 @@ class Gateway:
         try:
             # Recheck authority and config at the last boundary before the RPC.
             with self.mobile.connect() as conn:
-                self.mobile.owned(conn,scope[3],scope[0],scope[2],True)
+                try: self.mobile.owned(conn,scope[3],scope[0],scope[2],True)
+                except ValueError:
+                    row=self._row(conn,scope,request)
+                    value=json.loads(row['payload']) if row else {}
+                    job=conn.execute('SELECT * FROM jobs WHERE id=? AND owner=? AND provider=? AND profile=? AND call_id=? AND tool_request=? AND submission_digest=?',
+                        (value.get('_follow_job'),*scope,request,row['signature'] if row else '')).fetchone()
+                    if not job or job['stored']!=session_id: raise
+                    self.mobile.owned(conn,scope[3],scope[0],scope[2],False)
+                    if job['transfer']: sys.modules['beacon_voice_continuation'].native_binding(self.mobile,job['id'])
             timing['authority']=(time.perf_counter()-started)*1000
             # Catalogue discovery releases its profile scope before the store lock is needed below.
             phase=time.perf_counter()
@@ -1384,7 +1537,13 @@ class Gateway:
                 timing['profile']=(time.perf_counter()-phase)*1000
                 dispatched=True
                 execution=time.perf_counter()
-                try: return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
+                try:
+                    with self.db() as conn:
+                        original=json.loads(self._row(conn,scope,request)['payload'])
+                    if original.get('_native_claim'):
+                        with sys.modules['beacon_voice_continuation'].original_dispatch(self.mobile,original['_follow_job'],current,arguments):
+                            return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
+                    return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
                 finally: timing['execute']=(time.perf_counter()-execution)*1000
             try: raw=self.execution_scoped(scope[2],execute)
             finally:
@@ -1416,5 +1575,6 @@ class Gateway:
                 with self.db() as conn:
                     value=json.loads(self._row(conn,scope,request)['payload'])
                     # A timeout is terminal: a late return cannot manufacture certainty.
-                    if value['status']=='running': value.update(update,_timings_ms=timing);self._save(conn,scope,request,value)
+                    if value['status']=='running' and value.get('_boot')==BOOT and producer_running(value):
+                        value.update(update,_timings_ms=timing);self._save(conn,scope,request,value)
             finally: SLOTS.release()

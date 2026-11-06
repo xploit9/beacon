@@ -36,9 +36,9 @@ class UxChatCoreTest {
         assertTrue(scheduleTime("2026-10-14T06:00:00Z", "Asia/Dubai", "none", is24Hour = false, locale = Locale.US).plainSpace().endsWith("10:00 AM"))
     }
 
-    @Test fun runningScheduleCountsSaySchedulesRunning() {
-        val activity = BackgroundActivitySummary(agents = 2, processes = 1, cronJobs = 2, watches = 1)
-        assertEquals("2 agents · 1 process · 2 schedules running · 1 watch", backgroundActivityStatus(activity))
+    @Test fun conversationActivityCountsOnlyWorkersAndProcesses() {
+        val activity = BackgroundActivitySummary(agents = 2, processes = 1)
+        assertEquals("2 agents · 1 process", backgroundActivityStatus(activity))
     }
 
     // Every text the background line translates is one whole template from BackgroundActivityStrings (the list the catalog test checks),
@@ -46,12 +46,12 @@ class UxChatCoreTest {
     @Test fun theBackgroundLineAsksOnlyForItsListedTemplates() {
         val asked = mutableSetOf<String>()
         listOf(
-            BackgroundActivitySummary(agents = 1, processes = 1, cronJobs = 1, watches = 1, available = false),
-            BackgroundActivitySummary(agents = 2, processes = 2, cronJobs = 2, watches = 2),
+            BackgroundActivitySummary(agents = 1, processes = 1, available = false),
+            BackgroundActivitySummary(agents = 2, processes = 2),
             BackgroundActivitySummary(available = false),
         ).forEach { activity -> backgroundActivityStatus(activity) { text -> asked += text; text } }
         assertEquals(BackgroundActivityStrings.toSet(), asked)
-        assertEquals("Zeitpläne laufen: 3", backgroundActivityStatus(BackgroundActivitySummary(cronJobs = 3)) { if (it == "{0} schedules running") "Zeitpläne laufen: {0}" else it })
+        assertEquals("Prozesse: 3", backgroundActivityStatus(BackgroundActivitySummary(processes = 3)) { if (it == "{0} processes") "Prozesse: {0}" else it })
     }
 
     @Test fun countsKeepTheNumberInsideTheTemplate() {
@@ -75,11 +75,10 @@ class UxChatCoreTest {
         assertTrue(conversationMenuGroups(conversationActionGroups.values.toList()).daily.flatten().none { it in destructiveConversationActions })
     }
 
-    @Test fun anEnabledWatchAloneShowsActivityWithoutASpinner() {
-        // A watch that is only switched on waits for its next look: the strip shows it, but nothing spins all day.
-        val watching = BackgroundActivitySummary(watches = 1)
-        assertTrue(watching.active); assertFalse(watching.working)
-        for (running in listOf(BackgroundActivitySummary(agents = 1, watches = 1), BackgroundActivitySummary(processes = 1), BackgroundActivitySummary(cronJobs = 1)))
+    @Test fun unavailableKnownWorkStaysVisibleWithoutASpinner() {
+        val unknown = BackgroundActivitySummary(available = false, items = listOf(BackgroundActivityItem("worker", "Background agent", "", "Status unknown")))
+        assertTrue(unknown.active); assertFalse(unknown.working)
+        for (running in listOf(BackgroundActivitySummary(agents = 1), BackgroundActivitySummary(processes = 1)))
             assertTrue(running.working)
     }
 }
