@@ -651,7 +651,9 @@ def authorize(session_id):
         row = _session_row(profile, session_id)
     except Exception:
         raise Refusal('Beacon could not check this chat.') from None
-    if not row or row.get('source') == 'cron' or row.get('user_id') != provider + ':' + owner:
+    native=sys.modules['beacon_native']
+    principal=native.current_principal(owner,provider,profile,session_id)
+    if not row or row.get('source') == 'cron' or not native.owns_row(owner,provider,profile,session_id,row,principal):
         raise Refusal('Email drafts are shown in the owner\'s Beacon chat only. Write the email as text instead.')
     return owner, profile
 

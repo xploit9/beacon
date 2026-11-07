@@ -223,6 +223,7 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS timeline(call_id TEXT,event_id TEXT,digest TEXT,payload TEXT,PRIMARY KEY(call_id,event_id));
     CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,call_id TEXT,owner TEXT,profile TEXT,stored TEXT,runtime TEXT,request TEXT,title TEXT,callback INTEGER,epoch TEXT,seq INTEGER,status TEXT DEFAULT 'watching',UNIQUE(owner,profile,request));
     CREATE TABLE IF NOT EXISTS remote_admissions(admission_id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,home TEXT NOT NULL,session TEXT NOT NULL,request TEXT NOT NULL,principal TEXT NOT NULL,epoch INTEGER NOT NULL,generation INTEGER NOT NULL DEFAULT 0,wire_digest TEXT NOT NULL,payload_digest TEXT NOT NULL,confirmed REAL NOT NULL,expires REAL NOT NULL);
+    CREATE TABLE IF NOT EXISTS native_conversations(home TEXT NOT NULL,profile TEXT NOT NULL,session TEXT NOT NULL,owner TEXT NOT NULL,provider TEXT NOT NULL,principal TEXT NOT NULL,execution TEXT NOT NULL,kind TEXT NOT NULL,request TEXT NOT NULL,runtime TEXT NOT NULL,PRIMARY KEY(home,profile,session));
     CREATE TABLE IF NOT EXISTS targets(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,token TEXT,expires REAL,payload TEXT);
     CREATE TABLE IF NOT EXISTS beacon_devices(id TEXT PRIMARY KEY,owner TEXT NOT NULL,provider TEXT NOT NULL,profile TEXT NOT NULL,name TEXT NOT NULL,created REAL NOT NULL,last_seen REAL NOT NULL,removed INTEGER NOT NULL DEFAULT 0);
     CREATE TABLE IF NOT EXISTS deferred(id TEXT PRIMARY KEY,owner TEXT,profile TEXT,conversation TEXT,created REAL);
@@ -255,6 +256,10 @@ def _initialize_schema(conn):
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
     if 'callback_context' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN callback_context TEXT NOT NULL DEFAULT '{}'")
     if 'principal' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN principal TEXT NOT NULL DEFAULT ''")
+    for name in ('native_home','native_execution'):
+        if name not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN '+name+" TEXT NOT NULL DEFAULT ''")
+    if 'execution' not in {r[1] for r in conn.execute('PRAGMA table_info(remote_admissions)')}:
+        conn.execute("ALTER TABLE remote_admissions ADD COLUMN execution TEXT NOT NULL DEFAULT ''")
     if 'ended' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN ended REAL')
     if 'seen' not in call_columns: conn.execute('ALTER TABLE calls ADD COLUMN seen REAL')
     # Only unfinished calls are ever counted or swept, so the index holds just those rows.
@@ -751,20 +756,95 @@ def owned(conn, call_id, owner, profile=None, writable=False):
         raise ValueError('Call is closed')
     return dict(row)
 
-def reserve(owner, profile, conversation, voice=None, principal=''):
+def reserve(owner, profile, conversation, voice=None, principal='',native_home='',execution=''):
     if not isinstance(principal,str) or len(principal)>4096 or '\x00' in principal:
         raise ValueError('Invalid call principal')
+    if ((native_home or execution) and (not principal or not re.fullmatch(r'[0-9a-f]{64}',native_home) or
+            not isinstance(execution,str) or not 1<=len(execution)<=4096 or '\x00' in execution)):
+        raise ValueError('Invalid call execution binding')
     call_id = uuid.uuid4().hex
     with LOCK, connect() as conn:
         active=active_calls(conn,owner)
         if active>=MAX_ACTIVE_CALLS: raise ValueError('Active call limit reached')
         config={**(voice or {}),'client_key':True}
-        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config,principal) VALUES(?,?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config),principal))
+        conn.execute('INSERT INTO calls(id,owner,profile,conversation,created,voice_config,principal,native_home,native_execution) VALUES(?,?,?,?,?,?,?,?,?)', (call_id,owner,profile,ident(conversation),time.time(),json.dumps(config),principal,native_home,execution))
     return {'call_id':call_id,'conversation_id':conversation,'profile':profile,'transport':'gemini_live_direct','recording_status':'disabled','transcript_status':'pending',**(voice or {})}
+
+
+def bind_native_conversation(value):
+    names=('home','profile','session','owner','provider','principal','execution','kind','request','runtime')
+    if (set(value)!=set(names) or value['kind'] not in ('legacy','canonical','pending') or
+            any(not isinstance(value[k],str) or len(value[k])>4096 or '\x00' in value[k] or
+                not value[k] and k!='runtime' for k in names) or not re.fullmatch(r'[0-9a-f]{64}',value['home'])):
+        raise ValueError('Invalid native conversation binding')
+    with LOCK,connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        old=conn.execute('SELECT * FROM native_conversations WHERE home=? AND profile=? AND session=?',
+                         tuple(value[k] for k in names[:3])).fetchone()
+        if old:
+            if old['kind']=='pending':
+                if any(old[k]!=value[k] for k in names if k!='kind') or value['kind'] not in ('pending','canonical'): return False
+                if value['kind']=='canonical':
+                    conn.execute("UPDATE native_conversations SET kind='canonical' WHERE home=? AND profile=? AND session=?",
+                                 tuple(value[k] for k in names[:3]))
+                return True
+            if value['kind']=='pending': return False
+            return all(old[k]==value[k] for k in names if k not in ('kind','request','runtime'))
+        conn.execute('INSERT INTO native_conversations('+','.join(names)+') VALUES('+','.join('?' for _ in names)+')',
+                     tuple(value[k] for k in names))
+    return True
+
+
+def native_conversation(owner,provider,profile,home_key,session,principal,include_pending=False):
+    database=home()/'plugin-data'/'beacon'/'mobile.sqlite'
+    if not database.is_file(): return None
+    # Ownership reads must neither initialize storage nor migrate an older plugin database.
+    with sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True,factory=_Connection) as conn:
+        conn.row_factory=sqlite3.Row
+        tables={r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        row=None
+        if 'native_conversations' in tables:
+            row=conn.execute("SELECT * FROM native_conversations WHERE home=? AND profile=? AND session=? AND owner=? AND provider=? AND (? IS NULL OR principal=?) AND (kind!='pending' OR ?)",
+                             (home_key,profile,session,owner,provider,principal,principal,int(include_pending))).fetchone()
+        if row is not None: return dict(row)
+        if principal is None: return None
+        if 'remote_admissions' in tables:
+            row=conn.execute('SELECT * FROM remote_admissions WHERE home=? AND profile=? AND session=? AND owner=? AND provider=? AND principal=? ORDER BY confirmed DESC LIMIT 1',
+                             (home_key,profile,session,owner,provider,principal)).fetchone()
+            if row is not None:
+                return {**dict(row),'execution':(row['execution'] if 'execution' in row.keys() else '') or row['principal'],
+                        'kind':'admission','runtime':''}
+        if 'calls' in tables and {'native_home','native_execution'}<={r[1] for r in conn.execute('PRAGMA table_info(calls)')}:
+            row=conn.execute("SELECT * FROM calls WHERE native_home=? AND profile=? AND conversation=? AND owner=? AND principal=? AND native_execution!='' LIMIT 1",
+                             (home_key,profile,session,owner,principal)).fetchone()
+            if row is not None:
+                return {'home':home_key,'profile':profile,'session':session,'owner':owner,'provider':provider,'principal':principal,
+                        'execution':row['native_execution'],'kind':'call','runtime':'','request':row['id']}
+    return dict(row) if row else None
+
+
+def prior_call(owner,profile,session,principal):
+    """Old calls are login evidence only; their absent native home is never filled by a read."""
+    database=home()/'plugin-data'/'beacon'/'mobile.sqlite'
+    if not database.is_file() or any(p.is_symlink() or getattr(p,'is_junction',lambda:False)()
+                                     for p in (database,*database.parents)): return None
+    with sqlite3.connect(database.resolve().as_uri()+'?mode=ro',uri=True,factory=_Connection) as conn:
+        conn.row_factory=sqlite3.Row
+        columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
+        if not {'id','owner','profile','conversation','principal','created'}<=columns: return None
+        scope=(owner,profile,session,principal)
+        metadata=[name for name in ('native_home','native_execution') if name in columns]
+        if metadata and conn.execute('SELECT 1 FROM calls WHERE owner=? AND profile=? AND conversation=? AND principal=? AND ('+
+                ' OR '.join("COALESCE("+name+",'')!=''" for name in metadata)+') LIMIT 1',scope).fetchone(): return None
+        row=conn.execute('SELECT id,owner,profile,conversation,principal,created FROM calls WHERE owner=? AND profile=? AND conversation=? AND principal=? ORDER BY created DESC LIMIT 1',scope).fetchone()
+        return dict(row) if row else None
 
 
 def confirm_remote_admission(value):
     names=('admission_id','owner','provider','profile','home','session','request','principal','epoch','wire_digest','payload_digest')
+    if set(value) not in (set(names),set(names)|{'execution'}): raise ValueError('Invalid admission binding')
+    value={**value,'execution':value.get('execution') or value['principal']}
+    names+=('execution',)
     if set(value)!=set(names) or type(value['epoch']) is not int or value['epoch']<=0:
         raise ValueError('Invalid admission binding')
     if any(not isinstance(value[name],str) or not value[name] or len(value[name])>4096 for name in names if name!='epoch'):
@@ -780,9 +860,9 @@ def confirm_remote_admission(value):
                 conn.execute('DELETE FROM remote_admissions WHERE admission_id=?',(row['admission_id'],))
         old=conn.execute('SELECT * FROM remote_admissions WHERE admission_id=?',(value['admission_id'],)).fetchone()
         if old:
-            if any(old[name]!=value[name] for name in names if name!='wire_digest'): return False
-            conn.execute('UPDATE remote_admissions SET wire_digest=?,confirmed=?,expires=? WHERE admission_id=?',
-                         (value['wire_digest'],now,now+4*3600,value['admission_id']))
+            if any((old[name] or old['principal'] if name=='execution' else old[name])!=value[name] for name in names if name!='wire_digest'): return False
+            conn.execute('UPDATE remote_admissions SET wire_digest=?,execution=?,confirmed=?,expires=? WHERE admission_id=?',
+                         (value['wire_digest'],value['execution'],now,now+4*3600,value['admission_id']))
             return True  # Only a newly matched original-submit response can refresh this exact input.
         if conn.execute('SELECT COUNT(*) FROM remote_admissions').fetchone()[0]>=512: return False
         conn.execute('INSERT INTO remote_admissions('+','.join(names)+',confirmed,expires) VALUES('+','.join('?' for _ in names)+',?,?)',

@@ -71,7 +71,7 @@ internal fun deriveCallEndTitle(currentTitle: String, transcripts: List<CallTran
 internal fun List<CallTranscript>.acceptTranscript(event: CallTranscript): List<CallTranscript> {
     val previous = firstOrNull { it.eventId == event.eventId }
     if ((previous?.final == true || previous?.interrupted == true) && !event.final) return this
-    val next = event
+    val next = event.copy(at = previous?.at?.takeIf { it > 0 } ?: event.at)
     // Room speech progress and canonical conversation items have different IDs.
     // A final item supersedes transient progress of that role; partials never persist.
     val retained = if (next.final) filterNot { it.role == next.role && !it.final && it.eventId != next.eventId } else this

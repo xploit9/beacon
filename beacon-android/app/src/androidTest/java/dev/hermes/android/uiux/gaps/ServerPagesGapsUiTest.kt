@@ -143,7 +143,7 @@ class ServerPagesGapsUiTest {
 
     @Test fun anUpdateTheServerCanApplyShowsNoCommandAndOffersTheUpdate() {
         val calls = Calls()
-        show({ "Server updates" }, { NativeServerState(update = json("update_available" to true, "can_apply" to true, "current_version" to "1.0.0", "update_command" to "hermes update --yes")) }, calls)
+        show({ "Server updates" }, { NativeServerState(updateStatusFresh = true, update = json("update_available" to true, "can_apply" to true, "current_version" to "1.0.0", "update_command" to "hermes update --yes")) }, calls)
         compose.onNodeWithTag("server-update-command").assertDoesNotExist()
         compose.onNodeWithTag("server-update-apply").assertIsEnabled().performClick()
         compose.runOnIdle { assertEquals(1, calls.apply) }
@@ -152,7 +152,7 @@ class ServerPagesGapsUiTest {
     @Test fun anUnconfirmedUpdateOffersTheReviewAndNothingElseToApply() {
         val calls = Calls()
         val state = NativeServerState(
-            requestedAt = "2026-11-01T00:00:00Z", action = json("running" to false),
+            requestedAt = "2026-11-01T00:00:00Z", action = json("running" to false), updateStatusFresh = true,
             update = json("update_available" to true, "can_apply" to true, "current_version" to "1.0.0"),
         )
         assertTrue("The scenario is an unconfirmed update that may be reviewed", state.canReviewUnknown)
@@ -171,6 +171,32 @@ class ServerPagesGapsUiTest {
         compose.onNodeWithText("Not confirmed yet").assertIsDisplayed()
         compose.onNodeWithTag("server-review").assertDoesNotExist()
         compose.onNodeWithTag("server-check").assertIsDisplayed()
+    }
+
+    @Test fun cachedAvailabilityCannotAuthorizeAnotherUpdate() {
+        val calls = Calls()
+        show({ "Server updates" }, { NativeServerState(update = json("update_available" to true, "can_apply" to true)) }, calls)
+        compose.onNodeWithTag("server-update-apply").assertIsNotEnabled()
+        compose.runOnIdle { assertEquals(0, calls.apply) }
+    }
+
+    @Test fun theCurrentReceiptEndsTheRunningPageAndKeepsItsRestartNotice() {
+        val calls = Calls()
+        var state by mutableStateOf(NativeServerState(requestedAt = "2026-11-01T00:00:00Z", requestedActionId = "update-fixture",
+            updateStatusFresh = true, hostBusy = true, action = json("running" to true, "action_id" to "update-fixture")))
+        show({ "Server updates" }, { state }, calls)
+        compose.onNodeWithText("Server update is running").assertIsDisplayed()
+        compose.runOnIdle {
+            state = state.copy(receipt = json("receipt" to json("action_id" to "update-fixture", "started_at" to "2026-11-01T00:00:01Z",
+                "finished_at" to "2026-11-01T00:10:00Z", "outcome" to "success", "pending_manual_serves" to org.json.JSONArray()
+                    .put(json("command" to "hermes dashboard --port 9139", "reason" to "manual_restart_required")))))
+        }
+        compose.onNodeWithText("Server update is running").assertDoesNotExist()
+        compose.onNodeWithText("Server update completed").assertIsDisplayed()
+        compose.onNodeWithTag("server-update-warnings").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Update details").performClick()
+        compose.onNodeWithText("hermes dashboard --port 9139", substring = true).assertExists()
+        compose.runOnIdle { assertEquals("Displaying the receipt never repeats the update", 0, calls.apply) }
     }
 
     @Test fun checkpointsShowTheirSizeTheListAnEmptyAnswerAndPlaceholders() {

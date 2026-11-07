@@ -206,10 +206,15 @@ async def remove_device(device_id:str,request:Request):
     return {'removed':True,'device_id':device_id}
 
 async def body(request,limit=65536):
+    from starlette.requests import ClientDisconnect
     raw=bytearray()
-    async for part in request.stream():
-        raw.extend(part)
-        if len(raw)>limit: raise HTTPException(413,'Request too large')
+    try:
+        async for part in request.stream():
+            raw.extend(part)
+            if len(raw)>limit: raise HTTPException(413,'Request too large')
+    except ClientDisconnect:
+        # A cancelled upload must never dispatch its partial body or count as a server fault.
+        raise HTTPException(400,'Request disconnected before body was received') from None
     try: value=json.loads(raw or b'{}')
     except Exception: raise HTTPException(400,'Invalid JSON') from None
     if not isinstance(value,dict): raise HTTPException(400,'Expected object')
@@ -256,11 +261,13 @@ healing = sys.modules['beacon_healing_runtime'].Runtime(mobile,voice_context.sco
 router.include_router(sys.modules['beacon_healing_api'].build_router(identity_async,body,healing.healer))
 def safely(fn,*args):
     try: return fn(*args)
-    except KeyError: raise HTTPException(503,'Configured resource unavailable') from None
+    except (KeyError,OSError,TypeError,RuntimeError) as error:
+        import traceback
+        frames=' > '.join(f'{Path(frame.filename).name}:{frame.lineno}:{frame.name}' for frame in traceback.extract_tb(error.__traceback__,limit=8))
+        logging.getLogger(__name__).warning('Beacon native %s unavailable (%s); frames=%s',getattr(fn,'__name__','operation'),type(error).__name__,frames)
+        raise HTTPException(503,'Native service unavailable' if isinstance(error,RuntimeError) else 'Configured resource unavailable') from None
     except LookupError: raise HTTPException(404,'Owned resource unavailable') from None
     except ValueError as exc: raise HTTPException(409,str(exc)) from None
-    except (OSError,TypeError): raise HTTPException(503,'Configured resource unavailable') from None
-    except RuntimeError: raise HTTPException(503,'Native service unavailable') from None
 _NOT_OWNED_CONVERSATION='This chat is not linked to your Hermes sign-in, so Beacon cannot start a call from it. Start a new chat in Beacon.'
 def reject_unowned_conversation(owner,provider,profile,stored,principal=None):
     try:
@@ -268,7 +275,7 @@ def reject_unowned_conversation(owner,provider,profile,stored,principal=None):
         with server._profile_db({'profile':profile}) as db: row=db.get_session(stored) if db else None
     except Exception:
         return
-    if row is not None and row.get('user_id')!=provider+':'+owner and (not principal or row.get('user_id')!=principal):
+    if row is not None and not native.owns_row(owner,provider,profile,stored,row,principal,db):
         raise HTTPException(404,_NOT_OWNED_CONVERSATION) from None
 async def call(request,call_id,writable=False):
     def authorize():
@@ -411,12 +418,17 @@ def flush_held_posts(owner,provider,profile):
 async def calls(request:Request):
     value=await body(request);owner,provider,profile,cfg=await identity_async(request,value.get('profile'))
     principal=voice_principal(request,owner,provider)
+    native_home=await asyncio.to_thread(safely,native.profile_fingerprint,profile) if principal else None
     _client_key_mode(value)
     requested=value['voice_provider']
     if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
     selection=await asyncio.to_thread(voice_models.provider_selection,mobile,owner,profile,cfg,requested)
     conversation=value.get('conversation_id')
     if conversation:
+        if principal:
+            # A create whose socket confirmation was lost is retired here, only on the owner's
+            # explicit call start and only from its exact native receipt.
+            await asyncio.to_thread(safely,native.reconcile_created,mobile,owner,provider,profile,conversation,principal)
         await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,conversation,principal)
         args=(owner,provider,profile,conversation)+( (principal,) if principal else () )
         await asyncio.to_thread(safely,native.reserve_conversation,*args)
@@ -426,8 +438,12 @@ async def calls(request:Request):
                 if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
                     raise HTTPException(409,'Active call limit reached')
         await asyncio.to_thread(check_capacity)
-        conversation=await asyncio.to_thread(safely,native.create,owner,provider,profile)
-    result=await asyncio.to_thread(safely,mobile.reserve,owner,profile,conversation,selection,principal or '')
+        args=(owner,provider,profile)+((principal,) if principal else ())
+        conversation=await asyncio.to_thread(safely,native.create,*args)
+    if principal and await asyncio.to_thread(safely,native.profile_fingerprint,profile)!=native_home:
+        raise HTTPException(409,'Native profile changed before call reservation')
+    binding=(native_home,native.execution_subject(owner,provider,principal)) if principal else ()
+    result=await asyncio.to_thread(safely,mobile.reserve,owner,profile,conversation,selection,principal or '',*binding)
     greeting=await grant_greeting(request,profile,value.get('owner_name'))
     if greeting: result['greeting']=greeting
     return result
@@ -1072,7 +1088,7 @@ async def notice_detail(event_id:str,request:Request):
         with mobile.connect() as conn:
             found=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(event_id,owner,profile)).fetchone()
         if not found or not _visible_notice(dict(found),owner,provider,profile,principal): raise HTTPException(404,'Owned notification unavailable')
-        return found,notice_wire(dict(found),owner)
+        return dict(found),notice_wire(dict(found),owner)
     row,result=await asyncio.to_thread(load)
     # The Beacon chat's own replies are titled with the assistant's name on the phone, not with the chat's title.
     result['assistant_chat']=bool(row['conversation']) and row['conversation']==cfg.get('scheduled_callback_conversation_id')
@@ -1080,7 +1096,8 @@ async def notice_detail(event_id:str,request:Request):
         # The notification shows what the reply says; Android's lock-screen setting still hides it when locked. The chat is read
         # under the profile the notice was stored for (the query above already requires it to be the selected one).
         try:
-            snapshot=await feature(native.conversation_snapshot,owner,provider,row['profile'],row['conversation'],timeout=6)
+            args=(owner,provider,row['profile'],row['conversation'])+((row['principal'],) if row.get('principal') else ())
+            snapshot=await feature(native.conversation_snapshot,*args,timeout=6)
             reply=reply_preview(snapshot.get('messages') or [])
             if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
         except Exception as exc:  # the generic text stays
@@ -1102,7 +1119,8 @@ async def notice_detail(event_id:str,request:Request):
         elif phone_job.startswith('phone-cron-') and row['conversation']!=cfg.get('scheduled_callback_conversation_id'):
             # A post into a thread reads like a channel message: the thread's name over the post.
             try:
-                title=next((t['title'] for t in await feature(native.threads,owner,provider,profile,timeout=6) if t['id']==row['conversation']),'')
+                args=(owner,provider,profile)+((row['principal'],) if row.get('principal') else ())
+                title=next((t['title'] for t in await feature(native.threads,*args,timeout=6) if t['id']==row['conversation']),'')
                 if title: result['preview']={'title':str(title)[:120],'body':result['preview']['body']}
             except Exception: pass  # the generic title stays
     if row['request_id'] and result['state']=='pending':
@@ -1117,7 +1135,9 @@ async def notice_detail(event_id:str,request:Request):
 @router.post('/mobile/notifications/events/{event_id}/answer')
 async def activity_answer(event_id:str,request:Request):
     value=await body(request,4096);owner,provider,profile,_=await identity_async(request)
-    return await asyncio.to_thread(safely,activity.answer,mobile,native,owner,provider,profile,event_id,value.get('answer'))
+    principal=voice_principal(request,owner,provider)
+    args=(mobile,native,owner,provider,profile,event_id,value.get('answer'))+((principal,) if principal else ())
+    return await asyncio.to_thread(safely,activity.answer,*args)
 
 @router.post('/mobile/callbacks/{invitation_id}/{action}')
 async def answer(invitation_id:str,action:str,request:Request):
@@ -1521,7 +1541,9 @@ async def reserve_chat(stored_id:str,request:Request):
 async def list_mobile_sessions(request:Request):
     owner,provider,profile,cfg=await identity_async(request)
     hidden=request.query_params.get('include_archived')=='1'
-    result=await feature(native.conversation_list,owner,provider,profile,hidden,timeout=8)
+    principal=voice_principal(request,owner,provider)
+    args=(owner,provider,profile,hidden)+((principal,) if principal else ())
+    result=await feature(native.conversation_list,*args,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
 @router.post('/sessions/pin')
 async def pin_session(request:Request):
@@ -1530,6 +1552,7 @@ async def pin_session(request:Request):
     if set(value)!={'session_id','pinned','profile'} or type(value.get('pinned')) is not bool:
         raise HTTPException(400,'Choose a conversation and pin state')
     session_id=value.get('session_id')
+    principal=voice_principal(request,owner,provider)
     if not isinstance(session_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session_id):
         raise HTTPException(400,'Choose an existing conversation')
     def update():
@@ -1539,7 +1562,7 @@ async def pin_session(request:Request):
             if db is None: raise HTTPException(503,'Conversation is unavailable. Try again.')
             key=db.resolve_session_id(session_id)
             row=db.get_session(key) if key else None
-            if not row or row.get('user_id')!=provider+':'+owner:
+            if not native.owns_row(owner,provider,profile,key,row,principal):
                 raise HTTPException(404,'Conversation not found.')
             if not db.set_session_pinned(key,value['pinned']):
                 raise HTTPException(404,'Conversation not found.')
@@ -1552,7 +1575,9 @@ async def pin_session(request:Request):
 async def read_mobile_session(stored_id:str,request:Request):
     owner,provider,profile,cfg=await identity_async(request)
     if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',stored_id): raise HTTPException(400,'Choose an existing conversation')
-    result=await feature(native.conversation_snapshot,owner,provider,profile,stored_id,timeout=8)
+    principal=voice_principal(request,owner,provider)
+    args=(owner,provider,profile,stored_id)+((principal,) if principal else ())
+    result=await feature(native.conversation_snapshot,*args,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
 @router.get('/mobile/sessions/{stored_id}/voice-history')
 async def get_voice_history(stored_id:str,request:Request):
@@ -1566,7 +1591,9 @@ async def get_voice_history(stored_id:str,request:Request):
 async def list_threads(request:Request):
     # The chats a scheduled job can post into (`deliver: phone:<id>`); small and stable so the app can show a saved copy first.
     owner,provider,profile,cfg=await identity_async(request)
-    threads=await feature(native.threads,owner,provider,profile,timeout=8)
+    principal=voice_principal(request,owner,provider)
+    args=(owner,provider,profile)+((principal,) if principal else ())
+    threads=await feature(native.threads,*args,timeout=8)
     return JSONResponse({'threads':threads},headers={'Cache-Control':'no-store'})
 async def _proactive_source_labels(profile):
     # Settings can wait for a cold discovery longer than a call's opening can (6 s of the 8 s budget).

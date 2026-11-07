@@ -30,7 +30,7 @@ class CommandCoverageTest {
 
     /** The built-ins of Hermes' registry that its command catalog (`commands.catalog`) lists for a client, with the terminal-only /redraw left out as the phone does (1 Nov 2026). */
     private val offered = listOf(
-        "new", "clear", "history", "save", "retry", "prompt", "undo", "title", "handoff", "branch", "worktree", "compress", "rollback", "snapshot", "export", "import",
+        "new", "clear", "history", "save", "retry", "prompt", "undo", "rewind", "title", "handoff", "branch", "worktree", "compress", "rollback", "snapshot", "export", "import",
         "stop", "bg", "btw", "agents", "journey", "queue", "steer", "goal", "heartbeat", "refine", "review", "loop", "plan", "moa", "subgoal", "status", "egress", "context",
         "whoami", "profile", "resume", "sessions", "config", "model", "codex-runtime", "personality", "statusbar", "battery", "timestamps", "diff", "verbose", "focus", "footer",
         "yolo", "approvals", "reasoning", "fast", "skin", "indicator", "voice", "wake", "busy", "autoprune", "tools", "toolsets", "skills", "memory", "bundles", "pet", "hatch",

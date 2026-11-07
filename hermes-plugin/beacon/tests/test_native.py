@@ -271,7 +271,8 @@ def test_canonical_native_admission_cannot_distinguish_remote_from_named_local_s
              'capabilities':['session:read','session:create','session:submit'],'native_bootstrap':True}
     normal=AuthorityConnection(authority,object(),remote,operator=True)
     local=AuthorityConnection(authority,object(),private,operator=True)
-    assert normal.actor.subject==local.actor.subject==subject
+    native=sys.modules['beacon_native']
+    assert normal.actor.subject==local.actor.subject==native.execution_subject('owner','basic',subject)
     assert normal.native_owner is False and local.native_owner is True
     params=inspect.signature(admit_session_input).parameters
     assert 'principal_id' in params and 'transport_id' not in params and 'native_bootstrap' not in params

@@ -101,7 +101,8 @@ class VoiceLookupLiveTest {
             val previousSession=vm.chat.value.sessionId
             phases.put("phase","opening_native_chat")
             val qaTitle = "Native voice verification " + java.util.UUID.randomUUID().toString().take(8)
-            withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to qaTitle)) }.join()
+            val chatBody = liveTestChatBody(client, qaTitle)
+            withContext(Dispatchers.Main.immediate) { vm.newChat(chatBody) }.join()
             await { vm.chat.value.sessionId.isNotBlank()&&vm.chat.value.sessionId!=previousSession&&
                 vm.chat.value.projectionReady&&!vm.ui.value.newChatOpening&&
                 vm.authenticatedScope()?.session==vm.chat.value.sessionId }
@@ -351,6 +352,17 @@ class VoiceLookupLiveTest {
             if(call.isNotBlank()) runCatching { client?.nativeRequest("/api/plugins/beacon/mobile/calls/$call","DELETE") }
             if(session.isNotBlank()) runCatching { client?.nativeRpc("session.set_hidden",json("session_id" to session,"hidden" to true)) }
             phases.put("warning_present",app.calls.state.value.error.isNotBlank())
+            // Safe failure metadata only: state labels and stage names, never arguments, tokens or audio.
+            val failed=app.calls.state.value
+            phases.put("call_active",failed.active).put("call_state",failed.state.takeIf { it in setOf("connecting","listening","speaking","thinking","reconnecting","ending","idle") }?:"other")
+            phases.put("call_failure_reason",failed.failureReason.takeIf { it.matches(Regex("[A-Za-z0-9_ .:-]{0,120}")) }.orEmpty())
+            phases.put("call_error_length",failed.error.length)
+            val stageNames=org.json.JSONArray()
+            for(entry in app.calls.stageLog) stageNames.put(json("stage" to entry.optString("stage").take(60),
+                "elapsed_ms" to entry.optLong("elapsed_ms"),"error_code" to entry.optString("error_code").take(40),
+                "close_code" to entry.optString("close_code").take(20),"cause_class" to entry.optString("cause_class").take(80),
+                "failed_stage" to entry.optString("failed_stage").take(60)))
+            phases.put("call_stage_log",stageNames)
             File(app.filesDir,"voice-lookup-$provider-last-phase.json").writeText(phases.toString(),Charsets.UTF_8)
             client?.closeNative();check(removed) { "Synthetic PCM fixture cleanup failed" }
         } }

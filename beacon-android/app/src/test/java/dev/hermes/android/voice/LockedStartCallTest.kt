@@ -243,7 +243,7 @@ class LockedStartCallTest {
     @Test fun theServiceGivesTheDispatchAndThePhoneBridgeTheTrustOfTheCallsStart() {
         val service = source("voice/BeaconCallService.kt")
         assertTrue(service.contains("val trust = CallTrust.forPhone(app)"))
-        assertTrue(service.contains("phoneOrigin, trust)"))
+        assertTrue(service.contains("phoneOrigin, trust, earlyContext, earlyContextAt)"))
         assertTrue(service.contains("trust=spec.trust"))
         assertTrue(service.contains("PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust)"))
         // A locked start never takes the warm session or the context read before the tap: both carry the owner's memory.

@@ -1,6 +1,8 @@
 import importlib.util
 from pathlib import Path
 import sys
+import asyncio
+from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 from test_mobile import harness
@@ -306,7 +308,7 @@ def test_update_helper_server_clock_scope_and_old_receipts(harness, monkeypatch)
     async def start():
         calls.append('start')
         return {'ok': True, 'name': 'hermes-update', 'action_id': 'new-action', 'pid': 123}
-    async def status():
+    async def status(action_id=''):
         return {'action': {'running': False, 'action_id': 'new-action'},
                 'receipt': {'receipt': {'started_at': '2020-01-01T00:00:00Z', 'finished_at': '2020-01-01T00:01:00Z', 'outcome': 'success'}}}
     monkeypatch.setattr(api, 'native_update', start)
@@ -335,10 +337,103 @@ def test_update_helper_server_clock_scope_and_old_receipts(harness, monkeypatch)
 
 
 def test_current_receipt_requires_matching_time_and_action():
-    state = {'action': {'action_id': 'current'}, 'receipt': {'receipt': {'started_at': '2026-10-14T10:00:01Z'}}}
+    state = {'action': {'action_id': 'current'}, 'receipt': {'receipt': {'action_id': 'current', 'started_at': '2026-10-14T10:00:01Z'}}}
     assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
     assert not api.current_receipt(state, '2026-10-14T10:00:00Z', 'different')
     assert not api.current_receipt(state, '', 'current')
+
+
+@pytest.mark.parametrize('reported,expected', [('current', True), ('other', False), ('', False), (None, False)])
+def test_update_receipt_uses_its_own_identity_after_dashboard_restart(reported, expected):
+    state = {'action': {'running': False}, 'receipt': {'receipt': {
+        'action_id': reported, 'started_at': '2026-10-14T10:00:01Z', 'outcome': 'success'}}}
+    assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current') is expected
+    assert not api.current_receipt(state, '2026-10-14T10:00:00Z', '')
+
+
+def test_update_receipt_can_use_correlated_summary_instead_of_foreign_latest():
+    own = {'action_id': 'current', 'started_at': '2026-10-14T10:00:01Z'}
+    state = {'action': {'receipt': own}, 'receipt': {'receipt': {**own, 'action_id': 'other'}}}
+    assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
+    state['action'] = None
+    assert not api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
+    state['receipt']['receipt'] = own
+    assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
+
+
+@pytest.mark.parametrize('started', ['bad', '', '2026-10-13T10:00:00Z', '2026-10-14T10:00:01'])
+def test_update_receipt_invalid_full_timestamp_cannot_hide_a_valid_summary(started):
+    own = {'action_id': 'current', 'started_at': '2026-10-14T10:00:01Z'}
+    state = {'action': {'receipt': own}, 'receipt': {'receipt': {**own, 'started_at': started}}}
+    assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
+    state['action'] = None
+    assert not api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
+
+
+def test_native_update_status_keeps_matching_legacy_receipt_and_handles_missing_receipt(monkeypatch):
+    async def action(name, lines): return {'running': False}
+    async def latest(): return {'receipt': {'action_id': 'current', 'outcome': 'partial'}}
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_routers.actions', SimpleNamespace(get_action_status=action, get_update_receipt=latest))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.update_receipt', SimpleNamespace())
+    monkeypatch.setattr(api, 'update_in_progress', lambda: False)
+    assert asyncio.run(api.native_update_status('current'))['receipt']['receipt']['outcome'] == 'partial'
+    async def missing(): raise HTTPException(404)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_routers.actions', SimpleNamespace(get_action_status=action, get_update_receipt=missing))
+    assert asyncio.run(api.native_update_status('current'))['receipt'] is None
+    async def broken(): raise HTTPException(503)
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_routers.actions', SimpleNamespace(get_action_status=action, get_update_receipt=broken))
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(api.native_update_status('current'))
+    assert error.value.status_code == 503
+
+
+def test_native_update_status_reads_action_archive_and_preserves_restart_obligations(monkeypatch):
+    calls = []
+    own = {'action_id': 'current', 'started_at': '2026-10-14T10:00:01Z', 'outcome': 'success',
+           'followups': [{'step': 'gateway', 'reason': 'restart owed'}],
+           'gateway_restart': {'incomplete': True}, 'pending_manual_serves': [{'kind': 'dashboard'}]}
+    async def action(name, lines):
+        return {'running': False, 'pid': None, 'receipt': {**own, 'action_id': 'other'}}
+    async def latest():
+        pytest.fail('A global latest receipt must not replace an available per-action archive')
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_routers.actions', SimpleNamespace(get_action_status=action, get_update_receipt=latest))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.update_receipt', SimpleNamespace(
+        read_receipt_for_action=lambda key: calls.append(key) or own))
+    monkeypatch.setattr(api, 'update_in_progress', lambda: True)
+    state = asyncio.run(api.native_update_status('current'))
+    assert calls == ['current']
+    assert state['receipt']['receipt'] == own
+    assert state['host_busy'] is True  # A restarted dashboard's empty Popen registry is insufficient.
+    assert api.current_receipt(state, '2026-10-14T10:00:00Z', 'current')
+
+
+@pytest.mark.parametrize('reported', ['other', None])
+def test_native_update_status_legacy_latest_never_certifies_another_action(monkeypatch, reported):
+    async def action(name, lines): return {'running': False}
+    async def latest(): return {'receipt': {'action_id': reported, 'outcome': 'success'}}
+    monkeypatch.setitem(sys.modules, 'hermes_cli.web_routers.actions', SimpleNamespace(get_action_status=action, get_update_receipt=latest))
+    monkeypatch.setitem(sys.modules, 'hermes_cli.update_receipt', SimpleNamespace())
+    monkeypatch.setattr(api, 'update_in_progress', lambda: False)
+    state = asyncio.run(api.native_update_status('current'))
+    assert state['receipt'] is None and state['host_busy'] is False
+
+
+def test_update_status_route_passes_saved_action_id_without_starting_an_update(monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    calls = []
+    async def status(action_id=''):
+        calls.append(action_id)
+        return {'action': {'running': False}, 'receipt': {'receipt': {
+            'action_id': action_id, 'started_at': '2026-10-14T10:00:01Z', 'outcome': 'interrupted'}}, 'host_busy': False}
+    async def start(): pytest.fail('Read-only status must never POST another update')
+    monkeypatch.setattr(api, 'native_update_status', status)
+    monkeypatch.setattr(api, 'native_update', start)
+    app = FastAPI()
+    app.include_router(api.build_router(lambda *args, **kwargs: None, lambda *args: None))
+    response = TestClient(app).get('/admin/update/status', params={'action_id': 'current', 'requested_at': '2026-10-14T10:00:00Z'})
+    assert response.status_code == 200 and response.json()['receipt_current'] is True
+    assert calls == ['current']
 
 
 

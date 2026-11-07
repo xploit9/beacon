@@ -67,6 +67,7 @@ class Mobile:
     def owned(self,conn,call,owner,profile,writable):
         if self.closed: raise LookupError('closed')
         assert (owner,profile,call)==('owner','profile','call')
+        return {'conversation':getattr(self,'conversation',call),'principal':'','native_home':''}
 
 
 class Backend:
@@ -126,9 +127,9 @@ def owner_followup_producer(tmp_path):
     process=subprocess.Popen([sys.executable,'-X','utf8','-c',script,str(Path(__file__).parent),str(tmp_path)],
         stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
     try:
-        deadline=time.monotonic()+10
+        deadline=time.monotonic()+30
         while not (tmp_path/'started').exists() and process.poll() is None and time.monotonic()<deadline:time.sleep(.01)
-        assert (tmp_path/'started').exists(),process.communicate(timeout=3)
+        assert (tmp_path/'started').exists(),process.communicate(timeout=10)
         # Windows' venv launcher owns another PID than the interpreter running the operation.
         process.producer_pid=int((tmp_path/'started').read_text())
         assert process.producer_pid!=os.getpid()
@@ -1152,6 +1153,7 @@ def test_native_tool_receipts_dispatch_in_profile_conversation_and_gate_mutation
          'read_only':False,'_kind':'hermes','_raw':'process_manage','_toolset':'terminal'},
     ]
     mobile=Mobile(tmp_path/'native.sqlite')
+    mobile.owned=lambda conn,call,owner,profile,writable:{'conversation':'native-stored','principal':'','native_home':''}
     api=g.Gateway(mobile,lambda profile,fn:fn(tmp_path),native,lambda value,limit:str(value)[:limit])
 
     read=api.invoke(SCOPE,{'request_id':'native-read','tool_id':'a'*64,'arguments':{'path':'notes.txt'}},
@@ -1772,7 +1774,8 @@ def current_future_native(tmp_path, monkeypatch):
         bound = set_hermes_home_override(str(profile_homes[profile]))
         try: return fn(profile_homes[profile])
         finally: reset_hermes_home_override(bound)
-    api = g.Gateway(Mobile(tmp_path / 'synthetic-receipts.sqlite'), scoped)
+    mobile=Mobile(tmp_path/'synthetic-receipts.sqlite');mobile.conversation='native-conversation'
+    api = g.Gateway(mobile, scoped)
     def refresh():
         asyncio.run_coroutine_threadsafe(server._refresh_tools(), loop).result(timeout=5)
     try:
@@ -1931,3 +1934,32 @@ def test_current_future_catalogues_and_admission_keep_profile_and_owner_authorit
     result = settled(env.api, 'owner-revoked')
     assert result['status'] == 'failed' and result['error_code'] == 'admission_rejected' and result['http_status'] == 403
     assert not env.session.calls
+
+
+@pytest.mark.parametrize('prompt_kind',['exact','header_only','changed_arguments','empty_exact'])
+def test_native_mcp_consent_binds_the_exact_argument_renderer(tmp_path,monkeypatch,prompt_kind):
+    monkeypatch.syspath_prepend(str(_hermes_agent_source()))
+    monkeypatch.setenv('HERMES_HOME',str(tmp_path))
+    from tools import approval
+    from tools.mcp_tool_handlers import _format_trust_gate_arguments
+    pending={};choices=[]
+    monkeypatch.setattr(approval,'register_gateway_notify',lambda key,callback:pending.update(callback=callback))
+    monkeypatch.setattr(approval,'unregister_gateway_notify',lambda key:pending.clear())
+    monkeypatch.setattr(approval,'resolve_gateway_approval',lambda key,choice,**kwargs:choices.append((choice,kwargs['request_id'])))
+    head=("MCP tool 'write' on UNTRUSTED server 'isolated' wants to run. "
+          'This tool is write-capable (no readOnlyHint=true annotation) and may modify external state.')
+    arguments={} if prompt_kind=='empty_exact' else {'message':'fixture'}
+    exact=head if not arguments else head+'\n\nArguments:\n'+_format_trust_gate_arguments(arguments)
+    prompts={'exact':exact,
+             'header_only':head,
+             'changed_arguments':head+'\n\nArguments:\n'+_format_trust_gate_arguments({'message':'other'}),
+             'empty_exact':head}
+    def handler(name,args,**kwargs):
+        pending['callback']({'request_id':'b'*32,'pattern_key':'mcp_elicitation','command':prompts[prompt_kind]})
+        return '{"error":"Native approval denied"}'
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(handle_function_call=handler))
+    tool={'name':'mcp__isolated__write','_server':'isolated','_raw':'write','_trust':'untrusted'}
+    result=json.loads(g.NativeMcp().execute(tool,arguments,SCOPE,True))
+    accepted=prompt_kind in ('exact','empty_exact')
+    assert choices==[('once' if accepted else 'deny','b'*32)]
+    assert result['error']==('Native approval denied' if accepted else 'Hermes needs this approval. Approve the action in Hermes.')

@@ -28,6 +28,28 @@ import org.junit.Test
 import java.util.concurrent.atomic.AtomicInteger
 
 class DirectVoiceStartupTest {
+    @Test(timeout=14000) fun earlyContextIsUsedOnlyAfterItsScopeMatchesAndFallsBackWhenStaleOrCancelled() = runBlocking {
+        suspend fun exercise(early: Deferred<JSONObject?>?, expectedReads: Int) {
+            val reads=java.util.concurrent.atomic.AtomicInteger()
+            val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+            val scope=CoroutineScope(SupervisorJob()+Dispatchers.Default)
+            val client=client("stored",contextRead={reads.incrementAndGet()})
+            val voice=DirectVoice(client,"call","stored",scope,{}, { events+=it }, {},credentials=credentials(),providerSocketFactory=providerFactory(true),earlyContext=early,earlyContextAt=123)
+            try {
+                voice.start()
+                assertTrue("A scoped context must settle the call start",withTimeoutOrNull(5000) {
+                    while(events.none { it.optString("stage")=="context_ok" }) delay(10);true
+                }==true)
+                assertEquals("Only a valid early read may replace the call's own context read",expectedReads,reads.get())
+            } finally { voice.close();scope.cancel();client.closeNative() }
+        }
+        exercise(CompletableDeferred<JSONObject?>(json("profile" to "default","selected_session_id" to "stored")),0)
+        exercise(CompletableDeferred<JSONObject?>(json("profile" to "another-account","selected_session_id" to "stored")),1)
+        exercise(CompletableDeferred<JSONObject?>(json("profile" to "default","selected_session_id" to "another-chat")),1)
+        val cancelled=CompletableDeferred<JSONObject?>();cancelled.cancel()
+        exercise(cancelled,1)
+    }
+
     @Test(timeout=8000) fun setupSenderExceptionEndsAttemptWithSafeMetadata()=runBlocking {
         val events=java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
         val uncaught=java.util.concurrent.CopyOnWriteArrayList<Throwable>()

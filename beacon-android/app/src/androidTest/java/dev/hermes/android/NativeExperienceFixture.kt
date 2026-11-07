@@ -15,7 +15,29 @@ import java.util.concurrent.atomic.AtomicInteger
 
 @Suppress("DEPRECATION")
 internal suspend fun loginLiveTest(app: BeaconApplication, origin: String, credentials: JSONObject) {
-    BeaconClient(AuthContext(origin, emptyList()), app.auth).login(credentials.getString("password"), username = credentials.getString("username"))
+    val qa = androidx.test.platform.app.InstrumentationRegistry.getArguments().getString("beaconQaProfile")
+    qa?.let {
+        require(it.matches(Regex("qa-[a-f0-9]{32}")) && Uri.parse(origin).scheme == "https" && Uri.parse(origin).port == 8446) { "Use a disposable profile on the demo endpoint" }
+    }
+    // Explicit test sign-in installs a verified identity; it is not a rotation of an existing account.
+    val client = BeaconClient(AuthContext(origin, emptyList()))
+    try {
+        client.login(credentials.getString("password"), username = credentials.getString("username"))
+        qa?.let { profile ->
+            client.post("/api/profile/switch", json("name" to profile))
+            check(client.auth.profile == profile) { "QA profile selection was not retained" }
+        }
+        app.auth.write(client.auth)
+    } finally { client.closeNative() }
+}
+
+internal suspend fun liveTestChatBody(client: BeaconClient, title: String): JSONObject = json("title" to title).apply {
+    androidx.test.platform.app.InstrumentationRegistry.getArguments().getString("beaconQaProfile")?.let { profile ->
+        require(profile.matches(Regex("qa-[a-f0-9]{32}")) && client.auth.profile == profile)
+        val home = client.nativeRpc("config.get", json("key" to "profile")).getString("home").replace('\\', '/').trimEnd('/')
+        require(home.endsWith("/hermes-demo/profiles/$profile")) { "Use the demo QA profile home" }
+        put("workspace", "$home/workspace")
+    }
 }
 
 /** Synthetic in-process native protocol fixture. No socket, service, model, mailbox or sensor. */

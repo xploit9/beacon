@@ -38,19 +38,28 @@ def request_preview(frame):
 def snapshot(native, owner, provider, profile):
     from tui_gateway import server, server_requests
     with server._sessions_lock:
-        records = [(sid, dict(r)) for sid, r in server._sessions.items()
-                   if server._session_auth_user_id(r) == provider + ':' + owner]
+        records = [(sid, dict(r)) for sid, r in server._sessions.items()]
     result = []
-    for sid, record in records[:512]:
+    for sid, record in records:
+        if len(result)>=512: break
         stored = record.get('session_key')
         if not stored: continue
-        try: native.verify(owner, provider, profile, stored, sid, False)
+        principal=None
+        if server._session_auth_user_id(record)!=provider+':'+owner:
+            import sys
+            mobile=sys.modules.get('beacon_mobile')
+            bound=mobile.native_conversation(owner,provider,profile,native.profile_fingerprint(profile),stored,None) if mobile else None
+            if not bound or bound['kind']!='legacy' or bound['runtime']!=sid: continue
+            principal=bound['principal']
+        try:
+            args=(owner,provider,profile,stored,sid,False)+((principal,) if principal else ())
+            native.verify(*args)
         except LookupError: continue
         requests = [r for r in server_requests.open_requests(sid) if r.get('method') in ('approval', 'clarify')]
         turn = (record.get('_submit_user_row') or {}).get('_row_id')
         if not record.get('running') and not requests: continue
         key = hashlib.sha256((owner + '\0' + profile + '\0' + sid + '\0' + str(turn)).encode()).hexdigest()
-        result.append({'key': key, 'stored': stored, 'runtime': sid, 'requests': requests})
+        result.append({'key': key, 'stored': stored, 'runtime': sid, 'requests': requests,'principal':principal or ''})
     return result
 
 
@@ -70,37 +79,43 @@ def sync(mobile, native, owner, provider, profile):
                 if remaining == 0: continue
                 remaining -= 1
                 kind = frame['method'] if frame else 'working'
-                conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,runtime,request_id) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                             (event, owner, profile, kind, work['stored'], now, now + (300 if frame else 14400), (work['key'] + '-' + frame['id']) if frame else work['key'], work['runtime'], frame['id'] if frame else ''))
+                conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,runtime,request_id,principal) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+                             (event, owner, profile, kind, work['stored'], now, now + (300 if frame else 14400), (work['key'] + '-' + frame['id']) if frame else work['key'], work['runtime'], frame['id'] if frame else '',work.get('principal') or ''))
         previous = conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND kind IN ('working','approval','clarify') AND activity_key!='' AND state='pending'", (owner, profile)).fetchall()
         for row in previous:
             if row['id'] not in active:
-                if row['principal']: continue
-                try: native.verify(owner,provider,profile,row['conversation'])
+                if row['principal']:
+                    proof=mobile.native_conversation(owner,provider,profile,native.profile_fingerprint(profile),row['conversation'],row['principal'])
+                    if not proof or proof['kind']!='legacy' or proof['runtime']!=row['runtime']: continue
+                try:
+                    args=(owner,provider,profile,row['conversation'])+((None,True,row['principal']) if row['principal'] else ())
+                    native.verify(*args)
                 except (LookupError,RuntimeError,ValueError,ImportError,AttributeError): continue
                 conn.execute("UPDATE notices SET state='settled' WHERE id=?", (row['id'],))
                 # A new outbox row makes cancellation observable to cursor polling as well as FCM.
-                conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key) VALUES(?,?,?,?,?,?,?,?)',
-                             ('settled-' + row['id'], owner, profile, 'activity_end', row['conversation'], now, now + 300, row['activity_key']))
+                conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,principal) VALUES(?,?,?,?,?,?,?,?,?)',
+                             ('settled-' + row['id'], owner, profile, 'activity_end', row['conversation'], now, now + 300, row['activity_key'],row['principal']))
 
 
 def pending(native, owner, provider, profile, row):
     if row['state'] != 'pending' or row['expires'] <= time.time() or not row.get('request_id'):
         raise ValueError('Native request expired or settled')
-    native.verify(owner, provider, profile, row['conversation'], row['runtime'], False)
+    args=(owner,provider,profile,row['conversation'],row['runtime'],False)+((row['principal'],) if row.get('principal') else ())
+    native.verify(*args)
     from tui_gateway import server_requests
     frame = next((r for r in server_requests.open_requests(row['runtime']) if r['id'] == row['request_id']), None)
     if not frame or frame.get('method') != row['kind']: raise ValueError('Native request no longer open')
     return frame
 
 
-def answer(mobile, native, owner, provider, profile, event, value):
+def answer(mobile, native, owner, provider, profile, event, value,principal=None):
     if not isinstance(value, str) or not 0 < len(value) <= 1024: raise ValueError('Bounded answer required')
     with mobile.call_lock('notice:'+event):
         with mobile.LOCK, mobile.connect() as conn:
             found = conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?', (event, owner, profile)).fetchone()
             if not found: raise LookupError('Owned notification unavailable')
             row = dict(found)
+            if row.get('principal') and row['principal']!=principal: raise LookupError('Native request principal changed')
         frame = pending(native, owner, provider, profile, row)
         if not request_preview(frame)['complete'] and not(frame['method']=='approval' and value=='deny'):
             raise ValueError('Open Beacon to review the full request')
@@ -119,7 +134,8 @@ def answer(mobile, native, owner, provider, profile, event, value):
         # A lost or unrecognized receipt must not send the same mutation again.
         with mobile.LOCK, mobile.connect() as conn:
             conn.execute("UPDATE notices SET state='settled' WHERE id=? AND owner=? AND profile=?", (event,owner,profile))
-        receipt = native.rpc(owner, provider, method, arguments)
+        options={'principal':row['principal']} if row.get('principal') else {}
+        receipt = native.rpc(owner, provider, method, arguments,**options)
         if frame['method'] == 'approval':
             accepted = isinstance(receipt,dict) and type(receipt.get('resolved')) is int and receipt['resolved'] > 0
         else:

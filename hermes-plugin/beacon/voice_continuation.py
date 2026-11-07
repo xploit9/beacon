@@ -48,13 +48,19 @@ def transfer_available(profile,stored,principal):
     authority=existing_authority(profile)
     live=authority.sessions.get(stored) if authority else None
     if live is None: return False
+    from gateway.session_identity import parse_authenticated_subject
+    parts=parse_authenticated_subject(principal)
+    if parts is None: return False
+    native=sys.modules['beacon_native']
+    if not native.owns_row(parts[2],parts[0],profile,stored,authority.db.get_session(stored),principal): return False
+    execution=native.execution_subject(parts[2],parts[0],principal)
     from gateway.config import Platform
     from gateway.session_contract import SessionRef
     from gateway.session_managed_worker import managed_policy
     if live.source.platform!=Platform.LOCAL or managed_policy(authority,SessionRef(authority.profile_id,stored)) is not None:
         return False  # This bounded handler requires the real owner process; never retire an unsupported proposal.
     with live.event_stream.lock:
-        return any(actor.subject==principal and actor.profile_id==authority.profile_id and 'session:submit' in actor.capabilities
+        return any(actor.subject==execution and actor.profile_id==authority.profile_id and 'session:submit' in actor.capabilities
                    for actor in live.subscribers.values())
 
 
@@ -76,6 +82,7 @@ def receipt_binding(mobile,scope,stored,principal,request,conn):
             'profiles' in cfg and scope[2] not in cfg['profiles']): raise ValueError('Continuation owner changed')
     call=mobile.owned(conn,scope[3],scope[0],scope[2])
     if call['conversation']!=stored: raise ValueError('Original conversation changed')
+    if call.get('principal') and call['principal']!=principal: raise ValueError('Original call principal changed')
     row=conn.execute('SELECT * FROM tool_receipts WHERE owner=? AND provider=? AND profile=? AND call_id=? AND request_id=?',
                      (*scope,request)).fetchone()
     if not row: raise ValueError('Original receipt unavailable')
@@ -98,8 +105,9 @@ def local_preflight(mobile,value,principal):
     authority._require_admission_open()
     from gateway.session_contract import SessionRef
     live=authority.sessions[stored]
+    execution=sys.modules['beacon_native'].execution_subject(value['owner'],value['provider'],principal)
     with live.event_stream.lock:
-        actor=next(a for a in live.subscribers.values() if a.subject==principal and a.profile_id==authority.profile_id
+        actor=next(a for a in live.subscribers.values() if a.subject==execution and a.profile_id==authority.profile_id
                    and 'session:submit' in a.capabilities)
         authority.authorize(actor,SessionRef(authority.profile_id,stored),'session:submit')
     scope=(value['owner'],value['provider'],profile,value['call_id'])
@@ -114,6 +122,7 @@ def local_preflight(mobile,value,principal):
     sys.modules['beacon_gateway_tools'].validate(tool['parameters'],receipt['_arguments'])
     return {'implementation':_loaded_sha,'instance_id':authority.instance_id,'profile_id':authority.profile_id,
             'epoch':authority.epoch,'binding':binding,'nonce':value['nonce'],
+            'execution':execution,
             'valid_until':min(receipt['_expires'],time.time()+5)}
 
 
@@ -146,7 +155,7 @@ def remote_preflight(profile,principal,value):
                 body.extend(chunk)
                 if len(body)>4096 or time.monotonic()>=deadline: raise ValueError('Native response exceeded bounds')
             proof=json.loads(body)
-    if (not isinstance(proof,dict) or set(proof)!={'implementation','instance_id','profile_id','epoch','binding','nonce','valid_until'} or
+    if (not isinstance(proof,dict) or set(proof)!={'implementation','instance_id','profile_id','epoch','binding','nonce','valid_until','execution'} or
             proof['instance_id']!=endpoint.instance_id or proof['profile_id']!=endpoint.profile_id):
         raise ValueError('Native owner changed')
     return proof
@@ -160,6 +169,7 @@ def transfer_preflight(mobile,scope,stored,principal,request):
         proof=(local_preflight(mobile,value,principal) if existing_authority(scope[2]) is not None else
                remote_preflight(scope[2],principal,value))
         if (proof['implementation']!=_loaded_sha or proof['nonce']!=value['nonce'] or proof['binding']!=binding or
+                proof.get('execution')!=sys.modules['beacon_native'].execution_subject(scope[0],scope[1],principal) or
                 type(proof['epoch']) is not int or proof['epoch']<=0 or time.time()>=proof['valid_until']): return None
         return proof
     except Exception:
@@ -207,11 +217,11 @@ def verify_stored(native,owner,provider,profile,stored,principal=None):
 
 def verify_runtime(native,owner,provider,principal,profile,stored,runtime,verify_canonical=None):
     row=verify_stored(native,owner,provider,profile,stored,principal)
-    if principal and row.get('user_id')==principal:
+    if principal and (row.get('user_id')==principal or runtime==stored):
         if runtime!=stored or verify_canonical is None:
             raise LookupError('Canonical runtime proof unavailable')
         return verify_canonical(profile,stored,runtime)
-    return native.verify(owner,provider,profile,stored,runtime,False)
+    return native.verify(owner,provider,profile,stored,runtime,False,principal)
 
 
 def prepare(mobile, native, owner, provider, principal, call, value, verify_canonical=None):
@@ -276,6 +286,26 @@ def prepare(mobile, native, owner, provider, principal, call, value, verify_cano
     return {'job_id':job,'request_id':value['request_id'],'status':'prepared','continuation':True,'submit':True,'callback_consent':consent}
 
 
+def owner_transfer_admission(mobile,job,row,require_claim=True):
+    """A protected native-owner transfer attests its exact original receipt, separately from remote input."""
+    if not job.get('transfer') or not job.get('tool_request'): return False
+    scope=(job['owner'],job['provider'],job['profile'],job['call_id'])
+    with mobile.connect() as conn:
+        value,binding=receipt_binding(mobile,scope,job['stored'],job['principal'],job['tool_request'],conn)
+    proof=value.get('_continuation_owner',{})
+    native=sys.modules['beacon_native']
+    if (proof.get('implementation')!=_loaded_sha or proof.get('binding')!=binding or
+            not isinstance(proof.get('instance_id'),str) or not proof['instance_id'] or
+            proof.get('execution')!=native.execution_subject(job['owner'],job['provider'],job['principal']) or
+            proof.get('execution')!=row['principal_id'] or proof.get('epoch')!=row['owner_epoch'] or
+            native.home_fingerprint(proof.get('profile_id'))!=native.profile_fingerprint(job['profile']) or
+            row['target_session_id']!=job['stored'] or row['request_id']!=job['request'] or
+            row.get('payload',{}).get('text')!=transfer_prompt(job['id'])): return False
+    if require_claim and (type(row.get('generation')) is not int or row['generation']<=0 or
+            value.get('_native_claim')!=row['admission_id']+':'+str(row['generation'])): return False
+    return True
+
+
 def native_receipt(job,remote_binding=None):
     """Read only the exact principal/profile/conversation/submission; no transcript-text matching."""
     from tui_gateway import server
@@ -284,19 +314,21 @@ def native_receipt(job,remote_binding=None):
     with server._profile_db({'profile':job['profile']}) as db:
         if db is None: raise RuntimeError('Native admission store unavailable')
         stored=db.get_session(job['stored'])
-        if (not stored or stored.get('user_id') not in (job.get('principal'),job['provider']+':'+job['owner'])
-                or not stored.get('user_id')):
-            raise LookupError('Native conversation not owned')
-        canonical=bool(stored and stored.get('user_id')==job.get('principal'))
         mobile=sys.modules['beacon_mobile']
         native=sys.modules['beacon_native']
+        if not native.owns_row(job['owner'],job['provider'],job['profile'],job['stored'],stored,job.get('principal') or None,db):
+            raise LookupError('Native conversation not owned')
         durable=json.loads(job['remote_authorization']) if job.get('remote_authorization') else None
         row=(get_session_admission(db,admission_id=job['admission']) if job['admission'] else
-             find_session_admission(db,principal_id=job['principal'],session_id=job['stored'],request_id=job['request']))
+             native.find_admission(db,job['owner'],job['provider'],job['stored'],job['principal'],job['request']))
         if row is None: return None,None
+        transferred=owner_transfer_admission(mobile,job,row) if job.get('transfer') else False
+        canonical=(job.get('runtime')==job['stored'] or stored.get('user_id')!=job['provider']+':'+job['owner']
+                   or row['principal_id']!=job['principal']) and not transferred
         if canonical and not durable and remote_binding is None:
             raise LookupError('Remote admission provenance unavailable')
-        if (row['principal_id']!=job['principal'] or row['target_session_id']!=job['stored']
+        execution=native.execution_subject(job['owner'],job['provider'],job['principal'])
+        if (row['principal_id'] not in (job['principal'],execution) or row['target_session_id']!=job['stored']
                 or row['request_id']!=job['request']): raise LookupError('Native admission identity changed')
         text=row.get('payload',{}).get('text')
         signature=digest(transfer_prompt(job['id'])) if job.get('transfer') else job['submission_digest']
@@ -569,15 +601,17 @@ def native_binding(mobile,job_id,session_id=None,for_guard=False):
     if (live is None or live.source.platform!=Platform.LOCAL or session_id not in (None,job['stored']) or
             not for_guard and (not executing_admission.get() or viewer_turn.get() is not live or is_interrupted())):
         raise ValueError('Bound interactive native turn required')
-    admission=find_session_admission(authority.db,principal_id=job['principal'],session_id=job['stored'],request_id=job['request'])
+    native=sys.modules['beacon_native']
+    admission=native.find_admission(authority.db,job['owner'],job['provider'],job['stored'],job['principal'],job['request'])
     if (not admission or admission['status']!='started' or admission['owner_epoch']!=authority.epoch
             or admission['payload'].get('text')!=transfer_prompt(job['id']) or not is_viewer_input(admission)):
         raise ValueError('Exact native continuation admission required')
     stored=authority.db.get_session(job['stored'])
     if not stored or stored.get('source')=='cron': raise ValueError('Scheduled work cannot settle this request')
-    if stored.get('user_id') not in (job['principal'],job['provider']+':'+job['owner']):
+    if not native.owns_row(job['owner'],job['provider'],job['profile'],job['stored'],stored,job['principal'],authority.db):
         raise ValueError('Original conversation principal changed')
-    if stored.get('user_id')==job['principal']:
+    if (job.get('runtime')==job['stored'] or stored.get('user_id')!=job['provider']+':'+job['owner']
+            or admission['principal_id']!=job['principal']) and not owner_transfer_admission(mobile,job,admission,False):
         sys.modules['beacon_native'].confirmed_admission(mobile,admission,job['owner'],job['provider'],job['profile'],
                                                        job['stored'],json.loads(job['remote_authorization']) if job.get('remote_authorization') else None)
     check_local_input(authority,SessionRef(authority.profile_id,job['stored']),admission)
@@ -748,9 +782,9 @@ def _compiled_sha():
         return code.replace(co_filename='',co_firstlineno=0,
             co_consts=tuple(clean(c) if isinstance(c,CodeType) else c for c in code.co_consts))
     dispatcher=sys.modules['beacon_gateway_tools']
-    functions=(_compiled_sha,registered_owner,local_preflight,receipt_binding,native_binding,continue_tool,guard,original_dispatch,
+    functions=(_compiled_sha,registered_owner,local_preflight,receipt_binding,owner_transfer_admission,native_binding,continue_tool,guard,original_dispatch,
                dispatcher.Gateway._start,dispatcher.Gateway._run,dispatcher.Gateway.status,
-               dispatcher.NativeMcp.execute,dispatcher.producer_identity,dispatcher.producer_running)
+               dispatcher.NativeMcp.execute,dispatcher.NativeMcp._execute,dispatcher.producer_identity,dispatcher.producer_running)
     return hashlib.sha256(b''.join(marshal.dumps(clean(inspect.unwrap(fn).__code__)) for fn in functions)).hexdigest()
 
 

@@ -30,6 +30,8 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     private var skillJob: Job? = null
     private var memoryJob: Job? = null
     private var serverJob: Job? = null
+    private var updateJob: Job? = null
+    private var updateObservationRevision = 0L
     private var botJob: Job? = null
     private var skillsAt = 0L
     private var memoryAt = 0L
@@ -120,7 +122,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         if (_skills.value.editing) skillDrafts[scopeKey] = _skills.value.copy(loading = false, saving = false)
         if (_memory.value.editing.isNotBlank()) memoryDrafts[scopeKey] = _memory.value.copy(loading = false, saving = false)
         if (_bots.value.editing && carryBot == null) botDrafts[scopeKey] = _bots.value.copy(loading = false, saving = false)
-        skillJob?.cancel(); memoryJob?.cancel(); serverJob?.cancel(); botJob?.cancel()
+        skillJob?.cancel(); memoryJob?.cancel(); serverJob?.cancel(); botJob?.cancel(); updateJob?.cancel(); ++updateObservationRevision
         scopeKey = key; scopeAccount = account; boundClient = next; skillsAt = 0L; memoryAt = 0L
         _skills.value = skillDrafts.remove(key) ?: NativeSkillsState(profile = client()?.auth?.profile.orEmpty())
         _memory.value = memoryDrafts.remove(key) ?: NativeMemoryState(key)
@@ -276,20 +278,20 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         val active = global() ?: return
         bind(); serverJob?.cancel()
         _server.update { it.copy(loading = true, error = "") }
+        if (page == "Server updates") observeServerUpdate(active)
         serverJob = jobs.launch {
             val c = active.detached()
             try {
                 val q = mapOf("profile" to c.auth.profile)
+                if (page == "Server updates") {
+                    val check = if (force || _server.value.update == null) c.nativeGet("/api/hermes/update/check", q + ("force" to force.toString())) else _server.value.update
+                    if (global() === active) _server.update { it.copy(update = check, loading = false) }
+                    return@launch
+                }
                 val result = when (page) {
                     "Health" -> parseServerStatus(c.nativeGet("/api/status", q), _server.value)
                     "Logs" -> _server.value.copy(logs = c.nativeGet("/api/logs", q + mapOf("file" to _server.value.logFile, "search" to _server.value.logSearch, "lines" to "100")).optJSONArray("lines")?.strings().orEmpty())
                     "Session checkpoints" -> parseCheckpoints(c.nativeGet("/api/ops/checkpoints", q), _server.value)
-                    "Server updates" -> {
-                        val check = if (force || _server.value.update == null) c.nativeGet("/api/hermes/update/check", q + ("force" to force.toString())) else _server.value.update
-                        val result = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to _server.value.requestedAt, "action_id" to _server.value.requestedActionId))
-                        val next = _server.value.copy(update = check, action = result.optJSONObject("action"), receipt = result.optJSONObject("receipt"))
-                        next.copy(applying = next.action?.optBoolean("running") == true || next.requestedAt.isNotBlank() && next.outcome in setOf("running", "unconfirmed"))
-                    }
                     else -> error("Unknown server page")
                 }
                 if (global() === active) _server.value = result.copy(loading = false)
@@ -303,55 +305,87 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     fun clearReviewedUpdate() {
         val c = global() ?: return
         if (!_server.value.canReviewUnknown) return
-        serverJob?.cancel()
+        updateJob?.cancel(); ++updateObservationRevision
         val host = updateKey(c)
         saved["server-update:$host:at"] = ""; saved["server-update:$host:id"] = ""
-        _server.update { it.copy(requestedAt = "", requestedActionId = "", applying = false, update = null, notice = "Previous update result remains unconfirmed. Checking the current server version.") }
+        _server.update { it.copy(requestedAt = "", requestedActionId = "", applying = false, updateStatusFresh = false, update = null, notice = "Previous update result remains unconfirmed. Checking the current server version.") }
         loadServer("Server updates", force = true)
     }
     fun applyServerUpdate() {
         val active = global() ?: return
+        bind()
         if (!_server.value.canApply) return
+        observeServerUpdate(active, apply = true)
+    }
+
+    /** The page/reconnect may resume observation, but never repeats the update POST. */
+    fun resumeServerUpdate() {
+        val active = global() ?: return
+        bind()
+        if (_server.value.requestedAt.isNotBlank() || _server.value.hostBusy || !_server.value.updateStatusFresh) observeServerUpdate(active)
+    }
+
+    private fun observeServerUpdate(active: BeaconClient, apply: Boolean = false) {
+        if (updateJob?.isActive == true) return
+        val revision = ++updateObservationRevision
         val host = updateKey(active)
-        _server.update { it.copy(applying = true, action = null, receipt = null, error = "") }
-        serverJob?.cancel()
-        serverJob = jobs.launch {
+        fun observing() = global() === active && updateObservationRevision == revision
+        fun lost() { if (observing()) _server.update { it.copy(applying = false, updateStatusFresh = false, notice = "Waiting for Hermes to reconnect. Refresh to check the update receipt.") } }
+        _server.update { if (apply) it.copy(applying = true, updateStatusFresh = false, action = null, receipt = null, error = "")
+            else it.copy(applying = false, updateStatusFresh = false) }
+        updateJob = jobs.launch {
             val c = active.detached()
             try {
-                val before = c.nativeGet("/api/plugins/beacon/admin/update/status")
-                if (before.optJSONObject("action")?.optBoolean("running") == true) {
-                    if (global() === active) _server.update { it.copy(action = before.optJSONObject("action"), applying = true, notice = "A server update is already running. Refresh to follow its status.") }
-                    return@launch
+                val settled = withTimeoutOrNull(900_000L) {
+                    if (apply) {
+                        val prior = _server.value
+                        val before = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to prior.requestedAt, "action_id" to prior.requestedActionId))
+                        if (!observing()) return@withTimeoutOrNull true
+                        if (before.optBoolean("host_busy") || before.optJSONObject("action")?.optBoolean("running") == true) {
+                            _server.update { it.withUpdateStatus(before) }
+                        } else {
+                            val baseline = before.getString("server_now")
+                            saved["server-update:$host:at"] = baseline
+                            saved["server-update:$host:id"] = ""
+                            _server.update { it.copy(requestedAt = baseline, requestedActionId = "") }
+                            if (!observing()) return@withTimeoutOrNull true
+                            val response = c.nativeGet("/api/plugins/beacon/admin/update", method = "POST", data = JSONObject())
+                            if (!response.optBoolean("accepted")) {
+                                saved["server-update:$host:at"] = ""; saved["server-update:$host:id"] = ""
+                                if (!observing()) return@withTimeoutOrNull true
+                                _server.update { it.copy(applying = false, updateStatusFresh = false, requestedAt = "", requestedActionId = "",
+                                    error = if (response.optBoolean("already_running")) "" else response.string("message", response.string("error", "Hermes refused this update."))) }
+                                if (!response.optBoolean("already_running")) return@withTimeoutOrNull true
+                            } else {
+                                val id = response.string("action_id")
+                                require(id.isNotBlank()) { "Update action identity is missing" }
+                                val requestedAt = response.getString("requested_at")
+                                saved["server-update:$host:id"] = id
+                                saved["server-update:$host:at"] = requestedAt
+                                if (!observing()) return@withTimeoutOrNull true
+                                _server.update { it.copy(requestedActionId = id, requestedAt = requestedAt) }
+                            }
+                        }
+                    }
+                    var failures = 0
+                    repeat(450) {
+                        if (!observing()) return@withTimeoutOrNull true
+                        try {
+                            val state = _server.value
+                            val result = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to state.requestedAt, "action_id" to state.requestedActionId))
+                            if (!observing()) return@withTimeoutOrNull true
+                            _server.update { it.withUpdateStatus(result) }
+                            failures = 0
+                            if (!_server.value.applying && !_server.value.hostBusy) return@withTimeoutOrNull true
+                        } catch (e: CancellationException) { throw e }
+                        catch (_: Exception) { lost(); if (++failures >= 3) return@withTimeoutOrNull true }
+                        delay(2000)
+                    }
+                    false
                 }
-                val baseline = before.getString("server_now")
-                saved["server-update:$host:at"] = baseline
-                saved["server-update:$host:id"] = ""
-                if (global() !== active) return@launch
-                _server.update { it.copy(requestedAt = baseline, requestedActionId = "") }
-                val response = c.nativeGet("/api/plugins/beacon/admin/update", method = "POST", data = JSONObject())
-                if (!response.optBoolean("accepted")) {
-                    saved["server-update:$host:at"] = ""
-                    if (global() === active) _server.update { it.copy(applying = response.optBoolean("already_running"), requestedAt = "", error = response.string("message", response.string("error", "Hermes refused this update."))) }
-                    return@launch
-                }
-                val id = response.string("action_id")
-                saved["server-update:$host:id"] = id
-                saved["server-update:$host:at"] = response.getString("requested_at")
-                if (global() !== active) return@launch
-                _server.update { it.copy(requestedActionId = id, requestedAt = response.getString("requested_at")) }
-                repeat(60) {
-                    delay(2000)
-                    try {
-                        val result = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to _server.value.requestedAt, "action_id" to id))
-                        if (global() !== active) return@launch
-                        val next = _server.value.copy(action = result.optJSONObject("action"), receipt = result.optJSONObject("receipt"), error = "")
-                        _server.value = next.copy(applying = next.outcome in setOf("running", "unconfirmed"))
-                        if (!_server.value.applying) return@launch
-                    } catch (e: CancellationException) { throw e }
-                    catch (_: Exception) { if (global() === active) _server.update { it.copy(notice = "Waiting for Hermes to reconnect. Refresh to check the update receipt.") } }
-                }
+                if (settled != true) lost()
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { if (global() === active) _server.update { it.copy(error = "Update result is not confirmed. Refresh the update status before starting another update.") } }
+            catch (_: Exception) { lost() }
             finally { c.closeNative() }
         }
     }

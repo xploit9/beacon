@@ -1,5 +1,6 @@
 package dev.hermes.android.data
 import dev.hermes.android.Message
+import dev.hermes.android.mergeChatProjection
 import dev.hermes.android.core.*
 import dev.hermes.android.voice.*
 import org.json.JSONArray
@@ -10,6 +11,23 @@ import org.junit.Test
 class NativeVoiceHistoryTest {
     private val scope = Scope("https://native.example", "owner", "work", "stored-a")
     private fun archive() = json("session_id" to scope.session, "profile" to scope.profile, "events" to JSONArray().put(json("call_id" to "call-a", "event_id" to "call-a:user:1", "session_id" to scope.session, "role" to "user", "text" to "Archived voice", "final" to true)))
+
+    @Test fun partialArchiveCorrectionKeepsItsOriginalSlotTimeAndFinalization() {
+        fun line(id: String, text: String, at: Double, final: Boolean = true) = json("call_id" to "call-a", "event_id" to "call-a:user:$id",
+            "session_id" to scope.session, "turn_id" to id, "role" to "user", "text" to text, "created_at" to at, "final" to final)
+        val first = line("1", "Earlier", 1_800_000_001.0)
+        val second = line("2", "Later", 1_800_000_002.0)
+        val previous = json("session_id" to scope.session, "profile" to scope.profile, "voice_transcripts" to JSONArray(listOf(first, second)))
+        val partial = json("session_id" to scope.session, "profile" to scope.profile, "voice_transcripts_truncated" to true,
+            "voice_transcripts" to JSONArray().put(line("1", "Earlier corrected", 1_800_000_009.0)))
+        val merged = mergeChatProjection(previous, partial)
+        assertEquals(listOf("call-a:user:1", "call-a:user:2"), merged.rows("voice_transcripts").map { it.string("event_id") })
+        assertEquals("Earlier corrected", merged.rows("voice_transcripts").first().string("text"))
+        assertEquals(first.optDouble("created_at"), merged.rows("voice_transcripts").first().optDouble("created_at"), 0.0)
+        val regression = partial.copy().put("voice_transcripts", JSONArray().put(line("1", "Older partial", 1_800_000_010.0, final = false)))
+        assertEquals("Earlier corrected", mergeChatProjection(merged, regression).rows("voice_transcripts").first().string("text"))
+        assertEquals(2, mergeChatProjection(merged, json("session_id" to scope.session, "profile" to scope.profile)).rows("voice_transcripts").size)
+    }
     private fun providerEvent(item: String, turn: Int, text: String, callId: String = "call-a"): JSONObject {
         val wire = GrokWire()
         wire.inbound(json("type" to "input_audio_buffer.speech_started", "item_id" to item))

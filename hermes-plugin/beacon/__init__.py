@@ -54,7 +54,7 @@ def call_user(args,session_id=None,**kwargs):
             row=db.get_session(stored) if db else None
         if not row: raise LookupError('Native session unavailable')
         principal=native.current_principal(owner,provider,profile,stored)
-        if principal and row.get('user_id')==principal:
+        if principal:
             native.verify(owner,provider,profile,stored,None,True,principal)
         elif row.get('user_id')!=provider+':'+owner:
             if not _cron_fallback_allowed(cfg,row):
@@ -115,21 +115,13 @@ def _owned_proactive_run(owner,profile,session_id):
         return False
 
 
-_RECENT_VERIFIED={}
-_VERIFY_REUSE_SECONDS=1.0
-
 def _verify_owned(owner,provider,profile,session_id):
-    """The pre_llm_call hooks of one turn run back to back on the same chat: a passed ownership check is reused for a
-    second instead of asked again. A refusal is never kept."""
+    """Recheck each hook so an adopted or replaced row cannot reuse stale ownership."""
     principal=native.current_principal(owner,provider,profile,session_id)
     if principal:
         native.verify(owner,provider,profile,session_id,None,True,principal)
         return  # Canonical execution authorization is checked each time, never cached across generations.
-    key=(owner,provider,profile,session_id);now=time.monotonic()
-    if _RECENT_VERIFIED.get(key,0)>now: return
     native.verify(owner,provider,profile,session_id)
-    if len(_RECENT_VERIFIED)>=64: _RECENT_VERIFIED.clear()
-    _RECENT_VERIFIED[key]=now+_VERIFY_REUSE_SECONDS
 
 def native_live_context(session_id=None,**kwargs):
     """Inject the profile's live capabilities only into its owned chat or Proactive run."""

@@ -514,10 +514,11 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         val bound = requestBound.scope; val authority = requestBound.version
         try {
             try { fetch() }
-            catch (error: java.net.SocketException) {
-                if (sensitive || method != "GET" || authority == null || scope != bound || nativeAuthorityVersion() != authority) throw error
+            catch (error: IOException) {
+                if (error !is java.net.SocketException && error !is java.net.UnknownHostException) throw error
+                if (sensitive || method != "GET" || authority == null || scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
                 kotlinx.coroutines.delay(150)
-                if (scope != bound || nativeAuthorityVersion() != authority) throw error
+                if (scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
                 fetch()
             }
         } catch (error: Throwable) {

@@ -109,7 +109,8 @@ def test_integration_live_authority_proof_requires_exact_active_subject(canonica
     api, _, _, _, _, rows, _ = canonical_call
     transport = sys.modules['beacon_canonical_transport']
     issuer = 'https://issuer.example'
-    actor = SimpleNamespace(subject=subject(issuer), profile_id='profile-home', capabilities={'session:read'},transport_id='transport')
+    execution=api.native.execution_subject('owner','basic',subject(issuer))
+    actor = SimpleNamespace(subject=execution, profile_id='profile-home', capabilities={'session:read'},transport_id='transport')
     live = SimpleNamespace(subscribers={'transport': actor})
     authority = SimpleNamespace(profile_id='profile-home', instance_id='instance', epoch=7, retiring=False,
                                 sessions={'same-chat': live}, db=SimpleNamespace(get_session=rows.get),
@@ -127,7 +128,10 @@ def test_integration_live_authority_proof_requires_exact_active_subject(canonica
     actor.subject = subject('https://other.example')
     with pytest.raises(Exception):
         transport.canonical_live_proof(request, 'default', 'profile-home', 'same-chat', 'same-chat', 'a' * 64)
-    actor.subject = subject(issuer)
+    actor.subject = execution
+    authority.events['transport'].auth_identity={'provider':'basic','issuer':'https://other.example','user_id':'owner'}
+    with pytest.raises(Exception):
+        transport.canonical_live_proof(request, 'default', 'profile-home', 'same-chat', 'same-chat', 'a' * 64)
     authority.events['transport'].auth_identity={'provider':'local','user_id':subject(issuer),'native_bootstrap':True}
     with pytest.raises(Exception):
         transport.canonical_live_proof(request, 'default', 'profile-home', 'same-chat', 'same-chat', 'a' * 64)
@@ -399,6 +403,7 @@ def test_lifecycle_existing_database_migrates_without_assigning_unknown_principa
     spec=importlib.util.spec_from_file_location('migration_mobile',path)
     mobile=importlib.util.module_from_spec(spec);spec.loader.exec_module(mobile)
     monkeypatch.setattr(mobile,'home',lambda:tmp_path)
+    monkeypatch.setattr(mobile,'protect',lambda path:None)  # Existing private synthetic directory; no owner ACL calls.
     with mobile.connect() as conn:
         assert conn.execute("SELECT principal FROM calls WHERE id='old-call'").fetchone()[0]==''
         assert conn.execute("SELECT principal FROM call_log WHERE id='old-log'").fetchone()[0]==''
@@ -492,7 +497,9 @@ def test_lifecycle_unsubmitted_canonical_preparation_can_leave_active_capacity(c
         assert job['parked'] == 1 and job['status'] == 'awaiting_admission'
         assert not job['remote_authorization'] and not job['admission']
         assert conn.execute('SELECT COUNT(*) FROM notices WHERE job_id=?', (job['id'],)).fetchone()[0] == 0
-    assert reads == [{'principal_id': subject(), 'session_id': 'same-chat', 'request_id': 'never-submitted'}]
+    execution=api.native.execution_subject('owner','basic',subject())
+    expected=[execution] if execution==subject() else [execution,subject()]
+    assert reads == [{'principal_id': p, 'session_id': 'same-chat', 'request_id': 'never-submitted'} for p in expected]
 
 
 @pytest.mark.parametrize('owner',[subject('https://other.example'),'',None])
@@ -556,7 +563,8 @@ def test_lifecycle_receipt_binding_requires_exact_native_acceptance(canonical_ca
 
 
 @pytest.mark.parametrize('remote_response',[True,False])
-def test_integration_relay_native_admission_and_durable_same_chat_callback(canonical_call,monkeypatch,tmp_path,remote_response):
+@pytest.mark.parametrize('row_stamp',['login','legacy','bound_host'])
+def test_integration_relay_native_admission_and_durable_same_chat_callback(canonical_call,monkeypatch,tmp_path,remote_response,row_stamp):
     import asyncio
     from contextlib import contextmanager
     import json
@@ -569,13 +577,15 @@ def test_integration_relay_native_admission_and_durable_same_chat_callback(canon
     transport=sys.modules['beacon_canonical_transport']
     continuation=sys.modules['beacon_voice_continuation']
     db=SessionDB(tmp_path/'native.sqlite')
-    db.create_session('same-chat','local',user_id=subject())
+    execution=api.native.execution_subject('owner','basic',subject())
+    row_owner={'login':subject(),'legacy':'basic:owner','bound_host':execution}[row_stamp]
+    db.create_session('same-chat','local',user_id=row_owner)
     epoch=begin_runtime_epoch(db,instance_id='synthetic-instance')
     runner=SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False),_draining=False,_voice_key_for_source=lambda source:'synthetic-route',
                            session_runtime_descriptor={'state':'ready','instance_id':'synthetic-instance','authority_epoch':epoch})
     authority=SessionAuthority(runner,profile_id=str(tmp_path),instance_id='synthetic-instance',db=db,epoch=epoch)
     runner.session_authority=authority
-    live=LiveSession(SessionSource(platform=Platform.LOCAL,chat_id='same-chat',user_id=subject(),chat_type='dm'),'synthetic-route')
+    live=LiveSession(SessionSource(platform=Platform.LOCAL,chat_id='same-chat',user_id=execution if row_stamp=='bound_host' else subject(),chat_type='dm'),'synthetic-route')
     authority.sessions['same-chat']=live
     identity={'provider':'basic','issuer':sessions[0].issuer,'user_id':'owner'}
     peer=SimpleNamespace(auth_identity=identity)
@@ -591,6 +601,8 @@ def test_integration_relay_native_admission_and_durable_same_chat_callback(canon
         assert params['profile']=='default'
         yield db
     monkeypatch.setattr(server,'_profile_db',profile_db)
+    if row_stamp=='bound_host':
+        assert api.native.bind_conversation(api.mobile,'owner','basic','default','same-chat',subject(),execution,'canonical','create-same-chat')
     request=SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(gateway_runner=runner,session_authority=authority)),
                             state=SimpleNamespace(session=sessions[0]))
     monkeypatch.setattr(transport,'verify_live_session',lambda req,p,s,r:transport.canonical_live_proof(request,p,tmp_path,s,r,'a'*64))

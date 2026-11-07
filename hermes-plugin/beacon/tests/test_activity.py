@@ -204,7 +204,8 @@ def test_snapshot_filters_native_owner_profile_and_request_kind(harness,monkeypa
     records={'ours':{'user_id':'basic:owner','session_key':'stored','running':True,'_submit_user_row':{'_row_id':7}},
              'foreign':{'user_id':'basic:other','session_key':'secret','running':True},
              'wrong-profile':{'user_id':'basic:owner','session_key':'elsewhere','running':True}}
-    server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions=records,_session_auth_user_id=lambda r:r['user_id'])
+    server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions=records,_session_auth_user_id=lambda r:r['user_id'],
+                           _profile_home=lambda profile:tmp)
     requests=SimpleNamespace(open_requests=lambda sid:[{'id':'sudo-secret','method':'sudo','params':{}},{'id':'clarify-ours','method':'clarify','params':{'choices':['yes']}}])
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(server=server,server_requests=requests))
     verified=[]

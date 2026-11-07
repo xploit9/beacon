@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.dp
 import dev.hermes.android.core.string
 import dev.hermes.android.data.NativeComponent
 import dev.hermes.android.data.NativeServerState
+import dev.hermes.android.data.correlatedUpdateReceipt
 import kotlinx.coroutines.delay
 
 /** Log files the Logs page can show. The chip labels are translated; these ids are what the server is asked for. */
@@ -348,7 +349,8 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
     onCheckUpdate: () -> Unit, onApplyUpdate: () -> Unit, onReviewUnknown: () -> Unit) {
     val update = state.update
     val requested = state.applying || state.requestedAt.isNotBlank()
-    val running = state.applying || state.outcome == "running"
+    val running = state.outcome == "running"
+    val warnings = state.updateWarnings
     val lines = state.action?.optJSONArray("lines")
     val recent = lines?.let { array -> (0 until array.length()).map { array.optString(it) }.takeLast(40) }.orEmpty()
     val available = update?.optBoolean("update_available") == true
@@ -356,7 +358,7 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
     val command = update?.string("update_command").orEmpty()
     val message = update?.string("message").orEmpty()
     item {
-        val receipt = state.receipt?.optJSONObject("receipt") ?: state.action?.optJSONObject("receipt")
+        val receipt = correlatedUpdateReceipt(state.action, state.receipt, state.requestedActionId, state.requestedAt)
         val finished = receipt?.string("finished_at").orEmpty()
         val currentVersion = update?.string("current_version").orEmpty().ifBlank { uiText("Not reported") }
         val status: SettingsStatus
@@ -375,6 +377,7 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
                     "partial" -> uiText("Updated, but some steps need attention")
                     "failed" -> uiText("Server update failed")
                     "refused" -> uiText("Server update was refused")
+                    "interrupted" -> uiText("Server update was interrupted")
                     else -> uiText("Not confirmed yet")
                 }
                 line = if (state.outcome == "unconfirmed") uiText("The update isn't confirmed yet. Reconnect and refresh.")
@@ -407,6 +410,15 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
         SettingsStatusHero(status, title, line = line, primary = primary, secondary = secondary, lineTestTag = "server-update-line", testTag = "server-update-hero")
     }
     if (running) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
+    if (state.updateStatusFresh && state.hostBusy && !running) item {
+        SettingsSection(testTag = "server-update-busy") { SettingsValueRow(uiText("Hermes is busy with an update. New updates are blocked."), icon = Icons.Rounded.Info) }
+    }
+    if (warnings.isNotEmpty()) item {
+        SettingsSection(testTag = "server-update-warnings") {
+            SettingsValueRow(uiText("Some update steps need attention"), icon = Icons.Rounded.Warning)
+            Disclosure("Update details", warnings.joinToString("\n\n"))
+        }
+    }
     if (update != null && !canApplyOnServer && command.isNotBlank()) item {
         SettingsSection(testTag = "server-update-command") {
             Row(Modifier.padding(start = 16.dp, end = 4.dp, top = 12.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {

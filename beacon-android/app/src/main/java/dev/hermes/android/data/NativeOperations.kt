@@ -39,7 +39,12 @@ internal fun nativeHistoryNeedsRefresh(observed: List<String>?, stamp: List<Stri
 internal fun displayedNativeHistoryStamp(projection: JSONObject): List<String>? =
     projection.optJSONArray("_history_metadata_stamp")?.strings()?.takeIf { it.size == 10 }
 
-private fun nativeReplayNumber(value: Any?): Long? = when (value) { is Int -> value.toLong(); is Long -> value; else -> null }
+private fun nativeReplayNumber(value: Any?): Long? = when (value) {
+    is Int -> value.toLong()
+    is Long -> value
+    is Number -> value.toLong().takeIf { it.toDouble() == value.toDouble() }
+    else -> null
+}
 
 /** Canonical replay suppresses a truncated response; find its retained suffix without resubmitting. */
 internal suspend fun nativeRetainedReplay(epoch: String, fetch: suspend (Long) -> JSONObject): Pair<Long, JSONObject>? {
@@ -73,8 +78,7 @@ internal suspend fun nativeRetainedReplay(epoch: String, fetch: suspend (Long) -
 }
 
 /** A retained completion can identify one input even when earlier replay events have expired. */
-internal fun nativeCompletedTurn(replay: JSONObject, runtime: String, epoch: String, receipt: JSONObject, submission: String, after: Long): JSONObject? {
-    val admission = receipt.string("admission_id")
+internal fun nativeCompletedTurn(replay: JSONObject, runtime: String, epoch: String, receipt: JSONObject, submission: String, after: Long, requireComplete: Boolean = true): JSONObject? {    val admission = receipt.string("admission_id")
     if (runtime.isBlank() || epoch.isBlank() || admission.isBlank() || submission.isBlank() ||
         receipt.string("status") != "terminal" || receipt.string("outcome") != "completed" ||
         receipt.has("input_id") && receipt.opt("input_id") != submission ||
@@ -100,7 +104,35 @@ internal fun nativeCompletedTurn(replay: JSONObject, runtime: String, epoch: Str
     if (payload.string("status") in setOf("error", "failed", "failure", "interrupted", "cancelled", "canceled", "rejected") ||
         payload.string("outcome").let { it.isNotBlank() && it != "completed" } ||
         payload.string("error").isNotBlank() || payload.string("failure_reason").isNotBlank()) return null
-    return payload.optJSONObject("persisted_turn")?.takeIf { it.opt("complete") == true && it.string("submission_id") == submission }
+    return payload.optJSONObject("persisted_turn")?.takeIf { (!requireComplete || it.opt("complete") == true) && it.string("submission_id") == submission }
+}
+
+/**
+ * The terminal settlement result carries the committed row addresses of this admission
+ * (`persisted_turn`). Those rows are durable in the session transcript even after the runtime's
+ * event ring that once carried `message.complete` is gone, so a completed receipt can still be
+ * proven by exact row identity. The caller's submission is the same admission it asked about; it
+ * is added here as the submission identity and never inferred from message content.
+ */
+internal fun nativeSettledTurn(receipt: JSONObject, submission: String): JSONObject? {
+    if (receipt.string("status") != "terminal" || receipt.string("outcome") != "completed" || submission.isBlank()) return null
+    if (receipt.has("input_id") && receipt.opt("input_id") != submission) return null
+    val turn = receipt.optJSONObject("result")?.optJSONObject("persisted_turn") ?: return null
+    if (turn.opt("complete") != true) return null
+    val user = nativeReplayNumber(turn.opt("user_row_id")) ?: return null
+    val final = nativeReplayNumber(turn.opt("final_assistant_row_id")) ?: return null
+    // A missing or non-array row list is a malformed settlement, not proof: fail closed so the caller can
+    // still fall back to a retained message.complete event instead of throwing here.
+    val rowIds = turn.optJSONArray("row_ids") ?: return null
+    val userIds = turn.optJSONArray("user_row_ids") ?: return null
+    val rows = (0 until rowIds.length()).mapNotNull { index -> nativeReplayNumber(rowIds.opt(index)) }
+    val users = (0 until userIds.length()).mapNotNull { index -> nativeReplayNumber(userIds.opt(index)) }
+    if (user <= 0 || final <= 0 || final == user || rows.size != rowIds.length() ||
+        users.size != userIds.length() || users != listOf(user) ||
+        rows.distinct().size != rows.size || user !in rows || final !in rows) return null
+    val existing = turn.string("submission_id")
+    if (existing.isNotBlank() && existing != submission) return null
+    return turn.copy().put("submission_id", submission)
 }
 
 internal fun storedSessionSettings(snapshot: JSONObject): JSONObject {
@@ -807,17 +839,30 @@ internal class NativeOperations(private val c: BeaconClient) {
             admission = ids.singleOrNull().orEmpty()
         }
         if (admission.isBlank()) return json("status" to "unknown")
-        val receipt = c.nativeTurnRpc(lease, "prompt.receipt", json("session_id" to b.runtimeSessionId, "admission_id" to admission))
+        val receipt = c.nativeTurnRpc(lease, "prompt.receipt", json("session_id" to b.runtimeSessionId, "admission_id" to admission)
+            .apply { if (completedProof) put("include_result", true) })
         val ref = receipt.optJSONObject("ref")
         require(receipt.string("admission_id") == admission && ref?.string("session_id") == stored && ref.opt("profile_id") == profile) { "The admission belongs to another conversation" }
         receipt.remove("_confirmed_persisted_turn")
+        receipt.remove("_confirmed_persisted_input")
         val epoch = snapshot.string("replay_epoch")
-        if (completedProof && receipt.string("status") == "terminal" && receipt.string("outcome") == "completed" && epoch.isNotBlank()) {
+        // The committed settlement rows outlive the runtime event ring; use them first, then fall
+        // back to the retained message.complete event for older native versions without a stored result.
+        val settled = if (completedProof) nativeSettledTurn(receipt, input) else null
+        receipt.remove("result")
+        receipt.remove("usage")
+        if (settled != null) {
+            receipt.put("_confirmed_persisted_input", settled)
+            receipt.put("_confirmed_persisted_turn", settled)
+        } else if (completedProof && receipt.string("status") == "terminal" && receipt.string("outcome") == "completed" && epoch.isNotBlank()) {
             val retained = nativeRetainedReplay(epoch) { after ->
                 c.nativeTurnRpc(lease, "session.events.since", json("session_id" to b.runtimeSessionId, "last_seen" to after, "replay_epoch" to epoch))
             }
-            retained?.let { (after, replay) -> nativeCompletedTurn(replay, b.runtimeSessionId, epoch, receipt, input, after) }
-                ?.let { receipt.put("_confirmed_persisted_turn", it) }
+            retained?.let { (after, replay) -> nativeCompletedTurn(replay, b.runtimeSessionId, epoch, receipt, input, after, requireComplete = false) }
+                ?.let { proof ->
+                    receipt.put("_confirmed_persisted_input", proof)
+                    if (proof.opt("complete") == true) receipt.put("_confirmed_persisted_turn", proof)
+                }
         }
         return receipt.put("session_id", stored).put("stream_id", b.runtimeSessionId)
     }
@@ -1058,7 +1103,7 @@ internal class NativeOperations(private val c: BeaconClient) {
         return cwd.trimEnd('/', '\\') + "/" + path.removePrefix("./")
     }
     private fun sessionProjection(result: JSONObject, b: NativeSessionBinding): JSONObject {
-        val o = (result.optJSONObject("info")?.copy() ?: JSONObject()).apply { result.keys().forEach { put(it, result.opt(it)) } }.apply { if (has("provider")) put("model_provider", opt("provider")); if (has("cwd")) put("workspace", opt("cwd")) }.put("session_id", b.storedSessionId).put("stored_session_id", b.storedSessionId).put("runtime_session_id", b.runtimeSessionId)
+        val o = (result.optJSONObject("info")?.copy() ?: JSONObject()).apply { result.keys().forEach { put(it, result.opt(it)) } }.apply { if (has("provider")) put("model_provider", opt("provider")); if (has("cwd")) put("workspace", opt("cwd")) }.put("session_id", b.storedSessionId).put("stored_session_id", b.storedSessionId).put("runtime_session_id", b.runtimeSessionId).put("profile", b.scope.profile)
         // Agent construction/history hydration is not a turn; the first prompt must still send.
         if (result.optBoolean("running") || result.has("inflight") && !result.isNull("inflight") || result.string("status") in setOf("streaming", "running", "working", "waiting")) o.put("active_stream_id", b.runtimeSessionId)
         return o

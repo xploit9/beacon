@@ -12,6 +12,8 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.BeaconActivity
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.BeaconViewModel
+import dev.hermes.android.liveTestChatBody
+import dev.hermes.android.loginLiveTest
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.core.json
@@ -129,12 +131,16 @@ class VoiceConnectionLiveTest {
             voices.setSelection(voices.settings(provider))
             await { !vm.ui.value.restoringSession }
             phase = "reconnecting"
-            withContext(Dispatchers.Main.immediate) { vm.connect(vm.ui.value.origin) }.join()
+            val authFile = File(app.filesDir, "live-auth.json")
+            val auth = if (authFile.isFile) JSONObject(authFile.readText()).also { check(authFile.delete()) } else null
+            if (auth != null) loginLiveTest(app, auth.getString("origin"), auth)
+            withContext(Dispatchers.Main.immediate) { vm.connect(auth?.getString("origin") ?: vm.ui.value.origin) }.join()
             await { vm.ui.value.connected && vm.client != null && !vm.ui.value.restoringSession }
             client = requireNotNull(vm.client).detached()
             phase = "opening chat"
             previousSession = vm.chat.value.sessionId
-            withContext(Dispatchers.Main.immediate) { vm.tab("Chat"); vm.newChat(json("title" to "Voice connection timing")) }.join()
+            val chatBody = liveTestChatBody(client, "Voice connection timing " + java.util.UUID.randomUUID())
+            withContext(Dispatchers.Main.immediate) { vm.tab("Chat"); vm.newChat(chatBody) }.join()
             await { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.sessionId != previousSession &&
                 vm.chat.value.projectionReady && !vm.ui.value.newChatOpening && vm.authenticatedScope()?.session == vm.chat.value.sessionId }
             session = vm.chat.value.sessionId

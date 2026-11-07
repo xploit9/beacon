@@ -1,9 +1,11 @@
 package dev.hermes.android.data
 
 import dev.hermes.android.completedQueuedInputRow
+import dev.hermes.android.linkedQueuedInputRow
 import dev.hermes.android.core.QueuedMessage
 import dev.hermes.android.core.copy
 import dev.hermes.android.core.json
+import dev.hermes.android.core.string
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -33,6 +35,48 @@ class CompletedNativeInputTest {
         val proof = nativeCompletedTurn(replay, runtime, epoch, receipt, item.submissionId, after)
         val checked = receipt.copy().apply { if (proof != null) put("_confirmed_persisted_turn", proof) }
         return completedQueuedInputRow(item, checked, history, refreshed, queued)
+    }
+
+    @Test fun settledResultProvesCompletedRowsWithoutTheRuntimeEventRing() {
+        val turn = json("complete" to true, "user_row_id" to 15, "final_assistant_row_id" to 20,
+            "row_ids" to JSONArray(listOf(15, 16, 17, 18, 19, 20)), "user_row_ids" to JSONArray(listOf(15)))
+        fun settled(item: QueuedMessage, value: JSONObject = turn) = receipt(item).apply { put("result", json("persisted_turn" to value)) }
+        val proof = nativeSettledTurn(settled(first), first.submissionId)
+        assertEquals(first.submissionId, proof?.string("submission_id"))
+        assertEquals(15L, proof?.optLong("user_row_id"))
+        assertEquals(20L, proof?.optLong("final_assistant_row_id"))
+        assertEquals(listOf(15L, 16L, 17L, 18L, 19L, 20L),
+            (0 until proof!!.getJSONArray("row_ids").length()).map { proof.getJSONArray("row_ids").optLong(it) })
+        assertNull("incomplete settlement is not a completed turn",
+            nativeSettledTurn(settled(first, turn.copy().put("complete", false)), first.submissionId))
+        assertNull("terminal receipt with a missing result never invents proof",
+            nativeSettledTurn(receipt(first), first.submissionId))
+        assertNull("the final row cannot be the user row",
+            nativeSettledTurn(settled(first, turn.copy().put("final_assistant_row_id", 15)), first.submissionId))
+        assertNull("the user row must be the turn's exact user row",
+            nativeSettledTurn(settled(first, turn.copy().put("user_row_ids", JSONArray(listOf(16)))), first.submissionId))
+        assertNull("a different admission submission is refused",
+            nativeSettledTurn(settled(first, turn.copy().put("submission_id", second.submissionId)), first.submissionId))
+        assertNull("only terminal completed receipts prove a turn",
+            nativeSettledTurn(settled(first).apply { put("status", "started") }, first.submissionId))
+        assertNull("the receipt input identity is enforced",
+            nativeSettledTurn(settled(first).apply { put("input_id", second.submissionId) }, first.submissionId))
+        assertNull("duplicate rows are not an exact turn",
+            nativeSettledTurn(settled(first, turn.copy().put("row_ids", JSONArray(listOf(15, 20, 20)))), first.submissionId))
+        assertNull("a settlement without row_ids fails closed",
+            nativeSettledTurn(settled(first, turn.copy().apply { remove("row_ids") }), first.submissionId))
+        assertNull("a settlement without user_row_ids fails closed",
+            nativeSettledTurn(settled(first, turn.copy().apply { remove("user_row_ids") }), first.submissionId))
+        assertNull("a non-array row list fails closed",
+            nativeSettledTurn(settled(first, turn.copy().put("row_ids", "15,20")), first.submissionId))
+        assertNull("a non-numeric row id fails closed",
+            nativeSettledTurn(settled(first, turn.copy().put("row_ids", JSONArray(listOf(15, "20")))), first.submissionId))
+        val malformed = settled(first, turn.copy().apply { remove("row_ids") })
+        assertNull(nativeSettledTurn(malformed, first.submissionId))
+        val fallback = nativeCompletedTurn(replay(event(first, 15, 20, 15, 16, 17, 18, 19, 20)),
+            runtime, epoch, receipt(first), first.submissionId, after = 1)
+        assertEquals("a malformed settlement still falls back to the retained message.complete event",
+            first.submissionId, fallback?.string("submission_id"))
     }
 
     @Test fun bothObservedTurnShapesResolveOnlyTheirOwnRows() {
@@ -111,5 +155,29 @@ class CompletedNativeInputTest {
         assertNull(completed(first, replay(error), receiptData, history))
         val wrongRows = event(first, 19, 20, 19, 21)
         assertNull(completed(first, replay(wrongRows), receiptData, history))
+    }
+
+    @Test fun imageInputLinksByScopedRowProofBeforeCompleteTurnRetirement() {
+        val image = first.copy(state = "accepted", outcome = "", attachments = listOf(json("name" to "image.png", "mime" to "image/png", "staged_base64" to "Zml4dHVyZQ==")))
+        val wire = event(image, 19, 20, 19, 20)
+        val partial = wire.copy().apply { getJSONObject("payload").getJSONObject("persisted_turn").put("complete", false) }
+        fun checked(frame: JSONObject, input: QueuedMessage = image, confirmation: JSONObject = receipt(image)): JSONObject = confirmation.copy().apply {
+            nativeCompletedTurn(replay(frame), runtime, epoch, confirmation, input.submissionId, 0, requireComplete = false)
+                ?.let { put("_confirmed_persisted_input", it) }
+        }
+        val onlyUser = rows(19 to "user")
+        assertEquals("19", linkedQueuedInputRow(image, checked(partial), onlyUser, listOf(image)))
+        assertNull("A linked input does not prove that every reply row committed", completedQueuedInputRow(image, checked(partial), onlyUser, onlyUser, listOf(image)))
+        assertEquals("accepted", image.state)
+        assertEquals("19", linkedQueuedInputRow(image.copy(text = "different", attachments = emptyList()), checked(wire), onlyUser, listOf(image)))
+        assertNull(linkedQueuedInputRow(image.copy(submissionId = "foreign"), checked(wire), onlyUser, listOf(image)))
+        assertNull(linkedQueuedInputRow(image.copy(admissionId = "foreign"), checked(wire), onlyUser, listOf(image)))
+        assertNull(linkedQueuedInputRow(image, checked(wire), onlyUser, listOf(image, image.copy(id = "duplicate"))))
+        assertNull(linkedQueuedInputRow(image, checked(wire), rows(19 to "assistant"), listOf(image)))
+        assertNull(linkedQueuedInputRow(image, checked(wire.copy().put("session_id", "foreign")), onlyUser, listOf(image)))
+        assertNull(linkedQueuedInputRow(image, checked(wire.copy().put("replay_epoch", "foreign")), onlyUser, listOf(image)))
+        assertNull(linkedQueuedInputRow(image, checked(wire, confirmation = receipt(image).put("execution_generation", 8)), onlyUser, listOf(image)))
+        val fractional = checked(wire).apply { getJSONObject("_confirmed_persisted_input").put("user_row_id", 19.5) }
+        assertNull(linkedQueuedInputRow(image, fractional, onlyUser, listOf(image)))
     }
 }

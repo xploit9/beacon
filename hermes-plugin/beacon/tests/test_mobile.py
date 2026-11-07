@@ -27,10 +27,15 @@ def harness(tmp_path,monkeypatch):
     api._beacon_original_mobile_settings=api.mobile.settings
     monkeypatch.setattr(api.mobile,'settings',lambda profile=None:cfg)
     monkeypatch.setattr(api.mobile,'home',lambda:tmp_path)
+    # Synthetic homes need no owner SID lookup or Windows ACL subprocess.
+    def protect_fixture(path):
+        assert Path(path).resolve().is_relative_to(tmp_path.resolve())
+        Path(path).mkdir(parents=True,exist_ok=True)
+    monkeypatch.setattr(api.mobile,'protect',protect_fixture)
     monkeypatch.setattr(api.native,'verify',lambda *args:{'messages':[]})
     monkeypatch.setattr(api.native,'create',lambda *args:'native-stored')
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(
-        server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions={}),
+        server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions={},_profile_home=lambda profile:tmp_path),
         server_requests=SimpleNamespace(open_requests=lambda sid:[])))
     app=FastAPI();app.state.auth_required=True
     @app.middleware('http')
@@ -63,6 +68,44 @@ def reserve(client):
 def phone(client,name='Pixel'):
     """The header of a phone linked through /devices/link: push registration is refused without one."""
     return {'x-beacon-device-id':client.post('/api/plugins/beacon/devices/link',json={'device_name':name}).json()['device_id']}
+
+
+@pytest.mark.parametrize('prefix',[b'',b'{"events":',b'{"events":[]}'])
+def test_disconnected_request_body_is_rejected_before_dispatch(harness,prefix):
+    import asyncio
+    from fastapi import HTTPException
+    api,_,_,_,_=harness
+    packets=iter([{'type':'http.request','body':prefix,'more_body':True},{'type':'http.disconnect'}])
+    async def receive(): return next(packets)
+    request=Request({'type':'http','method':'POST','path':'/'},receive)
+    with pytest.raises(HTTPException) as error: asyncio.run(api.body(request))
+    assert error.value.status_code==400
+
+
+@pytest.mark.parametrize('payload,limit,status',[(b'{"events":[]}',64,None),(b'{"events":[]}',4,413),(b'{',64,400),(b'[]',64,400)])
+def test_request_body_keeps_complete_json_and_size_validation(harness,payload,limit,status):
+    import asyncio
+    from fastapi import HTTPException
+    api,_,_,_,_=harness
+    async def receive(): return {'type':'http.request','body':payload,'more_body':False}
+    request=Request({'type':'http','method':'POST','path':'/'},receive)
+    if status is None: assert asyncio.run(api.body(request,limit))=={'events':[]}
+    else:
+        with pytest.raises(HTTPException) as error: asyncio.run(api.body(request,limit))
+        assert error.value.status_code==status
+
+
+@pytest.mark.parametrize('kind',[KeyError,TypeError,RuntimeError,OSError])
+def test_native_failure_diagnostics_do_not_log_arguments_or_exception_text(harness,caplog,kind):
+    from fastapi import HTTPException
+    api,_,_,_,_=harness
+    private='SYNTHETIC_PRIVATE_DIAGNOSTIC_CANARY'
+    def unavailable(value): raise kind(value)
+    with pytest.raises(HTTPException) as error:
+        api.safely(unavailable,private)
+    assert error.value.status_code==503
+    assert private not in caplog.text
+    assert 'unavailable' in caplog.text and kind.__name__ in caplog.text
 
 
 def test_removed_phone_revokes_automatic_push_ids_across_profiles(harness):
@@ -868,11 +911,16 @@ def test_native_create_failure_rolls_back_only_own_draft(harness,monkeypatch):
     api,c,cfg,tmp,app=harness
     import threading
     spec=importlib.util.spec_from_file_location('fixture_create',ROOT/'native.py');native=importlib.util.module_from_spec(spec);spec.loader.exec_module(native)
-    record={'session_key':'stored','auth_user_id':'basic:owner'};server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions={'new':record},_session_auth_user_id=lambda row:row.get('auth_user_id'),_ensure_session_db_row=lambda row:False)
+    record={'session_key':'stored','auth_user_id':'basic:owner'};server=SimpleNamespace(_sessions_lock=threading.RLock(),_sessions={'new':record},_session_auth_user_id=lambda row:row.get('auth_user_id'),_ensure_session_db_row=lambda row:False,
+        _transport_auth_user_id=lambda transport:transport.auth_identity['provider']+':'+transport.auth_identity['user_id'],
+        _profile_home=lambda profile:None,_hermes_home=tmp,
+        _session_transport_contains=lambda row,transport:row.get('transport') is transport)
     monkeypatch.setitem(sys.modules,'tui_gateway',SimpleNamespace(server=server));calls=[]
-    def rpc(owner,provider,method,params):
+    def rpc(owner,provider,method,params,principal=None,transport=None):
         calls.append(method)
-        if method=='session.create':return {'session_id':'new','stored_session_id':'stored'}
+        if method=='session.create':
+            record['transport']=transport
+            return {'session_id':'new','stored_session_id':'stored'}
         server._sessions.pop(params['session_id'],None);return {'closed':True}
     monkeypatch.setattr(native,'rpc',rpc)
     with pytest.raises(RuntimeError):native.create('owner','basic','default')
@@ -1426,6 +1474,7 @@ def test_phone_clock_correction_diagnostic_is_admitted_and_preserved(harness):
 def test_plugin_settings_copy_authority_and_track_replacement(harness,monkeypatch):
     api,c,cfg,tmp,app=harness
     module=load_private('mobile');monkeypatch.setattr(module,'home',lambda:tmp)
+    monkeypatch.setattr(module,'protect',api.mobile.protect)  # The same private fixture root needs no owner SID lookup.
     # This fixture writes JSON, so it does not depend on Hermes' optional YAML adapter.
     monkeypatch.setitem(sys.modules,'utils',SimpleNamespace(load_yaml_file_readonly=lambda path:json.loads(Path(path).read_text(encoding='utf-8'))))
     path=tmp/'config.yaml'

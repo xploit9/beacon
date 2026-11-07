@@ -102,7 +102,11 @@ internal class BackgroundActivityFixture(val app: BeaconApplication) : AutoClose
                 check(edit.commit()) { "Could not restore synthetic delivery-log changes" }
                 check(deliveryPrefs.all.filterKeys { it in deliveryKeys } == originalDelivery) { "Delivery-log restoration was not retained" }
             } finally {
-                if (Build.VERSION.SDK_INT >= 33 && !permission) InstrumentationRegistry.getInstrumentation().uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS)
+                // The external device runner already restores a denied baseline; revoking an already
+                // denied runtime permission would kill this instrumentation process mid-suite.
+                if (Build.VERSION.SDK_INT >= 33 && !permission &&
+                    app.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED)
+                    InstrumentationRegistry.getInstrumentation().uiAutomation.revokeRuntimePermission(app.packageName, Manifest.permission.POST_NOTIFICATIONS)
             }
         }
     }

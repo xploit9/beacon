@@ -201,6 +201,23 @@ def outcome(value, read_only, depth=0, own=False):
     return 'completed'
 
 
+def native_trust_prompts(tool, arguments):
+    """The exact prompts Hermes' MCP trust gate renders for this operation.
+
+    Current and prior supported native sources append the call's arguments through their own
+    renderer whenever the call has any. An empty call has only the head sentence. A prompt for
+    different arguments, or a header-only prompt for a call that has arguments, never matches."""
+    head = (f"MCP tool '{tool['_raw']}' on UNTRUSTED server '{tool['_server']}' wants to run. "
+            'This tool is write-capable (no readOnlyHint=true annotation) and may modify external state.')
+    if not arguments:
+        return {head}
+    try:
+        from tools.mcp_tool_handlers import _format_trust_gate_arguments
+    except Exception:
+        return set()  # No renderer means no exact proof: fail closed, never accept a weaker prompt.
+    return {head + '\n\nArguments:\n' + _format_trust_gate_arguments(arguments)}
+
+
 def safe(value, limit):
     from agent.redact import redact_sensitive_text
     return redact_sensitive_text(str(value), force=True, redact_url_credentials=True)[:limit]
@@ -724,13 +741,16 @@ class NativeMcp:
         with server._session_profile_runtime_scope({'profile_home':str(root) if root else None}, hydrate_secrets=False):
             return fn(Path(root) if root else Path(server._hermes_home))
 
-    def approval_source(self, tool, arguments, scope, session_id, root):
+    def approval_source(self, tool, arguments, scope, session_id, root,principal=None):
         from hermes_cli.config import load_config_readonly
         from hermes_cli.web_server_sessions import _open_session_db_at_path
         from tools.approval_context import _normalize_approval_mode
         with closing(_open_session_db_at_path(Path(root)/'state.db',read_only=True)) as db:
             row=db.get_session(session_id)
-        if not row or row.get('user_id')!=scope[1]+':'+scope[0]: return None
+            if principal:
+                native=sys.modules['beacon_native']
+                if not native.owns_row(scope[0],scope[1],scope[2],session_id,row,principal,db): return None
+            elif not row or row.get('user_id')!=scope[1]+':'+scope[0]: return None
         # Hermes runs its memory tool and the memory provider's tools without asking in every approval mode; a call does too.
         if tool.get('_kind')=='hermes' and tool.get('_inline') in ('memory','provider'): return 'memory'
         config=row.get('model_config') or {}
@@ -751,7 +771,7 @@ class NativeMcp:
             from tools.approval_smart import _smart_verdict
             key='beacon-call/'+digest(scope)
             tokens=session_context.set_session_vars(platform='api_server',source='beacon',
-                user_id=scope[1]+':'+scope[0],profile=scope[2],session_key=key,session_id=session_id)
+                user_id=native.execution_subject(scope[0],scope[1],principal) if principal else scope[1]+':'+scope[0],profile=scope[2],session_key=key,session_id=session_id)
             try:
                 pattern='beacon-call:terminal'
                 if _smart_verdict(command,'Call terminal action',pattern,[pattern],key)=='approve': return 'smart'
@@ -972,14 +992,25 @@ class NativeMcp:
         output.extend(native_catalog())
         return output
 
-    def execute(self, tool, arguments, scope, approved, session_id=None):
+    def execute(self, tool, arguments, scope, approved, session_id=None,principal=None):
+        # Failed native setup must not leak call identity into a reused worker.
+        return contextvars.copy_context().run(self._execute,tool,arguments,scope,approved,session_id,principal)
+
+    def _execute(self, tool, arguments, scope, approved, session_id=None,principal=None):
         from gateway import session_context
         session_id=session_id or scope[3]
+        subject=scope[1]+':'+scope[0]
+        if principal:
+            native=sys.modules['beacon_native']
+            native.verify(scope[0],scope[1],scope[2],session_id,principal=principal)
+            subject=native.execution_subject(scope[0],scope[1],principal)
         key = 'beacon-tool/' + uuid.uuid4().hex
         # Reuse Hermes' environment within this call; approval callbacks still get a unique one-shot key.
         session_key='beacon-call/'+digest(scope)
         session_tokens = session_context.set_session_vars(platform='api_server', source='beacon',
-            user_id=scope[1]+':'+scope[0], profile=scope[2], session_key=session_key, session_id=session_id)
+            user_id=subject, profile=scope[2], session_key=session_key, session_id=session_id)
+        principal_token=(native.call_principal.set((*scope[:3],session_id,native.profile_fingerprint(scope[2]),principal))
+                         if principal else None)
         if tool.get('_kind')=='hermes':
             terminal=tool.get('_raw')=='terminal'
             registered=False
@@ -1014,12 +1045,11 @@ class NativeMcp:
                 if registered: approval.unregister_gateway_notify(key)
                 if token is not None: approval_context.reset_current_session_key(token)
                 session_context.clear_session_vars(session_tokens)
+                if principal_token is not None: native.call_principal.reset(principal_token)
 
         from tools import approval, approval_context
         token = approval_context.set_current_session_key(key)
         # This native gate represents the SAME approved operation, not another grant.
-        expected = (f"MCP tool '{tool['_raw']}' on UNTRUSTED server '{tool['_server']}' wants to run. "
-                    'This tool is write-capable (no readOnlyHint=true annotation) and may modify external state.')
         used = False
         native_consent_required = False
         once_lock=threading.Lock()
@@ -1030,9 +1060,10 @@ class NativeMcp:
                 # Raising makes the native notify path fail closed immediately, without a wait.
                 raise ValueError('Invalid native approval request identity')
             with once_lock:
+                exact = isinstance(data.get('command'), str) and data['command'] in native_trust_prompts(tool, arguments)
                 accept = (approved and not used and tool['_trust']=='untrusted'
-                          and data.get('pattern_key')=='mcp_elicitation' and data.get('command')==expected)
-                if approved and data.get('pattern_key')=='mcp_elicitation' and data.get('command')!=expected:
+                          and data.get('pattern_key')=='mcp_elicitation' and exact)
+                if approved and data.get('pattern_key')=='mcp_elicitation' and not exact:
                     native_consent_required = True
                 used = True
             approval.resolve_gateway_approval(key, 'once' if accept else 'deny', request_id=request)
@@ -1049,6 +1080,7 @@ class NativeMcp:
             approval.unregister_gateway_notify(key)
             approval_context.reset_current_session_key(token)
             session_context.clear_session_vars(session_tokens)
+            if principal_token is not None: native.call_principal.reset(principal_token)
 
 
 # The app's Ask for approval choices a tool request may carry (Manual, Auto, Full access).
@@ -1059,6 +1091,7 @@ class Gateway:
     def __init__(self, mobile, scoped, backend=None, sanitizer=safe):
         self.mobile = mobile
         self.backend = backend or NativeMcp()
+        self._native_backend=isinstance(NativeMcp,type) and isinstance(self.backend,NativeMcp)
         self.scoped = scoped
         self.execution_scoped = scoped
         self.sanitize = sanitizer
@@ -1310,7 +1343,7 @@ class Gateway:
                 self._save(conn,scope,request,value)
         return {k:v for k,v in value.items() if not k.startswith('_')}
 
-    def _approval_source(self, scope, tool, arguments, session_id):
+    def _approval_source(self, scope, tool, arguments, session_id,principal=None):
         # A call allowance never covers Hermes' own tools: it would also answer their dangerous-command prompts.
         # It binds to the approved definition's id: a republished definition under the same name is shown for approval again.
         if tool.get('_kind')!='hermes':
@@ -1321,7 +1354,8 @@ class Gateway:
         policy=getattr(self.backend,'approval_source',None)
         if not callable(policy): return None
         try:
-            result=self.scoped(scope[2],lambda root:policy(tool,arguments,scope,session_id,root))
+            options={'principal':principal} if self._native_backend else {}
+            result=self.scoped(scope[2],lambda root:policy(tool,arguments,scope,session_id,root,**options))
             return result if result in ('chat_yolo','profile_off','smart','memory') else None
         except Exception:
             return None  # Missing/malformed state or a failed guardian always asks the phone.
@@ -1354,7 +1388,7 @@ class Gateway:
         tool={**tool,'read_only':read_only}
         session_id=session_id or scope[3]
         asks=choice=='ask' or not read_only
-        approved_by=self._approval_source(scope,tool,arguments,session_id) if asks else None
+        approved_by=self._approval_source(scope,tool,arguments,session_id,principal) if asks else None
         # Full access is the owner's own standing approval, given in the app before the call: the change starts at once.
         if asks and approved_by is None and choice=='owner' and not read_only: approved_by='owner'
         needs_approval=asks and approved_by is None
@@ -1535,15 +1569,23 @@ class Gateway:
             def execute(_):
                 nonlocal dispatched
                 timing['profile']=(time.perf_counter()-phase)*1000
-                dispatched=True
                 execution=time.perf_counter()
                 try:
                     with self.db() as conn:
                         original=json.loads(self._row(conn,scope,request)['payload'])
+                    if self._native_backend:
+                        with self.mobile.connect() as conn:
+                            call=self.mobile.owned(conn,scope[3],scope[0],scope[2],False)
+                        if (call['conversation']!=session_id or call.get('principal') and call['principal']!=original.get('_principal') or
+                                call.get('native_home') and call['native_home']!=sys.modules['beacon_native'].profile_fingerprint(scope[2])):
+                            raise HTTPException(409,'Original call binding changed')
+                    options={'principal':original.get('_principal')} if self._native_backend else {}
                     if original.get('_native_claim'):
                         with sys.modules['beacon_voice_continuation'].original_dispatch(self.mobile,original['_follow_job'],current,arguments):
-                            return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
-                    return self.backend.execute(current,arguments,scope,approved,session_id=session_id)
+                            dispatched=True
+                            return self.backend.execute(current,arguments,scope,approved,session_id=session_id,**options)
+                    dispatched=True
+                    return self.backend.execute(current,arguments,scope,approved,session_id=session_id,**options)
                 finally: timing['execute']=(time.perf_counter()-execution)*1000
             try: raw=self.execution_scoped(scope[2],execute)
             finally:

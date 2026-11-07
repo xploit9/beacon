@@ -799,7 +799,9 @@ def test_profiles_native_sibling_replacement_preserves_actor_and_native_operator
     from gateway.config import Platform
     from gateway.session_controls import AuthorityConnection
     from gateway.session_authority import SessionAuthority
-    from gateway.session_contract import Principal,SessionRef
+    from gateway import session_contract
+    from gateway.session_contract import SessionRef
+    Principal=getattr(session_contract,'SessionActor',None) or session_contract.Principal
     from gateway.session_identity import authenticated_subject
     from hermes_cli import profiles
     from hermes_state_runtime import RuntimeStoreError
@@ -814,7 +816,8 @@ def test_profiles_native_sibling_replacement_preserves_actor_and_native_operator
     identity={'provider':'basic','issuer':'issuer-one','user_id':'owner','profile_scope':'host'}
     connection=AuthorityConnection(launch,object(),identity,operator=True)
     sibling=connection._sibling_for('qa')
-    assert sibling.authority is first and sibling.actor.subject==authenticated_subject(identity)
+    native=sys.modules['beacon_native']
+    assert sibling.authority is first and sibling.actor.subject==native.execution_subject('owner','basic',authenticated_subject(identity))
     second=authority(qa,10)
     first.retired=True
     runner.session_authorities=[launch,second]

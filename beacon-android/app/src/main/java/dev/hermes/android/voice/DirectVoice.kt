@@ -184,6 +184,10 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private val warm:LiveSession?=null,
     /** This conversation's context read before the tap; without it the call reads it now. */
     private val prefetched:JSONObject?=null,
+    /** An authenticated, scoped context read started before the service/Telecom pipeline; used only after the call re-validates it. */
+    private val earlyContext:Deferred<JSONObject?>?=null,
+    /** Tap-clock time the early read started, for the stage log. */
+    private val earlyContextAt:Long=0,
     /** Hermes' admission (the grant), running alongside the voice connection; tools and call reads wait for it. */
     admission:Deferred<JSONObject>?=null,
     /** A callback the owner answered: its context carries the call-bound reason and result. */
@@ -348,6 +352,15 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         try {
             val known=if(first) prefetched?.takeIf { contextMatches(it,callScope.session(selectedSession)) } else null
             if(first&&known!=null) { context=checkedContext(known);contextReady=true;stage("context_ok",warm=true);return }
+            if(first&&earlyContext!=null) {
+                stage("context_sent",at=earlyContextAt.takeIf { it>0 }?.let { (it-origin).coerceAtLeast(0) }?:elapsedMs())
+                // The early read is authenticated and scoped, but this call still re-validates its identity before using it.
+                val value=try { withTimeoutOrNull(timeout) { earlyContext.await() } }
+                    catch(error:CancellationException) { currentCoroutineContext().ensureActive();null }
+                if(value!=null&&contextMatches(value,callScope.session(selectedSession))) {
+                    context=checkedContext(value);contextReady=true;stage("context_ok");return
+                }
+            }
             if(first) stage("context_sent")
             val fresh=checkedContext(withTimeout(timeout) { readContext() })
             context=fresh;contextReady=true
@@ -526,7 +539,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 if(frame.has("id")&&frame.optString("method") in setOf("vault.save_login","vault.code","vault.unlock_prompt","secret"))
                     event(JSONObject().put("type","warning").put("message","Secure input is needed. Open the conversation to continue."))
             } } catch(e:CancellationException) { throw e } catch(e:Exception) {
-                if(!stopped) event(JSONObject().put("type","warning").put("message","Native live events disconnected. Job status continues through verified polling."))
+                if(!stopped) event(JSONObject().put("type","warning").put("message","Connection to Hermes interrupted. Check the attached conversation for task status."))
             }
         }
     }

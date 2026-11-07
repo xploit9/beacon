@@ -274,6 +274,8 @@ def canonical_live_proof(request, profile, home, stored, runtime, nonce):
     from gateway.session_identity import authenticated_subject
     session = request.state.session
     principal = authenticated_subject({'user_id':session.user_id,'provider':session.provider,'issuer':session.issuer})
+    native=sys.modules['beacon_native']
+    execution=native.execution_subject(session.user_id,session.provider,principal)
     from gateway.session_authorities import authority_for_home
     authority = authority_for_home(request.app.state.gateway_runner,home)
     row = authority.db.get_session(stored)
@@ -281,11 +283,11 @@ def canonical_live_proof(request, profile, home, stored, runtime, nonce):
     def remote_viewer(actor):
         transport=authority.events.get(getattr(actor,'transport_id',None))
         identity=getattr(transport,'auth_identity',None)
-        return (actor.subject==principal and actor.profile_id==authority.profile_id and
+        return (actor.subject==execution and actor.profile_id==authority.profile_id and
                 'session:read' in actor.capabilities and isinstance(identity,dict) and
                 identity.get('native_bootstrap') is not True and identity.get('provider')==session.provider and
                 identity.get('user_id')==session.user_id and identity.get('issuer','')==session.issuer)
-    if (not row or row.get('user_id')!=principal or live is None or
+    if (not native.owns_row(session.user_id,session.provider,profile,stored,row,principal,authority.db) or live is None or
             not any(remote_viewer(actor) for actor in tuple(live.subscribers.values()))):
         raise HTTPException(403, 'Canonical conversation unavailable')
     return {**proof,'stored':stored,'runtime':runtime}
@@ -412,22 +414,32 @@ async def relay_sockets(client, upstream, profile, mobile=None, binding=None, ru
     native=sys.modules.get('beacon_native')
     pending={}
 
-    def submission(raw):
-        if mobile is None or binding is None or native is None: return
+    async def submission(raw):
+        if mobile is None or binding is None or native is None: return raw
         frame=json.loads(raw,object_pairs_hook=_pairs)
         rid=frame.get('id')
-        if type(rid) not in (str,int): return
-        if type(rid) is str and len(rid)>256 or type(rid) is int and rid.bit_length()>64: return
+        if type(rid) not in (str,int): return raw
+        if type(rid) is str and len(rid)>256 or type(rid) is int and rid.bit_length()>64: return raw
         key=(type(rid),rid)
         if key in pending:
             pending[key]=(time.monotonic(),None)
-            return  # Ambiguous in-flight response ids cannot authorize either input.
+            return raw  # Ambiguous in-flight response ids cannot authorize either input.
         for old in [k for k,v in pending.items() if time.monotonic()-v[0]>=30]: pending.pop(old)
-        if frame.get('method')!='prompt.submit' or len(pending)>=128: return
+        method=frame.get('method')
+        if method not in ('prompt.submit','session.create') or len(pending)>=128: return raw
         params=frame.get('params',{})
+        if method=='session.create':
+            request=params.get('request_id')
+            if request is None:
+                request=params['request_id']=secrets.token_hex(32)
+                raw=json.dumps(frame,ensure_ascii=False,separators=(',',':'))
+            if not isinstance(request,str) or not 1<=len(request)<=256: return raw
+            value=await run(native.prepare_created,mobile,binding,profile,request)
+            pending[key]=(time.monotonic(),value)
+            return raw
         session=params.get('session_id');request=params.get('submission_id') or params.get('input_id')
         if (not isinstance(session,str) or not isinstance(request,str) or
-                not 1<=len(session)<=256 or not 1<=len(request)<=256): return
+                not 1<=len(session)<=256 or not 1<=len(request)<=256): return raw
         try:
             payload=native.remote_payload(params)
             value={name:binding[name] for name in ('owner','provider','principal','home')}
@@ -436,7 +448,8 @@ async def relay_sockets(client, upstream, profile, mobile=None, binding=None, ru
                          wire_digest=hashlib.sha256(raw.encode('utf-8')).hexdigest())
             pending[key]=(time.monotonic(),value)
         except Exception:
-            return  # Forward the original input; unsupported payloads acquire no authority.
+            pass  # Forward the original input; unsupported payloads acquire no authority.
+        return raw
 
     async def confirmation(raw):
         if mobile is None or binding is None or native is None: return
@@ -446,7 +459,14 @@ async def relay_sockets(client, upstream, profile, mobile=None, binding=None, ru
                 saved=pending.pop((type(frame['id']),frame['id']),None)
                 if (saved and saved[1] is not None and time.monotonic()-saved[0]<30 and
                         'error' not in frame and isinstance(frame.get('result'),dict)):
-                    await run(native.confirm_remote_receipt,mobile,saved[1],frame['result'])
+                    if saved[1].get('kind')=='create':
+                        # The native row and its creation receipt can become visible a moment after
+                        # the response; retry only that same exact proof, never a weaker one. The
+                        # final wait is followed by one last exact check.
+                        for delay in (0,0.05,0.1,0.2,0.4):
+                            if delay: await asyncio.sleep(delay)
+                            if await run(native.confirm_created,mobile,saved[1],frame['result']): break
+                    else: await run(native.confirm_remote_receipt,mobile,saved[1],frame['result'])
             elif frame.get('method')=='event':
                 params=frame.get('params',{})
                 if params.get('type')=='message.start':
@@ -463,7 +483,7 @@ async def relay_sockets(client, upstream, profile, mobile=None, binding=None, ru
                 return
             raw = message.get('text')
             capabilities_seen = validate_frame(raw, profile, capabilities_seen)
-            submission(raw)
+            raw=await submission(raw)
             await upstream.send(raw)
 
     async def incoming():

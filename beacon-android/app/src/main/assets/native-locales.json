@@ -1850,7 +1850,12 @@
     "couldn't clear earlier ratings. try again.": "Couldn't clear earlier ratings. Try again.",
     "starting screen share...": "Starting screen share…",
     "email": "Email",
-    "all sources": "All sources"
+    "all sources": "All sources",
+    "reply not confirmed": "Reply not confirmed",
+    "server update was interrupted": "Server update was interrupted",
+    "hermes is busy with an update. new updates are blocked.": "Hermes is busy with an update. New updates are blocked.",
+    "some update steps need attention": "Some update steps need attention",
+    "return to an earlier prompt": "Return to an earlier prompt"
   },
   "it": {
     "read-only status from this conversation": "Stato in sola lettura di questa conversazione",
@@ -5523,7 +5528,12 @@
     "hermes asks before it reads or changes anything": "Hermes chiede prima di leggere o modificare qualcosa",
     "hermes asks before it changes anything": "Hermes chiede prima di modificare qualcosa",
     "hermes acts without asking. phone calls still ask.": "Hermes agisce senza chiedere. Le chiamate chiedono comunque.",
-    "unlock to approve": "Sblocca per approvare"
+    "unlock to approve": "Sblocca per approvare",
+    "reply not confirmed": "Risposta non confermata",
+    "server update was interrupted": "L'aggiornamento del server è stato interrotto",
+    "hermes is busy with an update. new updates are blocked.": "Hermes sta eseguendo un aggiornamento. Non è possibile avviarne altri.",
+    "some update steps need attention": "Alcuni passaggi dell'aggiornamento richiedono attenzione",
+    "return to an earlier prompt": "Torna a una richiesta precedente"
   },
   "ja": {
     "read-only status from this conversation": "この会話の読み取り専用ステータス",
@@ -9199,7 +9209,12 @@
     "hermes asks before it reads or changes anything": "Hermes は読み取りや変更の前に確認します",
     "hermes asks before it changes anything": "Hermes は変更の前に確認します",
     "hermes acts without asking. phone calls still ask.": "Hermes は確認せずに実行します。電話の発信は引き続き確認します。",
-    "unlock to approve": "ロックを解除して承認"
+    "unlock to approve": "ロックを解除して承認",
+    "reply not confirmed": "返信が確認されていません",
+    "server update was interrupted": "サーバーの更新が中断されました",
+    "hermes is busy with an update. new updates are blocked.": "Hermes は更新中です。新しい更新は開始できません。",
+    "some update steps need attention": "更新の一部の手順に確認が必要です",
+    "return to an earlier prompt": "以前のプロンプトに戻る"
   },
   "ru": {
     "read-only status from this conversation": "Статус этой беседы только для чтения",
@@ -12875,7 +12890,12 @@
     "hermes asks before it reads or changes anything": "Hermes спрашивает перед тем, как что-то прочитать или изменить",
     "hermes asks before it changes anything": "Hermes спрашивает перед любыми изменениями",
     "hermes acts without asking. phone calls still ask.": "Hermes действует без вопросов. Перед звонком всё равно спросит.",
-    "unlock to approve": "Разблокируйте, чтобы одобрить"
+    "unlock to approve": "Разблокируйте, чтобы одобрить",
+    "reply not confirmed": "Ответ не подтверждён",
+    "server update was interrupted": "Обновление сервера прервано",
+    "hermes is busy with an update. new updates are blocked.": "Hermes выполняет обновление. Новые обновления пока недоступны.",
+    "some update steps need attention": "Некоторые этапы обновления требуют внимания",
+    "return to an earlier prompt": "Вернуться к предыдущему запросу"
   },
   "es": {
     "read-only status from this conversation": "Estado de solo lectura de esta conversación",
@@ -16515,7 +16535,12 @@
     "hermes asks before it reads or changes anything": "Hermes pregunta antes de leer o cambiar algo",
     "hermes asks before it changes anything": "Hermes pregunta antes de cambiar algo",
     "hermes acts without asking. phone calls still ask.": "Hermes actúa sin preguntar. Las llamadas siguen preguntando.",
-    "unlock to approve": "Desbloquea para aprobar"
+    "unlock to approve": "Desbloquea para aprobar",
+    "reply not confirmed": "Respuesta sin confirmar",
+    "server update was interrupted": "Se interrumpió la actualización del servidor",
+    "hermes is busy with an update. new updates are blocked.": "Hermes se está actualizando. No se pueden iniciar otras actualizaciones.",
+    "some update steps need attention": "Algunos pasos de la actualización requieren atención",
+    "return to an earlier prompt": "Volver a una petición anterior"
   },
   "de": {
     "read-only status from this conversation": "Schreibgeschützter Status dieser Unterhaltung",
@@ -20145,7 +20170,12 @@
     "hermes asks before it reads or changes anything": "Hermes fragt, bevor es etwas liest oder ändert",
     "hermes asks before it changes anything": "Hermes fragt, bevor es etwas ändert",
     "hermes acts without asking. phone calls still ask.": "Hermes handelt ohne Nachfrage. Anrufe fragen weiterhin.",
-    "unlock to approve": "Zum Zustimmen entsperren"
+    "unlock to approve": "Zum Zustimmen entsperren",
+    "reply not confirmed": "Antwort nicht bestätigt",
+    "server update was interrupted": "Das Serverupdate wurde unterbrochen",
+    "hermes is busy with an update. new updates are blocked.": "Hermes führt ein Update aus. Weitere Updates sind vorerst gesperrt.",
+    "some update steps need attention": "Einige Updateschritte brauchen Aufmerksamkeit",
+    "return to an earlier prompt": "Zu einer früheren Eingabe zurückkehren"
   },
   "zh": {
     "read-only status from this conversation": "此对话的只读状态",
@@ -23775,7 +23805,12 @@
     "hermes asks before it reads or changes anything": "Hermes 在读取或更改任何内容前都会询问",
     "hermes asks before it changes anything": "Hermes 在更改任何内容前都会询问",
     "hermes acts without asking. phone calls still ask.": "Hermes 不经询问直接执行。拨打电话仍会询问。",
-    "unlock to approve": "解锁以批准"
+    "unlock to approve": "解锁以批准",
+    "reply not confirmed": "回复尚未确认",
+    "server update was interrupted": "服务器更新已中断",
+    "hermes is busy with an update. new updates are blocked.": "Hermes 正在更新，暂时无法开始其他更新。",
+    "some update steps need attention": "部分更新步骤需要处理",
+    "return to an earlier prompt": "返回先前的提示词"
   },
   "zh-Hant": {
     "read-only status from this conversation": "此對話的唯讀狀態",
@@ -27451,7 +27486,12 @@
     "hermes asks before it reads or changes anything": "Hermes 在讀取或變更任何內容前都會詢問",
     "hermes asks before it changes anything": "Hermes 在變更任何內容前都會詢問",
     "hermes acts without asking. phone calls still ask.": "Hermes 不經詢問直接執行。撥打電話仍會詢問。",
-    "unlock to approve": "解鎖以核准"
+    "unlock to approve": "解鎖以核准",
+    "reply not confirmed": "回覆尚未確認",
+    "server update was interrupted": "伺服器更新已中斷",
+    "hermes is busy with an update. new updates are blocked.": "Hermes 正在更新，暫時無法開始其他更新。",
+    "some update steps need attention": "部分更新步驟需要處理",
+    "return to an earlier prompt": "返回先前的提示詞"
   },
   "pt": {
     "read-only status from this conversation": "Estado somente leitura desta conversa",
@@ -30986,7 +31026,12 @@
     "hermes asks before it reads or changes anything": "O Hermes pergunta antes de ler ou alterar algo",
     "hermes asks before it changes anything": "O Hermes pergunta antes de alterar algo",
     "hermes acts without asking. phone calls still ask.": "O Hermes age sem perguntar. As chamadas continuam a perguntar.",
-    "unlock to approve": "Desbloqueie para aprovar"
+    "unlock to approve": "Desbloqueie para aprovar",
+    "reply not confirmed": "Resposta não confirmada",
+    "server update was interrupted": "A atualização do servidor foi interrompida",
+    "hermes is busy with an update. new updates are blocked.": "O Hermes está a atualizar. Não é possível iniciar outras atualizações.",
+    "some update steps need attention": "Algumas etapas da atualização precisam de atenção",
+    "return to an earlier prompt": "Voltar a um pedido anterior"
   },
   "ko": {
     "read-only status from this conversation": "이 대화의 읽기 전용 상태",
@@ -34662,7 +34707,12 @@
     "hermes asks before it reads or changes anything": "Hermes는 무엇이든 읽거나 바꾸기 전에 묻습니다",
     "hermes asks before it changes anything": "Hermes는 무엇이든 바꾸기 전에 묻습니다",
     "hermes acts without asking. phone calls still ask.": "Hermes가 묻지 않고 실행합니다. 전화 걸기는 여전히 묻습니다.",
-    "unlock to approve": "잠금 해제하고 승인"
+    "unlock to approve": "잠금 해제하고 승인",
+    "reply not confirmed": "답변이 확인되지 않음",
+    "server update was interrupted": "서버 업데이트가 중단되었습니다",
+    "hermes is busy with an update. new updates are blocked.": "Hermes가 업데이트 중입니다. 새 업데이트를 시작할 수 없습니다.",
+    "some update steps need attention": "일부 업데이트 단계를 확인해야 합니다",
+    "return to an earlier prompt": "이전 프롬프트로 돌아가기"
   },
   "fr": {
     "read-only status from this conversation": "État en lecture seule de cette conversation",
@@ -38338,7 +38388,12 @@
     "hermes asks before it reads or changes anything": "Hermes demande avant de lire ou de modifier quoi que ce soit",
     "hermes asks before it changes anything": "Hermes demande avant de modifier quoi que ce soit",
     "hermes acts without asking. phone calls still ask.": "Hermes agit sans demander. Les appels demandent toujours.",
-    "unlock to approve": "Déverrouillez pour approuver"
+    "unlock to approve": "Déverrouillez pour approuver",
+    "reply not confirmed": "Réponse non confirmée",
+    "server update was interrupted": "La mise à jour du serveur a été interrompue",
+    "hermes is busy with an update. new updates are blocked.": "Hermes est en cours de mise à jour. Aucune autre mise à jour ne peut démarrer.",
+    "some update steps need attention": "Certaines étapes de la mise à jour nécessitent une vérification",
+    "return to an earlier prompt": "Revenir à une demande précédente"
   },
   "cs": {
     "read-only status from this conversation": "Stav této konverzace pouze pro čtení",
@@ -42014,7 +42069,12 @@
     "hermes asks before it reads or changes anything": "Hermes se zeptá, než něco přečte nebo změní",
     "hermes asks before it changes anything": "Hermes se zeptá, než něco změní",
     "hermes acts without asking. phone calls still ask.": "Hermes jedná bez ptaní. Hovory se stále zeptají.",
-    "unlock to approve": "Odemkněte a schvalte"
+    "unlock to approve": "Odemkněte a schvalte",
+    "reply not confirmed": "Odpověď není potvrzena",
+    "server update was interrupted": "Aktualizace serveru byla přerušena",
+    "hermes is busy with an update. new updates are blocked.": "Hermes se právě aktualizuje. Další aktualizace nelze spustit.",
+    "some update steps need attention": "Některé kroky aktualizace vyžadují pozornost",
+    "return to an earlier prompt": "Vrátit se k dřívějšímu zadání"
   },
   "tr": {
     "read-only status from this conversation": "Bu konuşmanın salt okunur durumu",
@@ -45690,7 +45750,12 @@
     "hermes asks before it reads or changes anything": "Hermes bir şeyi okumadan veya değiştirmeden önce sorar",
     "hermes asks before it changes anything": "Hermes bir şeyi değiştirmeden önce sorar",
     "hermes acts without asking. phone calls still ask.": "Hermes sormadan işlem yapar. Aramalar yine sorar.",
-    "unlock to approve": "Onaylamak için kilidi açın"
+    "unlock to approve": "Onaylamak için kilidi açın",
+    "reply not confirmed": "Yanıt doğrulanmadı",
+    "server update was interrupted": "Sunucu güncellemesi kesintiye uğradı",
+    "hermes is busy with an update. new updates are blocked.": "Hermes güncelleniyor. Yeni güncellemeler başlatılamaz.",
+    "some update steps need attention": "Bazı güncelleme adımları kontrol gerektiriyor",
+    "return to an earlier prompt": "Önceki bir isteme dön"
   },
   "pl": {
     "read-only status from this conversation": "Stan tej rozmowy tylko do odczytu",
@@ -49366,7 +49431,12 @@
     "hermes asks before it reads or changes anything": "Hermes pyta, zanim coś odczyta lub zmieni",
     "hermes asks before it changes anything": "Hermes pyta, zanim coś zmieni",
     "hermes acts without asking. phone calls still ask.": "Hermes działa bez pytania. Połączenia nadal pytają.",
-    "unlock to approve": "Odblokuj, aby zatwierdzić"
+    "unlock to approve": "Odblokuj, aby zatwierdzić",
+    "reply not confirmed": "Odpowiedź niepotwierdzona",
+    "server update was interrupted": "Aktualizacja serwera została przerwana",
+    "hermes is busy with an update. new updates are blocked.": "Hermes jest aktualizowany. Nie można rozpocząć kolejnych aktualizacji.",
+    "some update steps need attention": "Niektóre kroki aktualizacji wymagają uwagi",
+    "return to an earlier prompt": "Wróć do wcześniejszego polecenia"
   },
   "vi": {
     "read-only status from this conversation": "Trạng thái chỉ đọc của cuộc trò chuyện này",
@@ -53042,7 +53112,12 @@
     "hermes asks before it reads or changes anything": "Hermes hỏi trước khi đọc hoặc thay đổi bất cứ điều gì",
     "hermes asks before it changes anything": "Hermes hỏi trước khi thay đổi bất cứ điều gì",
     "hermes acts without asking. phone calls still ask.": "Hermes hành động mà không hỏi. Cuộc gọi vẫn hỏi.",
-    "unlock to approve": "Mở khóa để phê duyệt"
+    "unlock to approve": "Mở khóa để phê duyệt",
+    "reply not confirmed": "Chưa xác nhận phản hồi",
+    "server update was interrupted": "Quá trình cập nhật máy chủ bị gián đoạn",
+    "hermes is busy with an update. new updates are blocked.": "Hermes đang cập nhật. Chưa thể bắt đầu bản cập nhật khác.",
+    "some update steps need attention": "Một số bước cập nhật cần được kiểm tra",
+    "return to an earlier prompt": "Quay lại yêu cầu trước đó"
   },
   "ar": {
     "read-only status from this conversation": "حالة للقراءة فقط من هذه المحادثة",
@@ -55336,6 +55411,11 @@
     "hermes asks before it reads or changes anything": "يسأل Hermes قبل أن يقرأ أو يغيّر أي شيء",
     "hermes asks before it changes anything": "يسأل Hermes قبل أن يغيّر أي شيء",
     "hermes acts without asking. phone calls still ask.": "يتصرف Hermes دون أن يسأل. المكالمات ما زالت تسأل.",
-    "unlock to approve": "افتح القفل للموافقة"
+    "unlock to approve": "افتح القفل للموافقة",
+    "reply not confirmed": "لم يتم تأكيد الرد",
+    "server update was interrupted": "انقطع تحديث الخادم",
+    "hermes is busy with an update. new updates are blocked.": "يجري تحديث Hermes. لا يمكن بدء تحديثات أخرى الآن.",
+    "some update steps need attention": "بعض خطوات التحديث تحتاج إلى مراجعة",
+    "return to an earlier prompt": "العودة إلى طلب سابق"
   }
 }

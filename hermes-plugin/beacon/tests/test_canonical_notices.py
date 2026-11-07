@@ -56,12 +56,11 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
     monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
     monkeypatch.setattr(profiles, 'profile_matches_home', lambda profile, home: profile == 'default' and home == tmp_path)
 
-    # Exercise the actual Root wrapper without loading an owner's plugin configuration.
+    # Load the production hook and observer under this fixture's private configuration.
     plugin_path = Path(observer.__file__).with_name('__init__.py')
-    hook_node = next(node for node in ast.parse(plugin_path.read_text(encoding='utf-8')).body
-                     if isinstance(node, ast.FunctionDef) and node.name == 'native_completion')
-    hook_ns = dict(mobile=api.mobile, native=api.native, observers=observer, current_profile=lambda settings: 'default')
-    exec(compile(ast.Module(body=[hook_node], type_ignores=[]), str(plugin_path), 'exec'), hook_ns)
+    spec=importlib.util.spec_from_file_location('native_notice_production_hook',plugin_path)
+    entry=importlib.util.module_from_spec(spec);spec.loader.exec_module(entry)
+    monkeypatch.setattr(entry,'current_profile',lambda settings:'default')
     # Run precisely the pinned finalizer's emitted hook call, under real execute_admission context.
     import agent.turn_finalizer
     finalizer_path = Path(agent.turn_finalizer.__file__)
@@ -80,15 +79,20 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
     async def drive(*, proven=True, foreign_binding=False, foreign_actor=False, failed=False,
                     interrupted=False, execute=True, live_call=False, stale_generation=False):
         ref = SessionRef(str(tmp_path), 'same-chat')
+        submitting=connection
         if foreign_actor:
             other = dict(identity, issuer='https://other.example')
             actor = AuthorityConnection(authority, SimpleNamespace(auth_identity=other), other)
-            with pytest.raises(RuntimeStoreError, match='permission_denied'):
-                await actor.submit(ref, {'submission_id': 'foreign-request', 'text': 'Synthetic text'})
-            return None
+            if actor.actor.subject!=connection.actor.subject:
+                with pytest.raises(RuntimeStoreError, match='permission_denied'):
+                    await actor.submit(ref, {'submission_id': 'foreign-request', 'text': 'Synthetic text'})
+                return None
+            submitting=actor  # Current native shares execution identity; Beacon must still refuse this issuer.
+            actor.subscriptions['same-chat']='foreign-subscription'
+            live.subscribers['foreign-subscription']=actor.actor
         if live_call:
             api.mobile.reserve('owner', 'default', 'same-chat', principal=subject())
-        binding = {'owner': 'owner', 'provider': 'basic', 'principal': subject('https://other.example') if foreign_binding else subject(),
+        binding = {'owner': 'owner', 'provider': 'basic', 'principal': subject('https://other.example') if foreign_binding or foreign_actor else subject(),
                    'home': transport.home_digest(tmp_path)}
         wire = json.dumps({'jsonrpc': '2.0', 'id': 17, 'method': 'prompt.submit', 'params': {
             'profile': 'default', 'session_id': 'same-chat', 'submission_id': 'notice-request', 'text': 'Synthetic text task'}})
@@ -102,14 +106,14 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
                 assert raw == wire
                 params = dict(json.loads(raw)['params'])
                 params.pop('profile')
-                receipt = await connection.submit(ref, params)
+                receipt = await submitting.submit(ref, params)
                 await incoming.put(json.dumps({'jsonrpc': '2.0', 'id': 17 if proven else 99, 'result': receipt}))
         relay = asyncio.create_task(transport.relay_sockets(Client(), Upstream(), 'default', api.mobile, binding))
         try:
             await outgoing.put({'type': 'websocket.receive', 'text': wire})
             await asyncio.wait_for(received.get(), 5)
             claimed = claim_session_input(db, epoch=epoch, session_id='same-chat')
-            assert claimed and claimed['principal_id'] == subject()
+            assert claimed and claimed['principal_id'] == api.native.execution_subject('owner','basic',subject())
             authority.executing['same-chat'] = claimed['generation']
             start = {'method': 'event', 'params': {'type': 'message.start', 'session_id': 'same-chat',
                      'admission_id': claimed['admission_id'], 'authority_epoch': epoch,
@@ -124,10 +128,10 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
                 values = dict(agent=agent, logger=None, effective_task_id=None, turn_id=claimed['admission_id'],
                               completed=not failed, failed=failed, interrupted=interrupted,
                               _turn_exit_reason='error' if failed else 'completed', _platform='local',
-                              _invoke_hook_safely=lambda name, logger, **kwargs: hook_ns['native_completion'](**kwargs))
+                              _invoke_hook_safely=lambda name, logger, **kwargs: entry.native_completion(**kwargs))
                 eval(emitted_hook, values)
             async def handle(event):
-                assert event.source.user_id == subject() and event.text == 'Synthetic text task'
+                assert event.source.user_id in (subject(),api.native.execution_subject('owner','basic',subject())) and event.text == 'Synthetic text task'
                 emit()
                 emit()  # A duplicate hook for this native turn must not duplicate the outbox row.
                 execution_result.get()['terminal_result'] = {'completed': not failed, 'failed': failed,

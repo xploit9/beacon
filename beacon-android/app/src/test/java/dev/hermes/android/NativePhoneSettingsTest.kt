@@ -5,14 +5,220 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.test.*
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.*
 import org.junit.Test
+import org.json.JSONObject
 import java.util.concurrent.CopyOnWriteArrayList
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class NativePhoneSettingsTest {
+    private val updateId = "a".repeat(32)
+    private val updateRequestedAt = "2026-11-07T00:00:00Z"
+    private fun updateClient(reply: (Request) -> JSONObject) = BeaconClient(AuthContext("https://updater.example", emptyList(), owner = "owner", nativeProvider = "basic"), null) { builder ->
+        builder.addInterceptor { chain ->
+            val request = chain.request()
+            Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                .body(reply(request).toString().toResponseBody("application/json".toMediaType())).build()
+        }
+    }
+    private fun updateStatus(running: Boolean, finished: Boolean = false, sequence: Int = 0) = json("server_now" to updateRequestedAt,
+        "host_busy" to running, "action" to json("running" to running, "sequence" to sequence, "receipt" to json("action_id" to updateId)),
+        "receipt" to json("receipt" to json("action_id" to updateId, "started_at" to "2026-11-07T00:00:01Z",
+            "finished_at" to if (finished) "2026-11-07T00:10:01Z" else "", "outcome" to if (finished) "success" else "running",
+            "followups" to org.json.JSONArray().put(json("step" to "gateway", "reason" to "manual restart owed")))))
+    private fun readyUpdate() = json("can_apply" to true, "update_available" to true)
+    // The client uses real IO threads; drain ready work without advancing the virtual retry delays.
+    private fun TestScope.awaitUpdateIo(predicate: () -> Boolean) {
+        val deadline = System.nanoTime() + 5_000_000_000L
+        while (!predicate()) {
+            testScheduler.runCurrent()
+            check(System.nanoTime() < deadline) { "Updater fixture IO did not settle" }
+            Thread.sleep(1)
+        }
+        testScheduler.runCurrent()
+    }
+
+    @Test(timeout = 30_000) fun tenMinuteUpdateSurvivesReloadAndVersionCheckFailureWithoutAnotherPost() = runTest {
+        val posts = java.util.concurrent.atomic.AtomicInteger()
+        val reads = java.util.concurrent.atomic.AtomicInteger()
+        val finished = java.util.concurrent.atomic.AtomicBoolean()
+        val failCheck = java.util.concurrent.atomic.AtomicBoolean()
+        val client = updateClient { request -> when (request.url.encodedPath) {
+            "/api/hermes/update/check" -> { if (failCheck.get()) throw java.io.IOException("synthetic version-check outage"); readyUpdate() }
+            "/api/plugins/beacon/admin/update" -> { posts.incrementAndGet(); json("accepted" to true, "action_id" to updateId, "requested_at" to updateRequestedAt) }
+            "/api/plugins/beacon/admin/update/status" -> updateStatus(posts.get() > 0 && !finished.get(), finished.get(), reads.incrementAndGet())
+            else -> error("Unexpected updater fixture request")
+        } }
+        val saved = SavedStateHandle()
+        val worker = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        try {
+            val controller = NativePhoneSettings(worker, saved) { client }
+            controller.loadServer("Server updates"); awaitUpdateIo { controller.server.value.canApply }
+            controller.applyServerUpdate(); controller.applyServerUpdate()
+            awaitUpdateIo { posts.get() == 1 && controller.server.value.updateStatusFresh && controller.server.value.applying }
+            repeat(301) { index ->
+                val nextRead = reads.get() + 1
+                advanceTimeBy(2000); runCurrent()
+                awaitUpdateIo { (controller.server.value.action?.optInt("sequence") ?: 0) >= nextRead }
+                if (index == 30) {
+                    failCheck.set(true); controller.loadServer("Server updates", force = true)
+                    awaitUpdateIo { !controller.server.value.loading && controller.server.value.error.isNotBlank() }
+                    assertTrue(controller.server.value.applying)
+                }
+            }
+            assertTrue(reads.get() > 60)
+            finished.set(true); advanceTimeBy(2000); runCurrent()
+            awaitUpdateIo { controller.server.value.outcome == "success" }
+            assertFalse(controller.server.value.applying)
+            assertTrue(controller.server.value.updateWarnings.any { it.contains("manual restart owed") })
+            assertEquals(updateId, controller.server.value.requestedActionId)
+            assertEquals(1, posts.get())
+        } finally { worker.cancel(); client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun boundedObservationBecomesUnconfirmedAndSavedIdentityResumesWithoutPost() = runTest {
+        val posts = java.util.concurrent.atomic.AtomicInteger()
+        val finished = java.util.concurrent.atomic.AtomicBoolean()
+        val client = updateClient { request -> when (request.url.encodedPath) {
+            "/api/hermes/update/check" -> readyUpdate()
+            "/api/plugins/beacon/admin/update" -> { posts.incrementAndGet(); json("accepted" to true, "action_id" to updateId, "requested_at" to updateRequestedAt) }
+            "/api/plugins/beacon/admin/update/status" -> updateStatus(posts.get() > 0 && !finished.get(), finished.get())
+            else -> error("Unexpected updater fixture request")
+        } }
+        val saved = SavedStateHandle()
+        val worker = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        var resumedWorker: CoroutineScope? = null
+        try {
+            val controller = NativePhoneSettings(worker, saved) { client }
+            controller.loadServer("Server updates"); awaitUpdateIo { controller.server.value.canApply }
+            controller.applyServerUpdate(); awaitUpdateIo { controller.server.value.updateStatusFresh && controller.server.value.applying && controller.server.value.requestedActionId == updateId }
+            advanceTimeBy(900_001); runCurrent()
+            awaitUpdateIo { !controller.server.value.updateStatusFresh && !controller.server.value.applying }
+            assertEquals("unconfirmed", controller.server.value.outcome)
+            assertFalse(controller.server.value.canApply)
+            assertTrue(controller.server.value.notice.isNotBlank())
+            worker.cancel(); finished.set(true)
+            val nextWorker = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+            resumedWorker = nextWorker
+            val resumed = NativePhoneSettings(nextWorker, saved) { client }
+            resumed.loadServer("Server updates")
+            awaitUpdateIo { resumed.server.value.outcome == "success" }
+            assertEquals(updateId, resumed.server.value.requestedActionId)
+            assertEquals("", resumed.server.value.notice)
+            assertEquals(1, posts.get())
+        } finally { worker.cancel(); resumedWorker?.cancel(); client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun aLostAcceptedReplyKeepsPendingIdentityAndNeverRetriesPost() = runTest {
+        val posts = java.util.concurrent.atomic.AtomicInteger()
+        val client = updateClient { request -> when (request.url.encodedPath) {
+            "/api/hermes/update/check" -> readyUpdate()
+            "/api/plugins/beacon/admin/update" -> { posts.incrementAndGet(); throw java.io.IOException("synthetic accepted reply lost") }
+            "/api/plugins/beacon/admin/update/status" -> updateStatus(false, finished = posts.get() > 0)
+            else -> error("Unexpected updater fixture request")
+        } }
+        val saved = SavedStateHandle()
+        val worker = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        try {
+            val controller = NativePhoneSettings(worker, saved) { client }
+            controller.loadServer("Server updates"); awaitUpdateIo { controller.server.value.canApply }
+            controller.applyServerUpdate()
+            awaitUpdateIo { posts.get() == 1 && !controller.server.value.applying && controller.server.value.notice.isNotBlank() }
+            assertEquals(updateRequestedAt, controller.server.value.requestedAt)
+            assertEquals("", controller.server.value.requestedActionId)
+            controller.resumeServerUpdate(); awaitUpdateIo { controller.server.value.updateStatusFresh }
+            assertEquals("unconfirmed", controller.server.value.outcome)
+            assertFalse(controller.server.value.canApply)
+            controller.applyServerUpdate(); runCurrent()
+            assertEquals(1, posts.get())
+            assertEquals(updateRequestedAt, saved.get<String>("server-update:${client.scope.copy(profile = "", session = "").key}:at"))
+        } finally { worker.cancel(); client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun disconnectClearsRunningAndReadOnlyResumeRecoversTheReceipt() = runTest {
+        val offline = java.util.concurrent.atomic.AtomicBoolean(true)
+        val reads = java.util.concurrent.atomic.AtomicInteger()
+        val client = updateClient { request -> when (request.url.encodedPath) {
+            "/api/hermes/update/check" -> readyUpdate()
+            "/api/plugins/beacon/admin/update/status" -> { reads.incrementAndGet(); if (offline.get()) throw java.io.IOException("synthetic disconnect"); updateStatus(false, finished = true) }
+            else -> error("No update POST is authorized by this fixture")
+        } }
+        val key = client.scope.copy(profile = "", session = "").key
+        val saved = SavedStateHandle(mapOf("server-update:$key:at" to updateRequestedAt, "server-update:$key:id" to updateId))
+        val worker = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        try {
+            val controller = NativePhoneSettings(worker, saved) { client }
+            controller.loadServer("Server updates")
+            awaitUpdateIo { reads.get() >= 1 && controller.server.value.notice.isNotBlank() }
+            assertFalse(controller.server.value.applying)
+            assertEquals("unconfirmed", controller.server.value.outcome)
+            offline.set(false)
+            advanceTimeBy(2000); runCurrent(); controller.resumeServerUpdate()
+            awaitUpdateIo { controller.server.value.outcome == "success" }
+            assertEquals("", controller.server.value.notice)
+            assertEquals(updateId, controller.server.value.requestedActionId)
+        } finally { worker.cancel(); client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun aNewBusyHostPreventsPostWhileThePreviousTerminalReceiptRemainsVisible() = runTest {
+        val busy = java.util.concurrent.atomic.AtomicBoolean()
+        val posts = java.util.concurrent.atomic.AtomicInteger()
+        val client = updateClient { request -> when (request.url.encodedPath) {
+            "/api/hermes/update/check" -> readyUpdate()
+            "/api/plugins/beacon/admin/update/status" -> {
+                check(request.url.queryParameter("action_id") == updateId)
+                updateStatus(busy.get(), finished = true)
+            }
+            "/api/plugins/beacon/admin/update" -> { posts.incrementAndGet(); error("Busy host must block POST") }
+            else -> error("Unexpected updater fixture request")
+        } }
+        val key = client.scope.copy(profile = "", session = "").key
+        val saved = SavedStateHandle(mapOf("server-update:$key:at" to updateRequestedAt, "server-update:$key:id" to updateId))
+        val worker = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        try {
+            val controller = NativePhoneSettings(worker, saved) { client }
+            controller.loadServer("Server updates"); awaitUpdateIo { controller.server.value.canApply }
+            busy.set(true); controller.applyServerUpdate()
+            awaitUpdateIo { controller.server.value.updateStatusFresh && controller.server.value.hostBusy }
+            assertEquals("success", controller.server.value.outcome)
+            assertFalse(controller.server.value.applying)
+            assertFalse(controller.server.value.canApply)
+            assertEquals(0, posts.get())
+        } finally { worker.cancel(); client.closeNative() }
+    }
+
+    @Test(timeout = 10_000) fun lateUpdaterReceiptCannotCrossAHostRebind() = runBlocking {
+        val entered = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val first = updateClient { request ->
+            if (request.url.encodedPath.endsWith("/status")) { entered.countDown(); check(release.await(5, java.util.concurrent.TimeUnit.SECONDS)); updateStatus(false, finished = true) }
+            else readyUpdate()
+        }
+        val second = BeaconClient(AuthContext("https://other-updater.example", emptyList(), owner = "other", nativeProvider = "basic"), null) { builder ->
+            builder.addInterceptor { chain -> Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
+                .body((if (chain.request().url.encodedPath.endsWith("/status")) json("host_busy" to false) else readyUpdate()).toString().toResponseBody("application/json".toMediaType())).build() }
+        }
+        val active = java.util.concurrent.atomic.AtomicReference(first)
+        val key = first.scope.copy(profile = "", session = "").key
+        val saved = SavedStateHandle(mapOf("server-update:$key:at" to updateRequestedAt, "server-update:$key:id" to updateId))
+        val worker = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        try {
+            val controller = NativePhoneSettings(worker, saved) { active.get() }
+            controller.loadServer("Server updates")
+            assertTrue(withContext(Dispatchers.IO) { entered.await(3, java.util.concurrent.TimeUnit.SECONDS) })
+            active.set(second); controller.bind(); controller.loadServer("Server updates")
+            withTimeout(5000) { controller.server.first { it.canApply } }
+            release.countDown(); worker.coroutineContext[Job]!!.children.toList().joinAll()
+            assertEquals("", controller.server.value.requestedActionId)
+            assertEquals("unconfirmed", controller.server.value.outcome)
+            assertTrue(controller.server.value.updateWarnings.isEmpty())
+            assertEquals(updateId, saved.get<String>("server-update:$key:id"))
+        } finally { release.countDown(); worker.cancel(); first.closeNative(); second.closeNative() }
+    }
     @Test(timeout = 10_000) fun lateMemoryReadCannotReplaceAnotherProfileOrAccount() = runBlocking {
         val captured = java.util.concurrent.CountDownLatch(1)
         val release = java.util.concurrent.CountDownLatch(1)

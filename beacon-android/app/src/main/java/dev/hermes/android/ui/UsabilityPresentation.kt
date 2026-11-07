@@ -216,7 +216,7 @@ internal fun mobileSlashCommands(commands: List<JSONObject>): List<JSONObject> =
  */
 private val slashCommandTexts = mapOf(
     "new" to "New chat", "reset" to "New chat", "clear" to "Start fresh", "history" to "Show history", "save" to "Export chat",
-    "retry" to "Try again", "undo" to "Undo last turn", "title" to "Rename chat", "branch" to "Branch chat", "fork" to "Branch chat",
+    "retry" to "Try again", "undo" to "Undo last turn", "rewind" to "Return to an earlier prompt", "title" to "Rename chat", "branch" to "Branch chat", "fork" to "Branch chat",
     "compress" to "Shorten history", "stop" to "Stop reply", "status" to "Show status", "model" to "Change model", "usage" to "Show usage",
     "help" to "Show commands", "queue" to "Queue a message", "background" to "Run in background", "bg" to "Run in background", "reasoning" to "Set reasoning level",
     "skills" to "Browse skills", "tools" to "Choose tools",

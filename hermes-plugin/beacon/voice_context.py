@@ -127,8 +127,14 @@ def live_agents(owner,provider,profile,stored,principal=None):
     """The agents of this owner's open chats on this conversation and profile."""
     from tui_gateway import server
     target=server._profile_home(profile)
+    def owned(record):
+        stamp=server._session_auth_user_id(record)
+        if principal and stamp==provider+':'+owner:
+            proof=mobile.native_conversation(owner,provider,profile,native.profile_fingerprint(profile),stored,principal)
+            if proof is None: return False
+        return native.owns_row(owner,provider,profile,stored,{'user_id':stamp},principal)
     with server._sessions_lock:
-        records=[r for r in server._sessions.values() if server._session_auth_user_id(r)==(principal or provider+':'+owner) and (r.get('profile_home') or None)==(str(target) if target else None) and r.get('session_key')==stored]
+        records=[r for r in server._sessions.values() if r.get('session_key')==stored and (r.get('profile_home') or None)==(str(target) if target else None) and not r.get('_finalized') and owned(r)]
     return [r['agent'] for r in records if r.get('agent') is not None]
 
 def external_provider(owner,provider,profile,stored,cfg,call_id=None,principal=None):
@@ -145,7 +151,8 @@ def external_provider(owner,provider,profile,stored,cfg,call_id=None,principal=N
         if match and callable(getattr(match,'prefetch',None)): return (manager,match),name
     target=server._profile_home(profile)
     root=Path(target) if target else Path(server._hermes_home)
-    return (None,load_recall_provider(name,root,stored,principal or owner)),name
+    subject=native.execution_subject(owner,provider,principal) if principal else owner
+    return (None,load_recall_provider(name,root,stored,subject)),name
 
 def external_memory_configured(cfg):
     section = cfg.get('memory') if isinstance(cfg, dict) else None
@@ -225,7 +232,7 @@ def build_manager(root, owner, provider, profile, stored,principal=None):
         manager.add_provider(matching)
         # The primary context, with the owner as the runtime user, as the dashboard chat agent builds it.
         manager.initialize_all(session_id=stored, platform=row.get('source') or 'api_server', hermes_home=str(root),
-                               agent_context='primary', user_id=principal or provider + ':' + owner, agent_identity=profile,
+                               agent_context='primary', user_id=native.execution_subject(owner,provider,principal) if principal else provider+':'+owner, agent_identity=profile,
                                agent_workspace='hermes')
     except BaseException:
         manager.shutdown_all()
@@ -360,10 +367,11 @@ def provider_tool_call(root, owner, provider, profile, stored, call_id, name, ar
 
 class OwnedSessions:
     """A profile's session store seen through the owner's own conversations only, the rule the app's History uses."""
-    def __init__(self, db, owner):
+    def __init__(self, db, owner,check=None):
         self._db = db
         self._owner = owner
         self._owned = {}
+        self._check=check
 
     def __getattr__(self, name):
         return getattr(self._db, name)
@@ -372,7 +380,7 @@ class OwnedSessions:
         if not isinstance(session_id, str): return False
         if session_id not in self._owned:
             row = self._db.get_session(session_id)
-            self._owned[session_id] = bool(row) and row.get('user_id') == self._owner
+            self._owned[session_id] = self._check(session_id,row) if self._check else bool(row) and row.get('user_id') == self._owner
         return self._owned[session_id]
 
     def get_session(self, session_id):
@@ -409,7 +417,10 @@ def session_search_call(owner, provider, profile, arguments,principal=None):
         return json.dumps({'success': False, 'error': 'A call searches the current profile only.'})
     with server._profile_db({'profile': profile}) as db:
         if db is None: return json.dumps({'success': False, 'error': 'The conversation store is unavailable.'})
-        return session_search(db=OwnedSessions(db, principal or provider + ':' + owner),
+        return session_search(db=OwnedSessions(db, principal or provider + ':' + owner,
+                              lambda sid,row:native.owns_row(owner,provider,profile,sid,row,principal,db) and
+                              (not principal or row.get('user_id')!=provider+':'+owner or
+                               mobile.native_conversation(owner,provider,profile,native.profile_fingerprint(profile),sid,principal) is not None)),
                               **{key: arguments[key] for key in SEARCH_ARGUMENTS if key in arguments})
 
 
@@ -719,13 +730,13 @@ SESSION_CONTEXTS_LOCK=threading.Lock()
 def _clock(): return time.monotonic()
 
 
-def _owned_live_draft(owner,provider,profile,stored):
+def _owned_live_draft(owner,provider,profile,stored,principal=None):
     """The owner's open, not yet saved chat (a new chat before its first message), by the rule the grant reserves it with."""
     from tui_gateway import server
     home=server._profile_home(profile)
     expected_home=str(home) if home else None
     with server._sessions_lock:
-        return any(record.get('session_key')==stored and server._session_auth_user_id(record)==provider+':'+owner
+        return any(record.get('session_key')==stored and native.owns_row(owner,provider,profile,stored,{'user_id':server._session_auth_user_id(record)},principal)
                    and (record.get('profile_home') or None)==expected_home and not record.get('_finalized')
                    for record in server._sessions.values())
 
@@ -737,7 +748,7 @@ def _verify_saved_or_draft(owner,provider,profile,stored,principal=None):
         with server._profile_db({'profile':profile}) as db:
             if db is None: raise RuntimeError('Native conversation store unavailable')
             if db.get_session(stored) is not None: raise
-        if _owned_live_draft(owner,provider,profile,stored): return {}
+        if _owned_live_draft(owner,provider,profile,stored,principal): return {}
         raise
 
 

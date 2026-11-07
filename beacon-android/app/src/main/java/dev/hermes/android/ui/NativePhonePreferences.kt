@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
+import kotlinx.coroutines.delay
 
 @Composable internal fun NativePhonePreferences(vm: BeaconViewModel, page: String) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -69,7 +70,10 @@ import dev.hermes.android.BeaconViewModel
     var confirm by remember { mutableStateOf(false) }
     var reviewUnknown by remember { mutableStateOf(false) }
     val callBlocksUpdate = uiText("End the current call before updating Hermes.")
-    LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page) }
+    LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) {
+        vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page)
+        while (page == "Server updates" && ui.connected) { delay(15_000); vm.phoneSettings.resumeServerUpdate() }
+    }
     Column(Modifier.fillMaxSize()) {
         // The checkpoints page is named for what it holds: the earlier versions of changed files.
         val backups = serverCheckpointPage(page)

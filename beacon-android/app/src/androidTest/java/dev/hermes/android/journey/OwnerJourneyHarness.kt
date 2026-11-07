@@ -39,7 +39,11 @@ internal val ownerRuntimeOptIn = TestRule { base: Statement, _: Description ->
             check(emulator) { "emulator_required" }
             try { base.evaluate() }
             catch (skip: AssumptionViolatedException) { throw skip }
-            catch (_: Throwable) { throw AssertionError("owner_journey_rule_failed") }
+            catch (error: Throwable) {
+                val detail = (error.message ?: "").replace(Regex("https?://\\S+"), "[url]").take(160)
+                throw AssertionError("owner_journey_rule_failed: " + error.javaClass.simpleName +
+                    (if (detail.isBlank()) "" else ": " + detail))
+            }
         }
     }
 }
@@ -132,6 +136,7 @@ internal class OwnerJourneyHarness(
             val frame=error.stackTrace.firstOrNull { it.className.startsWith("dev.hermes.android.journey.") }
             val kind=when(error) { is kotlinx.coroutines.TimeoutCancellationException -> "timeout"; is AssertionError -> "assertion"; is IllegalStateException -> "state"; else -> "other" }
             runCatching { mark("X-04", "failure_$kind", "failed", frame?.lineNumber?.takeIf { it>=0 }) }
+            frame?.lineNumber?.takeIf { it>0 }?.let { line -> runCatching { mark("X-04", "failure_line_$line", "failed") } }
             val type=error.javaClass.simpleName.lowercase().replace(Regex("[^a-z0-9_]"), "").take(32)
             if(type.isNotBlank()) runCatching { mark("X-04", "failure_type_$type", "failed") }
             runCatching { mark("X-04", "test_failed", "failed") }

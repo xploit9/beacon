@@ -174,10 +174,11 @@ class ChatDeliveryTest {
         val after = liveAfterEvent(before, "state_saved", json("replay_reset" to true, "session" to json(
             "running" to false, "pending" to JSONArray().put(json("status" to "unknown", "admission_id" to "synthetic-admission")),
             "active_stream_id" to JSONObject.NULL, "messages" to JSONArray())), false, LiveAssistantBoundary())
-        assertEquals("An unknown admission must keep the unresolved turn fenced", before.streamId, after?.streamId)
+        assertEquals("An old epoch has no current stream authority", "", after?.streamId)
         assertEquals("Turn status unknown", after?.status)
         assertEquals("retained-receipt", after?.uncertain)
         assertEquals("", after?.liveText)
+        assertEquals("Old epoch", after?.raw?.rows("_unconfirmed_replies")?.singleOrNull()?.string("text"))
     }
 
     @Test(timeout = 10_000) fun longTaskReplayDeliversProgressAndTheFinalCompletionInOrder() = runBlocking {

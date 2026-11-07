@@ -64,9 +64,10 @@ data class QueuedMessage(
     val text: String, val attachments: List<JSONObject> = emptyList(), val model: String = "", val provider: String = "",
     val id: String = UUID.randomUUID().toString(), val createdAt: Long = System.currentTimeMillis(),
     val state: String = "queued", val kind: String = "queue", val rowId: String = "", val admissionId: String = "", val outcome: String = "", val submissionId: String = id,
+    val afterRowId: String? = null,
 ) {
     fun encode(): JSONObject = json("text" to text, "attachments" to JSONArray(attachments), "model" to model, "provider" to provider,
-        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId)
+        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId, "after_row_id" to afterRowId)
     companion object {
         fun decode(item: Any?): QueuedMessage {
             if (item !is JSONObject) return QueuedMessage(item?.toString().orEmpty(), createdAt = 0L)
@@ -75,7 +76,7 @@ data class QueuedMessage(
             val id = item.string("id").ifBlank { UUID.randomUUID().toString() }
             return QueuedMessage(item.string("text"), item.rows("attachments"), item.string("model"), item.string("provider"),
                 id, item.optLong("created_at").coerceAtLeast(0), state, item.string("kind").takeIf { it in setOf("queue", "steer") } ?: "queue",
-                item.string("row_id"), item.string("admission_id"), item.string("outcome"), item.string("submission_id").ifBlank { id })
+                item.string("row_id"), item.string("admission_id"), item.string("outcome"), item.string("submission_id").ifBlank { id }, item.opt("after_row_id") as? String)
         }
     }
 }
@@ -103,9 +104,9 @@ sealed interface SendReceipt {
 
 data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val state: String = "uncertain",
     val createdAt: Long = System.currentTimeMillis(), val model: String = "", val provider: String = "", val queued: Boolean = false,
-    val rowId: String = "", val admissionId: String = "", val submissionId: String = id) {
+    val rowId: String = "", val admissionId: String = "", val submissionId: String = id, val afterRowId: String? = null) {
     fun encode(): String = json("id" to id, "draft" to draft.encode(), "state" to state, "created_at" to createdAt,
-        "model" to model, "provider" to provider, "queued" to queued, "row_id" to rowId, "admission_id" to admissionId, "submission_id" to submissionId).toString()
+        "model" to model, "provider" to provider, "queued" to queued, "row_id" to rowId, "admission_id" to admissionId, "submission_id" to submissionId, "after_row_id" to afterRowId).toString()
     companion object {
         fun create(scope: Scope, draft: Draft, queued: QueuedMessage? = null): PendingSend {
             val id = queued?.id ?: UUID.randomUUID().toString()
@@ -113,7 +114,7 @@ data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val s
                 provider = queued?.provider.orEmpty(), queued = queued != null, submissionId = queued?.submissionId ?: id)
         }
         fun decode(scope: Scope, raw: String): PendingSend = JSONObject(raw).let { o -> PendingSend(o.getString("id"), scope, Draft.decode(o.getString("draft")),
-            o.string("state", "uncertain"), o.optLong("created_at").coerceAtLeast(0), o.string("model"), o.string("provider"), o.optBoolean("queued"), o.string("row_id"), o.string("admission_id"), o.string("submission_id").ifBlank { o.getString("id") }) }
+            o.string("state", "uncertain"), o.optLong("created_at").coerceAtLeast(0), o.string("model"), o.string("provider"), o.optBoolean("queued"), o.string("row_id"), o.string("admission_id"), o.string("submission_id").ifBlank { o.getString("id") }, o.opt("after_row_id") as? String) }
     }
 }
 

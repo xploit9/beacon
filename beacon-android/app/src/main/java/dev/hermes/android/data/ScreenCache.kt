@@ -5,6 +5,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -33,6 +36,16 @@ fun screenReadCacheable(path: String, query: Map<String, String>, profile: Strin
 /** The answer's identity inside one profile: the profile is the scope, so it is not part of the request. */
 fun screenRequest(path: String, query: Map<String, String>): String =
     path + query.filterKeys { it != "profile" }.toSortedMap().entries.joinToString("") { "&${it.key}=${it.value}" }
+
+/** A matching explicit profile and an omitted profile name the same read; JSON prevents path/query collisions. */
+internal fun screenReadIdentity(scope: Scope, path: String, query: Map<String, String>, generation: Int): String =
+    JSONArray(listOf(scope.key, generation, path, JSONArray(query.filterNot { it.key == "profile" && it.value == scope.profile }
+        .toSortedMap().map { (key, value) -> JSONArray(listOf(key, value)) }))).toString()
+
+internal fun screenDisplayFresh(path: String, at: Long, now: Long, invalidatedAt: Long = 0L): Boolean =
+    startupReadFresh(at, now, invalidatedAt) && (path != "/api/approval/mode" || now - at < 10_000L)
+
+data class ScreenReadVersion(val account: Int, val family: Long)
 
 /** A write to /api/crons/create touches every cached /api/crons… read; a plural noun and its singular share a family. */
 internal fun readFamily(path: String): String {
@@ -73,9 +86,37 @@ class ScreenCache(
     // Per account, bumped by clear(): what an open() or flush() took before a sign-out must not be installed or written after it.
     private val epochs = HashMap<String, Int>()
     private val flushes = HashMap<String, Job>()
+    private val versions = HashMap<String, Long>()
+    private class Flight(val scope: Scope, val result: Deferred<JSONObject>, var readers: Int = 0)
+    private val flights = HashMap<String, Flight>()
     private val io = Mutex()
     private fun account(scope: Scope) = scope.copy(profile = "", session = "")
     private fun epoch(account: Scope) = epochs[account.key] ?: 0
+    private fun versionKey(scope: Scope, request: String) = "${scope.key}:${readFamily(request)}"
+    internal fun readVersion(scope: Scope, request: String): ScreenReadVersion = synchronized(this) {
+        ScreenReadVersion(epoch(account(scope)), versions[versionKey(scope, request)] ?: 0L)
+    }
+    internal fun readCurrent(scope: Scope, request: String, version: ScreenReadVersion): Boolean = readVersion(scope, request) == version
+
+    /** One transport read per normalized scoped request. Cancelling one screen leaves other readers attached. */
+    internal suspend fun fetch(scope: Scope, request: String, read: suspend () -> JSONObject): JSONObject {
+        val id = "${scope.key}\u0000$request"
+        val flight = synchronized(this) {
+            flights.getOrPut(id) { Flight(scope, jobs.async(start = CoroutineStart.LAZY) { read() }) }.also { it.readers++ }
+        }
+        try { return JSONObject(flight.result.await().toString()) }
+        finally {
+            var cancel = false
+            synchronized(this) {
+                flight.readers--
+                if (flight.readers == 0) {
+                    if (flights[id] === flight) flights.remove(id)
+                    cancel = true
+                }
+            }
+            if (cancel) flight.result.cancel()
+        }
+    }
 
     /** Loads the account's row once; later calls are free and an unreadable row is the same as no row. A sign-out that lands first leaves the account closed. */
     suspend fun open(scope: Scope) {
@@ -101,12 +142,13 @@ class ScreenCache(
     fun set(scope: Scope, key: String, value: JSONObject, request: String = "") = put(scope, key, request, clock(), value)
 
     /** A payload that is too large or credential-shaped replaces nothing on disk and removes the older copy. */
-    fun put(scope: Scope, key: String, request: String, at: Long, value: JSONObject) {
+    fun put(scope: Scope, key: String, request: String, at: Long, value: JSONObject, version: ScreenReadVersion? = null) {
         val text = value.toString()
         val bytes = text.toByteArray().size
         val account = account(scope)
         val keep = bytes <= MAX_ENTRY_BYTES && !hasSecretKey(value)
         synchronized(this) {
+            if (version != null && !readCurrent(scope, request, version)) return
             val map = rows[account.key] ?: return
             val id = "${scope.profile}\u0000$key\u0000$request"
             map.remove(id)
@@ -118,7 +160,10 @@ class ScreenCache(
     fun invalidate(scope: Scope, path: String) {
         val family = readFamily(path)
         val account = account(scope)
-        val changed = synchronized(this) { rows[account.key]?.values?.removeAll { it.profile == scope.profile && readFamily(it.request) == family } == true }
+        val changed = synchronized(this) {
+            val key = versionKey(scope, path); versions[key] = (versions[key] ?: 0L) + 1L
+            rows[account.key]?.values?.removeAll { it.profile == scope.profile && readFamily(it.request) == family } == true
+        }
         if (changed) schedule(account)
     }
     suspend fun remove(scope: Scope, key: String, request: String = "") {
@@ -129,16 +174,21 @@ class ScreenCache(
     suspend fun clear(scope: Scope) = clear(scope, { remove -> remove(); true }, drop)
     internal suspend fun clear(removal: DeviceRemovalAuthority, dropCurrent: suspend (Scope) -> Unit) =
         clear(removal.scope, removal::ifCurrent, dropCurrent)
-    private suspend fun clear(scope: Scope, removeIfCurrent: (() -> Unit) -> Boolean, dropCurrent: suspend (Scope) -> Unit) {
+    internal suspend fun clear(scope: Scope, removeIfCurrent: (() -> Unit) -> Boolean, dropCurrent: suspend (Scope) -> Unit) {
         val account = account(scope)
         // One step under the row's lock: an open() either finished before it (and is removed here) or reads the empty store.
         io.withLock {
             var pendingFlush: Job? = null
+            val pendingReads = ArrayList<Deferred<JSONObject>>()
             if (!removeIfCurrent {
-                synchronized(this) { rows.remove(account.key); epochs[account.key] = epoch(account) + 1; pendingFlush = flushes.remove(account.key) }
+                synchronized(this) {
+                    rows.remove(account.key); epochs[account.key] = epoch(account) + 1; pendingFlush = flushes.remove(account.key)
+                    flights.entries.removeAll { (_, flight) -> if (flight.scope.sameAccount(account)) { pendingReads.add(flight.result); true } else false }
+                }
             }) return@withLock
-            // Cancel the captured old job outside AuthStore; cancellation may invoke handlers immediately.
+            // Cancel outside AuthStore and the cache monitor; handlers may run immediately.
             pendingFlush?.cancel()
+            pendingReads.forEach { it.cancel() }
             // The disk target rechecks inside its transaction; this call may suspend after re-admission.
             try { dropCurrent(account) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next open reads whatever remains */ }
         }

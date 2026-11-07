@@ -13,6 +13,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.BeaconActivity
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.BuildConfig
+import dev.hermes.android.liveTestChatBody
 import dev.hermes.android.preferences
 import dev.hermes.android.core.*
 import dev.hermes.android.data.*
@@ -68,7 +69,11 @@ class VoiceContinuationLiveTest {
                 }
                 base.evaluate()
             } catch (skip: AssumptionViolatedException) { throw skip }
-            catch (_: Throwable) { throw AssertionError("voice_continuation_preflight_or_journey_failed") }
+            catch (error: Throwable) {
+                val detail = (error.message ?: "").replace(Regex("https?://\\S+"), "[url]").take(160)
+                throw AssertionError("voice_continuation_preflight_or_journey_failed: " + error.javaClass.simpleName +
+                    (if (detail.isBlank()) "" else ": " + detail))
+            }
         }
     } }
     @get:Rule val rules: RuleChain = RuleChain.outerRule(ownerRuntimeOptIn).around(optIn).around(compose)
@@ -98,7 +103,7 @@ class VoiceContinuationLiveTest {
             save("draft_guard"); check(vm.composer.value.text.isBlank() && vm.attachments.value.isEmpty())
             val voice = VoiceKeyStore(app)
             val previousVoice = voice.settings()
-            save("voice_guard"); check(previousVoice.provider == "grok" && voice.hasKey("grok"))
+            save("voice_guard"); check(voice.hasKey("grok"))
             suspend fun recipient(sourceHint: String? = null): String? {
                 current(); save("recipient_status")
                 val status = client.nativeRequest("/api/plugins/beacon/mobile/notifications/status")
@@ -214,8 +219,10 @@ class VoiceContinuationLiveTest {
                 }
             }
             try {
+                voice.setSelection(voice.settings("grok"))
                 val previous = vm.chat.value.sessionId
-                withContext(Dispatchers.Main.immediate) { vm.newChat(json("title" to "Voice continuation $runId")) }.join()
+                val chatBody = liveTestChatBody(client, "Voice continuation $runId")
+                withContext(Dispatchers.Main.immediate) { vm.newChat(chatBody) }.join()
                 withTimeout(60_000) { withContext(Dispatchers.Main.immediate) { vm.awaitSelection() } }
                 await(60_000) { vm.chat.value.sessionId.isNotBlank() && vm.chat.value.sessionId != previous && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
                 session = vm.chat.value.sessionId; id("qa_session_id", session)
@@ -367,8 +374,11 @@ class VoiceContinuationLiveTest {
                 val source = notice.getString("source_ref")
                 check(source.isNotBlank() && (initialSource == null || source == initialSource) && notice.string("profile") == scope.profile && notice.string("owner_id") == scope.owner && notice.string("conversation_id") == session)
                 requireIncomingRoute(notice, source, scope.profile); evidence.put("callback_invitation", true); save("callback_invitation")
+                // The first notice also establishes the local source binding; the invitation store only
+                // permits this source after that binding exists, so verify the recipient before waiting.
+                check(recipient(source) == source)
                 await(30_000) { app.push.invitation(source, event)?.valid() == true }
-                check(recipient(source) == source && app.push.authorizeKeepConnectedAction(source, event, "answer"))
+                check(app.push.authorizeKeepConnectedAction(source, event, "answer"))
                 evidence.put("recipient_verified", true).put("recipient_source_pending", false).put("callback_action_receipt_verified", true); save("callback_arrived")
                 withContext(Dispatchers.Main.immediate) { app.calls.answer(source, event) }
                 await(45_000) {
@@ -422,6 +432,7 @@ class VoiceContinuationLiveTest {
                 }
                 // Calls/jobs/answered invitations have no per-record public purge API; leave their exact QA IDs for Root.
                 evidence.put("cleanup_pending", true).put("status", if (complete) "passed_with_cleanup_pending" else "failed_or_blocked")
+                voice.setSelection(previousVoice)
                 check(voice.settings() == previousVoice)
                 save(evidence.string("phase"))
             }

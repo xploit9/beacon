@@ -150,16 +150,32 @@ async def native_update():
     return await update_hermes()
 
 
-async def native_update_status():
+async def native_update_status(action_id=''):
     from hermes_cli.web_routers.actions import get_action_status, get_update_receipt
     action = await get_action_status('hermes-update', lines=100)
-    try:
-        receipt = await get_update_receipt()
-    except HTTPException as error:
-        if error.status_code != 404:
-            raise
-        receipt = None
-    return {'action': action, 'receipt': receipt}
+    receipt = None
+    reader = None
+    if action_id:
+        try:
+            from hermes_cli.update_receipt import read_receipt_for_action
+            reader = read_receipt_for_action
+        except ImportError:  # Older native versions expose only the latest-receipt endpoint.
+            pass
+    if reader is not None:
+        row = await asyncio.to_thread(reader, action_id)
+        if isinstance(row, dict) and row.get('action_id') == action_id:
+            receipt = {'receipt': row}
+    else:
+        try:
+            receipt = await get_update_receipt()
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+        if action_id and (not isinstance(receipt, dict) or
+                          not isinstance(receipt.get('receipt'), dict) or receipt['receipt'].get('action_id') != action_id):
+            receipt = None
+    busy = bool(isinstance(action, dict) and action.get('running')) or await asyncio.to_thread(update_in_progress)
+    return {'action': action, 'receipt': receipt, 'host_busy': busy}
 
 
 def restart_error_code(result):
@@ -201,17 +217,22 @@ def dashboard_restarter():
 
 def current_receipt(state, requested_at, action_id):
     from datetime import datetime
-    if not requested_at:
+    if not requested_at or not action_id:
         return False
     try:
         requested = datetime.fromisoformat(requested_at.replace('Z', '+00:00'))
-        receipt = (state.get('receipt') or {}).get('receipt') or {}
-        started = datetime.fromisoformat(str(receipt.get('started_at') or '').replace('Z', '+00:00'))
-        action = state.get('action')
-        if not isinstance(action, dict):
-            return False
-        reported = action.get('action_id') or ''
-        return started >= requested and not (action_id and reported and action_id != reported)
+        response, action = state.get('receipt'), state.get('action')
+        candidates = [response.get('receipt') if isinstance(response, dict) else None,
+                      action.get('receipt') if isinstance(action, dict) else None]
+        for receipt in candidates:
+            if isinstance(receipt, dict) and receipt.get('action_id') == action_id:
+                try:
+                    started = datetime.fromisoformat(str(receipt.get('started_at') or '').replace('Z', '+00:00'))
+                    if started >= requested:
+                        return True
+                except (ValueError, TypeError):
+                    continue
+        return False
     except (ValueError, TypeError, KeyError):
         return False
 
@@ -322,7 +343,7 @@ def build_router(identity, read_body):
                     raise ValueError()
             except ValueError:
                 raise HTTPException(400, 'Update timestamp must include its time zone') from None
-        state = await native_update_status()
+        state = await native_update_status(action_id)
         return {**state, 'server_now': datetime.now(timezone.utc).isoformat(),
                 'receipt_current': current_receipt(state, requested_at, action_id)}
 

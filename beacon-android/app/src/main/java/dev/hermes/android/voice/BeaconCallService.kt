@@ -107,7 +107,9 @@ internal class CallSpec(val client: BeaconClient, val admission: Deferred<JSONOb
     /** Where this conversation's phone requests come from: the assistant overlay when it started the call, else the call itself. */
     val phoneOrigin: dev.hermes.android.phone.PhoneOrigin = dev.hermes.android.phone.PhoneOrigin.LiveCall,
     /** Whether the phone was unlocked when the call started, or since; until then no tool runs and the brief holds nothing private. Held back unless a start says otherwise. */
-    val trust: CallTrust = CallTrust { true }) {
+    val trust: CallTrust = CallTrust { true },
+    /** An authenticated, scoped context read started before the service/Telecom pipeline; never used until the normal call boundary validates it. */
+    val earlyContext: Deferred<JSONObject?>? = null, val earlyContextAt: Long = 0) {
     constructor(client: BeaconClient, grant: JSONObject) : this(client, CompletableDeferred(grant))
     val grant: JSONObject get() = if (admission.isCompleted && !admission.isCancelled) runCatching { admission.getCompleted() }.getOrElse { JSONObject() } else JSONObject()
 }
@@ -307,6 +309,19 @@ class CallController(private val app: BeaconApplication) {
             warm = if (target != null && prefetched != null) prewarm.claim(target, voiceSettings) else null
             // The Call button's touch-down usually sent it already.
             warm?.takeIf { !it.cueRequested }?.let { it.startTurn(liveStartCue(it.context)) }
+            // An authenticated, scoped context read may overlap the service/Telecom/media pipeline. Its value is never
+            // used here: DirectVoice re-validates it against this call's scope and trust before it becomes the brief.
+            val earlyContextAt = if (prefetched == null && target != null && trust.trusted() && ownerName.isNotBlank())
+                android.os.SystemClock.elapsedRealtime() else 0L
+            val earlyContext = if (earlyContextAt > 0) {
+                val earlySession = target!!.session
+                background.async {
+                    if (generation != epoch.get()) null else try {
+                        withTimeoutOrNull(8_000) { frozen.nativeVoiceContext(earlySession, ownerName) }
+                    } catch (error: CancellationException) { currentCoroutineContext().ensureActive(); null }
+                    catch (_: Throwable) { null }
+                }
+            } else null
             val early = java.util.Collections.synchronizedList(mutableListOf<JSONObject>())
             earlyStage(early, "grant_sent", tappedAt, voiceSettings.provider)
             suspend fun admit(): JSONObject {
@@ -342,7 +357,7 @@ class CallController(private val app: BeaconApplication) {
                 }
                 CompletableDeferred(grant)
             }
-            val call = CallSpec(frozen, admission, incoming != null, voiceSettings, tappedAt, warm, prefetched, target?.session.orEmpty(), early, phoneOrigin, trust)
+            val call = CallSpec(frozen, admission, incoming != null, voiceSettings, tappedAt, warm, prefetched, target?.session.orEmpty(), early, phoneOrigin, trust, earlyContext, earlyContextAt)
             spec = call
             // Ended while it was being set up: nothing starts, and the admission is released once it lands (unless the hangup took it).
             if (generation != epoch.get()) { if (spec === call) { spec = null; warm?.close(); background.launch { release(call) } }; return }
@@ -601,7 +616,7 @@ class BeaconCallService : Service() {
                 val direct=DirectVoice(spec.client,spec.grant.optString("call_id"),spec.conversation.ifBlank { spec.grant.getString("conversation_id") },scope,{bytes ->
                     if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
                 },::directEvent,::failure,voiceSettings,ownerName=ownerName,ownerFence=closed,ownerActive={ !closed.get() },
-                    clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true,
+                    clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,earlyContext=spec.earlyContext,earlyContextAt=spec.earlyContextAt,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true,
                     recentSpeech={ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },
                     phone=PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust),trust=spec.trust,
                     microphoneMuted={ microphoneGate.snapshot().muted })
@@ -645,11 +660,11 @@ class BeaconCallService : Service() {
             "transcript" -> {
                 val pendingItem=spec?:return
                 providerTranscript(JSONObject(value.toString()).put("turn_id",transcriptTurn.toString()),pendingItem.grant.string("call_id"),pendingItem.grant.string("conversation_id"),pcm?.clock()?:0)?.let { item ->
-                    syncEvent(item);handleControl(item);return
+                    timestampCaption(item);syncEvent(item);handleControl(item);return
                 }
                 val role=value.string("role");val text=accumulatedCaption(transcriptText[role].orEmpty(),value.string("text"));transcriptText[role]=text
                 val pending=spec?:return
-                val transcript=directCaption(value,pending.grant.string("call_id"),pending.grant.string("conversation_id"),transcriptTurn,text)
+                val transcript=timestampCaption(directCaption(value,pending.grant.string("call_id"),pending.grant.string("conversation_id"),transcriptTurn,text))
                 syncEvent(JSONObject(transcript.toString()).put("at_ms",pcm?.clock()?:0))
                 handleControl(transcript)
             }
@@ -717,9 +732,12 @@ class BeaconCallService : Service() {
         val turn=transcriptTurn
         val cut=interruptsReply(interrupted,transcriptText)
         transcriptTurn=finishDirectTranscriptTurn(pending.grant.string("call_id"),pending.grant.string("conversation_id"),turn,transcriptText,pcm?.clock()?:0,cut) {
-            deliver(it);syncEvent(it)
+            timestampCaption(it);deliver(it);syncEvent(it)
         }
         if(cut) syncEvent(json("event_id" to "${pending.grant.string("call_id")}:assistant:interrupt:$turn","turn_id" to turn.toString(),"type" to "interrupted","interrupted" to true,"at_ms" to (pcm?.clock()?:0)))
+    }
+    private fun timestampCaption(value: JSONObject): JSONObject = value.apply {
+        if (!has("created_at")) put("created_at", System.currentTimeMillis() / 1000.0)
     }
     fun camera(value:Boolean) { if(value&&!app.calls.state.value.visionAvailable) return;updateCamera(value,app.calls.state.value.cameraRear) }
     internal fun previewFailed(expectedCall:String) { if(app.calls.state.value.callId==expectedCall) camera(false) }

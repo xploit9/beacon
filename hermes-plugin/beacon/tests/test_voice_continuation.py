@@ -19,9 +19,21 @@ from test_mobile import harness, reserve
 NATIVE = Path(os.environ['HERMES_AGENT_SOURCE']) if 'HERMES_AGENT_SOURCE' in os.environ else Path.home() / 'AppData/Local/hermes/hermes-agent'
 
 
+def approval_presentation():
+    """Native approval state stays real; only the model runner's presentation helpers are replaced.
+
+    ``session_pending_controls`` formats prompts with ``_redact_approval_command`` and
+    ``SessionAuthority.interrupt`` compares the route's agent with ``_AGENT_PENDING_SENTINEL``.
+    Both are defined in ``gateway.run``, whose import pulls in the model runner and the owner's
+    ``.env``; the fixture supplies the same symbols without either."""
+    return SimpleNamespace(_redact_approval_command=lambda value:value or '', _AGENT_PENDING_SENTINEL=object())
+
+
 @pytest.fixture
 def continuation(harness, monkeypatch):
     api, client, cfg, tmp, app = harness
+    # Native approval state stays real while presentation avoids importing the model runner.
+    monkeypatch.setitem(sys.modules,'gateway.run',approval_presentation())
     from hermes_cli.dashboard_auth.base import Session
     verified=Session(user_id='owner',provider='basic',issuer='',email='',display_name='',org_id='',
                      expires_at=int(time.time())+120,access_token='synthetic-token',refresh_token='')
@@ -637,11 +649,15 @@ def native_contract(tmp_path,monkeypatch):
     monkeypatch.setenv('HERMES_HOME',str(tmp_path))
     monkeypatch.syspath_prepend(str(NATIVE))
     from gateway.session_authority import SessionAuthority,LiveSession
-    from gateway.session_contract import Principal,SessionRef
+    from gateway import session_contract
+    from gateway.session_contract import SessionRef
+    Principal=getattr(session_contract,'SessionActor',None) or session_contract.Principal
     from gateway.session import SessionSource
     from gateway.config import Platform
     from gateway.session_ingress import viewer_turn,executing_admission
     import gateway.run_api
+    # Native approval state is real; its display formatter must not import the model runner or owner .env.
+    monkeypatch.setitem(sys.modules,'gateway.run',approval_presentation())
     return SimpleNamespace(**locals())
 
 
@@ -655,7 +671,8 @@ def transfer_case(native_contract,continuation,monkeypatch):
     authority.runner=runner
     live=n.LiveSession(n.SessionSource(platform=n.Platform.LOCAL,chat_id='native-stored',user_id=c[5],chat_type='dm'),'synthetic-native-route')
     authority.sessions['native-stored']=live
-    actor=n.Principal(c[5],authority.profile_id,frozenset({'session:read','session:submit','session:approve','session:respond','session:control'}),'owner-transport')
+    subject=c[0].native.execution_subject('owner','basic',c[5])
+    actor=n.Principal(subject,authority.profile_id,frozenset({'session:read','session:submit','session:approve','session:respond','session:control'}),'owner-transport')
     live.subscribers['owner-subscription']=actor
     monkeypatch.setattr(sys.modules['gateway.run_api'],'_ACTIVE_RUNNER',runner)
     server=sys.modules['tui_gateway'].server
@@ -678,7 +695,7 @@ def native_claim(t,callback=True):
     from hermes_state_runtime import admit_session_input,claim_session_input
     prepared=follow(t.c,callback=callback)
     assert prepared['native_transfer'] is True
-    row=admit_session_input(t.c[3],epoch=t.c[4],principal_id=t.c[5],session_id='native-stored',
+    row=admit_session_input(t.c[3],epoch=t.c[4],principal_id=t.actor.subject,session_id='native-stored',
         request_id=prepared['request_id'],payload={'text':prepared['text']})
     claimed=claim_session_input(t.c[3],epoch=t.c[4],session_id='native-stored')
     assert claimed['admission_id']==row['admission_id']
@@ -706,6 +723,10 @@ def native_handler(t):
 def test_adaptive_transfer_native_approve_deny_settles_original_exactly_once(transfer_case,choice):
     t=transfer_case
     native_claim(t);close(t.c)
+    tokens=(t.n.viewer_turn.set(t.live),t.n.executing_admission.set(True))
+    try: assert t.module.native_binding(t.c[0].mobile,t.prepared['job_id'],'native-stored')
+    finally:
+        t.n.viewer_turn.reset(tokens[0]);t.n.executing_admission.reset(tokens[1])
     # The old HTTP proposal can no longer approve or dispatch this operation.
     assert t.dispatcher.decide(('owner','basic','default',t.c[-1]),'inline-original',
         {'proposal_id':t.receipt['proposal']['id'],'decision':'approve'})['status']=='transferred'
@@ -931,7 +952,9 @@ def _owner_followup_server():
     """Separate synthetic owner; real native authority, tickets, approvals and admission ledger."""
     from hermes_state import SessionDB
     from gateway.session_authority import SessionAuthority,LiveSession
-    from gateway.session_contract import Principal,SessionRef
+    from gateway import session_contract
+    from gateway.session_contract import SessionRef
+    Principal=getattr(session_contract,'SessionActor',None) or session_contract.Principal
     from gateway.session import SessionSource
     from gateway.config import Platform
     from gateway.runtime_bootstrap import TicketStore
@@ -948,6 +971,7 @@ def _owner_followup_server():
     patch=pytest.MonkeyPatch();fixture=harness.__wrapped__(home,patch)
     api,_,owner_cfg,_,app=next(fixture)
     patch.setitem(sys.modules,'agent.redact',native_redaction)
+    patch.setitem(sys.modules,'gateway.run',approval_presentation())
     db=SessionDB(home/'synthetic-native.sqlite')
     authority=SessionAuthority(SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False)),
         profile_id=str(home),instance_id='split-synthetic-owner',db=db,epoch=initial['epoch'])
@@ -959,7 +983,7 @@ def _owner_followup_server():
     authority.runner=runner
     live=LiveSession(SessionSource(platform=Platform.LOCAL,chat_id='native-stored',user_id=initial['principal'],chat_type='dm'),'split-route')
     authority.sessions['native-stored']=live
-    actor=Principal(initial['principal'],str(home),frozenset({'session:read','session:submit','session:approve','session:respond','session:control'}),'split-viewer')
+    actor=Principal(api.native.execution_subject('owner','basic',initial['principal']),str(home),frozenset({'session:read','session:submit','session:approve','session:respond','session:control'}),'split-viewer')
     live.subscribers['split-viewer']=actor
     gateway.run_api._ACTIVE_RUNNER=runner
     native_server=sys.modules['tui_gateway'].server
@@ -984,9 +1008,12 @@ def _owner_followup_server():
     while not server.started and time.monotonic()<deadline:time.sleep(.01)
     assert server.started
     controls=socket.socket();controls.bind(('127.0.0.1',0));controls.listen();controls.settimeout(60)
-    (home/'owner-ready.json').write_text(json.dumps({'origin':'http://127.0.0.1:'+str(listener.getsockname()[1]),
+    ready={'origin':'http://127.0.0.1:'+str(listener.getsockname()[1]),
         'control_port':controls.getsockname()[1],'instance_id':authority.instance_id,
-        'profile_id':str(home),'epoch':authority.epoch,'pid':os.getpid()}),encoding='utf-8')
+        'profile_id':str(home),'epoch':authority.epoch,'pid':os.getpid()}
+    staged=home/'owner-ready.tmp'
+    staged.write_text(json.dumps(ready),encoding='utf-8')
+    os.replace(staged,home/'owner-ready.json')  # publish atomically: an exists() poll never sees a partial file
     worker=None;result=[];claimed=None
     while True:
         connection,_=controls.accept()
@@ -996,7 +1023,7 @@ def _owner_followup_server():
         if operation=='stop':connection.sendall(b'{}\n');connection.close();break
         if operation=='mint':
             answer={'ticket':runner.session_ticket_store.mint(profile_id=command.get('profile_id',str(home)),
-                subject=command.get('subject',actor.subject),purpose=command.get('purpose','native-http'))}
+                subject=command.get('subject',initial['principal']),purpose=command.get('purpose','native-http'))}
         elif operation=='start':
             from hermes_state_runtime import admit_session_input,claim_session_input
             with api.mobile.connect() as conn:job=dict(conn.execute('SELECT * FROM jobs WHERE id=?',(command['job_id'],)).fetchone())
@@ -1098,11 +1125,18 @@ def split_owner(transfer_case,monkeypatch):
         if not (home/'owner-ready.json').exists():
             stop_unready()
             pytest.fail('Synthetic owner failed bounded startup: '+process.communicate(timeout=3)[1][-3000:])
-        owner=json.loads((home/'owner-ready.json').read_text());assert owner['pid']!=os.getpid()
+        owner=None
+        for _ in range(200):
+            try:
+                owner=json.loads((home/'owner-ready.json').read_text())
+                break
+            except (OSError,ValueError): time.sleep(.01)
+        assert owner is not None,'Synthetic owner readiness was not published';assert owner['pid']!=os.getpid()
         import hermes_cli.gateway_client as native_client
         import hermes_cli.gateway_runtime as native_runtime
-        endpoint=SimpleNamespace(api_origin=owner['origin'],profile_id=owner['profile_id'],instance_id=owner['instance_id'])
-        monkeypatch.setattr(native_runtime,'discover_gateway_endpoint',lambda home,timeout=1.5:SimpleNamespace(endpoint=endpoint))
+        endpoint=SimpleNamespace(api_origin=owner['origin'],profile_id=owner['profile_id'],instance_id=owner['instance_id'],
+                                 authority_epoch=owner['epoch'],runtime_protocol=1)
+        monkeypatch.setattr(native_runtime,'discover_gateway_endpoint',lambda home,timeout=1.5:SimpleNamespace(state='ready',endpoint=endpoint))
         monkeypatch.setattr(native_runtime,'ensure_gateway_runtime',lambda *a,**k:pytest.fail('A probe must never start an owner'))
         def mint(home,explicit,*,purpose='interactive',scope=None,subject=None):
             assert explicit is endpoint and purpose=='native-http' and subject==t.c[5]
@@ -1132,6 +1166,38 @@ def test_owner_followup_red_split_owner_accepts_exact_pending_proposal(split_own
     assert response.status_code==200,(response.text,peer.errors)
     assert response.json()['native_transfer'] is True
     assert not t.backend.calls
+
+
+def test_separated_owner_reconciles_stranded_create_from_verified_readiness(split_owner,monkeypatch):
+    """The dashboard process has no live runner; the verified owner readiness supplies the epoch."""
+    from gateway.session_local import stage_local_session
+    from gateway.session_policy import LocalSessionPolicy
+    from hermes_state_local import commit_local_session
+    peer=split_owner;t=peer.t
+    monkeypatch.setattr(sys.modules.get('gateway.run'),'_resolve_gateway_model',
+        lambda config:(_ for _ in ()).throw(AssertionError('Creation resolved a model')),raising=False)
+    monkeypatch.setattr(t.authority.runner,'session_store',
+        SimpleNamespace(_generate_session_key=lambda source:'local:'+source.chat_id),raising=False)
+    home=t.c[0].mobile.home();request='separated-create'
+    assert getattr(sys.modules['gateway.run_api'],'_ACTIVE_RUNNER',None) is None
+    pending=t.c[0].native.prepare_created(t.c[0].mobile,
+        {'owner':'owner','provider':'basic','principal':t.c[5],'home':t.c[0].native.home_fingerprint(home),'epoch':t.c[4]},
+        'default',request)
+    assert pending is not None
+    policy=LocalSessionPolicy(source='desktop',platform='local',cwd=str(home),model='gpt-6-luna',
+        toolsets=(),config_json='{}',request_json='{}',terminal_json='{}')
+    create_actor=t.n.Principal(t.actor.subject,t.authority.profile_id,
+        frozenset(set(t.actor.capabilities)|{'session:create'}),'separated-create-transport')
+    staged=stage_local_session(t.authority,create_actor,{'request_id':request},trusted_policy=policy)
+    saved=commit_local_session(t.c[3],epoch=t.c[4],receipt=staged)
+    session=saved['session_id'];assert session==pending['session']
+    with t.c[0].mobile.connect() as conn:
+        assert conn.execute('SELECT kind FROM native_conversations WHERE session=?',(session,)).fetchone()[0]=='pending'
+    # The child owner's readiness endpoint carries the same verified epoch the canonical socket uses.
+    assert t.c[0].native.current_epoch('default')==t.c[4]
+    assert t.c[0].native.reconcile_created(t.c[0].mobile,'owner','basic','default',session,t.c[5])
+    final=t.c[0].mobile.native_conversation('owner','basic','default',t.c[0].native.home_fingerprint(home),session,t.c[5])
+    assert final['kind']=='canonical' and final['principal']==t.c[5]
 
 
 def _owner_followup_value(peer):

@@ -645,10 +645,14 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         ?.let { NativeServerSecurePrompt(vm, it) }
     val composerDraft by vm.composer.collectAsStateWithLifecycle()
     // Saved call turns and alerts sit among the messages by the time they happened.
-    val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId, chatState.queued) {
+    val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId, chatState.queued, chatState.raw) {
         val localTimes = chatState.queued.filter { it.rowId.isNotBlank() }.associate { it.rowId to it.createdAt }
+        val native = visibleTranscriptMessages(chatState.messages).map { row -> localTimes[row.id]?.let { row.copy(recordedAt = it) } ?: row }
+        val inputs = dev.hermes.android.chatTimelineMessages(native, chatState.queued)
+        val retained = chatState.raw.rows("_unconfirmed_replies").mapIndexed { index, row -> Message.from(row, index, chatState.sessionId) }
+            .sortedBy { it.recordedAt.takeIf { at -> at > 0 } ?: Long.MAX_VALUE }
         dev.hermes.android.voice.interleaveCallMessages(
-            dev.hermes.android.voice.interleaveCallMessages(visibleTranscriptMessages(chatState.messages).map { row -> localTimes[row.id]?.let { row.copy(recordedAt = it) } ?: row }, chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }),
+            dev.hermes.android.voice.interleaveCallMessages(dev.hermes.android.voice.interleaveCallMessages(inputs, retained), chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }),
             chatState.alerts.map { Message("alert:${it.noticeId}", "assistant", it.text, sessionId = chatState.sessionId, recordedAt = it.createdAt) },
         )
     }
@@ -1152,7 +1156,17 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                         val group = callGroupByFirstMessageId[message.id]
                         val alert = alertsByMessageId[message.id]
                         val findHit = when { search.isBlank() || message.id !in findMatchSet -> FindHit.None; message.id == currentMatchId -> FindHit.Current; else -> FindHit.Match }
-                        if (group != null) {
+                        val local = chat.queued.firstOrNull { "queued:${it.id}" == message.id }
+                        if (local != null && message.displayKind in setOf("local_input", "local_input_unresolved")) {
+                            QueuedMessageRow(vm, local, bubbleMax, canDismiss = chat.uncertain != local.id, positionUnknown = message.displayKind == "local_input_unresolved")
+                        } else if (message.displayKind == "unconfirmed_reply") {
+                            Column(Modifier.fillMaxWidth().padding(top = 10.dp).testTag("unconfirmed-reply:${message.id}")) {
+                                ChatBubble(own = false, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) {
+                                    BubbleText(message.text.ifBlank { message.reasoning }, vm, null, interactive = false)
+                                    Text(uiText("Reply not confirmed"), style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        } else if (group != null) {
                             val metadata = callMetadata[group.callId]
                             CallTranscriptCard(group.callId, group.lines, metadata?.durationSeconds, metadata?.provider,
                                 assistantName = LocalAssistantName.current, modifier = Modifier.fillMaxWidth().padding(top = 10.dp).findOutline(findHit, RoundedCornerShape(20.dp)), searchQuery = search)
@@ -1175,7 +1189,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
                     }
-                    items(chat.queued.filter { queued -> queued.rowId.isBlank() || chat.messages.none { it.id == queued.rowId } }, key = { "queued:${it.id}" }, contentType = { "queued" }) { queued ->
+                    items(chat.queued.filter { it.state == "queued" }, key = { "queued:${it.id}" }, contentType = { "queued" }) { queued ->
                         QueuedMessageRow(vm, queued, bubbleMax, canDismiss = chat.uncertain != queued.id)
                     }
                     chat.approval?.let { p -> item("approval:${p.string("approval_id", p.string("id"))}", contentType = "approval") {
@@ -1793,14 +1807,14 @@ internal fun findRanges(text: String, query: String): List<IntRange> {
     }
 }
 
-@Composable private fun QueuedMessageRow(vm: BeaconViewModel, message: QueuedMessage, bubbleMax: Dp, canDismiss: Boolean) {
+@Composable private fun QueuedMessageRow(vm: BeaconViewModel, message: QueuedMessage, bubbleMax: Dp, canDismiss: Boolean, positionUnknown: Boolean = false) {
     var menu by remember(message.id) { mutableStateOf(false) }
     val editable = message.state == "queued"
     val dismissible = canDismiss && message.state in setOf("accepted", "unknown", "settled")
     val status = when (message.state) {
         "queued" -> "Queued on this phone"
         "sending" -> if (message.kind == "steer") "Sending guidance" else "Sending"
-        "accepted" -> "Accepted; delivery pending"
+        "accepted" -> if (positionUnknown) "Accepted; position unconfirmed" else "Accepted"
         "settled" -> when (message.outcome) {
             "failed" -> "Turn failed; check history"
             "interrupted" -> "Turn interrupted; check history"

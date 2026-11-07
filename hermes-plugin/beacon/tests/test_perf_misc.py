@@ -193,7 +193,7 @@ def test_watch_pass_leaves_a_finished_callback_alone_while_a_call_is_open(harnes
 
 # --- hooks ------------------------------------------------------------------------------------------------------
 
-def test_pre_llm_hooks_read_settings_once_each_and_verify_a_chat_once_a_turn(harness, monkeypatch):
+def test_pre_llm_hooks_read_settings_once_each_and_revalidate_each_hook(harness, monkeypatch):
     api, _, cfg, _, _ = harness
     plugin = load_private('__init__')
     monkeypatch.setattr(plugin, 'current_profile', lambda config: 'default')
@@ -207,32 +207,31 @@ def test_pre_llm_hooks_read_settings_once_each_and_verify_a_chat_once_a_turn(har
     plugin.native_live_context('chat')
 
     assert reads == [None, None]
-    assert verified == [('owner', 'basic', 'default', 'chat')]
+    assert verified == [('owner', 'basic', 'default', 'chat')]*2
 
 
-def test_a_refused_chat_is_verified_again_and_a_passed_one_expires(harness, monkeypatch):
+def test_hook_ownership_is_rechecked_after_both_refusal_and_success(harness, monkeypatch):
     api, _, cfg, _, _ = harness
     plugin = load_private('__init__')
     monkeypatch.setattr(plugin, 'current_profile', lambda config: 'default')
-    calls = []
+    calls = [];allowed=[True]
 
     def verify(*args):
         calls.append(args)
-        if args[-1] == 'foreign': raise LookupError('not owned')
+        if args[-1] == 'foreign' or not allowed[0]: raise LookupError('not owned')
 
     monkeypatch.setattr(plugin.native, 'verify', verify)
     monkeypatch.setattr(plugin.mobile, 'voice_history', lambda *args, **kwargs: {'events': []})
-    monkeypatch.setattr(plugin, '_VERIFY_REUSE_SECONDS', 0.05)
 
     assert plugin.native_voice_context('foreign', []) is None
     assert plugin.native_voice_context('foreign', []) is None
     assert len(calls) == 2  # a refusal is never reused
     plugin.native_voice_context('mine', [])
     plugin.native_voice_context('mine', [])
-    assert len(calls) == 3
-    time.sleep(0.1)
-    plugin.native_voice_context('mine', [])
     assert len(calls) == 4
+    allowed[0]=False
+    assert plugin.native_voice_context('mine', []) is None
+    assert len(calls) == 5
 
 
 # --- event loop hygiene -----------------------------------------------------------------------------------------
