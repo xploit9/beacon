@@ -110,7 +110,7 @@ class CallHistoryUiTest {
             }
 
             compose.onNodeWithText("Transcript from completed call").assertDoesNotExist()
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithContentDescription("Chat actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
             compose.waitUntil(10_000) {
                 fixture.requests.any { it.string("path") == "/api/plugins/beacon/mobile/calls" && it.string("profile") == "default" } &&
@@ -153,23 +153,23 @@ class CallHistoryUiTest {
 
             // Checked while the assistant chat is open: after the jump to chat-b this screen's actions menu is disabled.
             fixture.callHistoryRouteMissing = true
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithContentDescription("Chat actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
-            compose.waitUntil(10_000) { compose.onAllNodesWithText("Update the Beacon plugin").fetchSemanticsNodes().isNotEmpty() }
+            compose.waitUntil(10_000) { compose.onAllNodesWithText("Update Beacon on Hermes").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Retry").assertDoesNotExist()
             compose.onNodeWithTag("call-history-feedback-not-important:$callId").assertDoesNotExist()
 
             compose.onNodeWithTag("call-history-close").performClick()
             fixture.callHistoryRouteMissing = false
             fixture.pluginStatus = 503
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithContentDescription("Chat actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
             compose.waitUntil(10_000) { compose.onAllNodesWithText("Call history unavailable").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Retry").assertExists()
             compose.onNodeWithTag("call-history-close").performClick()
             fixture.pluginStatus = null
 
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithContentDescription("Chat actions").performClick()
             compose.onNodeWithTag("call-history-open").performClick()
             compose.waitUntil(10_000) { compose.onAllNodesWithTag("call-history-row:call-history-missed").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("call-history-row:call-history-missed").performClick()

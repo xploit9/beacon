@@ -76,9 +76,24 @@ class NativeOperationPolicyTest {
             assertFalse("PATCH " + path, NativeOperationPolicy.direct(path, "PATCH"))
     }
 
-    @Test fun gatewaySafePinRouteOnlyAcceptsPost() {
-        assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/sessions/pin", "POST"))
-        for (method in listOf("GET", "PUT", "PATCH", "DELETE")) assertFalse(NativeOperationPolicy.direct("/api/plugins/beacon/sessions/pin", method))
+    @Test fun hermesUpdateStatusReceiptAndProfileModelRoutesAreOpenWithTheirOwnMethodOnly() {
+        assertTrue(NativeOperationPolicy.direct("/api/hermes/update", "POST"))
+        for (method in listOf("GET", "PUT", "PATCH", "DELETE")) assertFalse("$method /api/hermes/update", NativeOperationPolicy.direct("/api/hermes/update", method))
+        for (path in listOf("/api/actions/hermes-update/status", "/api/hermes/update/receipt")) {
+            assertTrue("GET $path", NativeOperationPolicy.direct(path, "GET"))
+            for (method in listOf("POST", "PUT", "PATCH", "DELETE")) assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
+        }
+        // Only the update's own action log: no other action name, and no log of the gateway restart or other helpers.
+        for (path in listOf("/api/actions/gateway-restart/status", "/api/actions/hermes-update/status/extra", "/api/actions/hermes-update"))
+            assertFalse(path, NativeOperationPolicy.direct(path, "GET"))
+        assertTrue(NativeOperationPolicy.direct("/api/profiles/work/model", "PUT"))
+        for (method in listOf("GET", "POST", "PATCH", "DELETE")) assertFalse("$method model", NativeOperationPolicy.direct("/api/profiles/work/model", method))
+        for (path in listOf("/api/profiles/../model", "/api/profiles/Work/model", "/api/profiles/work/model/x", "/api/profiles//model"))
+            assertFalse(path, NativeOperationPolicy.direct(path, "PUT"))
+        assertTrue(NativeOperationPolicy.direct("/api/model/options", "GET"))
+        // A profile's instructions are read as well as written; its description and model are not read here.
+        assertTrue(NativeOperationPolicy.direct("/api/profiles/work/soul", "GET"))
+        for (path in listOf("/api/profiles/work/description", "/api/profiles/work/model")) assertFalse("GET $path", NativeOperationPolicy.direct(path, "GET"))
     }
 
     @Test fun clientBoundariesRejectSessionMutationsBeforeTransport() = runBlocking<Unit> {
@@ -111,17 +126,11 @@ class NativeOperationPolicyTest {
         assertTrue(NativeOperationPolicy.direct("/api/plugins/beacon/mobile/bootstrap", "GET"))
     }
 
-    @Test fun onlyTheOwnerPluginUpdatePostIsAllowedOutsideThePluginNamespace() {
-        val path = "/api/dashboard/agent-plugins/beacon/update"
-        assertTrue(NativeOperationPolicy.direct(path, "POST"))
-        for (method in listOf("GET", "PUT", "PATCH", "DELETE", "post"))
-            assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
-        // Beacon's own install and enable are allowed for the in-app install (PluginInstallTest); its other actions stay out.
-        for (other in listOf(
-            "/api/dashboard/agent-plugins/other/update",
-            "/api/dashboard/agent-plugins/beacon/disable",
-            "/api/dashboard/agent-plugins/beacon/update/",
-        )) assertFalse("POST $other", NativeOperationPolicy.direct(other, "POST"))
+    @Test fun thePluginIsNeverUpdatedByGitPullFromThePhone() {
+        // Every install, update and repair is the pinned install (PluginInstallTest); Hermes' own update route stays closed.
+        for (path in listOf("/api/dashboard/agent-plugins/beacon/update", "/api/dashboard/agent-plugins/other/update", "/api/dashboard/agent-plugins/update-all",
+                "/api/dashboard/agent-plugins/beacon/disable", "/api/dashboard/agent-plugins/beacon/update/"))
+            for (method in listOf("GET", "POST", "PUT", "PATCH", "DELETE")) assertFalse("$method $path", NativeOperationPolicy.direct(path, method))
     }
 
     @Test fun profilesCanBeListedCreatedDescribedAndDeletedAndNothingElse() {
@@ -139,7 +148,9 @@ class NativeOperationPolicyTest {
             for (method in listOf("GET", "POST", "PATCH", "DELETE")) assertFalse("$method $name role", NativeOperationPolicy.direct("/api/profiles/$name/description", method))
             // Owner, 4 Nov 2026: a profile's instructions are edited in the app, saved whole through Hermes' own route.
             assertTrue("PUT $name instructions", NativeOperationPolicy.direct("/api/profiles/$name/soul", "PUT"))
-            for (method in listOf("GET", "POST", "PATCH", "DELETE")) assertFalse("$method $name instructions", NativeOperationPolicy.direct("/api/profiles/$name/soul", method))
+            // Lane NR: the same route is read to open a bot (Hermes' GET /api/profiles/{name}/soul), so the plugin keeps no bot-read route.
+            assertTrue("GET $name instructions", NativeOperationPolicy.direct("/api/profiles/$name/soul", "GET"))
+            for (method in listOf("POST", "PATCH", "DELETE")) assertFalse("$method $name instructions", NativeOperationPolicy.direct("/api/profiles/$name/soul", method))
         }
         // The built-in profile cannot be deleted from here (its role can be set); anything that is not a plain profile id is refused.
         assertFalse(NativeOperationPolicy.direct("/api/profiles/default", "DELETE"))

@@ -43,7 +43,7 @@ class HermesSettingsTest {
         assertTrue(profileApprovalsOff("off"))
         listOf("manual", "smart", "", "yolo").forEach { assertFalse(it, profileApprovalsOff(it)) }
         assertEquals(listOf("manual", "smart"), ProfileApprovalChoices)
-        assertEquals(listOf("Manual", "Auto"), ProfileApprovalChoices.map(::approvalChoiceLabel))
+        assertEquals(listOf("Always ask", "Ask for risky ones"), ProfileApprovalChoices.map(::approvalChoiceLabel))
     }
 
     @Test fun modelSearchMatchesProviderOrModelAnywhereAndShowsRepeatsOnce() {

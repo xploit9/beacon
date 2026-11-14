@@ -11,8 +11,8 @@ internal class CameraOperationGate {
 }
 internal fun CallState.afterCameraFailure(stopped: Boolean) = copy(
     cameraSharing = false, cameraStopPending = !stopped, cameraBusy = false, cameraCanFlip = false,
-    error = if (stopped) "Camera unavailable. Camera sharing is off. Your voice call continues."
-        else "Camera stop could not be confirmed. Video delivery is blocked. Your voice call continues; retry Camera off or end the call."
+    error = if (stopped) "Camera unavailable. The call goes on."
+        else "Camera may still be on. Tap Camera off again or end the call."
 )
 internal fun requireCameraReleasedForNewCall(state: CallState) {
     check(!state.cameraStopPending) { "Camera cleanup is still unconfirmed. Another call cannot start yet." }

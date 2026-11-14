@@ -67,9 +67,9 @@ class TelegramChatTest {
     @Test fun theHeaderLineShowsWorkWhileATurnStreamsElseTheCallOrTheModel() {
         assertEquals("thinking…", chatHeaderSubtitle(streaming = true, hasReplyText = false, inCall = true, model = "gpt", assistantChat = true))
         assertEquals("typing…", chatHeaderSubtitle(streaming = true, hasReplyText = true, inCall = false, model = "gpt", assistantChat = false))
-        assertEquals("Voice conversation", chatHeaderSubtitle(streaming = false, hasReplyText = false, inCall = true, model = "gpt", assistantChat = true))
+        assertEquals("On a call", chatHeaderSubtitle(streaming = false, hasReplyText = false, inCall = true, model = "gpt", assistantChat = true))
         assertEquals("gpt", chatHeaderSubtitle(streaming = false, hasReplyText = false, inCall = false, model = "gpt", assistantChat = true))
-        assertEquals("Text and voice, together", chatHeaderSubtitle(streaming = false, hasReplyText = false, inCall = false, model = "", assistantChat = true))
+        assertEquals("Chat and calls", chatHeaderSubtitle(streaming = false, hasReplyText = false, inCall = false, model = "", assistantChat = true))
         assertEquals("", chatHeaderSubtitle(streaming = false, hasReplyText = false, inCall = false, model = "", assistantChat = false))
     }
 

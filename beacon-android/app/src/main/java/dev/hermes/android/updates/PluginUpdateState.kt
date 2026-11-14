@@ -29,7 +29,7 @@ internal data class PluginVersions(val running: String, val installed: String, v
 }
 
 internal enum class PluginStatus {
-    Hidden, Checking, UpToDate, Available, Updating, Updated, NeedsReview, Restart, Busy, Failed,
+    Hidden, Checking, UpToDate, Available, Updating, Updated, Restart, Busy, Failed,
     /** Hermes refused the restart because it is working; the phone retries when it is idle. */
     Waiting,
     /** The gateway restarted but the dashboard still runs the old plugin: only the owner can restart that. */
@@ -43,27 +43,26 @@ internal enum class PluginStatus {
 }
 
 /** The "Beacon plugin" row of the update screen. [target] is the plugin version the latest release ships with. */
-internal data class PluginRow(val status: PluginStatus = PluginStatus.Hidden, val installed: String = "", val target: String = "", val review: List<String> = emptyList()) {
-    /** The sentence behind the row's state: shown beside the version, or as the row's only action when it needs the owner's review. */
+internal data class PluginRow(val status: PluginStatus = PluginStatus.Hidden, val installed: String = "", val target: String = "") {
+    /** The sentence behind the row's state, shown beside the version. */
     val text: String get() = when (status) {
         PluginStatus.Checking -> "Checking…"
         PluginStatus.UpToDate -> "Up to date"
-        PluginStatus.Available -> "Ready to update"
+        PluginStatus.Available -> "Update available"
         PluginStatus.Updating -> "Updating…"
         PluginStatus.Updated -> "Updated"
-        PluginStatus.NeedsReview -> "Review changes"
         PluginStatus.Restart -> "Restart Hermes"
         PluginStatus.Busy -> "Hermes is busy. Try again later."
-        PluginStatus.Failed -> "The Beacon plugin didn't update"
-        PluginStatus.Waiting -> "Hermes is busy — restarts when it's idle"
+        PluginStatus.Failed -> "Beacon on Hermes didn't update"
+        PluginStatus.Waiting -> "Hermes is busy. It restarts when idle."
         PluginStatus.DashboardRestart -> StepNote.DashboardManual
         PluginStatus.RestartFailed -> StepNote.GatewayFailed
-        PluginStatus.DashboardFailed -> "The plugin is updated. The Hermes dashboard didn't restart."
-        PluginStatus.Newer -> "The Beacon plugin is newer than this app. Update the app."
+        PluginStatus.DashboardFailed -> "Beacon is updated. The Hermes dashboard didn't restart."
+        PluginStatus.Newer -> "Beacon on Hermes is newer than this app. Update the app."
         PluginStatus.Hidden -> ""
     }
     /** A tap on Update (or Restart Hermes, or Restart dashboard) can move this forward. */
-    val actionable: Boolean get() = status in setOf(PluginStatus.Available, PluginStatus.NeedsReview, PluginStatus.Busy, PluginStatus.Failed,
+    val actionable: Boolean get() = status in setOf(PluginStatus.Available, PluginStatus.Busy, PluginStatus.Failed,
         PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed, PluginStatus.DashboardFailed)
     /** The row needs the owner's attention, even when nothing on the phone can fix it (the dashboard restart, a plugin newer than the app). */
     val attention: Boolean get() = actionable || status == PluginStatus.DashboardRestart || status == PluginStatus.Newer
@@ -153,7 +152,7 @@ internal fun hermesIdle(status: GatewayStatus): Boolean = status.running && !sta
 
 internal interface PluginEndpoint {
     suspend fun version(): PluginVersions
-    suspend fun update(acceptCapabilities: Boolean): JSONObject
+    suspend fun update(): JSONObject
     /**
      * Restarts the Hermes gateway the safe way (never an interrupt). [last] is the restart already asked for; [remember] is told each pid
      * before it is waited on, and when it finishes. No forced restart fallback.
@@ -230,6 +229,9 @@ private suspend fun restartDashboardStep(endpoint: PluginEndpoint, installed: St
 /** How long the phone waits for the gateway to restart a dashboard that is too old to restart itself. */
 internal const val GATEWAY_LED_RESTART_MS = 150_000L
 
+/** How many one-second looks at the plugin's version follow an install whose reply was lost: the install may still be running on Hermes. */
+private const val LOST_REPLY_POLLS = 90
+
 /** The versions once the dashboard runs the new plugin, or null when it did not within [GATEWAY_LED_RESTART_MS]. */
 private suspend fun awaitGatewayLedRestart(endpoint: PluginEndpoint, target: String, steps: StepTracker, pause: suspend (Long) -> Unit): PluginVersions? {
     var waited = 0L
@@ -255,12 +257,12 @@ catch (error: Exception) {
 }
 
 /**
- * Runs Hermes' own updater once and says how the plugin row ends. It never throws (so the app update that follows
- * is never blocked) and never installs a plugin Hermes asked the owner to review. [memo] and [remember] carry the restart already asked for.
+ * Runs Hermes' own pinned install once and says how the plugin row ends. It never throws (so the app update that follows
+ * is never blocked). [memo] and [remember] carry the restart already asked for.
  * [steps] is told each step as it really starts and ends; a step this update does not need is skipped, never shown as done.
  */
 internal suspend fun runPluginUpdate(
-    endpoint: PluginEndpoint, target: String, accept: Boolean, restartOnly: Boolean = false,
+    endpoint: PluginEndpoint, target: String, restartOnly: Boolean = false,
     memo: RestartMemo = RestartMemo(), remember: (RestartMemo) -> Unit = {}, steps: StepTracker = StepTracker(), pause: suspend (Long) -> Unit = { delay(it) },
 ): PluginRow {
     var before: PluginVersions? = null
@@ -282,22 +284,19 @@ internal suspend fun runPluginUpdate(
         steps.plan(UpdateStep.PluginDownload, UpdateStep.PluginInstall, UpdateStep.PluginGateway, UpdateStep.PluginDashboard)
         // Hermes downloads the new plugin and puts it in place in this one request: it is the download until it answers.
         steps.active(UpdateStep.PluginDownload)
-        val response = endpoint.update(accept)
-        if (response.optBoolean("scan_blocked")) { steps.clear(); return PluginRow(PluginStatus.NeedsReview, before?.installed.orEmpty(), target) }
-        if (response.optBoolean("consent_required")) {
-            steps.clear()
-            val lines = response.optJSONArray("delta_lines")?.let { rows -> (0 until rows.length()).mapNotNull { rows.optString(it).takeIf { line -> line.isNotBlank() && line != "null" } } }.orEmpty()
-            return PluginRow(PluginStatus.NeedsReview, before?.installed.orEmpty(), target, lines)
-        }
-        if (!response.optBoolean("ok")) { steps.fail(UpdateStep.PluginDownload, StepNote.PluginFailed); return PluginRow(PluginStatus.Failed, before?.installed.orEmpty(), target) }
+        // A reply lost after the request left (a slow install outlasting the phone's read time) may still have installed the plugin: go on to
+        // the versions below instead of failing the step, which would also stop the app update. [response] is null then.
+        val response = try { endpoint.update() } catch (error: CancellationException) { throw error } catch (error: Exception) { if (lostReply(error)) null else throw error }
+        if (response != null && !response.optBoolean("ok")) { steps.fail(UpdateStep.PluginDownload, StepNote.PluginFailed); return PluginRow(PluginStatus.Failed, before?.installed.orEmpty(), target) }
         // New files are on disk: whatever restart was remembered belonged to the version before.
         remember(RestartMemo())
-        if (response.optBoolean("unchanged")) steps.skipAll(UpdateStep.PluginDownload, UpdateStep.PluginInstall)
+        val unchanged = response?.optBoolean("unchanged") == true
+        if (unchanged) steps.skipAll(UpdateStep.PluginDownload, UpdateStep.PluginInstall)
         else { steps.done(UpdateStep.PluginDownload); steps.active(UpdateStep.PluginInstall) }
         var latest = runCatching { endpoint.version() }.getOrNull()
-        if (!response.optBoolean("unchanged")) {
-            // Hermes reports the new version a moment after the update call returns.
-            for (attempt in 0 until 10) {
+        if (!unchanged) {
+            // Hermes reports the new version a moment after the update call returns; after a lost reply the install may still be running.
+            for (attempt in 0 until if (response == null) LOST_REPLY_POLLS else 10) {
                 if (latest != null && latest != before) break
                 pause(1000)
                 latest = runCatching { endpoint.version() }.getOrNull() ?: latest
@@ -305,7 +304,7 @@ internal suspend fun runPluginUpdate(
         }
         val done = latest ?: run { steps.fail(UpdateStep.PluginInstall, StepNote.PluginFailed); return PluginRow(PluginStatus.Failed, before?.installed.orEmpty(), target) }
         if (!olderVersion(done.installed, target)) steps.done(UpdateStep.PluginInstall)
-        if (response.optBoolean("restart_required") || done.restartKind() == RestartKind.Gateway)
+        if (response?.optBoolean("restart_required") == true || done.restartKind() == RestartKind.Gateway)
             return restartUpdatedPlugin(endpoint, done.installed, target, RestartMemo(), remember, steps, pause)
         steps.skip(UpdateStep.PluginGateway)
         if (olderVersion(done.installed, target)) { steps.fail(UpdateStep.PluginInstall, StepNote.PluginFailed); return PluginRow(PluginStatus.Failed, done.installed, target) }
@@ -318,7 +317,8 @@ internal suspend fun runPluginUpdate(
         return when {
             error is ApiFailure && (error.status == 403 || error.status == 404) -> { steps.clear(); PluginRow() }
             error is ApiFailure && error.status in setOf(409, 423, 429) -> { steps.rows.active?.let { steps.fail(it.step, StepNote.HermesBusy) }; PluginRow(PluginStatus.Busy, installed, target) }
-            else -> { steps.rows.active?.let { steps.fail(it.step, StepNote.PluginFailed) }; PluginRow(PluginStatus.Failed, installed, target) }
+            // Hermes' scan said no, and forcing never overrides it: the step says that instead of "Didn't update".
+            else -> { steps.rows.active?.let { steps.fail(it.step, if (scanBlocked(error)) StepNote.PluginBlocked else StepNote.PluginFailed) }; PluginRow(PluginStatus.Failed, installed, target) }
         }
     }
 }

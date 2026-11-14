@@ -111,9 +111,9 @@ class TranslationKeysTest {
     /** The Settings overview shows each fixed summary part through uiText; a few snapshots reach every one of them. */
     private fun settingsSummaryTexts(): List<String> {
         val snapshots = listOf(
-            SettingsSnapshot(connected = true, profile = "work", sendKey = "enter", showThinking = true, theme = "dark", installedVersion = "1.0.0", voiceProviderId = "gemini", voiceKeySaved = true, keepConnectedEnabled = true),
-            SettingsSnapshot(sendKey = "ctrl_enter", showThinking = false, theme = "light", updateReady = true, voiceProviderId = "gemini", voiceKeySaved = false, keepConnectedEnabled = false),
-            SettingsSnapshot(sendKey = "shift+enter", theme = "system", updateName = "1.1.0", installedVersion = "1.0.0"),
+            SettingsSnapshot(connected = true, profile = "work", sendKey = "enter", showThinking = true, theme = "dark", installedVersion = "1.0.0", voiceProviderId = "gemini", voiceKeySaved = true, keepConnectedEnabled = true, hardwareKeyboard = true),
+            SettingsSnapshot(sendKey = "ctrl_enter", showThinking = false, theme = "light", updateReady = true, voiceProviderId = "gemini", voiceKeySaved = false, keepConnectedEnabled = false, hardwareKeyboard = true),
+            SettingsSnapshot(sendKey = "shift+enter", theme = "system", updateName = "1.1.0", installedVersion = "1.0.0", hardwareKeyboard = true),
             SettingsSnapshot(phoneAccess = emptyList()),
             SettingsSnapshot(phoneAccess = listOf("Calendar & reminders", "Alarms & timers", "Contacts", "Phone calls", "Messages")),
         )
@@ -171,6 +171,7 @@ class TranslationKeysTest {
             "ScheduleStateStrings" to ScheduleStateStrings, "ApprovalStrings" to ApprovalStrings, "NavigationStrings" to NavigationStrings,
             "UpdateFailureStrings" to UpdateFailureStrings, "PluginRowStrings" to PluginRowStrings, "CallToolStrings" to CallToolStrings, "CallStrings" to CallStrings, "CallFailureStrings" to CallFailureStrings,
             "PhoneAccessStrings" to (PhoneAccessStrings + PhoneAccessLabels), "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "ScheduleBuilderStrings" to ScheduleBuilderStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
+            "BotModeNavigationStrings" to BotModeNavigationStrings, "ScheduleRunStrings" to ScheduleRunStrings,
         )
         lists.forEach { (name, texts) -> assertTrue("$name is empty, so nothing is checked.", texts.isNotEmpty()) }
         val missing = untranslated(lists.flatMap { (name, texts) -> texts.map { it to name } })

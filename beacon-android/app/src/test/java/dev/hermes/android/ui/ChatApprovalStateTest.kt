@@ -39,7 +39,7 @@ class ChatApprovalStateTest {
 
     @Test fun autoAndBypassNeverFallBackToManual() {
         assertEquals("smart", chatApprovalSelection(record(), "owner-profile", "chat-a"))
-        assertEquals("Auto", approvalChoiceLabel("smart"))
+        assertEquals("Ask for risky ones", approvalChoiceLabel("smart"))
         assertEquals("yolo", chatApprovalSelection(record(bypass = true), "owner-profile", "chat-a"))
         assertEquals("off", chatApprovalSelection(record("off").put("session_status_known", false), "owner-profile", "chat-a"))
     }

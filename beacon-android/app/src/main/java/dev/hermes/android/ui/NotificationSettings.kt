@@ -123,16 +123,16 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     // Words the callbacks below show are translated here, where uiText can run.
-    val historyLoadFailed = uiText("Couldn’t load history retention from Hermes.")
-    val historyUnsupported = uiText("Hermes returned an unsupported history retention period.")
-    val historySaved = uiText("History retention saved")
-    val historySaveFailed = uiText("Couldn’t save history retention. Try again.")
-    val permissionOffKeepConnected = uiText("Notification permission is off. Keep connected was not enabled.")
-    val permissionOffEvents = uiText("Notification permission is off. Events stay available inside Beacon.")
+    val historyLoadFailed = uiText("Couldn't load history settings.")
+    val historyUnsupported = uiText("Unknown history setting.")
+    val historySaved = uiText("Saved")
+    val historySaveFailed = uiText("Couldn't save. Try again.")
+    val permissionOffKeepConnected = uiText("Allow notifications to turn on Keep connected.")
+    val permissionOffEvents = uiText("Notifications are off. Updates stay in Beacon.")
     val registrationUnavailable = uiText("Can’t set up notifications now. Check your network.")
     val couldntTurnOn = uiText("Couldn’t turn on notifications. Try again.")
     val couldntTurnOff = uiText("Couldn’t turn off notifications. Try again.")
-    val testFailed = uiText("Couldn’t queue a test. Try again.")
+    val testFailed = uiText("Couldn't send a test. Try again.")
     val appSettingsHint = uiText("Open Beacon’s app settings in Android")
     val backgroundHint = uiText("Open Beacon’s app settings in Android and allow background use.")
     val liveUpdatesHint = uiText("Open Android notification settings to manage Live Updates")
@@ -290,7 +290,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
         }
     }
     val pushStatus = data["push-status"]
-    // Reaching Hermes for the status is itself a sign of life, for "Last contact".
+    // Reaching Hermes for the status is itself a sign of life, for "Last heard from Hermes".
     LaunchedEffect(pushStatus) { if (pushStatus != null && !pushStatus.has("_error")) { DeliveryLog.markHeard(context); heardAt = DeliveryLog.heardAt(context) } }
     val serverReady = pushStatus?.optBoolean("android_configured") == true
     val registered = target != null && pushStatus?.rows("targets")?.any { it.string("target_id") == target && it.string("kind") == "fcm" && !it.optBoolean("revoked") } == true
@@ -361,15 +361,24 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
         item("hero") {
             val retry = uiText("Retry")
             val allow = uiText("Allow")
+            // Without Firebase the hero shows one state: the first failing item when there is one (its title, its action), else Keep connected in plain words.
+            val noFirebaseIssue = if (firebase) null else when (state) {
+                DeliveryState.PhoneOff -> uiText("Off on this phone")
+                DeliveryState.Muted -> uiText("Alerts are muted")
+                DeliveryState.Limited -> uiText("Android may stop Beacon")
+                DeliveryState.Reconnecting -> uiText("Reconnecting")
+                DeliveryState.SignedOut -> uiText("Signed out")
+                else -> null
+            }
             val title = when {
-                !firebase -> if (keepConnectedEnabled) uiText("Keep connected is on") else uiText("Keep connected is off")
+                !firebase -> noFirebaseHeroTitle(noFirebaseIssue, keepConnectedOn = uiText("Calls and alerts on"), keepConnectedOff = uiText("Keep connected is off"), keepConnectedEnabled = keepConnectedEnabled)
                 state == DeliveryState.Checking -> uiText("Checking")
                 state == DeliveryState.Unreachable -> uiText("Can’t reach Hermes")
                 state == DeliveryState.ServerSetup -> uiText("Set up on your Hermes")
                 state == DeliveryState.PhoneOff -> uiText("Off on this phone")
                 state == DeliveryState.Muted -> uiText("Alerts are muted")
                 state == DeliveryState.Off -> uiText("Off for {0}").replace("{0}", profileName)
-                state == DeliveryState.NotWorking -> uiText("Not working yet")
+                state == DeliveryState.NotWorking -> uiText("Not set up yet")
                 state == DeliveryState.Limited -> uiText("Android may stop Beacon")
                 state == DeliveryState.Reconnecting -> uiText("Reconnecting")
                 state == DeliveryState.SignedOut -> uiText("Signed out")
@@ -378,7 +387,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
                 else -> uiText("Calls and alerts on")
             }
             val line = when {
-                !firebase -> if (keepConnectedEnabled) uiText("Even when Beacon is closed") else uiText("Turn it on to get calls and alerts while Beacon is closed.")
+                !firebase && noFirebaseIssue == null -> if (keepConnectedEnabled) uiText("Even when Beacon is closed") else uiText("Turn it on to get calls and alerts while Beacon is closed.")
                 state == DeliveryState.Unreachable -> uiText("Check your network")
                 state == DeliveryState.Limited -> uiText("Allow background use")
                 state == DeliveryState.Unconfirmed -> uiText("Send a test alert")
@@ -390,19 +399,11 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
                 DeliveryState.Unreachable -> SettingsAction(retry, { vm.load("push-status", PUSH_STATUS_PATH) }, enabled = !busy)
                 DeliveryState.PhoneOff -> SettingsAction(allow, ::openAppNotifications)
                 DeliveryState.Muted -> SettingsAction(uiText("Open settings"), ::openAppNotifications)
-                DeliveryState.Off -> SettingsAction(uiText("Turn on"), { if (firebase) enable() else setKeepConnected(true) }, enabled = !busy && ownerScope != null)
+                // Off: the switch in Delivery, right under this card, is the one control.
+                DeliveryState.Off -> null
                 DeliveryState.NotWorking -> SettingsAction(retry, ::enable, enabled = !busy)
                 DeliveryState.Limited -> nextStep?.let { step -> SettingsAction(allow, { openStep(step) }) }
                 DeliveryState.Unconfirmed -> SettingsAction(uiText("Send a test"), ::sendTest, enabled = testReady && !busy, loading = testing)
-                else -> null
-            }
-            // Without Firebase the title stays about Keep connected, so the first failing item rides along as a badge and the action.
-            val noFirebaseIssue = if (firebase) null else when (state) {
-                DeliveryState.PhoneOff -> uiText("Off on this phone")
-                DeliveryState.Muted -> uiText("Alerts are muted")
-                DeliveryState.Limited -> uiText("Android may stop Beacon")
-                DeliveryState.Reconnecting -> uiText("Reconnecting")
-                DeliveryState.SignedOut -> uiText("Signed out")
                 else -> null
             }
             val pending = delivery?.optInt("pending") ?: 0
@@ -410,11 +411,10 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
             val missed = held > 0 || (droppedAt > lastAlertAt && !keepConnectedEnabled)
             SettingsStatusHero(
                 status = deliveryStatus(state), title = title, line = line,
-                meta = if (pending > 0 || lastError || missed || noFirebaseIssue != null) ({
+                meta = if (pending > 0 || lastError || missed) ({
                     if (pending > 0) SettingsStatusPill(SettingsStatus.Working, uiText("Waiting: {0}").replace("{0}", "$pending"))
                     if (lastError) SettingsStatusPill(SettingsStatus.Error, uiText("Last delivery failed"))
-                    if (missed) SettingsStatusPill(SettingsStatus.Attention, if (held > 0) uiText("Missed: {0}").replace("{0}", "$held") else uiText("Missed alerts"))
-                    noFirebaseIssue?.let { SettingsStatusPill(deliveryStatus(state), it) }
+                    if (missed) SettingsStatusPill(SettingsStatus.Attention, missedAlertsText(held, uiText("Missed alerts")))
                 }) else null,
                 primary = primary,
                 testTag = "notification-hero",
@@ -440,7 +440,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
                     stop = explainingStop(stop, keepConnectedEnabled, keepConnectedStatus, now)?.let { if (it == "Force-stopped") uiText("Force-stopped") else uiText("Stopped by Android") },
                 )
                 SettingsDivider()
-                SettingsMetricRow(listOf(uiText("Last alert") to agoText(now, lastAlertAt), uiText("Last contact") to agoText(now, heardAt)), Modifier.testTag("notification-last-seen"))
+                SettingsMetricRow(listOf(uiText("Last alert") to agoText(now, lastAlertAt), uiText("Last heard from Hermes") to agoText(now, heardAt)), Modifier.testTag("notification-last-seen"))
                 if (firebase) {
                     SettingsDivider()
                     SettingsActionRow(uiText("Send a test"), ::sendTest, icon = Icons.AutoMirrored.Rounded.Send, enabled = testReady && !busy, busy = testing, busyLabel = uiText("Sending…"), testTag = "notification-test")
@@ -468,7 +468,7 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
         item("phone") {
             val onLabel = uiText("On")
             val offLabel = uiText("Off")
-            SettingsSection(uiText("Phone settings"), footer = uiText("After a force stop, open Beacon once"), testTag = "notification-phone-settings") {
+            SettingsSection(uiText("Phone settings"), footer = if (stop?.first == "Force-stopped") uiText("After a force stop, open Beacon once") else "", testTag = "notification-phone-settings") {
                 SettingsNavRow(uiText("Notification types"), ::openAppNotifications, icon = Icons.Rounded.Tune, external = true)
                 if (liveUpdatesSettings != null) {
                     SettingsDivider()
@@ -504,6 +504,13 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
         }
     }
 }
+
+/** The missed-alerts chip: the count after what was missed ("Missed alerts: 7"); the bare label when no count is known. */
+internal fun missedAlertsText(held: Int, label: String): String = if (held > 0) "$label: $held" else label
+
+/** Without Firebase the hero's title: the one issue when there is one, else Keep connected's state in plain words. */
+internal fun noFirebaseHeroTitle(issue: String?, keepConnectedOn: String, keepConnectedOff: String, keepConnectedEnabled: Boolean): String =
+    issue ?: if (keepConnectedEnabled) keepConnectedOn else keepConnectedOff
 
 /** The Keep connected state as a pill, the reason it is not connected, and what else explains silence. */
 @Composable private fun KeepConnectedDetails(status: String, reason: String, deviceAllowed: Boolean, stop: String?) {
@@ -570,7 +577,7 @@ internal fun historyRetentionNeedsConfirmation(currentDays: Int, selectedDays: I
     }
     pendingDays?.let { days ->
         SettingsConfirmDialog(
-            title = uiText("Shorten history retention?"),
+            title = uiText("Delete older history?"),
             text = uiText("Delete call and task history older than {0}. This can’t be undone.").replace("{0}", uiText(historyRetentionLabel(days))),
             confirmLabel = uiText("Delete older history"),
             onConfirm = { pendingDays = null; onSave(days) },

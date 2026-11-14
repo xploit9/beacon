@@ -20,6 +20,7 @@ import dev.hermes.android.ui.setupPluginCanRetry
 import dev.hermes.android.ui.setupPluginPhase
 import dev.hermes.android.ui.setupPluginRows
 import dev.hermes.android.ui.setupPluginStepShown
+import dev.hermes.android.ui.setupRestartLine
 import dev.hermes.android.updates.GatewayStatus
 import dev.hermes.android.updates.PluginInstallController
 import dev.hermes.android.updates.PluginInstallEndpoint
@@ -38,7 +39,7 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
-/** The wizard's "Add the Beacon plugin to Hermes" page, against a Hermes that does not have the plugin yet. */
+/** The wizard's "Add Beacon to Hermes" page, against a Hermes that does not have the plugin yet. */
 @OptIn(ExperimentalCoroutinesApi::class)
 class SetupPluginStepTest {
     /** A Hermes without Beacon: it answers only once the install has run, and says whether its gateway needs a restart. */
@@ -127,8 +128,10 @@ class SetupPluginStepTest {
 
     @Test fun tryAgainAppearsOnlyWhereTryingAgainCanChangeTheOutcome() {
         // Hermes refusing a non-owner and a sign-in that has ended fail the same way every time; a Hermes without the install route has only the computer route.
-        for (failure in listOf(PluginInstallFailure.Unsupported, PluginInstallFailure.Denied, PluginInstallFailure.SignIn)) assertFalse("$failure", setupPluginCanRetry(failed(failure)))
-        for (failure in PluginInstallFailure.values().filter { it !in setOf(PluginInstallFailure.Unsupported, PluginInstallFailure.Denied, PluginInstallFailure.SignIn) }) assertTrue("$failure", setupPluginCanRetry(failed(failure)))
+        // Hermes' security scan saying no does the same: forcing never overrides it, so asking again asks the same question.
+        val settled = setOf(PluginInstallFailure.Unsupported, PluginInstallFailure.Denied, PluginInstallFailure.SignIn, PluginInstallFailure.Blocked)
+        for (failure in settled) assertFalse("$failure", setupPluginCanRetry(failed(failure)))
+        for (failure in PluginInstallFailure.values().filter { it !in settled }) assertTrue("$failure", setupPluginCanRetry(failed(failure)))
         assertTrue("a failure without a reason can still be tried again", setupPluginCanRetry(failed(null)))
         assertFalse(setupPluginCanRetry(PluginInstallUi(PluginInstallStage.Installing)))
         assertFalse(setupPluginCanRetry(done))
@@ -287,20 +290,27 @@ class SetupPluginStepTest {
     private val catalog by lazy { JSONObject(File(app, "src/main/assets/native-locales.json").readText()) }
     private val normalize = { text: String -> text.lowercase().replace("…", "...").replace(Regex("\\s+"), " ").trim() }
 
+    /** UX re-check of F9, NEW-P2-1: the restart offer's line said its own title again ("Restart Hermes to finish. Restart Hermes to finish..."). */
+    @Test fun theRestartLineDoesNotRepeatItsTitleAndSaysWhatTheInstallCardSays() {
+        for (busy in listOf(false, true)) assertFalse(setupRestartLine(busy), setupRestartLine(busy).startsWith("Restart Hermes to finish"))
+        assertEquals("Restarting stops any reply or scheduled task that is running.", setupRestartLine(busy = false))
+        assertEquals("Hermes is busy. Restarting stops what it's doing.", setupRestartLine(busy = true))
+    }
+
     @Test fun theNewTextIsTranslatedIntoEveryLanguage() {
         // The English text, and the names that stay as they are in every language; the rest must differ from English.
         val texts = mapOf(
-            "Add the Beacon plugin to Hermes" to listOf("Beacon", "Hermes"),
-            "The Beacon plugin is on your Hermes" to listOf("Beacon", "Hermes"),
-            "Checking for the Beacon plugin…" to listOf("Beacon"),
-            "Hermes downloads the Beacon plugin from GitHub and turns it on." to listOf("Hermes", "Beacon", "GitHub"),
-            "Install the Beacon plugin" to listOf("Beacon"),
-            "Check that it answers" to emptyList(),
-            "The Beacon plugin is installed. Restart Hermes to finish turning it on. Anything Hermes is doing right now will stop." to listOf("Beacon", "Hermes"),
-            "The Beacon plugin is installed. Hermes is working right now; restarting stops that work." to listOf("Beacon", "Hermes"),
-            "Only the owner of this Hermes can add the Beacon plugin." to listOf("Beacon", "Hermes"),
+            "Add Beacon to Hermes" to listOf("Beacon", "Hermes"),
+            "Beacon is on your Hermes" to listOf("Beacon", "Hermes"),
+            "Checking for Beacon on Hermes…" to listOf("Beacon"),
+            "Adds Beacon's calls and phone tools to Hermes." to listOf("Beacon", "Hermes"),
+            "Install Beacon" to listOf("Beacon"),
+            "Check it works" to emptyList(),
+            "Restarting stops any reply or scheduled task that is running." to emptyList(),
+            "Hermes is busy. Restarting stops what it's doing." to listOf("Hermes"),
+            "Only the owner of this Hermes can add Beacon." to listOf("Beacon", "Hermes"),
             "Hermes needs you to sign in again." to listOf("Hermes"),
-            "Set up from a computer" to emptyList(),
+            "Set up from a computer (steps)" to emptyList(),
             "Restart later" to emptyList(),
         )
         val languages = catalog.keys().asSequence().filter { it != "en" }.toList()
@@ -330,16 +340,18 @@ class SetupPluginStepTest {
 
     @Test fun thePageCallsTheThingOnHermesTheBeaconPluginAndNothingElse() {
         val literals = pageLiterals()
-        // The owner's words: the Beacon plugin, on Hermes. Not "Beacon on your Hermes", "Hermes plugin" or a bare "the plugin".
+        // Root, 13 Nov 2026 (slop list, decision 12): a line names neither "plugin" nor "add-on" where it works without the word: "Add Beacon to Hermes",
+        // "Checking for Beacon on Hermes…". Never "the Beacon plugin", "add-on" or "Hermes plugin" on this page.
         for (text in literals) {
-            assertFalse("\"$text\" says Beacon on Hermes", Regex("(?i)beacon on (your )?hermes").containsMatchIn(text))
+            assertFalse("\"$text\" says the Beacon plugin", Regex("(?i)beacon plugin").containsMatchIn(text))
+            assertFalse("\"$text\" says add-on", Regex("(?i)add-on").containsMatchIn(text))
             assertFalse("\"$text\" says Hermes plugin", Regex("(?i)hermes plugin").containsMatchIn(text))
             assertFalse("\"$text\" names a URL", "github.com/" in text || "http" in text)
         }
-        for (expected in listOf("Add the Beacon plugin to Hermes", "The Beacon plugin is on your Hermes", "Install the Beacon plugin", "Check that it answers", "Hermes downloads the Beacon plugin from GitHub and turns it on.",
-            "Only the owner of this Hermes can add the Beacon plugin.", "Set up from a computer", "Restart later", "Skip for now")) assertTrue(expected, expected in literals)
+        for (expected in listOf("Add Beacon to Hermes", "Beacon is on your Hermes", "Install Beacon", "Check it works", "Adds Beacon's calls and phone tools to Hermes.", "Checking for Beacon on Hermes…",
+            "Only the owner of this Hermes can add Beacon.", "Set up from a computer (steps)", "Restart later", "Skip for now")) assertTrue(expected, expected in literals)
         // The old wording is gone from the page.
-        for (gone in listOf("Install Beacon on your Hermes", "Do it on the PC instead", "Hermes only lets its owner add Beacon.", "Not now", "Beacon is ready on your Hermes.")) assertFalse(gone, gone in literals)
+        for (gone in listOf("Add the Beacon plugin to Hermes", "Hermes downloads the Beacon plugin from GitHub and turns it on.", "Check that it answers", "Install Beacon on your Hermes", "Do it on the PC instead", "Hermes only lets its owner add Beacon.", "Not now", "Beacon is ready on your Hermes.")) assertFalse(gone, gone in literals)
     }
 
     @Test fun thePcLinkNamesTheReadmeSectionThePageSendsTheOwnerTo() {

@@ -55,6 +55,7 @@ import dev.hermes.android.ui.PhoneCountdownTitle
 import dev.hermes.android.ui.rememberCountdownRun
 import dev.hermes.android.ui.rememberKeyguardLocked
 import dev.hermes.android.ui.verticalScrollFade
+import kotlinx.coroutines.launch
 import dev.hermes.android.ui.uiText
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallToolApproval
@@ -171,6 +172,10 @@ internal fun liveActivityColor(light: Boolean, primary: Color): Color = if (ligh
             } else RequestApprovalBody(approval)
         }
         Column(Modifier.fillMaxWidth().padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (scroll.canScrollForward) {
+                val reader = androidx.compose.runtime.rememberCoroutineScope()
+                TextButton(onClick = { reader.launch { scroll.animateScrollTo(scroll.maxValue) } }, modifier = Modifier.testTag("assist-approval-read-all")) { Text(uiText("Read all")) }
+            }
             if (card != null && run != null) PhoneCountdownButtons(approval, run) else RequestApprovalButtons(approval, onDecision)
         }
     }

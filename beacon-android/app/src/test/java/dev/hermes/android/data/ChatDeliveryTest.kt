@@ -16,7 +16,7 @@ import org.junit.Test
 
 /** Controlled native contracts from bf0203a; no native process, owner records or network. */
 class ChatDeliveryTest {
-    private class Wire(val canonical: Boolean = true, val strictEpoch: Boolean = true) : WebSocket.Factory {
+    private class Wire(val canonical: Boolean = true, val strictEpoch: Boolean = true, store: AuthStore? = null) : WebSocket.Factory {
         val calls = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
         val listeners = java.util.concurrent.CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         var epoch = "first-epoch"
@@ -31,7 +31,7 @@ class ChatDeliveryTest {
         var afterHistoryRead: (() -> Unit)? = null
         val receipts = mutableMapOf<String, JSONObject>()
         val subscribed = CompletableDeferred<Unit>()
-        val client = BeaconClient(AuthContext("https://delivery.example", emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
+        val client = BeaconClient(AuthContext("https://delivery.example", emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard"), store, this, persistContext = store == null) { builder ->
             builder.addInterceptor { chain ->
                 val path = chain.request().url.encodedPath
                 val body = when (path) {
@@ -113,6 +113,21 @@ class ChatDeliveryTest {
         } finally { collector.cancelAndJoin(); wire.client.closeNative() }
     }
 
+    // Hermes stamps every frame of the turn it runs with that turn's admission (session_events.publish, stamped at the claim in
+    // session_authority._stamp_claim). The app keeps that stamp so a started turn can be told from another turn running before it.
+    @Test(timeout = 10_000) fun aFrameOfAStartedTurnCarriesTheAdmissionHermesStampedOnIt() = runBlocking {
+        val wire = Wire()
+        wire.replay = JSONArray().put(wire.event(1, "message.start").put("admission_id", "admitted-a").put("execution_generation", 7))
+            .put(wire.event(2, "message.delta", json("text" to "Progress")).put("admission_id", "admitted-a"))
+            .put(wire.event(3, "message.delta", json("text" to "Unstamped")))
+        val seen = java.util.concurrent.CopyOnWriteArrayList<Pair<String, String>>()
+        val collector = launch { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { seen += it.type to it.payload().string("turn_admission_id") } }
+        try {
+            withTimeoutOrNull(1500) { while (seen.size < 3) delay(10) }
+            assertEquals(listOf("server_turn_started" to "admitted-a", "token" to "admitted-a", "token" to ""), seen.toList())
+        } finally { collector.cancelAndJoin(); wire.client.closeNative() }
+    }
+
     @Test(timeout = 10_000) fun recoveryUsesCanonicalResumeWithoutTheLegacyLazyFlag() = runBlocking {
         val wire = Wire()
         try {
@@ -175,7 +190,7 @@ class ChatDeliveryTest {
             "running" to false, "pending" to JSONArray().put(json("status" to "unknown", "admission_id" to "synthetic-admission")),
             "active_stream_id" to JSONObject.NULL, "messages" to JSONArray())), false, LiveAssistantBoundary())
         assertEquals("An old epoch has no current stream authority", "", after?.streamId)
-        assertEquals("Turn status unknown", after?.status)
+        assertEquals("Reply status unknown", after?.status)
         assertEquals("retained-receipt", after?.uncertain)
         assertEquals("", after?.liveText)
         assertEquals("Old epoch", after?.raw?.rows("_unconfirmed_replies")?.singleOrNull()?.string("text"))
@@ -192,6 +207,23 @@ class ChatDeliveryTest {
             withTimeout(1500) { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { types += it.type } }
             assertEquals(listOf("server_turn_started", "tool", "token", "done"), types)
             assertEquals(0, wire.historyReads)
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 10_000) fun anOrdinaryTurnEndStreamsItsTokenThenDone() = runBlocking {
+        val prefs = java.lang.reflect.Proxy.newProxyInstance(android.content.SharedPreferences::class.java.classLoader, arrayOf(android.content.SharedPreferences::class.java)) { _, method, args ->
+            if (method.name == "getString") args!![1] else error("Unexpected preference operation")
+        } as android.content.SharedPreferences
+        val store = AuthStore(object : android.content.ContextWrapper(null) {
+            override fun getSharedPreferences(ignored: String, mode: Int) = prefs
+        }, AppCipher())
+        val wire = Wire(store = store).apply { latest = 3 }
+        wire.replay = JSONArray().put(wire.event(1, "message.start")).put(wire.event(2, "message.delta", json("text" to "Synthetic final")))
+            .put(wire.event(3, "message.complete", json("status" to "completed")))
+        val types = mutableListOf<String>()
+        try {
+            withTimeout(3000) { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { types += it.type } }
+            assertEquals(listOf("server_turn_started", "token", "done"), types)
         } finally { wire.client.closeNative() }
     }
 

@@ -46,7 +46,9 @@ private fun boundedBoundaryIds(ids: Iterable<String>): Set<String> = ids.filter 
 
 data class LiveAssistantBoundary(val closed: Boolean = false, val toolIds: Set<String> = emptySet()) {
     fun after(event: String, payload: JSONObject = JSONObject()): LiveAssistantBoundary = when (event) {
-        "token", "reasoning" -> LiveAssistantBoundary()
+        // Hermes' message.delta with text null is the reply segment boundary (tui_gateway/contracts/events.py): every viewer but the classic CLI ignores an empty chunk.
+        "token" -> if (payload.string("text").isEmpty()) this else LiveAssistantBoundary()
+        "reasoning" -> LiveAssistantBoundary()
         "interim_assistant" -> if (!payload.optBoolean("already_streamed") && payload.string("text").isNotBlank()) LiveAssistantBoundary(closed = true) else copy(closed = true)
         "tool" -> copy(closed = true, toolIds = boundedBoundaryIds(toolIds + toolIdentity(payload)))
         else -> this
@@ -115,6 +117,29 @@ fun runningTurnMessages(messages: List<JSONObject>): List<JSONObject> = messages
 }.coerceAtLeast(0))
 
 private val runsOfSpace = Regex("\\s+")
+
+/** The most sealed segments a turn keeps on screen and in its live frame. */
+private const val MAX_SEALED_SEGMENTS = 24
+
+/**
+ * The words of the running turn's closed segments that its saved rows do not hold yet, in the order they were said. Hermes saves a model message before it runs its tools,
+ * and the phone reads that history only now and then, so a closed segment stays on screen (as Hermes desktop's sealed interim bubble does) until a saved assistant row of the turn
+ * has the same words. Each saved row holds ONE sealed entry: a sentence the model repeats in two messages is not dropped because only the first one is saved.
+ */
+fun sealedWordsNotSaved(messages: List<JSONObject>, sealed: List<String>): List<String> {
+    if (sealed.isEmpty()) return sealed
+    val saved = runningTurnMessages(messages).filter { it.string("role") == "assistant" }
+        .map { messageContentText("assistant", historyRowContent(it)).trim().replace(runsOfSpace, " ") }.filter { it.isNotEmpty() }.toMutableList()
+    return sealed.filter { words ->
+        val key = words.trim().replace(runsOfSpace, " ")
+        key.isNotEmpty() && !saved.remove(key)
+    }.takeLast(MAX_SEALED_SEGMENTS)
+}
+
+/** The sealed words in a live frame (the checkpoint a reselect or reconnect restores); a frame of an older build has none. */
+fun sealedFromFrame(frame: JSONObject): List<String> = frame.optJSONArray("sealed")?.let { values ->
+    (0 until values.length()).mapNotNull { (values.opt(it) as? String)?.takeIf(String::isNotBlank) }.takeLast(MAX_SEALED_SEGMENTS)
+}.orEmpty()
 
 /**
  * Words that name no tool call (Hermes saves such a message when it makes the model go on, and its turn continues) have only their text to be told by.

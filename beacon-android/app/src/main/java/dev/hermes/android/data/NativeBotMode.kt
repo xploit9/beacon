@@ -32,6 +32,8 @@ data class NativeBotModeState(
     val canRename: Boolean = false, val canDelete: Boolean = false,
     val earlierEventsOmitted: Boolean = false, val moreSpaces: Boolean = false, val actions: List<BotModeAction> = emptyList(),
     val roster: List<BotModeMember> = emptyList(), val typing: List<String> = emptyList(), val working: Boolean = false,
+    /** True once a list is on screen: Hermes' answer or the last one saved on this phone. Until then "no bots" is not known, so no screen may say it. */
+    val loaded: Boolean = false,
 )
 
 /** A room is read fast while a bot answers, so its "typing" and the reply show up promptly. */
@@ -40,6 +42,22 @@ internal fun botModePollMillis(working: Boolean): Long = if (working) 1_000L els
 /** The bots a new space gets: those picked plus the one in use (Hermes only lets a space's own bots open it), two to six of them, else null. */
 internal fun botModeChosen(selected: Set<String>, using: String): List<String>? =
     (selected + using).filter(String::isNotBlank).distinct().sorted().takeIf { it.size in 2..6 }
+
+/** What Bot Mode says when a request fails: Hermes' refusals and internal messages become one plain line; the app's own plain sentences pass. */
+internal fun botModeFailureText(error: Throwable): String = when {
+    error is java.io.IOException -> appErrorText(error)
+    // Only a sentence this file wrote itself (a require or check) passes; a parser's or the runtime's message never does.
+    (error is IllegalArgumentException || error is IllegalStateException) && error !is NumberFormatException ->
+        error.message.orEmpty().takeIf { it.isNotBlank() && it.length <= 160 && !it.contains("native", ignoreCase = true) && '\n' !in it && it.endsWith('.') } ?: BOT_MODE_UNAVAILABLE
+    else -> BOT_MODE_UNAVAILABLE
+}
+internal const val BOT_MODE_UNAVAILABLE = "Bot Mode isn't available right now."
+/** What a Bot Chat that would not open says: short, and nothing about owners, stores or routes. */
+internal fun botChatFailure(status: Int): String = when {
+    status == 409 -> "This Bot Chat can't be opened right now."
+    status >= 500 -> "Bot Chat isn't available right now."
+    else -> "Couldn't open this Bot Chat."
+}
 
 /** Hermes names a new space this; an owner's or the bots' name goes on with the rename route. */
 internal const val NEW_SPACE_NAME = "Shared space"
@@ -76,9 +94,9 @@ internal fun botModeDisbanded(data: JSONObject, id: String): Boolean {
 
 internal fun botModeActions(data: JSONObject): List<BotModeAction> = data.optJSONObject("driver_status")?.rows("pending_actions").orEmpty().mapNotNull { action ->
     val kind = action.string("kind")
-    if (kind in setOf("retry", "discard")) return@mapNotNull BotModeAction("unavailable", action.string("task_id"), description = "This Hermes version cannot safely resolve work whose outcome may be unknown in Beacon. Review it in Hermes; do not replay it blindly.")
+    if (kind in setOf("retry", "discard")) return@mapNotNull BotModeAction("unavailable", action.string("task_id"), description = "Finish this in Hermes. It may already have run.")
     if (kind != "approval") return@mapNotNull null
-    if (data.optJSONObject("capabilities")?.optBoolean("approval") != true) return@mapNotNull BotModeAction("unavailable", action.string("task_id"), description = "Native approval support could not be confirmed. Refresh this space before trying again.")
+    if (data.optJSONObject("capabilities")?.optBoolean("approval") != true) return@mapNotNull BotModeAction("unavailable", action.string("task_id"), description = "Couldn't check approvals. Refresh this space.")
     val task = action.opt("task_id") as? String ?: return@mapNotNull null
     val member = action.opt("member_id") as? String ?: return@mapNotNull null
     val request = action.opt("request_id") as? String ?: return@mapNotNull null
@@ -98,16 +116,16 @@ internal fun botModeEvents(data: JSONObject): List<BotModeEvent> = data.rows("ev
         val reason = payload.string("reason_code")
         val error = payload.string("error")
         val readable = when {
-            reason == "provider_quota_limit" || Regex("(?i)http\\s*402|insufficient.?balance|out of funds").containsMatchIn(error) -> "Provider balance or quota is exhausted. Review this bot’s provider in Profiles."
-            reason == "provider_auth_or_access" -> "Provider authentication or access was refused. Review this bot’s provider in Profiles."
-            reason == "provider_rate_limit" -> "The provider is rate limiting this bot."
-            reason == "provider_server_error" -> "The provider could not complete this bot’s turn."
-            reason == "missing_config" || reason == "model_unavailable" -> "This bot’s model or provider configuration is unavailable. Review Profiles."
-            reason == "context_overflow" -> "This bot’s conversation exceeded the provider context limit."
-            reason == "runtime_offline" || reason == "delivery_timeout" -> "This bot’s runtime did not respond."
-            reason == "agent_blocked" -> "This bot’s turn was blocked."
-            reason == "cancelled" -> "This bot’s turn was cancelled."
-            else -> "This bot’s turn failed. Review its provider and model in Profiles."
+            reason == "provider_quota_limit" || Regex("(?i)http\\s*402|insufficient.?balance|out of funds").containsMatchIn(error) -> "This bot's provider is out of credit. Check it in Profiles."
+            reason == "provider_auth_or_access" -> "This bot's provider refused its key. Check it in Profiles."
+            reason == "provider_rate_limit" -> "This bot's provider is busy. Try again soon."
+            reason == "provider_server_error" -> "This bot's provider didn't reply."
+            reason == "missing_config" || reason == "model_unavailable" -> "This bot's model isn't available. Check it in Profiles."
+            reason == "context_overflow" -> "This bot's chat is too long for its model."
+            reason == "runtime_offline" || reason == "delivery_timeout" -> "This bot didn't answer."
+            reason == "agent_blocked" -> "This bot was stopped from replying."
+            reason == "cancelled" -> "This bot's reply was cancelled."
+            else -> "This bot couldn't reply. Check its model in Profiles."
         }
         return@mapNotNull BotModeEvent(event.getString("event_id"), payload.getString("member_id"), readable, true, eventSeconds(event))
     }
@@ -141,6 +159,8 @@ class NativeBotModeController(
     // The list as last read, kept with those lines so Bot Mode opens already filled after a restart.
     private var rosterRead: JSONObject? = null
     private var rosterSaved = ""
+    // The account the list shown before any client came was saved for.
+    private var paint: Triple<String, String, String>? = null
     private val path = "/api/plugins/beacon/mobile/bot-mode"
     private fun key(space: String) = "bot-mode:${requireNotNull(root) { "Load Bot Mode before editing a draft" }.key}:$space"
     private fun operationKey(purpose: String, identity: String, legacy: String): String {
@@ -162,9 +182,9 @@ class NativeBotModeController(
     }
     private fun current(c: BeaconClient, token: Int): Boolean = source === c && token == generation &&
         client()?.let { it.scope.sameAccount(c.scope) } == true
-    fun clear() { ++generation; job?.cancel(); job = null; source?.closeNative(); source = null; accountClient = null; root = null; rosterAt = 0L; hasRoster = false; backgroundRead = false; last.clear(); rosterRead = null; rosterSaved = ""; mutable.value = NativeBotModeState() }
+    fun clear() { ++generation; job?.cancel(); job = null; source?.closeNative(); source = null; accountClient = null; root = null; rosterAt = 0L; hasRoster = false; backgroundRead = false; last.clear(); rosterRead = null; rosterSaved = ""; paint = null; mutable.value = NativeBotModeState() }
     fun draft(text: String) {
-        if (root == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open an authorized shared space before editing its draft"); return }
+        if (root == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open a shared space first."); return }
         mutable.value = mutable.value.copy(draft = text); saved[key(mutable.value.selectedSpace)] = text
     }
     /** The bot you are using is always in a space you create: Hermes lets only a space's own bots open it. */
@@ -180,7 +200,9 @@ class NativeBotModeController(
     /** Bots or their roles changed on Hermes: read the list again now, not at the next 30-second refresh. */
     fun rosterChanged() { rosterAt = 0L; if (job?.isActive != true || backgroundRead) refresh() }
     private fun launch(userAction: Boolean = true, action: suspend (BeaconClient, Int) -> Unit) {
-        val live = client() ?: run { clear(); return }
+        // Before any client exists (a cold start) there is nothing bound to clear, and the saved list stays on screen.
+        val live = client() ?: run { if (root != null) clear(); return }
+        paint?.let { (origin, owner, profile) -> if (live.scope.origin != origin || live.scope.owner != owner || live.scope.profile != profile) clear() else paint = null }
         if (root?.let { !it.sameAccount(live.scope) } == true) clear()
         if (job?.isActive == true) {
             if (!userAction) return
@@ -207,8 +229,8 @@ class NativeBotModeController(
             catch (e: CancellationException) { throw e }
             catch (e: Exception) {
                 if (current(c, token)) {
-                    mutable.value = if (e is ApiFailure && e.status in setOf(401, 403)) mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "", error = e.message)
-                    else mutable.value.copy(error = e.message ?: "Native Bot Mode unavailable")
+                    mutable.value = if (e is ApiFailure && e.status in setOf(401, 403)) mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "", error = botModeFailureText(e))
+                    else mutable.value.copy(error = botModeFailureText(e))
                 }
             }
             finally { if (current(c, token)) mutable.value = mutable.value.copy(loading = false, sending = false) }
@@ -221,6 +243,7 @@ class NativeBotModeController(
             moreSpaces = result.optBoolean("has_more_spaces"),
             canRename = result.optJSONObject("capabilities")?.optBoolean("rename") == true,
             canDelete = result.optJSONObject("capabilities")?.optBoolean("delete") == true,
+            loaded = true,
         )
     }
     private fun saveRoster(c: BeaconClient) {
@@ -234,6 +257,17 @@ class NativeBotModeController(
         rosterSaved = text
         // Publish memory snapshots in order; ScreenCache already writes the disk row asynchronously.
         try { cache.set(at, "bot-mode:roster", value) } catch (e: Exception) { if (e is CancellationException) throw e }
+    }
+    /**
+     * The last list saved on this phone, shown before the app is connected (a cold start waits a moment for Hermes). Ignored once a list is
+     * on screen or the controller is bound to an account: from then on it reads its own cache, scoped to that account and profile.
+     * [origin], [owner] and [profile] name the account it was saved for; a client of any other one drops it before reading its own list.
+     */
+    fun showCached(stored: JSONObject?, origin: String, owner: String, profile: String) {
+        if (stored == null || root != null || mutable.value.loaded) return
+        paint = Triple(origin, owner, profile)
+        stored.optJSONObject("previews")?.let { lines -> lines.keys().forEach { id -> lines.optJSONObject(id)?.let { last.putIfAbsent(id, BotModePreview(it.string("speaker"), it.string("text"))) } } }
+        try { showRoster(stored) } catch (e: org.json.JSONException) { last.clear() }
     }
     fun refresh(silent: Boolean = false) {
         launch(userAction = !silent) { c, token ->
@@ -256,7 +290,7 @@ class NativeBotModeController(
             val selected = mutable.value.selectedSpace
             if (selected.isNotBlank() && mutable.value.activeBot == null) {
                 if (mutable.value.spaces.none { it.id == selected } && !mutable.value.moreSpaces) {
-                    mutable.value = mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "", error = "This shared space is no longer authorized or available. Its local draft is retained.")
+                    mutable.value = mutable.value.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "", error = "This shared space isn't available any more. Your draft is kept.")
                 } else readSpace(c, token, selected)
             }
         }
@@ -279,7 +313,7 @@ class NativeBotModeController(
             spaces = mutable.value.spaces.map { if (it.id == id) it.copy(name = room?.string("name", it.name) ?: it.name, last = last[id] ?: it.last, updatedAt = maxOf(it.updatedAt, events.maxOfOrNull { event -> event.at } ?: 0L)) else it },
             events = events, earlierEventsOmitted = data.optBoolean("earlier_events_omitted"),
             actions = botModeActions(data),
-            status = when { driver?.optBoolean("blocked") == true -> "Shared space needs your attention"; driver?.optBoolean("working") == true -> "Bots are discussing…"; failed > 0 -> "Shared space needs attention"; driver?.optBoolean("running") == true -> "Shared space is ready"; else -> "Shared-space worker is unavailable" } + if (failed > 0) " · $failed failed bot turn${if (failed == 1) "" else "s"}. Review the failures below." else "")
+            status = when { driver?.optBoolean("blocked") == true -> "Shared space needs you"; driver?.optBoolean("working") == true -> "Bots are discussing…"; failed > 0 -> "Shared space needs you"; driver?.optBoolean("running") == true -> "Shared space is ready"; else -> "Shared space is offline" } + if (failed > 0) " · $failed bot ${if (failed == 1) "reply" else "replies"} failed" else "")
     }
     fun selectSpace(id: String) {
         back()
@@ -336,7 +370,7 @@ class NativeBotModeController(
     }
     fun deleteSpace(id: String = mutable.value.selectedSpace) {
         val before = mutable.value
-        if (!before.canDelete) { mutable.value = before.copy(error = "Native shared-space deletion is unavailable. Refresh before trying again."); return }
+        if (!before.canDelete) { mutable.value = before.copy(error = "Can't delete this space right now. Refresh and try again."); return }
         val name = before.spaces.firstOrNull { it.id == id }?.name ?: run { mutable.value = before.copy(error = "This space changed. Refresh before deleting."); return }
         launch { c, token ->
             val intentKey = operationKey("delete", id, key("delete:$id"))
@@ -379,8 +413,8 @@ class NativeBotModeController(
     fun action(action: BotModeAction, choice: String = "") {
         val id = mutable.value.selectedSpace
         val actionScope = root
-        val payload = try { action.payload(choice) } catch (e: IllegalArgumentException) { mutable.value = mutable.value.copy(error = e.message.orEmpty()); return }
-        if (id.isBlank() || actionScope == null) { mutable.value = mutable.value.copy(error = "Open the shared space before resolving its action"); return }
+        val payload = try { action.payload(choice) } catch (e: IllegalArgumentException) { mutable.value = mutable.value.copy(error = botModeFailureText(e)); return }
+        if (id.isBlank() || actionScope == null) { mutable.value = mutable.value.copy(error = "Open the shared space first."); return }
         launch { c, token ->
             require(root == actionScope) { "The account changed. Refresh before resolving this action." }
             c.nativeRequest("$path/space/$id/action", "POST", payload)
@@ -389,12 +423,18 @@ class NativeBotModeController(
     }
     fun openBot(bot: BotModeBot) = launch { c, token ->
         mutable.value = mutable.value.copy(openingBot = bot, activeBot = null, sessionId = "")
-        val data = c.nativeRequest("$path/chat", "POST", json("bot" to bot.profile))
-        require(data.getString("profile") == bot.profile && data.getString("title") == "Bot Chat") { "Native Bot Chat identity changed" }
-        val id = data.getString("stored_session_id")
-        if (!current(c, token)) return@launch
-        openChat(bot.profile, id)
-        if (current(c, token)) mutable.value = mutable.value.copy(activeBot = bot, openingBot = null, sessionId = id)
+        try {
+            val data = c.nativeRequest("$path/chat", "POST", json("bot" to bot.profile))
+            require(data.getString("profile") == bot.profile && data.getString("title") == "Bot Chat") { "Native Bot Chat identity changed" }
+            val id = data.getString("stored_session_id")
+            if (!current(c, token)) return@launch
+            openChat(bot.profile, id)
+            if (current(c, token)) mutable.value = mutable.value.copy(activeBot = bot, openingBot = null, sessionId = id)
+        } catch (e: CancellationException) { throw e }
+        // A signed-out or refused account keeps its own handling; anything else is said in plain words, whatever an older plugin wrote.
+        catch (e: ApiFailure) { if (e.status in setOf(401, 403)) throw e; throw IllegalStateException(botChatFailure(e.status)) }
+        catch (e: IllegalArgumentException) { throw IllegalStateException(botChatFailure(0)) }
+        catch (e: org.json.JSONException) { throw IllegalStateException(botChatFailure(0)) }
     }
     fun pause() {
         ++generation; job?.cancel(); job = null

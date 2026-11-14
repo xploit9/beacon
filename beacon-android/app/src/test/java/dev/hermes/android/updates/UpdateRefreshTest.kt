@@ -59,11 +59,13 @@ class UpdateRefreshTest {
         val metadata = JSONObject().put("package_name", "dev.hermes.android.stable").put("version_name", build.name).put("version_code", build.code)
             .put("artifact_filename", "Beacon-${build.name}.apk").put("size_bytes", build.apk.size).put("sha256", build.sha)
             .put("certificate_sha256", "a".repeat(64)).put("plugin_version", build.name)
-        val announcement = JSONObject().put("draft", false).put("prerelease", false).put("body", "").put("published_at", "2026-10-27T09:00:00Z")
+        val announcement = JSONObject().put("tag_name", "v${build.name}").put("draft", false).put("prerelease", false).put("body", "").put("published_at", "2026-10-27T09:00:00Z")
             .put("assets", JSONArray(listOf(asset("Beacon-${build.name}.json"), asset("Beacon-${build.name}.apk", build.apk.size))))
         routes[latestPath] = { MockResponse().setBody(announcement.toString()).setHeader("ETag", etag) }
         routes["/dl/Beacon-${build.name}.json"] = { MockResponse().setBody(metadata.toString()) }
         routes["/dl/Beacon-${build.name}.apk"] = { MockResponse().setBody(Buffer().write(build.apk)) }
+        // The check also asks which commit the tag names; the plugin install pins it, so a tap never asks again.
+        routes["/repos/xploit9/beacon/commits/v${build.name}"] = { MockResponse().setBody("0123456789abcdef0123456789abcdef01234567") }
     }
 
     /** The check's own mapping: a 304 stands for the stored release, anything else is what GitHub now calls latest. */

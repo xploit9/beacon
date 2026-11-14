@@ -74,11 +74,11 @@ class TelegramChatUiTest {
         assertEquals(150f, ((chip.left + chip.right) / 2).value, 2f)
     }
 
-    @Test fun eachSendStateHasItsOwnTickAndWords() {
-        compose.setContent { MaterialTheme { Column { SendTickIcon(SendTick.Sending); SendTickIcon(SendTick.Sent); SendTickIcon(SendTick.Unconfirmed) } } }
-        compose.onNodeWithContentDescription("Sending").assertExists()
-        compose.onNodeWithContentDescription("Sent").assertExists()
-        compose.onNodeWithContentDescription("Not confirmed").assertExists()
-        listOf("sending", "sent", "unconfirmed").forEach { compose.onNodeWithTag("send-tick:$it", useUnmergedTree = true).assertExists() }
+    @Test fun eachSendStateHasItsOwnTickAndTalkBackWords() {
+        compose.setContent { MaterialTheme { Column { SendTick.entries.forEach { SendTickIcon(it) } } } }
+        compose.onNodeWithContentDescription("Not confirmed yet").assertExists()
+        compose.onNodeWithContentDescription("Delivered").assertExists()
+        compose.onNodeWithContentDescription("Answered").assertExists()
+        listOf("pending", "delivered", "answered").forEach { compose.onNodeWithTag("send-tick:$it", useUnmergedTree = true).assertExists() }
     }
 }

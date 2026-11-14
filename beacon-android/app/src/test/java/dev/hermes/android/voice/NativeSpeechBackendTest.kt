@@ -113,7 +113,7 @@ class NativeSpeechBackendTest {
             f.start(); f.fail(java.io.IOException("Synthetic upgrade refusal"), 429)
             assertTrue(waitFor { f.requestCount("Verified reply.") == 2 })
             f.fail(java.io.IOException("Synthetic upgrade refusal"), 429)
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("provider is busy") } })
+            assertTrue(waitFor { f.events.any { it.optString("message").contains("Voice is busy") } })
             assertEquals(2, f.requestCount("Verified reply.")); assertTrue(f.audio.isEmpty())
         } finally { f.close() }
     }
@@ -122,7 +122,7 @@ class NativeSpeechBackendTest {
         val f = RenderFixture()
         try {
             f.start(); f.fail(java.io.IOException("SYNTHETIC_PRIVATE_PROVIDER_DETAIL"), 401)
-            assertTrue(waitFor { f.events.any { it.optString("message").contains("speech session could not start") } })
+            assertTrue(waitFor { f.events.any { it.optString("message").contains("Voice didn't start") } })
             assertEquals(1, f.requestCount("Verified reply.")); assertTrue(f.audio.isEmpty())
             assertFalse(f.events.toString().contains("SYNTHETIC_PRIVATE_PROVIDER_DETAIL"))
             assertFalse(f.events.filter { it.optString("type") == "warning" }.toString().contains("401"))
@@ -257,7 +257,7 @@ class NativeSpeechBackendTest {
             val response = code?.let { Response.Builder().request(socket.request()).protocol(Protocol.HTTP_1_1).code(it).message("Fixture").build() }
             listener.onFailure(socket, error, response)
         }
-        fun warned() = events.any { it.optString("message").contains("could not safely read") }
+        fun warned() = events.any { it.optString("message").contains("Couldn't read this aloud") }
         fun close() { renderer.close(); scope.cancel() }
     }
     private class Fixture(private val provider: String = "gemini", private val authority: Boolean = false, stallAfterMs: Long = 20000, sendGatewayReady: Boolean = true,

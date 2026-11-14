@@ -264,8 +264,9 @@ class NativeGatewayTest {
         try {
             withTimeout(5_000) { fixture.eventsReady.await() }
             val unsupported = listOf(
-                "secret" to -32601, "sudo" to -32601, "display.install.sudo" to -32601,
-                "vault.code" to -32601, "vault.save_login" to -32601, "vault.unlock_prompt" to -32601,
+                "sudo" to -32601, "display.install.sudo" to -32601,
+                // Hermes' own secret questions are taken, but one without its fields is refused as malformed.
+                "secret" to -32602, "vault.code" to -32602, "vault.save_login" to -32602, "vault.unlock_prompt" to -32602,
                 "theme.apply" to -32601, "theme.pick" to -32601, "setup_beat" to -32601,
                 "preview.act" to 4404, "preview.read" to 4404, "terminal.read" to 4404,
                 "window.read" to 4404, "tour" to 4404, "future.method" to -32601,

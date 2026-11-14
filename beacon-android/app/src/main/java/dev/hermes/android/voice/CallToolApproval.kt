@@ -147,8 +147,8 @@ internal fun callToolApprovalErrorMessage(message: String): String {
         text.contains("Invalid approval decision", ignoreCase = true) -> "Choose Deny, Allow once, or Always allow during this call."
         text.contains("Approval proposal mismatch", ignoreCase = true) -> "The approval changed. Review the request again."
         text.contains("Call is closed or unavailable", ignoreCase = true) -> "This call ended. The action was not allowed."
-        text.contains("Call tool allowance capacity reached", ignoreCase = true) -> "This call has reached its saved-tool limit. Choose Allow once."
-        text.contains("Tool allowance capacity reached", ignoreCase = true) -> "The app has reached its saved-tool limit. Choose Allow once."
+        text.contains("Call tool allowance capacity reached", ignoreCase = true) -> "Can't save more. Choose Allow once."
+        text.contains("Tool allowance capacity reached", ignoreCase = true) -> "Can't save more. Choose Allow once."
         text.contains("Request identity conflicts", ignoreCase = true) -> "The request changed. Review the current details."
         text.contains("Tool changed or is no longer configured", ignoreCase = true) -> "This tool changed. Refresh the list and try again."
         text.contains("Tool execution capacity reached", ignoreCase = true) || text.contains("Tool request capacity reached", ignoreCase = true) -> "The call is busy. Try again shortly."
@@ -228,7 +228,7 @@ internal fun CallToolReceipt.statusLabel(): String? = statusTemplate()?.replace(
 /** The receipt texts that reach uiText whole or as templates; the tool chip's "<tool> complete" forms are built from the tool's own name. */
 internal val CallToolStrings = listOf(
     "Using {0}…", "Writing a file…", "Updating a file…", "Reading files…",
-    "Needs approval", "Completion not confirmed", "Action denied", "Approval expired", "Action cancelled",
+    "Needs approval", "Not confirmed", "Action denied", "Approval expired", "Action cancelled",
 )
 
 internal fun CallToolReceipt.chipLabel(): String? {
@@ -244,7 +244,7 @@ internal fun CallToolReceipt.chipLabel(): String? {
     }
     return when (status) {
         "needs_approval" -> "Needs approval"
-        "completed" -> if (hasResult) action + " complete" else "Completion not confirmed"
+        "completed" -> if (hasResult) action + " complete" else "Not confirmed"
         "failed" -> action + " failed"
         "denied" -> "Action denied"
         "expired" -> "Approval expired"

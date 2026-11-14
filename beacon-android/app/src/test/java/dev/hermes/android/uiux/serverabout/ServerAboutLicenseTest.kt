@@ -3,6 +3,7 @@ package dev.hermes.android.uiux.serverabout
 import dev.hermes.android.ui.licenseDocuments
 import dev.hermes.android.ui.openSourceWorks
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -15,7 +16,9 @@ class ServerAboutLicenseTest {
 
     @Test fun everyNoticeNamesItsLicenseAndKeepsTheLegalLines() {
         openSourceWorks.forEach { work -> assertTrue(work.name, work.notice.contains(work.license)) }
-        assertTrue(openSourceWorks.single { it.name == "Hermes Relay" }.notice.contains("Relay’s search pattern"))
+        assertTrue(openSourceWorks.single { it.name == "Hermes Relay" }.notice.let { it.contains("adapted from it") && it.contains("Hermes Relay MIT notice") })
+        // No class names on the page.
+        assertFalse(openSourceWorks.any { work -> listOf("NativeAuth", "NativeOperations", "OpenAiWire", "RelayCallback", "SettingsSearch").any { it in work.notice } })
         assertTrue(openSourceWorks.single { it.name.startsWith("JLaTeXMath") }.notice.endsWith("cc2a83dcf695028b5588f91a90734d94eb5bd02b"))
     }
 

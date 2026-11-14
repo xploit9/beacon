@@ -58,8 +58,17 @@ internal fun skillDisplayName(name: String): String =
 
 /** The filter ids are "all", "on" (enabled) and "setup" (needs setup); a search matches the name as stored, as shown, the description and the category. */
 internal fun skillMatches(skill: NativeSkill, filter: String, search: String): Boolean =
-    (filter == "all" || filter == "on" && skill.enabled || filter == "setup" && skill.requirements.isNotEmpty()) &&
+    (filter == "all" || filter == "on" && skill.enabled || filter == "setup" && skillNeedsSetup(skill)) &&
         (search.isBlank() || "${skill.name} ${skillDisplayName(skill.name)} ${skill.description} ${skill.category}".contains(search.trim(), ignoreCase = true))
+
+/** The start of the plugin's note for a skill this host's platform cannot run (a macOS-only skill on Windows); Hermes writes the note in English. */
+internal const val HostPlatformMismatch = "Host platform does not match"
+
+/** A skill this computer cannot run: it is marked "Not available" and its switch stays off, instead of asking for a setup step. */
+internal fun skillUnavailableHere(skill: NativeSkill): Boolean = skill.requirements.any { it.startsWith(HostPlatformMismatch) }
+
+/** A skill with a setup step still open that this computer can take (a missing key, a missing app); one it cannot run is not counted here. */
+internal fun skillNeedsSetup(skill: NativeSkill): Boolean = skill.requirements.isNotEmpty() && !skillUnavailableHere(skill)
 
 /**
  * The skills as sections: enabled first, then by name. With two or more categories each category is a section (the key is the
@@ -105,7 +114,7 @@ private fun LazyListScope.skillList(
     val all = state.skills
     if (all.isEmpty() && state.loading) { item(key = "skeleton") { SettingsSection { SettingsSkeletonRows(4) } }; return }
     item(key = "counts") { SettingsSection(testTag = "skills-counts") {
-        SettingsMetricRow(listOf(uiText("Installed") to "${all.size}", uiText("Enabled") to "${all.count { it.enabled }}", uiText("Need setup") to "${all.count { it.requirements.isNotEmpty() }}"))
+        SettingsMetricRow(listOf(uiText("Installed") to "${all.size}", uiText("Enabled") to "${all.count { it.enabled }}", uiText("Needs setup") to "${all.count(::skillNeedsSetup)}"))
     } }
     item(key = "search") { SettingsSearchField(state.search, onSearch, uiText("Search skills"), testTag = "skills-search") }
     item(key = "filter") {
@@ -144,16 +153,18 @@ internal fun skillDescriptionLines(fontScale: Float): Int = if (fontScale > 1.15
 /** A skill: its name, its description (one line, two at large text) and, when it can't work yet, a "Needs setup" pill. The row opens it; the switch is its own target. */
 @Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, switchSaving: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
     val descriptionLines = skillDescriptionLines(LocalDensity.current.fontScale)
+    val unavailable = skillUnavailableHere(skill)
     Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = !busy, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsIconTile(SkillsIcon)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(skillDisplayName(skill.name), style = MaterialTheme.typography.bodyLarge.contentDirection(), fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(skill.description.ifBlank { uiText("No description") }, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = descriptionLines, overflow = TextOverflow.Ellipsis)
-            if (skill.requirements.isNotEmpty()) SettingsStatusPill(SettingsStatus.Attention, uiText("Needs setup"))
+            if (unavailable) SettingsStatusPill(SettingsStatus.Off, uiText("Not available"))
+            else if (skillNeedsSetup(skill)) SettingsStatusPill(SettingsStatus.Attention, uiText("Needs setup"))
             else if (skill.essential) SettingsStatusPill(SettingsStatus.Off, uiText("Always on"))
         }
-        Switch(checked = skill.enabled, onCheckedChange = onToggle, enabled = !busy && !switchSaving && !skill.essential, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "$enableLabel ${skill.name}" })
+        Switch(checked = skill.enabled, onCheckedChange = onToggle, enabled = !busy && !switchSaving && !skill.essential && !unavailable, modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "$enableLabel ${skill.name}" })
     }
 }
 
@@ -161,17 +172,19 @@ private fun LazyListScope.skillDetail(
     skill: NativeSkill, state: NativeSkillsState, busy: Boolean, enableLabel: String, onToggle: (NativeSkill, Boolean) -> Unit,
     onEdit: (Boolean) -> Unit, onDraft: (String) -> Unit, onSave: () -> Unit, renderInstructions: @Composable (String) -> Unit,
 ) {
+    val unavailable = skillUnavailableHere(skill)
     val ready = skill.requirements.isEmpty()
-    val status = if (ready) SettingsStatus.Ok else SettingsStatus.Attention
+    val status = when { unavailable -> SettingsStatus.Off; ready -> SettingsStatus.Ok; else -> SettingsStatus.Attention }
     item(key = "hero") {
         SettingsStatusHero(status, skillDisplayName(skill.name), line = skill.description.ifBlank { uiText("No description") },
-            meta = { SettingsStatusPill(status, uiText(if (ready) "Ready" else "Needs setup")) }, testTag = "skill-hero")
+            meta = { SettingsStatusPill(status, uiText(when { unavailable -> "Not available"; ready -> "Ready"; else -> "Needs setup" })) }, testTag = "skill-hero")
     }
     item(key = "enabled") { SettingsSection {
         SettingsSwitchRow(uiText("Enabled"), skill.enabled, { onToggle(skill, it) }, Modifier.semantics { contentDescription = "$enableLabel ${skill.name}" }, icon = Icons.Rounded.PowerSettingsNew,
-            summary = if (skill.essential) uiText("Always on") else "", enabled = !busy && state.toggling == null && !skill.essential, testTag = "skill-enabled")
+            summary = if (skill.essential) uiText("Always on") else "", enabled = !busy && state.toggling == null && !skill.essential && !unavailable, testTag = "skill-enabled")
     } }
-    if (!ready) item(key = "needs") { SettingsSection(title = uiText("Needs"), testTag = "skill-needs") {
+    // A skill this computer cannot run shows its one status, not Hermes' platform note.
+    if (!ready && !unavailable) item(key = "needs") { SettingsSection(title = uiText("Needs"), testTag = "skill-needs") {
         skill.requirements.forEachIndexed { index, requirement ->
             if (index > 0) SettingsDivider()
             SettingsValueRow(requirement, icon = Icons.Rounded.Key)

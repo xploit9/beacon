@@ -18,7 +18,10 @@ class ProactiveSettingsTest {
         assertEquals("06:45", body.getString("quiet_end"))
         assertEquals("model", body.getString("model"))
         assertEquals("provider", body.getString("provider"))
-        assertEquals(7, body.length())
+        // The watch's own model is "Same as assistant" (blank) by default; nightly memory upkeep keeps the assistant's model.
+        assertEquals("", body.getString("watch_model"))
+        assertEquals("", body.getString("watch_provider"))
+        assertEquals(9, body.length())
     }
 
     @Test fun settingsValidationAcceptsOnlySupportedDeliveryIntervalsAndTimes() {

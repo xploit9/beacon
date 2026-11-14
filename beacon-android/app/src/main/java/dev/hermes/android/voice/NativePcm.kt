@@ -84,9 +84,9 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
                     } }
                 }
             } catch(error:CancellationException) { throw error }
-            catch(error:Exception) { if(!closed.get()) failure("Microphone capture failed") }
+            catch(error:Exception) { if(!closed.get()) failure("The microphone stopped.") }
         }
-        watchdogJob=scope.launch { delay(5000);if(!captureObserved.get()&&!closed.get()) failure("Native microphone did not produce audio") }
+        watchdogJob=scope.launch { delay(5000);if(!captureObserved.get()&&!closed.get()) failure("The microphone isn't picking up sound.") }
         // Feed hardware without waiting for presentation of each 20ms write.
         playbackJob=scope.launch(Dispatchers.IO) {
             try {
@@ -106,7 +106,7 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
                     }
                 }
             } catch(error:CancellationException) { throw error }
-            catch(error:Exception) { if(!closed.get()) failure("Speaker playback failed") }
+            catch(error:Exception) { if(!closed.get()) failure("The speaker stopped.") }
         }
         presentationJob=scope.launch(Dispatchers.IO) {
             try {
@@ -125,7 +125,7 @@ internal class NativePcm(private val scope:CoroutineScope,private val input:(Byt
                     delay(5)
                 }
             } catch(error:CancellationException) { throw error }
-            catch(error:Exception) { if(!closed.get()) failure("Speaker playback failed") }
+            catch(error:Exception) { if(!closed.get()) failure("The speaker stopped.") }
         }
     }
     fun mute(value:Boolean)=synchronized(lock) { capture.set(!value&&!closed.get()) }

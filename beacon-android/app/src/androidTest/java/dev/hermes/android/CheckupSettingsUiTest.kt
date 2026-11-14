@@ -70,7 +70,7 @@ class CheckupSettingsUiTest {
             assertTrue(writes().isEmpty())
             // Check-in calls are a section of their own, with no expander; a failed read shows a short error and Retry instead of the switch.
             compose.onNodeWithTag("assistant-settings").performScrollToNode(hasText("Check-in calls"))
-            compose.onNodeWithText("Couldn't load check-up calls").assertExists()
+            compose.onNodeWithText("Couldn't load check-in calls").assertExists()
             compose.onAllNodesWithTag("assistant-checkups-toggle").assertCountEquals(0)
             fixture.checkupCapabilitiesFailure = false
             compose.onNodeWithTag("checkups-retry").performScrollTo().performClick()

@@ -60,6 +60,7 @@ class SettingsMigrationUiTest {
         connected = true, profile = "work", sendKey = "ctrl_enter", formatMessages = false, showThinking = true,
         autoFollow = true, animateBackground = true,
         theme = "dark", colorStyle = "graphite", installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true,
+        hardwareKeyboard = true,
     )
 
     private fun show(widthDp: Float, fontScale: Float = 1f, snapshot: SettingsSnapshot? = known): Host {
@@ -104,7 +105,7 @@ class SettingsMigrationUiTest {
         show(widthDp = PhoneWidthDp)
         shown("Connection").assertTextContains("work")
         shown("Connection").assertTextContains("Connected")
-        shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
+        shown("Chat").assertTextContains("Enter adds a line · Thinking shown")
         shown("Voice & calls").assertTextContains("Gemini Live")
         shown("Voice & calls").assertTextContains("Key saved")
         shown("Appearance").assertTextContains("Dark · Graphite")
@@ -202,7 +203,7 @@ class SettingsMigrationUiTest {
         shown("Connection").assertTextContains("Server, account, phones")
         compose.runOnIdle { host.snapshot = known }
         shown("Appearance").assertTextContains("Dark · Graphite")
-        shown("Chat").assertTextContains("Ctrl + Enter to send · Thinking shown")
+        shown("Chat").assertTextContains("Enter adds a line · Thinking shown")
         compose.runOnIdle { host.snapshot = known.copy(theme = "light", updateName = "0.4.15") }
         shown("Appearance").assertTextContains("Light · Graphite")
         shown("App updates").assertTextContains("Update available")
@@ -213,7 +214,7 @@ class SettingsMigrationUiTest {
         shown("Notifications & Keep connected").assertTextContains("Alerts and calls")
         assertTrue("Reading a summary must not open a route", host.opened.isEmpty())
         compose.runOnIdle { host.pluginAbsent = true }
-        compose.onNodeWithText("Add the Beacon plugin to Hermes").assertIsDisplayed()
+        compose.onNodeWithText("Add Beacon to Hermes").assertIsDisplayed()
         compose.runOnIdle { host.pluginAbsent = false }
         compose.onNodeWithText("Calls need the Beacon plugin on your Hermes.").assertDoesNotExist()
     }
@@ -235,11 +236,11 @@ class SettingsMigrationUiTest {
             shown("Appearance").assertTextContains("Dark · Graphite")
         }
         compose.runOnIdle { host.snapshot = known.withLoaded(json("send_key" to "shift+enter")) }
-        shown("Chat").assertTextContains("Shift + Enter to send")
+        shown("Chat").assertTextContains("Enter adds a line")
         shown("Voice & calls").assertTextContains("Gemini Live")
         shown("Voice & calls").assertTextContains("Key saved")
         compose.runOnIdle { host.snapshot = known.copy(voiceProviderId = "grok", voiceKeySaved = false).withLoaded(json("send_key" to "enter")) }
-        shown("Chat").assertTextContains("Enter to send")
+        shown("Chat").assertTextContains("Enter sends")
         shown("Voice & calls").assertTextContains("Grok")
         shown("Voice & calls").assertTextContains("Add key")
         assertTrue(host.opened.isEmpty())

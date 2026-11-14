@@ -132,7 +132,7 @@ class CatalogScreensUiTest {
     @Test fun memoryStatesAreWordsWithGlyphsNotRedSentences() {
         memory(NativeMemoryState("s", provider = "mem0", providerReady = false, documents = listOf(doc("memory", "Notes", enabled = false)), message = "Notes saved"))
         compose.onNodeWithTag("memory-recall-pill").assertExists()
-        compose.onNodeWithText("Recall not ready").assertExists()
+        compose.onNodeWithText("Memory not ready").assertExists()
         compose.onNodeWithText("Off for new chats").assertExists()
         compose.onNodeWithText("Notes saved").assertExists()
         compose.onNodeWithText("Memory recall is not ready. Your profile notes remain available.").assertDoesNotExist()

@@ -75,7 +75,7 @@ internal fun mcpTestPill(testedTools: Int?, testFailed: Boolean): ToolPill = whe
     var opened by remember(client, ui.origin, ui.owner, ui.profile, mcp) { mutableStateOf("") }
     val saved = uiText("Saved for new chats")
     val couldNotFinish = uiText("Couldn't finish. Try again.")
-    val notConfirmed = uiText("Hermes did not confirm this change. Refresh to see the saved state.")
+    val notConfirmed = uiText("Hermes didn't confirm. Refresh to check.")
     val couldNotSave = uiText(if (mcp) "Couldn't save the MCP server. Try again." else "Couldn't save the tool change. Try again.")
     fun refresh(force: Boolean = true) { error = ""; vm.load(key, path, mapOf("profile" to ui.profile), force = force) }
     LaunchedEffect(path, ui.origin, ui.owner, ui.profile, ui.connected, client) { refresh(force = false) }

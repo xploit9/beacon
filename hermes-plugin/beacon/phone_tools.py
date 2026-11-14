@@ -319,6 +319,27 @@ def register(ctx):
         ctx.register_tool(name=name, toolset=TOOLSET, description=description,
                           schema={'name': name, 'description': description, 'parameters': parameters},
                           handler=handler(name), check_fn=available)
+    _register_card_tool(ctx)
+
+
+def _register_card_tool(ctx):
+    """The saved-card tool (any_site_card.py) is asked on the phone like the tools above, so it registers with them; it is loaded here, as
+    __init__ loads its siblings, so the plugin's module list stays as released. A failure to load it never costs the phone tools."""
+    try:
+        import importlib.util
+        from pathlib import Path
+        key, path = 'beacon_any_site_card', Path(__file__).with_name('any_site_card.py')
+        module = sys.modules.get(key)
+        if module is None or getattr(module, '_beacon_mtime', None) != path.stat().st_mtime_ns:
+            spec = importlib.util.spec_from_file_location(key, path)
+            module = importlib.util.module_from_spec(spec)
+            module._beacon_mtime = path.stat().st_mtime_ns
+            sys.modules[key] = module
+            spec.loader.exec_module(module)
+        module.register(ctx)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning('Beacon could not add the saved-card tool: %s', type(exc).__name__)
 
 
 def clean_state(value):

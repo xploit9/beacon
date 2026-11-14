@@ -89,6 +89,9 @@ The voice is Grok; the caller's side is synthetic speech. Screens and videos com
   Important / Not important.
 - **The side button, even locked.** Hold it and the assistant talks at once over any app or the lock screen. Personal
   things wait for the unlock, unless you allow them in Settings > Assistant ([phone access](docs/phone-access.md)).
+- **Passwords & Logins.** Hermes' own vault on your phone: see what is saved for a profile, add a login, card or address,
+  remove one, and unlock 1Password or Bitwarden. When Hermes asks to save a login or for a code, you answer on the phone,
+  and a card is only ever filled after you approve it.
 - **All of Hermes.** Profiles, skills, memory, schedules, files, Kanban and Bot Mode, with screens that open ready.
   Editing a profile in Settings keeps the active chat profile; switch chats' profiles from the top drawer selector.
   Check-in calls (every hour to once a day) and profile descriptions and instructions are edited in the app.

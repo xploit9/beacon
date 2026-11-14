@@ -34,7 +34,9 @@ class ConversationMenuDrawerTest {
         assertEquals("Unpin", conversationActionLabel("Pin", pinned = true, archived = false))
         assertEquals("Unarchive", conversationActionLabel("Archive", pinned = false, archived = true))
         assertEquals("Tools", conversationActionLabel("Toolsets", pinned = false, archived = false))
-        assertEquals("Delete conversation", conversationActionLabel("Delete conversation", pinned = false, archived = false))
+        assertEquals("Delete chat", conversationActionLabel("Delete conversation", pinned = false, archived = false))
+        assertEquals("New chat", conversationActionLabel("New conversation", pinned = false, archived = false))
+        assertEquals("Undo last message", conversationActionLabel("Undo last turn", pinned = false, archived = false))
         assertTrue("Shorten history" in ConversationStrings)
     }
 

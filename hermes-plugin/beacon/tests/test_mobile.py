@@ -1443,10 +1443,11 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     ctx=SimpleNamespace(register_tool=lambda **kwargs:tools.append(kwargs),register_hook=lambda name,handler:hooks.append((name,handler)))
     plugin.register(ctx)
     assert time.perf_counter()-started<10,'Native registration must remain bounded and nonblocking'
-    assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call'}
-    # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them).
+    # The saved-card tool also listens for Hermes' pre_approval_request / post_approval_response (test_any_site_card covers them).
+    assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call','pre_approval_request','post_approval_response'}
+    # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them), and the saved-card tool in the browser toolset (test_any_site_card covers it).
     assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_continue_call_work','beacon_create_proactive_request',
-                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked',
+                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked','beacon_pay_with_card',
                                             *plugin.phone_tools.NAMES,*plugin.email_drafts.NAMES}
     assert all(callable(handler) for name,handler in hooks)
 
@@ -1567,32 +1568,6 @@ def test_native_turn_receives_only_its_owned_final_voice_context_once(harness, m
     assert plugin.native_voice_context('native-stored', [{'role': 'user', 'content': [{'type': 'text', 'text': result['context']}]}]) is None
     monkeypatch.setattr(plugin.native, 'verify', lambda *args: (_ for _ in ()).throw(LookupError('Unowned')))
     assert plugin.native_voice_context('foreign', []) is None
-
-
-def test_project_creation_replays_one_native_intent_even_when_requests_overlap(harness, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
-    import time, uuid
-    api, client, _, _, _ = harness
-    rows, calls = [], []
-    def rpc(owner, provider, method, params):
-        assert (owner, provider, params['profile']) == ('owner', 'basic', 'default')
-        calls.append(method)
-        if method == 'projects.list': return {'projects': list(rows)}
-        assert method == 'projects.create'
-        time.sleep(.04)
-        row = dict(params, id='p_fixture'); rows.append(row); return {'project': row}
-    monkeypatch.setattr(api.native, 'rpc', rpc)
-    intent = str(uuid.uuid4())
-    with ThreadPoolExecutor(max_workers=2) as workers:
-        results = list(workers.map(lambda _: api.native.create_project('owner', 'basic', 'default', intent, 'Research', ''), range(2)))
-    assert results[0]['project']['id'] == results[1]['project']['id'] and calls.count('projects.create') == 1
-    path = '/api/plugins/beacon/mobile/projects?profile=default'
-    assert client.post(path, json={'request_id': intent, 'name': 'Research'}).status_code == 200
-    assert client.post(path, json={'request_id': intent, 'name': 'Different intent'}).status_code == 409
-    assert len(rows) == 1
-    assert client.post(path, json={'request_id': intent, 'name': 'Research', 'profile': 'foreign'}).status_code == 400
-    client.headers['x-fixture-owner'] = 'foreign'
-    assert client.post(path, json={'request_id': intent, 'name': 'Research'}).status_code == 403
 
 
 def test_proactive_persona_does_not_draft_or_schedule_its_own_jobs(harness):

@@ -124,29 +124,29 @@ class Ux2GlyphTest {
     // ---- UX-10: the missing-plugin card and its dialog
 
     private val newKeys = mapOf(
-        "the beacon plugin is ready." to "The Beacon plugin is ready.",
-        "update the beacon plugin" to "Update the Beacon plugin",
-        "add the beacon plugin to hermes" to "Add the Beacon plugin to Hermes",
-        "finish setting up the beacon plugin, then retry." to "Finish setting up the Beacon plugin, then retry.",
-        "hermes downloads the beacon plugin from github and turns it on." to "Hermes downloads the Beacon plugin from GitHub and turns it on.",
+        "beacon is ready on hermes." to "Beacon is ready on Hermes.",
+        "update beacon on hermes" to "Update Beacon on Hermes",
+        "add beacon to hermes" to "Add Beacon to Hermes",
+        "finish setting up beacon on hermes, then retry." to "Finish setting up Beacon on Hermes, then retry.",
+        "adds beacon's calls and phone tools to hermes." to "Adds Beacon's calls and phone tools to Hermes.",
         "install beacon" to "Install Beacon",
     )
 
     @Test fun theCardAndDialogSayBeaconPluginInTheOwnersTerms() {
         val card = source("ui/Components.kt")
-        for (text in listOf("The Beacon plugin is ready.", "Update the Beacon plugin", "Add the Beacon plugin to Hermes", "Hermes downloads the Beacon plugin from GitHub and turns it on.", "Install Beacon"))
+        for (text in listOf("Beacon is ready on Hermes.", "Update Beacon on Hermes", "Add Beacon to Hermes", "Adds Beacon's calls and phone tools to Hermes.", "Install Beacon"))
             assertTrue("Components.kt says \"$text\"", "uiText(\"$text\")" in card)
-        for (old in listOf("Beacon is ready on your Hermes.", "Update Beacon on your Hermes", "Add Beacon to your Hermes", "Hermes will download Beacon"))
+        for (old in listOf("Beacon is ready on your Hermes.", "Update Beacon on your Hermes", "Add Beacon to your Hermes", "Hermes will download Beacon", "The Beacon plugin is ready.", "Hermes downloads the Beacon plugin"))
             assertFalse("Components.kt no longer says \"$old\"", old in card)
         val settings = source("ui/BeaconSettings.kt")
-        assertTrue("uiText(\"Finish setting up the Beacon plugin, then retry.\")" in settings)
-        assertTrue("uiText(\"Update the Beacon plugin\")" in settings)
-        for (old in listOf("Finish setting up Beacon on your Hermes dashboard", "Update Beacon on your Hermes")) assertFalse(old, old in settings)
+        assertTrue("uiText(\"Finish setting up Beacon on Hermes, then retry.\")" in settings)
+        assertTrue("uiText(\"Update Beacon on Hermes\")" in settings)
+        for (old in listOf("Finish setting up Beacon on your Hermes dashboard", "Update Beacon on your Hermes", "Finish setting up the Beacon plugin", "Update the Beacon plugin")) assertFalse(old, old in settings)
     }
 
     @Test fun theDialogNamesNoAddress() {
         val dialog = Regex("""text = \{ Text\(uiText\("([^"]*)"\)\) \}""").findAll(source("ui/Components.kt")).map { it.groupValues[1] }.filter { "Beacon" in it }.toList()
-        assertEquals(listOf("Hermes downloads the Beacon plugin from GitHub and turns it on."), dialog)
+        assertEquals(listOf("Adds Beacon's calls and phone tools to Hermes."), dialog)
         dialog.forEach { text -> assertFalse(text, "github.com" in text || "http" in text || "xploit9" in text) }
         // The button keeps its short word.
         assertTrue("confirmButton" in source("ui/Components.kt") && "Text(uiText(\"Install Beacon\"))" in source("ui/Components.kt"))
@@ -167,7 +167,7 @@ class Ux2GlyphTest {
             }
         }
         val english = catalog.getJSONObject("en")
-        listOf("the beacon plugin is ready.", "finish setting up the beacon plugin, then retry.").forEach { key -> assertEquals(newKeys.getValue(key), english.getString(key)) }
+        listOf("beacon is ready on hermes.", "finish setting up beacon on hermes, then retry.").forEach { key -> assertEquals(newKeys.getValue(key), english.getString(key)) }
     }
 
     @Test fun arabicReadsNaturallyAndKeepsTheLatinNames() {

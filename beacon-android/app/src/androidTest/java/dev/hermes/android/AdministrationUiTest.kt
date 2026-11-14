@@ -18,7 +18,7 @@ class AdministrationUiTest {
     @Test fun botModelFailureKeepsDraftAndShowsRealInstructions() {
         var saved = ""
         compose.setContent {
-            var state by remember { mutableStateOf(NativeBotsState(selected = NativeBot("work", "Work bot", "Route work tasks", "Use the approved work inbox.", "custom", "old", "revision"))) }
+            var state by remember { mutableStateOf(NativeBotsState(selected = NativeBot("work", "Work bot", "Route work tasks", "Use the approved work inbox.", "custom", "old"))) }
             MaterialTheme { NativeBotSettings(state, {}, {}, { state = state.copy(editing = true, draftProvider = "custom", draftModel = "old") },
                 { provider, model -> state = state.copy(draftProvider = provider, draftModel = model) },
                 { saved = state.draftModel; state = state.copy(error = "Model changed elsewhere. Review before saving.") },
@@ -38,7 +38,8 @@ class AdministrationUiTest {
     @Test fun serverCheckAndApplyAreSeparateRealCallbacks() {
         var checked = false
         var applied = false
-        compose.setContent { MaterialTheme { NativeServerSettings("Server updates", NativeServerState(update = JSONObject("""{"current_version":"1","can_apply":true,"update_available":true,"message":null}""")), { checked = true }, { applied = true }, {}, {}) } }
+        // 93c0090b (1.1.33): Update Hermes is enabled only after a fresh status read (updateStatusFresh), so the shown state is a fresh one.
+        compose.setContent { MaterialTheme { NativeServerSettings("Server updates", NativeServerState(update = JSONObject("""{"current_version":"1","can_apply":true,"update_available":true,"message":null}"""), updateStatusFresh = true), { checked = true }, { applied = true }, {}, {}) } }
         compose.onNodeWithText("Update available").assertExists()
         compose.onNodeWithText("null").assertDoesNotExist()
         compose.onNodeWithText("Check now").performClick()

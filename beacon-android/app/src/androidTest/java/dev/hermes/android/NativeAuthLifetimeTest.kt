@@ -71,7 +71,7 @@ class NativeAuthLifetimeTest {
         it.isAccessible = true; it.set(vm, value)
     }
 
-    private suspend fun withModel(initial: (AuthContext) -> AuthContext = { it }, block: suspend (BeaconViewModel, AuthContext) -> Unit) {
+    private suspend fun withModel(initial: (AuthContext) -> AuthContext = { it }, server: ((okhttp3.OkHttpClient.Builder) -> Unit)? = null, block: suspend (BeaconViewModel, AuthContext) -> Unit) {
         check(BuildConfig.DEBUG && InstrumentationRegistry.getArguments().getString("native_ui_probe") == "1")
         check(!app.calls.state.value.active && app.calls.service == null)
         val previousPreferences = app.preferences.data.first()
@@ -79,15 +79,19 @@ class NativeAuthLifetimeTest {
         val auth = initial(context(old.copy(origin = "https://lifetime-${UUID.randomUUID()}.example")))
         val selected = auth.scope().session("draft-chat")
         val models = ViewModelStore()
-        val client = BeaconClient(auth, app.auth, persistContext = false, configureHttp = { builder ->
-            builder.addInterceptor { chain ->
-                check(chain.request().url.encodedPath in setOf("/api/fs/write-text", "/auth/logout", "/api/sessions"))
-                response(chain.request(), 200, if (chain.request().url.encodedPath == "/api/sessions") """{"sessions":[]}""" else """{"ok":true}""")
-            }
-        })
+        var client: BeaconClient? = null
         try {
             app.preferences.edit { it[stringPreferencesKey("origin")] = "" }
             app.auth.persist(auth)
+            // 8a344aec: a client refuses requests once the store's credential epoch has moved past the one it was built at (a stale view),
+            // so, as after a real sign-in, it is built from the stored record, not before the write that advances the epoch.
+            client = BeaconClient(auth, app.auth, persistContext = false, configureHttp = server ?: { builder ->
+                builder.addInterceptor { chain ->
+                    check(chain.request().url.encodedPath in setOf("/api/fs/write-text", "/auth/logout", "/api/sessions"))
+                    response(chain.request(), 200, if (chain.request().url.encodedPath == "/api/sessions") """{"sessions":[]}""" else """{"ok":true}""")
+                }
+                Unit
+            })
             val vm = withContext(Dispatchers.Main.immediate) {
                 ViewModelProvider(models, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java].also {
                     field(it, "originGeneration", 100)
@@ -101,7 +105,7 @@ class NativeAuthLifetimeTest {
             block(vm, auth)
         } finally {
             withContext(NonCancellable) {
-                withContext(Dispatchers.Main.immediate) { models.clear(); client.closeNative() }
+                withContext(Dispatchers.Main.immediate) { models.clear(); client?.closeNative() }
                 (app.auth.ioDispatcher as? HoldOneWrite)?.releaseIfHeld()?.let { check(it.await(5, TimeUnit.SECONDS)) }
                 app.auth.ioDispatcher = previousDispatcher
                 app.auth.remove(auth.origin)
@@ -519,7 +523,9 @@ class NativeAuthLifetimeTest {
                 assertEquals(source.auth.cookies, first.auth.cookies)
                 val pending = requireNotNull(Cookie.parse(auth.origin.toHttpUrl(), "__Host-hermes_session_rt=pending-response; Path=/; Secure; HttpOnly"))
                 copy.http.cookieJar.saveFromResponse(auth.origin.toHttpUrl(), listOf(pending))
-                assertEquals(listOf(pending), copy.http.cookieJar.loadForRequest(auth.origin.toHttpUrl()))
+                // 8a344aec (rejectedCookieRotationCannotBecomeTheNextRequestCredential): a rotation the store rejects, because the copy's baseline moved on, is
+                // dropped for the store's latest and never sent as the next credential.
+                assertEquals(source.auth.cookies, copy.http.cookieJar.loadForRequest(auth.origin.toHttpUrl()).map { it.toString() })
                 assertEquals(source.auth.cookies, app.auth.read(auth.origin).cookies)
             } finally { later?.closeNative(); first.closeNative(); source.closeNative() }
         } }
@@ -540,11 +546,18 @@ class NativeAuthLifetimeTest {
                     if (newer != null) app.auth.persist(newer)
                     val copy = source.detached().also { later = it }
                     val logout = source.detachedForLogout().also { cleanup = it }
-                    for (captured in listOf(source, first, copy, logout)) {
-                        assertEquals("fixture-cookie", captured.http.cookieJar.loadForRequest(auth.origin.toHttpUrl()).single().value)
-                        captured.retainCookieRotation()
+                    // 8a344aec (BeaconClient.retainCookieRotationLocked): a view bound to the store whose account was logged out or replaced no longer
+                    // sends its credential at all; it clears its jar and refuses, and nothing it holds can reach the store.
+                    for (captured in listOf(source, first, copy)) {
+                        assertTrue(runCatching { captured.http.cookieJar.loadForRequest(auth.origin.toHttpUrl()) }.exceptionOrNull() is CachedIdentityMismatch)
+                        assertTrue(runCatching { captured.retainCookieRotation() }.exceptionOrNull() is CachedIdentityMismatch)
+                        assertTrue(captured.jar.snapshot().isEmpty())
                         assertEquals(newer ?: AuthContext(auth.origin, emptyList()), app.auth.read(auth.origin))
                     }
+                    // Cleanup owns its captured credential to sign the old session out. It holds no store, so it can send it and never writes one.
+                    assertEquals("fixture-cookie", logout.http.cookieJar.loadForRequest(auth.origin.toHttpUrl()).single().value)
+                    logout.retainCookieRotation()
+                    assertEquals(newer ?: AuthContext(auth.origin, emptyList()), app.auth.read(auth.origin))
                 } finally { cleanup?.closeNative(); later?.closeNative(); first.closeNative(); source.closeNative() }
             }
         }
@@ -572,16 +585,17 @@ class NativeAuthLifetimeTest {
                 })
                 detached = source.detached()
                 try {
-                    val work = async(Dispatchers.IO) { detached.nativeRequest("/api/files") }
+                    val work = async(Dispatchers.IO) { runCatching { detached.nativeRequest("/api/files") } }
                     arrived.await()
                     app.auth.remove(auth.origin)
                     val newer = replacement(auth)
                     if (newer != null) app.auth.persist(newer)
                     release.countDown()
-                    work.await()
+                    // 8a344aec: the late response's rotation is refused, not retained: the call fails with CachedIdentityMismatch and writes nothing.
+                    assertTrue(work.await().exceptionOrNull() is CachedIdentityMismatch)
                     assertEquals(newer ?: AuthContext(auth.origin, emptyList()), app.auth.read(auth.origin))
-                    // Even a later request from this captured view cannot adopt the replacement's epoch.
-                    detached.nativeRequest("/api/files")
+                    // Even a later request from this captured view cannot adopt the replacement's epoch: it stays refused.
+                    assertTrue(runCatching { detached.nativeRequest("/api/files") }.exceptionOrNull() is CachedIdentityMismatch)
                     assertEquals(newer ?: AuthContext(auth.origin, emptyList()), app.auth.read(auth.origin))
                     detached.closeNative()
                     detached = source.detachedForLogout()
@@ -606,7 +620,8 @@ class NativeAuthLifetimeTest {
             })
             try {
                 app.auth.remove(auth.origin)
-                source.bootstrap()
+                // 8a344aec: a bootstrap that finishes after the logout is refused (CachedIdentityMismatch) before it can persist anything.
+                assertTrue(runCatching { source.bootstrap() }.exceptionOrNull() is CachedIdentityMismatch)
                 assertEquals(AuthContext(auth.origin, emptyList()), app.auth.read(auth.origin))
             } finally { source.closeNative() }
         } }
@@ -679,6 +694,8 @@ class NativeAuthLifetimeTest {
             }
             val keep = app.getSharedPreferences(dev.hermes.android.push.KeepConnectedService.PREFS, Context.MODE_PRIVATE)
             val oldOrigin = keep.getString(dev.hermes.android.push.KeepConnectedService.KEY_ORIGIN, null)
+            val oldOwner = keep.getString(dev.hermes.android.push.KeepConnectedService.KEY_OWNER, null)
+            val oldProvider = keep.getString(dev.hermes.android.push.KeepConnectedService.KEY_NATIVE_PROVIDER, null)
             val oldStatus = keep.getString(dev.hermes.android.push.KeepConnectedService.KEY_STATUS, null)
             val source = "logout-${UUID.randomUUID()}"
             val stream = Job()
@@ -687,7 +704,10 @@ class NativeAuthLifetimeTest {
             try {
                 assertFalse(dev.hermes.android.push.KeepConnectedService.isEnabled(app))
                 assertTrue(push.bindKeepConnectedSource(auth.scope(), source))
+                // 8a344aec: a sign-out marks Keep connected signed out only for the account it was enabled for (origin, owner and provider), so seed all three.
                 check(keep.edit().putString(dev.hermes.android.push.KeepConnectedService.KEY_ORIGIN, auth.origin)
+                    .putString(dev.hermes.android.push.KeepConnectedService.KEY_OWNER, auth.owner)
+                    .putString(dev.hermes.android.push.KeepConnectedService.KEY_NATIVE_PROVIDER, auth.nativeProvider)
                     .putString(dev.hermes.android.push.KeepConnectedService.KEY_STATUS, dev.hermes.android.push.KeepConnectedService.STATUS_CONNECTED).commit())
                 withContext(Dispatchers.Main.immediate) {
                     field(vm, "streams", mutableMapOf("fixture" to stream))
@@ -709,7 +729,7 @@ class NativeAuthLifetimeTest {
                 assertEquals("", vm.chat.value.sessionId)
                 assertEquals("", vm.composer.value.text)
                 assertNull(vm.form.value)
-                assertTrue(vm.ui.value.notice.contains("Push notification cleanup"))
+                assertEquals("Signed out. Notifications may still arrive for a while.", vm.ui.value.notice)
                 assertEquals("Private unsent draft", Draft.decode(requireNotNull(app.cache.read(auth.scope().session("draft-chat"), "draft"))).text)
             } finally {
                 prefsField.set(push, previous)
@@ -717,6 +737,8 @@ class NativeAuthLifetimeTest {
                 check(previous.edit().remove("source:" + source.digest()).remove("active:" + auth.scope().key).commit())
                 check(keep.edit().apply {
                     if (oldOrigin == null) remove(dev.hermes.android.push.KeepConnectedService.KEY_ORIGIN) else putString(dev.hermes.android.push.KeepConnectedService.KEY_ORIGIN, oldOrigin)
+                    if (oldOwner == null) remove(dev.hermes.android.push.KeepConnectedService.KEY_OWNER) else putString(dev.hermes.android.push.KeepConnectedService.KEY_OWNER, oldOwner)
+                    if (oldProvider == null) remove(dev.hermes.android.push.KeepConnectedService.KEY_NATIVE_PROVIDER) else putString(dev.hermes.android.push.KeepConnectedService.KEY_NATIVE_PROVIDER, oldProvider)
                     if (oldStatus == null) remove(dev.hermes.android.push.KeepConnectedService.KEY_STATUS) else putString(dev.hermes.android.push.KeepConnectedService.KEY_STATUS, oldStatus)
                 }.commit())
             }
@@ -827,12 +849,17 @@ class NativeAuthLifetimeTest {
     private suspend fun retainedProfile(alreadyRotated: Boolean = false, switchDuringRefresh: Boolean = false) = withStore { store ->
         val auth = context(old)
         store.write(auth)
+        // A real profile switch persists a snapshot that keeps the credential epoch (BeaconClient.bindProfile); store.write is a new admission and
+        // advances it, which a view captured before it rightly refuses (8a344aec), so the switch is written the way the app writes it.
+        fun selectProfile(profile: String) = kotlinx.coroutines.runBlocking {
+            check(store.persistIfUnchanged(auth.copy(profile = profile, bearer = auth.bearer?.copy(profile = profile)), store.authorityEpoch.readVersion(), snapshot = true, selectProfileIf = { true }))
+        }
         val requests = mutableListOf<Request>()
         val source = BeaconClient(auth, store, persistContext = false, configureHttp = { builder ->
             builder.addInterceptor { chain ->
                 val request = chain.request(); requests += request
                 val refresh = request.url.encodedPath == "/auth/native/refresh"
-                if (refresh && switchDuringRefresh) store.write(context(old.copy(profile = "c")))
+                if (refresh && switchDuringRefresh) selectProfile("c")
                 val status = if (refresh || request.header("Authorization") == "Bearer rotated") 200 else 401
                 val body = if (refresh) """{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","provider":"basic","user_id":"alice"}"""
                     else if (status == 200) """{"ok":true}""" else """{"error":"session_expired"}"""
@@ -841,9 +868,9 @@ class NativeAuthLifetimeTest {
         })
         val retained = source.detached()
         try {
-            // Matches the saved B selection after a real UI switch, without rebinding source/retained A.
-            store.write(context(old.copy(profile = "b", accessToken = if (alreadyRotated) "rotated" else old.accessToken,
-                refreshToken = if (alreadyRotated) "rotated-refresh" else old.refreshToken, issuedAt = if (alreadyRotated) 2 else old.issuedAt)))
+            // Matches the saved B selection after a real UI switch, without rebinding source/retained A; B's own refresh is the exact bearer CAS.
+            if (alreadyRotated) assertTrue(store.replaceBearer(old, old.copy(accessToken = "rotated", refreshToken = "rotated-refresh", issuedAt = 2)))
+            selectProfile("b")
             assertTrue(retained.nativeRequest("/api/files", params = mapOf("profile" to "a")).getBoolean("ok"))
             assertEquals(if (alreadyRotated) 0 else 1, requests.count { it.url.encodedPath == "/auth/native/refresh" })
             assertEquals(2, requests.count { it.url.encodedPath == "/api/files" })
@@ -931,6 +958,300 @@ class NativeAuthLifetimeTest {
                     assertTrue(runCatching { retained.nativeRequest("/api/files", params = mapOf("profile" to "a")) }.exceptionOrNull() is NativeAuthExpiredException)
                     assertEquals(replacement.takeUnless { it == old.copy(profile = "b") }, store.read(old.origin).bearer)
                 } finally { retained.closeNative(); source.closeNative() }
+            }
+        }
+    }
+
+    // ---- F2C: can a valid sign-in be ended by an unrelated store write? ----------------------------------------------------------------------------
+    // 8a344aec gates every native request on the credential epoch (BeaconClient.retainCookieRotationLocked). These cases build long-lived clients the way the
+    // app does (BeaconClient(auth, store, persistContext = false): BeaconViewModel.connect, KeepConnectedService.createClient) and make the unrelated write
+    // through the production call, never store.write: a sibling's token refresh (NativeAuth.refresh -> AuthStore.replaceBearer), a profile selection
+    // (BeaconClient.bindProfile), a sign-in or logout on another origin (AuthStore.persistIfUnchanged and retireIfUnchanged, as BeaconViewModel.kt:1956 and
+    // :2242), a loopback renewal (AuthStore.replaceLoopbackSession) and the issuer a sibling learns (replaceBearer with a new provider).
+
+    private val otherOrigin = "https://other.example"
+    private fun otherAccount() = context(old.copy(origin = otherOrigin, owner = "bob", profile = "default"))
+    private fun loopbackContext(token: String, origin: String = old.origin) = AuthContext(origin, emptyList(), "local", "default", backend = "hermes-dashboard",
+        loopbackSession = LoopbackSessionRecord(token, origin, "local", verified = true, persisted = true))
+
+    /** A stand-in Hermes that accepts only the bearer tokens in [valid] and rotates to "rotated" on refresh. */
+    private fun bearerServer(valid: Set<String>, provider: String = "basic"): (okhttp3.OkHttpClient.Builder) -> Unit = { builder ->
+        builder.addInterceptor { chain ->
+            val request = chain.request()
+            val token = request.header("Authorization")?.removePrefix("Bearer ")
+            if (request.url.encodedPath == "/auth/native/refresh") response(request, 200, """{"access_token":"rotated","refresh_token":"rotated-refresh","token_type":"Bearer","provider":"$provider","user_id":"alice"}""")
+            else if (token != null && token in valid) response(request, 200, """{"ok":true}""")
+            else response(request, 401, """{"error":"session_expired"}""")
+        }
+    }
+
+    /** A stand-in loopback dashboard: its root page hands out [renewed], and only the tokens in [accepts] pass. */
+    private fun loopbackServer(accepts: Set<String>, renewed: String): (okhttp3.OkHttpClient.Builder) -> Unit = { builder ->
+        builder.addInterceptor { chain ->
+            val request = chain.request()
+            val token = request.header(HERMES_LOOPBACK_SESSION_HEADER)
+            if (request.url.encodedPath == "/") Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(200).message("Synthetic fixture").header("Content-Type", "text/html")
+                .body("<script>window.__HERMES_SESSION_TOKEN__=${org.json.JSONObject.quote(renewed)};</script>".toResponseBody("text/html".toMediaType())).build()
+            else if (token != null && token in accepts) response(request, 200, """{"ok":true}""")
+            else response(request, 401, """{"detail":"Unauthorized"}""")
+        }
+    }
+
+    private suspend fun BeaconClient.nextRequest(): Throwable? = runCatching { nativeRequest("/api/files") }.exceptionOrNull()
+
+    @Test fun aBearerSignInSurvivesASiblingsTokenRefresh() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(context(old))
+            val server = bearerServer(setOf("rotated"))
+            val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = server)
+            val keepConnectedClient = BeaconClient(context(old), store, persistContext = false, configureHttp = server)
+            try {
+                assertTrue(keepConnectedClient.nativeRequest("/api/files").getBoolean("ok"))
+                assertEquals("rotated", store.read(old.origin).bearer?.accessToken)
+                val own = keepConnectedClient.nextRequest()
+                val other = viewModelClient.nextRequest()
+                assertTrue("refreshing client's next request: $own; the other long-lived client: $other", own == null && other == null)
+            } finally { viewModelClient.closeNative(); keepConnectedClient.closeNative() }
+        } }
+    }
+
+    @Test fun aBearerSignInSurvivesAProfileSelectionMadeByAnotherClient() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(context(old))
+            val server = bearerServer(setOf("old-access"))
+            val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = server)
+            val selecting = BeaconClient(context(old), store, persistContext = false, configureHttp = server)
+            try {
+                selecting.bindProfile("b")
+                assertEquals("b", store.read(old.origin).profile)
+                val other = viewModelClient.nextRequest()
+                assertNull("The other long-lived client after the profile selection: $other", other)
+            } finally { viewModelClient.closeNative(); selecting.closeNative() }
+        } }
+    }
+
+    @Test fun aBearerSignInSurvivesKeepConnectedsOwnAdmissionReadAndRefresh() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(context(old))
+            val server = bearerServer(setOf("rotated"))
+            val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = server)
+            try {
+                // KeepConnectedService.startIfEnabled reads the incident admission under the store lock, then createClient builds its poller's client.
+                val scope = requireNotNull(store.read(old.origin).cachedScopeFor(old.origin, replacingAccount = false))
+                synchronized(store) { assertNotNull(store.incidentAdmission(scope)) }
+                val keepConnected = BeaconClient(store.read(old.origin), store, persistContext = false, configureHttp = server)
+                try { assertTrue(keepConnected.nativeGet("/api/profiles").getBoolean("ok")) } finally { keepConnected.closeNative() }
+                assertEquals("rotated", store.read(old.origin).bearer?.accessToken)
+                val other = viewModelClient.nextRequest()
+                assertNull("The app's client after Keep connected's admission read and token refresh: $other", other)
+            } finally { viewModelClient.closeNative() }
+        } }
+    }
+
+    @Test fun aBearerSignInSurvivesASignInAndALogoutOnAnotherOrigin() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(context(old))
+            val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = bearerServer(setOf("old-access")))
+            try {
+                val second = otherAccount()
+                assertTrue(store.persistIfUnchanged(second, store.authorityEpoch.readVersion(), snapshot = false))
+                val afterSignIn = viewModelClient.nextRequest()
+                assertTrue(store.retireIfUnchanged(second.scope(), store.authorityEpoch.readVersion()).removed)
+                val afterLogout = viewModelClient.nextRequest()
+                assertEquals("The first origin's record is untouched", "old-access", store.read(old.origin).bearer?.accessToken)
+                assertTrue("after a sign-in on another origin: $afterSignIn; after a logout on another origin: $afterLogout", afterSignIn == null && afterLogout == null)
+            } finally { viewModelClient.closeNative() }
+        } }
+    }
+
+    @Test fun aSavedBearerSignInSurvivesASiblingLearningItsIssuer() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            val unstamped = old.copy(provider = "")
+            store.write(context(unstamped))
+            val viewModelClient = BeaconClient(context(unstamped), store, persistContext = false, configureHttp = bearerServer(setOf("old-access", "rotated")))
+            val sibling = BeaconClient(context(unstamped), store, persistContext = false, configureHttp = bearerServer(setOf("rotated")))
+            try {
+                val refreshing = sibling.nextRequest()
+                assertEquals("The sibling's refresh learned the issuer", "basic", store.read(old.origin).nativeProvider)
+                val other = viewModelClient.nextRequest()
+                assertTrue("the refreshing sibling's own request: $refreshing; the app's client: $other", refreshing == null && other == null)
+            } finally { viewModelClient.closeNative(); sibling.closeNative() }
+        } }
+    }
+
+    @Test fun aLoopbackSignInSurvivesASiblingsRenewalAndRenewsItself() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(loopbackContext("loopback-old-session"))
+            val server = loopbackServer(accepts = setOf("loopback-new-session"), renewed = "loopback-new-session")
+            val viewModelClient = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false, configureHttp = server)
+            val keepConnectedClient = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false, configureHttp = server)
+            try {
+                val renewing = keepConnectedClient.nextRequest()
+                assertEquals("The renewal is saved", "loopback-new-session", store.read(old.origin).loopbackSession?.token)
+                val renewingAgain = keepConnectedClient.nextRequest()
+                val other = viewModelClient.nextRequest()
+                assertTrue("the request that renewed: $renewing; the renewing client's next request: $renewingAgain; the other long-lived loopback client: $other",
+                    renewing == null && renewingAgain == null && other == null)
+            } finally { viewModelClient.closeNative(); keepConnectedClient.closeNative() }
+        } }
+    }
+
+    @Test fun aLoopbackSignInSurvivesAProfileSelectionMadeByAnotherClient() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(loopbackContext("loopback-old-session"))
+            val server = loopbackServer(accepts = setOf("loopback-old-session"), renewed = "loopback-old-session")
+            val viewModelClient = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false, configureHttp = server)
+            val selecting = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false, configureHttp = server)
+            try {
+                selecting.bindProfile("b")
+                assertEquals("b", store.read(old.origin).profile)
+                val other = viewModelClient.nextRequest()
+                assertNull("The other long-lived loopback client after the profile selection: $other", other)
+            } finally { viewModelClient.closeNative(); selecting.closeNative() }
+        } }
+    }
+
+    @Test fun aProfileSelectionNeverWritesAnOlderLoopbackSessionOverANewerOne() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(loopbackContext("loopback-old-session"))
+            val server = loopbackServer(accepts = setOf("loopback-new-session"), renewed = "loopback-new-session")
+            val viewModelClient = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false, configureHttp = server)
+            try {
+                // A sibling (Keep connected's detached copy) renewed the session and saved it; this client still holds the old one.
+                val oldSession = LoopbackSessionRecord("loopback-old-session", old.origin, "local", verified = true, persisted = true)
+                val newSession = LoopbackSessionRecord("loopback-new-session", old.origin, "local", verified = true, persisted = true)
+                assertTrue(store.replaceLoopbackSession(oldSession, newSession))
+                viewModelClient.bindProfile("b")
+                assertEquals("The selection is saved", "b", store.read(old.origin).profile)
+                assertEquals("The newer session stays in the store", "loopback-new-session", store.read(old.origin).loopbackSession?.token)
+                val next = viewModelClient.nextRequest()
+                assertNull("The client's next request after the selection: $next", next)
+            } finally { viewModelClient.closeNative() }
+        } }
+    }
+
+    @Test fun aLoopbackSignInSurvivesASignInAndALogoutOnAnotherOrigin() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(loopbackContext("loopback-old-session"))
+            val viewModelClient = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false,
+                configureHttp = loopbackServer(accepts = setOf("loopback-old-session"), renewed = "loopback-old-session"))
+            try {
+                val second = otherAccount()
+                assertTrue(store.persistIfUnchanged(second, store.authorityEpoch.readVersion(), snapshot = false))
+                val afterSignIn = viewModelClient.nextRequest()
+                assertTrue(store.retireIfUnchanged(second.scope(), store.authorityEpoch.readVersion()).removed)
+                val afterLogout = viewModelClient.nextRequest()
+                assertTrue("after a sign-in on another origin: $afterSignIn; after a logout on another origin: $afterLogout", afterSignIn == null && afterLogout == null)
+            } finally { viewModelClient.closeNative() }
+        } }
+    }
+
+    @Test fun aProfileSelectionIsStillSavedAfterAnUnrelatedWrite() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(context(old))
+            val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = bearerServer(setOf("old-access")))
+            try {
+                assertTrue(store.persistIfUnchanged(otherAccount(), store.authorityEpoch.readVersion(), snapshot = false))
+                // NativeProfiles: /api/profile/switch binds the profile on the client and BeaconViewModel.action skips its own save for that path (BeaconViewModel.kt:5217).
+                viewModelClient.bindProfile("b")
+                assertEquals("The selection reaches the store", "b", store.read(old.origin).profile)
+            } finally { viewModelClient.closeNative() }
+        } }
+    }
+
+    // The decision the fix makes explicit (F2C): a bearer client goes on while the store holds the same account (origin, owner, issuer). So one built before a logout and a
+    // fresh sign-in of that same account is that account's client again; a logout alone, another owner or another issuer still refuse it (the controls below).
+    @Test fun aBearerClientBuiltBeforeALogoutAndAFreshSignInOfTheSameAccountIsThatAccountsClientAgain() = runBlocking {
+        withTimeout(30_000) { withStore { store ->
+            store.write(context(old))
+            val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = bearerServer(setOf("old-access", "new-login")))
+            try {
+                assertTrue(store.retireIfUnchanged(context(old).scope(), store.authorityEpoch.readVersion()).removed)
+                assertTrue(store.persistIfUnchanged(context(old.copy(accessToken = "new-login", refreshToken = "new-login-refresh", issuedAt = 2)), store.authorityEpoch.readVersion(), snapshot = false))
+                val other = viewModelClient.nextRequest()
+                assertNull("A client of the same account after its logout and a fresh sign-in: $other", other)
+                assertEquals("The fresh sign-in is what stays saved", "new-login", store.read(old.origin).bearer?.accessToken)
+            } finally { viewModelClient.closeNative() }
+        } }
+    }
+
+    // The fences the cases above must not loosen: a bearer or loopback client is still refused once its account is gone or another account holds the origin.
+    @Test fun aBearerClientIsStillRefusedAfterLogoutAndAfterAnotherAccountOrIssuerIsAdmitted() = runBlocking {
+        withTimeout(30_000) {
+            val admissions = listOf<Pair<String, suspend (AuthStore) -> Unit>>(
+                "logout" to { store -> assertTrue(store.retireIfUnchanged(context(old).scope(), store.authorityEpoch.readVersion()).removed) },
+                "another owner" to { store -> assertTrue(store.persistIfUnchanged(context(old.copy(owner = "bob")), store.authorityEpoch.readVersion(), snapshot = false)) },
+                "another issuer" to { store -> assertTrue(store.persistIfUnchanged(context(old.copy(provider = "oidc")), store.authorityEpoch.readVersion(), snapshot = false)) },
+            )
+            for ((name, admit) in admissions) withStore { store ->
+                store.write(context(old))
+                val viewModelClient = BeaconClient(context(old), store, persistContext = false, configureHttp = bearerServer(setOf("old-access")))
+                try {
+                    admit(store)
+                    val refused = viewModelClient.nextRequest()
+                    assertTrue("A bearer client must be refused after $name, not $refused", refused is CachedIdentityMismatch)
+                } finally { viewModelClient.closeNative() }
+            }
+        }
+    }
+
+    @Test fun aLoopbackClientIsStillRefusedAfterLogoutAndAfterAnotherAccountIsAdmitted() = runBlocking {
+        withTimeout(30_000) {
+            val admissions = listOf<Pair<String, suspend (AuthStore) -> Unit>>(
+                "logout" to { store -> assertTrue(store.retireIfUnchanged(loopbackContext("loopback-old-session").scope(), store.authorityEpoch.readVersion()).removed) },
+                "a bearer account on the same origin" to { store -> assertTrue(store.persistIfUnchanged(context(old.copy(profile = "default")), store.authorityEpoch.readVersion(), snapshot = false)) },
+            )
+            for ((name, admit) in admissions) withStore { store ->
+                store.write(loopbackContext("loopback-old-session"))
+                val viewModelClient = BeaconClient(loopbackContext("loopback-old-session"), store, persistContext = false,
+                    configureHttp = loopbackServer(accepts = setOf("loopback-old-session"), renewed = "loopback-old-session"))
+                try {
+                    admit(store)
+                    val refused = viewModelClient.nextRequest()
+                    assertTrue("A loopback client must be refused after $name, not $refused", refused is CachedIdentityMismatch)
+                } finally { viewModelClient.closeNative() }
+            }
+        }
+    }
+
+    // End to end through the view model: the sequences a phone really meets. The user is signed out when BeaconViewModel.fail() sees CachedIdentityMismatch (endsSignIn).
+    @Test fun aLoopbackAccountStaysSignedInWhenItsDashboardSessionRotates() = runBlocking {
+        withTimeout(30_000) {
+            val rotated = "loopback-rotated-session"
+            withModel(initial = { loopbackContext("loopback-old-session", it.origin) }, server = loopbackServer(accepts = setOf(rotated), renewed = rotated)) { vm, auth ->
+                // Hermes restarted its dashboard: the saved session token is refused, the client renews it from the root page and the request goes on.
+                withContext(Dispatchers.Main.immediate) { vm.action("/api/fs/write-text", json("path" to "/notes.md", "content" to "Confirmed mutation"), refresh = false, successNotice = "Saved") { _, _ -> } }.join()
+                assertTrue("signed out: authenticated=${vm.ui.value.authenticated} error='${vm.ui.value.error}' stored=${app.auth.read(auth.origin).loopbackSession?.token}", vm.ui.value.authenticated && vm.ui.value.error.isBlank())
+                assertEquals("The renewed session is saved", rotated, app.auth.read(auth.origin).loopbackSession?.token)
+                // The request that renewed ends with the notice "Sign-in changed; reconnect": the action's own saved credential version predates the renewal (observed, not asserted).
+                // The next request, on the same client, goes through.
+                var next = false
+                withContext(Dispatchers.Main.immediate) { vm.action("/api/fs/write-text", json("path" to "/notes.md", "content" to "Second"), refresh = false, successNotice = "Saved") { _, _ -> next = true } }.join()
+                assertTrue("the next request: authenticated=${vm.ui.value.authenticated} error='${vm.ui.value.error}' notice='${vm.ui.value.notice}' done=$next", vm.ui.value.authenticated && next)
+            }
+        }
+    }
+
+    @Test fun anAccountStaysSignedInWhenAnotherOriginSignsInAndOut() = runBlocking {
+        withTimeout(30_000) {
+            withModel { vm, auth ->
+                val second = otherAccount()
+                try {
+                    val version = app.auth.authorityEpoch.readVersion()
+                    assertTrue("the second origin's sign-in was not saved (version=$version)", app.auth.persistIfUnchanged(second, version, snapshot = false))
+                    var afterSignIn = false
+                    withContext(Dispatchers.Main.immediate) { vm.action("/api/fs/write-text", json("path" to "/notes.md", "content" to "One"), refresh = false, successNotice = "Saved") { _, _ -> afterSignIn = true } }.join()
+                    // The request's success is the signal: a failure signs the user out through BeaconViewModel.fail(), which finishes after this returns.
+                    assertTrue("after a sign-in on another origin the first account's request failed: authenticated=${vm.ui.value.authenticated} error='${vm.ui.value.error}'", afterSignIn)
+                    val stillSignedIn = vm.ui.value.authenticated
+                    val logoutVersion = app.auth.authorityEpoch.readVersion()
+                    assertTrue("the second origin's logout was not applied (version=$logoutVersion)", app.auth.retireIfUnchanged(second.scope(), logoutVersion).removed)
+                    var afterSignOut = false
+                    if (stillSignedIn) withContext(Dispatchers.Main.immediate) { vm.action("/api/fs/write-text", json("path" to "/notes.md", "content" to "Two"), refresh = false, successNotice = "Saved") { _, _ -> afterSignOut = true } }.join()
+                    assertTrue("after a sign-in on another origin: authenticated=$stillSignedIn done=$afterSignIn; after its logout: authenticated=${vm.ui.value.authenticated} done=$afterSignOut error='${vm.ui.value.error}'",
+                        stillSignedIn && afterSignIn && vm.ui.value.authenticated && afterSignOut)
+                    assertEquals("The first account is still saved", auth.owner, app.auth.read(auth.origin).owner)
+                } finally { app.auth.remove(second.origin) }
             }
         }
     }

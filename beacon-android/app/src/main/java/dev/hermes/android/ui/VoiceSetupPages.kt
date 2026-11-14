@@ -291,7 +291,7 @@ internal fun voiceKeyPage(
     val enterKeyFirst = uiText("Enter an API key first.")
     val keyNotSaved = uiText("That key couldn't be saved. Try again.")
     val choiceNotSaved = uiText("Couldn't save that choice. Try again.")
-    val keyNotRemoved = uiText("The key could not be removed.")
+    val keyNotRemoved = uiText("Couldn't remove the key.")
     LaunchedEffect(provider) { saved = withContext(Dispatchers.IO) { store.maskedKey(provider) } }
     // A first key typed here is saved (encrypted) when the page is left, unless the provider just refused it. A saved key is only replaced by Test key, so a stray paste cannot overwrite a working one.
     DisposableEffect(provider) { onDispose { if (saved == null && draft.isNotBlank() && !rejected) runCatching { store.saveKey(provider, draft) } } }
@@ -369,15 +369,6 @@ internal fun voiceKeyPage(
                     }
                 }
                 if (status.isNotBlank()) SettingsErrorRow(status, null, "")
-                SettingsDivider()
-                // What a call shares, in one line: the provider hears and speaks, Hermes does the thinking.
-                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Box(Modifier.size(SettingsKit.TileSize), contentAlignment = Alignment.Center) {
-                        Icon(Icons.Rounded.Info, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Text(uiText("Your provider hears you and speaks the replies"), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2)
-                }
             }
             if (removable && saved != null) SettingsSection {
                 SettingsDestructiveRow(uiText("Remove key"), { confirmRemove = true }, enabled = !testing, testTag = "voice-key-remove")
@@ -462,7 +453,6 @@ internal fun voiceChoicesPage(
     val info = voiceProviderInfo(provider)
     val heroStatus = when (hasKey) { true -> SettingsStatus.Ok; false -> SettingsStatus.Attention; null -> null }
     val heroLine = when { hasKey == null -> ""; hasKey == false -> uiText("Add a key to call"); keyWorks -> uiText("Key works"); else -> uiText("Key saved") }
-    val keyOnPhone = uiText("Key on this phone")
     val nextCall = uiText("Applies next call")
     val addKey = SettingsAction(uiText("Add key"), onAddKey, testTag = "voice-add-key")
     val change = SettingsAction(uiText("Change"), onChange, testTag = "voice-provider-change")
@@ -475,10 +465,7 @@ internal fun voiceChoicesPage(
     return SetupPage(
         content = {
             SettingsStatusHero(heroStatus, info.name, line = heroLine, icon = Icons.Rounded.GraphicEq,
-                meta = if (hasKey == true || settingsMode && callActive) ({
-                    if (hasKey == true) SettingsStatusPill(SettingsStatus.Ok, keyOnPhone)
-                    if (settingsMode && callActive) SettingsStatusPill(SettingsStatus.Working, nextCall)
-                }) else null,
+                meta = if (settingsMode && callActive) ({ SettingsStatusPill(SettingsStatus.Working, nextCall) }) else null,
                 primary = if (settingsMode && hasKey == false) addKey else null,
                 secondary = if (settingsMode) change else null,
                 lineTestTag = "voice-provider-summary", testTag = "voice-hero")

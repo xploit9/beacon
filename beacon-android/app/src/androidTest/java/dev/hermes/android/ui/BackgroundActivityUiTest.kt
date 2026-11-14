@@ -26,7 +26,7 @@ class BackgroundActivityUiTest {
             if (open) ChatActivitySheet(current) { open = false }
         } }
         compose.onNodeWithTag("chat-activity-strip").assertHeightIsAtLeast(48.dp).performClick()
-        compose.onNodeWithText("Read-only status from this conversation").assertExists()
+        compose.onNodeWithText("Read-only status from this conversation").assertDoesNotExist()
         compose.onNodeWithText("Check synthetic notes").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Running · 50s elapsed").assertExists()
         compose.onNodeWithText("synthetic build").performScrollTo().assertIsDisplayed()

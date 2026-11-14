@@ -46,7 +46,9 @@ class NativeAdministrationTest {
         assertEquals("unconfirmed", confirmedUpdateOutcome(null, full, "current", requested))
         assertEquals("unconfirmed", confirmedUpdateOutcome(null, JSONObject().put("receipt", receipt()), "", requested))
         assertEquals("unconfirmed", confirmedUpdateOutcome(null, JSONObject().put("receipt", receipt().put("action_id", JSONObject.NULL)), "current", requested))
-        assertEquals("unconfirmed", confirmedUpdateOutcome(null, JSONObject().put("receipt", receipt().put("started_at", "2020-01-01T00:00:00Z")), "current", requested))
+        // Hermes mints a fresh action id for every update, so the id alone says which run a receipt belongs to; no phone or server clock decides it.
+        assertEquals("success", confirmedUpdateOutcome(null, JSONObject().put("receipt", receipt().put("started_at", "2020-01-01T00:00:00Z")), "current", requested))
+        assertEquals("success", confirmedUpdateOutcome(null, JSONObject().put("receipt", receipt()), "current", "2099-01-01T00:00:00Z"))
     }
 
     @Test fun bothNativeInterruptedFormsAreTerminalButUnfinishedRunningIsNotLiveness() {
@@ -95,8 +97,18 @@ class NativeAdministrationTest {
         assertEquals(17L, checkpoints.checkpointBytes)
         assertEquals(2, checkpoints.checkpoints.single().files)
     }
-    @Test fun modelSavePinsOriginalRevision() {
-        val bot = NativeBot("default", "Bot", "", "", "provider", "model", "original")
-        assertEquals("original", bot.saveModel("provider", "new").getString("revision"))
+    @Test fun modelSaveSendsOnlyWhatHermesProfileModelRouteTakes() {
+        val body = NativeBot("default", "Bot", "", "", "provider", "model").saveModel("provider", "new")
+        assertEquals(setOf("provider", "model"), body.keys().asSequence().toSet())
+        assertEquals("new", body.getString("model"))
+    }
+
+    @Test fun aBotIsReadFromHermesProfileRowAndInstructions() {
+        val row = JSONObject("""{"name":"work","bot_title":"","display_name":"Work bot","description":"Route tasks","provider":"custom","model":"m1"}""")
+        val bot = NativeBot.fromNative(row, "Use the inbox.")
+        assertEquals(NativeBot("work", "Work bot", "Route tasks", "Use the inbox.", "custom", "m1"), bot)
+        assertEquals("Mentor", NativeBot.fromNative(row.put("bot_title", "Mentor"), "").title)
+        assertEquals("work", NativeBot.fromNative(JSONObject("""{"name":"work","provider":null,"model":null}"""), "").title)
+        assertEquals("", NativeBot.fromNative(JSONObject("""{"name":"work","provider":null,"model":null}"""), "").model)
     }
 }

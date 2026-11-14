@@ -54,10 +54,10 @@ class ChatLaneTest {
     }
 
     @Test fun offlineTheBannerAloneSaysTheChatIsSaved() {
-        assertFalse(transcriptStatusShown("Cached · reconnect to synchronize", streaming = false, connected = false))
-        assertFalse(transcriptStatusShown("Cached · reconnecting", streaming = false, connected = false))
-        assertTrue("Online, a failed refresh still shows", transcriptStatusShown("Cached · refresh failed", streaming = false, connected = true))
-        assertTrue(transcriptStatusShown("Could not load conversation · retry", streaming = false, connected = false))
+        assertFalse(transcriptStatusShown("Saved copy · reconnect to update", streaming = false, connected = false))
+        assertFalse(transcriptStatusShown("Saved copy · reconnecting", streaming = false, connected = false))
+        assertTrue("Online, a failed refresh still shows", transcriptStatusShown("Saved copy · couldn't refresh", streaming = false, connected = true))
+        assertTrue(transcriptStatusShown("Couldn't load this chat · retry", streaming = false, connected = false))
         assertFalse("A running turn speaks in its live row", transcriptStatusShown("Sending", streaming = true, connected = true))
         assertFalse(transcriptStatusShown("", streaming = false, connected = true))
     }

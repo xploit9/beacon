@@ -67,7 +67,7 @@ import org.junit.Rule
 import org.junit.Test
 
 /**
- * The setup wizard's "Add the Beacon plugin to Hermes" page, driven with a fake Hermes that does not have the plugin: the page comes after
+ * The setup wizard's "Add Beacon to Hermes" page, driven with a fake Hermes that does not have the plugin: the page comes after
  * sign-in, installs through the app's own install flow, shows what it is doing, and hands over to the call pages. Arabic runs in a real
  * right-to-left layout, and a tour of every page in dark, light, Arabic dark and large light checks that each fits and keeps 48 dp targets.
  */
@@ -155,13 +155,13 @@ class SetupPluginStepUiTest {
         val hold = CompletableDeferred<Unit>()
         val hermes = AbsentHermes(hold = hold)
         show(controller(hermes))
-        compose.onNodeWithText("Add the Beacon plugin to Hermes").assertIsDisplayed()
+        compose.onNodeWithText("Add Beacon to Hermes").assertIsDisplayed()
         compose.onNodeWithText("Step 2 of 4").assertIsDisplayed()
-        compose.onNodeWithText("Hermes downloads the Beacon plugin from GitHub and turns it on.").assertIsDisplayed()
+        compose.onNodeWithText("Adds Beacon's calls and phone tools to Hermes.").assertIsDisplayed()
         compose.onNodeWithTag("setup-plugin-install").assertTextEquals("Install Beacon")
         // At most two quiet actions under the primary: Skip for now and Set up from a computer. Close setup is the header's X, not a third link.
         compose.onNodeWithTag("setup-plugin-skip").assertTextEquals("Skip for now")
-        compose.onNodeWithTag("setup-plugin-pc").assertTextEquals("Set up from a computer")
+        compose.onNodeWithTag("setup-plugin-pc").assertTextEquals("Set up from a computer (steps)")
         compose.onNodeWithText("Close setup").assertDoesNotExist()
         compose.onNodeWithTag("setup-close").assertIsDisplayed().assertIsEnabled()
         gone("setup-plugin-rows")
@@ -174,15 +174,15 @@ class SetupPluginStepUiTest {
         compose.onNodeWithTag("setup-close").assertIsNotEnabled()
         row("install", "Working")
         row("answers", "Waiting")
-        compose.onNodeWithText("Install the Beacon plugin").assertIsDisplayed()
-        compose.onNodeWithText("Check that it answers").assertIsDisplayed()
+        compose.onNodeWithText("Install Beacon").assertIsDisplayed()
+        compose.onNodeWithText("Check it works").assertIsDisplayed()
         hold.complete(Unit)
 
         waitFor("setup-plugin-continue")
         row("install", "Done")
         row("answers", "Done")
         gone("setup-plugin-row-restart")
-        compose.onNodeWithText("The Beacon plugin is on your Hermes").assertIsDisplayed()
+        compose.onNodeWithText("Beacon is on your Hermes").assertIsDisplayed()
         compose.onNodeWithText("Beacon is ready on your Hermes.").assertDoesNotExist()
         compose.onNodeWithTag("setup-close").assertIsEnabled()
         assertEquals(1, hermes.installs)
@@ -202,13 +202,13 @@ class SetupPluginStepUiTest {
         show(controller(hermes))
         compose.onNodeWithTag("setup-plugin-install").performClick()
         waitFor("setup-plugin-error")
-        compose.onNodeWithText("Only the owner of this Hermes can add the Beacon plugin.").assertIsDisplayed()
+        compose.onNodeWithText("Only the owner of this Hermes can add Beacon.").assertIsDisplayed()
         row("install", "Failed")
         // Trying again as a non-owner would fail the same way, so there is no Try again: Skip for now leads, with the computer route beside it.
         gone("setup-plugin-retry")
         compose.onNodeWithTag("setup-plugin-skip").assertIsDisplayed().assertTextEquals("Skip for now")
-        compose.onNodeWithTag("setup-plugin-pc").assertIsDisplayed().assertTextEquals("Set up from a computer")
-        compose.onNodeWithText("The Beacon plugin is on your Hermes").assertDoesNotExist()
+        compose.onNodeWithTag("setup-plugin-pc").assertIsDisplayed().assertTextEquals("Set up from a computer (steps)")
+        compose.onNodeWithText("Beacon is on your Hermes").assertDoesNotExist()
         assertEquals(1, hermes.installs)
         compose.onNodeWithTag("setup-plugin-skip").performClick()
         compose.onNodeWithText("Choose a voice provider").assertIsDisplayed()
@@ -262,7 +262,7 @@ class SetupPluginStepUiTest {
         compose.onNodeWithText("This Hermes can't add plugins from the app.").assertIsDisplayed()
         gone("setup-plugin-retry")
         compose.onNodeWithTag("setup-plugin-skip").assertIsDisplayed()
-        compose.onNodeWithTag("setup-plugin-pc").assertTextEquals("Set up from a computer").performClick()
+        compose.onNodeWithTag("setup-plugin-pc").assertTextEquals("Set up from a computer (steps)").performClick()
         assertEquals(listOf(BEACON_PC_INSTALL_URL), opened.toList())
     }
 
@@ -272,7 +272,7 @@ class SetupPluginStepUiTest {
         compose.onNodeWithTag("setup-plugin-install").performClick()
         waitFor("setup-plugin-restart")
         compose.onNodeWithText("Restart Hermes to finish").assertIsDisplayed()
-        compose.onNodeWithText("The Beacon plugin is installed. Restart Hermes to finish turning it on. Anything Hermes is doing right now will stop.").assertIsDisplayed()
+        compose.onNodeWithText("Restarting stops any reply or scheduled task that is running.").assertIsDisplayed()
         compose.onNodeWithTag("setup-plugin-not-now").assertTextEquals("Restart later")
         row("install", "Done")
         row("answers", "Done")
@@ -301,7 +301,7 @@ class SetupPluginStepUiTest {
         compose.onNodeWithText("Choose a voice provider").assertIsDisplayed()
         assertEquals(0, hermes.installs)
         // At the end of the wizard a skipped install is still one tap away, as before.
-        compose.runOnUiThread { state = state.copy(setupStep = "done", setupPluginMessage = "Beacon plugin not installed on this Hermes — chat works; calls need the plugin.") }
+        compose.runOnUiThread { state = state.copy(setupStep = "done", setupPluginMessage = "Calls need Beacon on Hermes.") }
         compose.waitUntil(10_000) { compose.onAllNodesWithTag("missing-plugin-install").fetchSemanticsNodes().isNotEmpty() }
         gone("setup-plugin-install")
         // The last page finishes setup with its own button, so it has no X (the old page's X leaves with its fade).
@@ -328,7 +328,7 @@ class SetupPluginStepUiTest {
         val hermes = AbsentHermes()
         state = afterSignIn("not_probed")
         show(controller(hermes))
-        compose.onNodeWithText("Checking for the Beacon plugin…").assertIsDisplayed()
+        compose.onNodeWithText("Checking for Beacon on Hermes…").assertIsDisplayed()
         compose.onNodeWithTag("setup-plugin-checking").assertIsDisplayed()
         compose.onNodeWithTag("setup-close").assertIsDisplayed().assertIsEnabled()
         gone("setup-plugin-install")
@@ -486,7 +486,7 @@ class SetupPluginStepUiTest {
 
     @Test fun theLightSystemThemeKeepsTheWizardsOwnLookAndGold() {
         show(controller(AbsentHermes()), dark = false)
-        compose.onNodeWithText("Add the Beacon plugin to Hermes").assertIsDisplayed()
+        compose.onNodeWithText("Add Beacon to Hermes").assertIsDisplayed()
         compose.onNodeWithTag("setup-plugin-install").assertIsDisplayed()
     }
 }

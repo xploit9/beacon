@@ -180,6 +180,54 @@ class ProactiveUiTest {
         assertEquals("notify", fixture.proactiveDelivery["coder"])
     }
 
+    // Owner, 7 Nov: the watch has its own model; Same as assistant (the default) follows the assistant's. Live check 8 Nov: a pick on a watch that was already on did not save.
+    @Test fun theWatchModelIsPickedSavedWithItsProviderAndShownAfterTheAnswer() = withFixture { vm, fixture ->
+        fixture.proactiveEnabled["coder"] = true
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optBoolean("enabled") == true && vm.data.value["picker:models"]?.rows("groups")?.isNotEmpty() == true }
+        val row = compose.onNodeWithTag("proactive-model")
+        row.performScrollTo().assertTextContains("Same as assistant").performClick()
+        compose.onNodeWithTag("choice-option:Model:fixture\tother-model").performClick()
+
+        await { fixture.proactiveWatchModel["coder"] == "other-model" }
+        val write = fixture.requests.last { it.string("path") == PROACTIVE_SETTINGS_PATH && it.string("method") == "PUT" }.getJSONObject("body")
+        assertEquals("other-model", write.getString("watch_model"))
+        assertEquals("fixture", write.getString("watch_provider"))
+        // The pick travels with the other choices as they are, and the row shows it once Hermes has answered.
+        assertTrue(write.getBoolean("enabled"))
+        assertEquals("notify", write.getString("delivery"))
+        assertEquals(15, write.getInt("check_minutes"))
+        // The row names the pick the way its menu does, by provider and name; it is one text of the row, so the whole text is what is matched.
+        awaitModelRow(WATCH_MODEL_ROW_TEXT)
+        assertEquals("other-model", vm.data.value[proactiveKey(fixture)]?.getString("watch_model"))
+
+        // Reopening Settings reads the same name from the saved answer.
+        compose.runOnIdle { vm.tab("Chat"); vm.more("Assistant") }
+        await { runCatching { compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-model")) }.isSuccess }
+        awaitModelRow(WATCH_MODEL_ROW_TEXT)
+
+        // Same as assistant clears it again.
+        compose.onNodeWithTag("proactive-model").performClick()
+        compose.onNodeWithTag("choice-option:Model:").performClick()
+        await { fixture.proactiveWatchModel["coder"] == "" }
+        awaitModelRow("Same as assistant")
+        assertEquals("", fixture.requests.last { it.string("path") == PROACTIVE_SETTINGS_PATH && it.string("method") == "PUT" }.getJSONObject("body").getString("watch_provider"))
+    }
+
+    @Test fun aFailedWatchModelSaveShowsAMessageOnSettingsAndTheRowGoesBack() = withFixture { vm, fixture ->
+        fixture.proactiveEnabled["coder"] = true
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optBoolean("enabled") == true && vm.data.value["picker:models"]?.rows("groups")?.isNotEmpty() == true }
+        fixture.proactiveSaveStatusCode = 503
+
+        compose.onNodeWithTag("proactive-model").performScrollTo().performClick()
+        compose.onNodeWithTag("choice-option:Model:fixture\tother-model").performClick()
+
+        await { compose.onAllNodesWithText("Settings change refused").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("proactive-model").assertTextContains("Same as assistant")
+        assertNull(fixture.proactiveWatchModel["coder"])
+    }
+
     // Importance rules sit in the one rules list beside the delivery rules: a verdict instead of Notify / Call, with edit, switch and delete.
     @Test fun importanceRulesSitInTheOneRulesListWithEditSwitchAndDelete() = withFixture { vm, fixture ->
         fixture.proactiveEnabled["coder"] = true
@@ -215,8 +263,34 @@ class ProactiveUiTest {
         compose.onNodeWithTag("proactive-rule-delete-rule-imp").performScrollTo().performClick()
         compose.onNodeWithTag("proactive-rule-delete-confirm").performClick()
         await { fixture.proactiveRequests["coder"]?.none { it.string("id") == "rule-imp" } == true }
+        // Hermes has applied the delete; the row leaves the screen with the list the app reads again after Hermes answered, a moment later (G3 run F6, #482: asserted between the two).
+        await { compose.onAllNodesWithTag("proactive-rule-rule-imp").fetchSemanticsNodes().isEmpty() }
         compose.onAllNodesWithTag("proactive-rule-rule-imp").assertCountEquals(0)
         compose.onNodeWithTag("proactive-rule-rule-call").performScrollTo().assertExists()
+    }
+
+    // G3H (#482). A delete reaches Hermes first and the app then reads the list again; the row leaves when that read lands. The read is held here, so the order cannot depend on how fast the
+    // device is: Hermes has deleted the rule, the app asks for the list again, and the row is gone once the answer arrives.
+    @Test fun aDeletedRuleLeavesTheScreenWhenTheAppReadsTheListAgain() = withFixture { vm, fixture ->
+        fixture.proactiveEnabled["coder"] = true
+        fixture.proactiveRequests["coder"] = CopyOnWriteArrayList(listOf(
+            json("id" to "rule-call", "text" to "Call when the client moves a review", "action" to "call", "signal" to null, "night" to false, "enabled" to true, "created_at" to 1),
+            json("id" to "rule-imp", "text" to "Sent by Acme Promotions", "action" to "not_important", "signal" to "email", "night" to false, "enabled" to true, "created_at" to 2),
+        ))
+        compose.runOnIdle { vm.more("Assistant") }
+        await { vm.data.value[proactiveKey(fixture)]?.optJSONArray("rules")?.length() == 2 }
+        compose.onNodeWithTag("assistant-settings").performScrollToNode(hasTestTag("proactive-rule-rule-imp"))
+        compose.onNodeWithTag("proactive-rule-delete-rule-imp").performScrollTo().performClick()
+        try {
+            fixture.holdNextProactiveRead.set(true)
+            compose.onNodeWithTag("proactive-rule-delete-confirm").performClick()
+            await { fixture.proactiveRequests["coder"]?.none { it.string("id") == "rule-imp" } == true }
+            assertTrue("The app reads the list again after the delete", fixture.proactiveReadCaptured.await(10, java.util.concurrent.TimeUnit.SECONDS))
+        } finally { fixture.releaseProactiveRead.countDown() }
+        await { compose.onAllNodesWithTag("proactive-rule-rule-imp").fetchSemanticsNodes().isEmpty() }
+        compose.onAllNodesWithTag("proactive-rule-rule-imp").assertCountEquals(0)
+        compose.onNodeWithTag("proactive-rule-rule-call").performScrollTo().assertExists()
+        assertEquals(listOf("rule-call"), fixture.proactiveRequests["coder"]?.map { it.string("id") })
     }
 
     // Ratings from before importance became rules show once. Turn into rules lets the owner review and change what is proposed.
@@ -314,7 +388,7 @@ class ProactiveUiTest {
         fixture.proactiveRouteMissing = true
         compose.runOnIdle { vm.more("Assistant") }
         await { vm.data.value[proactiveKey(fixture)]?.optBoolean("_pluginUpdateRequired") == true }
-        compose.onNodeWithText("Update the Beacon plugin").assertExists()
+        compose.onNodeWithText("Update Beacon on Hermes").assertExists()
         compose.onNodeWithText("Retry").assertDoesNotExist()
 
         fixture.proactiveRouteMissing = false
@@ -682,9 +756,10 @@ class ProactiveUiTest {
         compose.onAllNodesWithTag("assistant-proactive-toggle").assertCountEquals(0)
         compose.runOnIdle { vm.tab("Beacon") }
         await { vm.ui.value.tab == "Beacon" && vm.ui.value.profile == "coder" && vm.chat.value.projectionReady }
-        // The native summary appears only after the background poll has completed.
-        await { compose.onAllNodesWithTag("chat-activity-strip").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithTag("chat-activity-strip").assertIsDisplayed().assertContentDescriptionEquals("Background activity, 1 schedule running")
+        // 8a344aec: the strip summarizes the open chat's background agents and processes, read from Hermes itself after its poll (BackgroundActivityUiTest holds the
+        // strip's own cases); a running schedule is no longer part of it, so with the plugin absent and nothing running for this chat there is no strip.
+        await { fixture.requests.any { it.string("method") == "session.active_list" } }
+        compose.onAllNodesWithTag("chat-activity-strip").assertCountEquals(0)
         compose.onAllNodesWithTag("proactive-prompt-card").assertCountEquals(0)
         assertFalse(fixture.requests.any { it.string("path") == PROACTIVE_SETTINGS_PATH })
     }
@@ -728,6 +803,7 @@ class ProactiveUiTest {
         val profileSwitchClientFactory: (AuthContext) -> BeaconClient = { auth -> fixture.freshClientFor(auth, app.auth) }
         try {
             compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java] }
+            diagnosticVm = vm; diagnosticFixture = fixture
             compose.runOnIdle {
                 field(vm, "originGeneration", 100)
                 field(vm, "client", fixture.client)
@@ -783,5 +859,21 @@ class ProactiveUiTest {
         }
     }
 
-    private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    private var diagnosticVm: BeaconViewModel? = null
+    private var diagnosticFixture: NativeExperienceFixture? = null
+    private fun await(condition: () -> Boolean) = AwaitDiagnostics.await(compose, { waitState() }, condition)
+    /** What a timed-out wait reports: the Watch data the app holds, what the fixture recorded, and the last calls it received. */
+    private fun waitState(): String {
+        val vm = diagnosticVm ?: return "no case running"
+        val fixture = diagnosticFixture ?: return "no fixture"
+        val data = vm.data.value[proactiveKey(fixture)]
+        val calls = fixture.requests.toList().takeLast(10).joinToString { "${it.string("method")} ${it.string("path")}".trim() }
+        return "watch data: rules=${data?.optJSONArray("rules")?.length()} learned=${data?.optJSONArray("learned")?.length()} proposal=${data?.optJSONArray("learned_proposal")?.length()} loading=${data?.optBoolean("_loading")}; " +
+            "rule bodies posted=${fixture.proactiveLearnedRuleBodies.size}; notice='${vm.ui.value.notice}' error='${vm.ui.value.error}'; last calls: $calls"
+    }
+
+    /** The Watch model row after a pick, as the fixture's model list names it ("<provider name> · <model name>"). */
+    private val WATCH_MODEL_ROW_TEXT = "Configured provider · Other Model"
+    private fun awaitModelRow(text: String) = try { await { runCatching { compose.onNodeWithTag("proactive-model").assertTextContains(text) }.isSuccess } }
+        catch (e: Throwable) { throw AssertionError("The Model row does not show \"$text\": ${runCatching { compose.onNodeWithTag("proactive-model").printToString() }.getOrElse { "no row" }}", e) }
 }

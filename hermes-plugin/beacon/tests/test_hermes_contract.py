@@ -87,6 +87,63 @@ def test_hermes_still_offers_its_forced_gateway_restart(hermes):
     assert '"--interrupt"' in server
 
 
+def _text(hermes, *parts):
+    return hermes.joinpath(*parts).read_text(encoding='utf-8-sig')
+
+
+def test_hermes_still_takes_the_one_install_the_app_sends_for_install_update_and_repair(hermes):
+    # app: pluginInstallBody = {identifier, enable:true, force:true, ref:<40-hex release commit>}; the app's policy lets exactly that through.
+    models = _text(hermes, 'hermes_cli', 'web_models.py')
+    body = re.search(r'class _AgentPluginInstallBody\(BaseModel\):(.*?)\n\S', models, re.S).group(1)
+    for field in ('identifier', 'force', 'enable', 'ref'):
+        assert re.search(rf'^\s+{field}\s*:', body, re.M), field
+    assert re.search(r'@router\.post\("/api/dashboard/agent-plugins/install"\)', _text(hermes, 'hermes_cli', 'web_routers', 'dashboard_ui.py'))
+    # ref is a full commit; a forced reinstall of the same source replaces the code and carries the owner's own files; the answer says if a restart is needed
+    assert '_EXACT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")' in _text(hermes, 'hermes_cli', 'plugins_cmd_git.py')
+    install = _text(hermes, 'hermes_cli', 'plugins_cmd_install.py')
+    assert '`install --force --ref` is the documented way to move a pin' in install and '_carry_user_files' in install
+    assert '"restart_required": not reloaded or bool(missing)' in _text(hermes, 'hermes_cli', 'plugins_activation.py')
+
+
+def test_hermes_still_refuses_git_pull_updates_of_a_pinned_plugin(hermes):
+    # Why the app updates through the pinned install and never through `.../beacon/update` (a pinned plugin cannot be pulled).
+    update = _text(hermes, 'hermes_cli', 'plugins_cmd_update.py')
+    assert 'install_record.get("pinned") is True' in update and "is pinned to {rec.get('revision')}" in update
+
+
+def test_hermes_still_never_lets_a_forced_install_pass_a_dangerous_scan(hermes):
+    # The app sends force:true on every install, update and repair. That is safe only because of Hermes' own rule that --force accepts a
+    # "caution" verdict and never a "dangerous" one, and because a block comes back as an HTTP 400 the app reads as a refusal.
+    assert '--force does not override a dangerous verdict.' in _text(hermes, 'tools', 'plugin_guard.py')
+    ui = _text(hermes, 'hermes_cli', 'web_routers', 'dashboard_ui.py')
+    assert re.search(r'if not result\.get\("ok"\):\s+raise HTTPException\(status_code=400, detail=result\.get\("error"\) or fallback_error\)', ui)
+    # The install route lets no flag through as "the client decides": a scan block there is the 400, never a 200 with scan_blocked.
+    install_route = re.search(r'async def post_agent_plugin_install\(.*?return result', ui, re.S).group(0)
+    assert 'client_decides' not in install_route
+    # The 400 says "Security scan blocked ...": the app shows that as its own line instead of "Hermes couldn't do that".
+    assert 'f"Security scan blocked plugin install: {reason}' in _text(hermes, 'hermes_cli', 'plugins_cmd.py')
+    assert '"error": str(exc), "scan_blocked": True' in _text(hermes, 'hermes_cli', 'plugins_cmd_install.py')
+
+
+def test_hermes_still_lists_beacon_the_way_the_repair_reads_it(hermes):
+    # app: hubPluginOf reads the `beacon` row of GET /api/dashboard/plugins/hub: name, version, runtime_status ("enabled" is on).
+    assert re.search(r'@router\.get\("/api/dashboard/plugins/hub"\)', _text(hermes, 'hermes_cli', 'web_routers', 'dashboard_ui.py'))
+    dashboard = _text(hermes, 'hermes_cli', 'web_server_dashboard.py')
+    row = re.search(r'rows\.append\(\{(.*?)\n        \}\)', dashboard, re.S).group(1)
+    for key in ('"name"', '"version"', '"runtime_status"'):
+        assert key in row, key
+    assert 'payload = {\n        "plugins": rows,' in dashboard
+    assert 'runtime_status = "inactive"' in dashboard
+    assert re.search(r'def _plugin_status\(.*?return "enabled".*?return "not enabled"', _text(hermes, 'hermes_cli', 'plugins_cmd.py'), re.S)
+
+
+def test_hermes_still_mounts_a_plugin_that_was_not_mounted_on_its_first_request(hermes):
+    # The repair's "missing / off / never loaded" ends without a restart only because of this fallback, and a mounted plugin is never re-mounted.
+    dashboard = _text(hermes, 'hermes_cli', 'web_server_dashboard.py')
+    assert 'class _PluginApiHotMount' in dashboard and 'def _try_hot_mount_plugin_api(name: str) -> bool:' in dashboard
+    assert "if _plugin_api_mounted(app, name):  # a mounted plugin's unknown subpath: no disk rescan" in dashboard
+
+
 def test_hermes_still_launches_its_gateway_as_gateway_run(hermes):
     # __init__._is_gateway_process records the gateway's plugin version only for a process launched as `gateway run`.
     main = hermes.joinpath('hermes_cli', 'main.py').read_text(encoding='utf-8-sig')
@@ -100,6 +157,28 @@ def test_the_check_names_a_renamed_hermes_function(hermes):
     alternative = renamed + present
     assert compat.missing([present, alternative], hermes) == []
     assert compat.missing([renamed], hermes) == ['tui_gateway.server._sessions_renamed_in_a_later_hermes (native.py)']
+
+
+# The Watch, the check-in task and scheduled callbacks reach Hermes' cron by these private spellings: no public Hermes API creates a
+# script job (no_agent), changes a job's own fields or lists the paused ones (cron.manage cannot; Lane NR, row 5).
+WATCH_CRON_NAMES = {'_cron_profile_home', '_call_cron_for_profile', '_create_cron_job_sync', '_mutate_cron_for_profile'}
+
+
+def test_the_private_cron_names_the_watch_uses_are_watched_and_exist(hermes):
+    compat = _compat()
+    groups = [group for group in compat.needs() if any(entry[0] == 'hermes_cli.web_server_cron' for entry in group)]
+    watched = {entry[1] for group in groups for entry in group if entry[0] == 'hermes_cli.web_server_cron'}
+    assert WATCH_CRON_NAMES <= watched, sorted(WATCH_CRON_NAMES - watched)
+    assert compat.missing(groups, hermes) == []
+
+
+def test_a_renamed_cron_helper_says_which_features_need_a_beacon_update(hermes):
+    compat = _compat()
+    renamed = (('hermes_cli.web_server_cron', '_mutate_cron_for_profile_renamed_in_a_later_hermes', None, 'proactive.py', False),)
+    gone = compat.missing([renamed], hermes)
+    assert gone == ['hermes_cli.web_server_cron._mutate_cron_for_profile_renamed_in_a_later_hermes (proactive.py)']
+    assert compat.stopped(gone) == ['The Watch, check-in calls and scheduled callbacks need a Beacon update for this Hermes']
+    assert compat.stopped(['tui_gateway.server._sessions_renamed (native.py)']) == []
 
 
 def test_every_native_method_the_app_calls_exists(hermes, app_source):
@@ -182,3 +261,106 @@ except ImportError:
     assert (('tui_gateway.session_history', '_history_to_messages', None, False),
             ('tui_gateway.server', '_history_to_messages', None, False)) in needs, 'either import serves'
     assert (('firebase_admin', None, None, True),) in needs, 'an ImportError-only guard marks an optional import'
+
+
+# Turning Beacon on for another profile reaches Hermes' own enable by these private spellings: Hermes has no profile-scoped enable route, its name
+# resolver only sees the active profile's own plugins, and the one way it changes plugins.enabled is the PM transaction behind `_activate_key`.
+PROFILE_ENABLE_NAMES = {'_resolve_plugin_key', '_activate_key', '_get_enabled_set'}
+
+
+def test_the_profile_enable_names_are_watched_and_exist(hermes):
+    compat = _compat()
+    groups = [group for group in compat.needs() if any(entry[:2] == ('hermes_cli', 'plugins_cmd') or entry[0] == 'hermes_cli.web_server_profiles' for entry in group)]
+    watched = {entry[2] for group in groups for entry in group if entry[:2] == ('hermes_cli', 'plugins_cmd') and entry[2]}
+    assert PROFILE_ENABLE_NAMES <= watched, sorted(PROFILE_ENABLE_NAMES - watched)
+    scope = [entry for group in groups for entry in group if entry[:2] == ('hermes_cli.web_server_profiles', '_config_profile_scope')]
+    assert any(entry[3] == 'admin_api.py' for entry in scope), 'the scope helper the enable runs in is watched too'
+    assert compat.missing(groups, hermes) == []
+
+
+def _function(path, name):
+    import ast
+    tree = ast.parse(path.read_text(encoding='utf-8-sig'))
+    return next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+def test_hermes_enable_still_has_the_shape_the_route_relies_on(hermes):
+    """Read from source, never imported: the key resolver, the activation that is the PM transaction, the selection read-back and the scope."""
+    import ast
+    commands = hermes / 'hermes_cli' / 'plugins_cmd.py'
+    resolve = _function(commands, '_resolve_plugin_key')
+    assert [a.arg for a in resolve.args.args] == ['name']
+    activate = _function(commands, '_activate_key')
+    assert [a.arg for a in activate.args.args] == ['key'] and [a.arg for a in activate.args.kwonlyargs][:1] == ['enable']
+    called = {n.func.id for n in ast.walk(activate) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert '_set_plugin_enabled' in called, 'activation goes through the PM transaction, which Hermes says every enable surface must use'
+    admission = _function(commands, '_set_plugin_enabled')
+    assert '_admit_and_save_plugin_sets' in {n.func.id for n in ast.walk(admission) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert '_get_enabled_set' in commands.read_text(encoding='utf-8-sig')
+    scope = _function(hermes / 'hermes_cli' / 'web_server_profiles.py', '_config_profile_scope')
+    assert [a.arg for a in scope.args.args] == ['profile']
+    assert any((isinstance(d, ast.Name) and d.id == 'contextmanager') for d in scope.decorator_list)
+    # The name resolver scans bundled plus the ACTIVE profile's own plugins directory only, which is why the key is resolved in the dashboard's profile.
+    discover = _function(commands, '_discover_all_plugins')
+    assert '_plugins_dir' in ast.unparse(discover)
+
+
+def _assert_profile_scope_is_per_request(root):
+    """The profile route runs Hermes' own activation in a worker thread for up to 120 s inside `_config_profile_scope(profile)`. That is only safe
+    while the scope is a context variable (`asyncio.to_thread` copies the request's context into the thread); a process-global swap would let a
+    concurrent request read or write the wrong profile's config. Source reads only."""
+    import ast
+
+    def calls(node):
+        return {n.func.id for n in ast.walk(node) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+
+    profiles = root / 'hermes_cli' / 'web_server_profiles.py'
+    assert '_hermes_home_scope' in calls(_function(profiles, '_config_profile_scope')), '_config_profile_scope no longer enters the context-local home scope'
+    assert 'set_hermes_home_override' in calls(_function(profiles, '_hermes_home_scope')), '_hermes_home_scope no longer sets the context-local override'
+    constants = ast.parse((root / 'hermes_constants.py').read_text(encoding='utf-8-sig'))
+    held = [n.value for n in constants.body if isinstance(n, (ast.Assign, ast.AnnAssign)) and n.value is not None
+            and '_HERMES_HOME_OVERRIDE' in {t.id for t in (n.targets if isinstance(n, ast.Assign) else [n.target]) if isinstance(t, ast.Name)}]
+    assert len(held) == 1 and isinstance(held[0], ast.Call) and getattr(held[0].func, 'id', None) == 'ContextVar', '_HERMES_HOME_OVERRIDE is no longer a ContextVar'
+    setter = _function(root / 'hermes_constants.py', 'set_hermes_home_override')
+    assert any(isinstance(n, ast.Attribute) and n.attr == 'set' and getattr(n.value, 'id', None) == '_HERMES_HOME_OVERRIDE' for n in ast.walk(setter)), \
+        'set_hermes_home_override no longer sets the ContextVar'
+
+
+def test_hermes_profile_scope_is_per_request_not_process_global(hermes):
+    _assert_profile_scope_is_per_request(hermes)
+
+
+@pytest.mark.parametrize('name, file, old, new', [
+    ('the override becomes a plain module global', 'hermes_constants.py',
+     'ContextVar("_HERMES_HOME_OVERRIDE", default=_UNSET)', '_UNSET'),
+    ('the home scope swaps the process environment', 'hermes_cli/web_server_profiles.py',
+     'token = set_hermes_home_override(str(path))', 'token = os.environ.__setitem__("HERMES_HOME", str(path))'),
+    ('the config scope stops using the home scope', 'hermes_cli/web_server_profiles.py',
+     'with (_hermes_home_scope(profile_dir) if profile_dir is not None else nullcontext()):', 'with nullcontext():'),
+])
+def test_the_scope_check_fails_on_a_hermes_that_scopes_by_global(hermes, tmp_path, name, file, old, new):
+    """A mutant in a temporary copy of the two Hermes files (Hermes itself is never touched) must trip the check above."""
+    for relative in ('hermes_constants.py', 'hermes_cli/web_server_profiles.py'):
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_bytes((hermes / relative).read_bytes())
+    _assert_profile_scope_is_per_request(tmp_path)  # the unmutated copy passes, so a failure below is the mutant's
+    text = (tmp_path / file).read_text(encoding='utf-8')
+    assert old in text, 'Hermes changed this line; update the mutant'
+    (tmp_path / file).write_text(text.replace(old, new, 1), encoding='utf-8')
+    with pytest.raises(AssertionError):
+        _assert_profile_scope_is_per_request(tmp_path)
+
+
+def test_a_renamed_enable_helper_says_which_feature_needs_a_beacon_update(hermes):
+    compat = _compat()
+    renamed = (('hermes_cli.plugins_cmd', '_activate_key_renamed_in_a_later_hermes', None, 'admin_api.py', False),)
+    gone = compat.missing([renamed], hermes)
+    assert gone == ['hermes_cli.plugins_cmd._activate_key_renamed_in_a_later_hermes (admin_api.py)']
+    assert compat.stopped(gone) == ['Turning Beacon on for another profile from the phone needs a Beacon update for this Hermes']
+    assert compat.stopped(['tui_gateway.server._sessions_renamed (native.py)']) == []
+
+
+def test_every_route_the_app_asks_the_plugin_for_to_turn_a_profile_on_exists(app_source):
+    routes = _beacon_routes()
+    assert '/api/plugins/beacon/admin/profile-plugin/enable' in routes
+    assert _matches('/api/plugins/beacon/admin/profile-plugin/enable', routes)

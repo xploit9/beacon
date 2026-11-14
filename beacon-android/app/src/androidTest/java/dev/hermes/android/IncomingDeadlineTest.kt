@@ -26,6 +26,16 @@ import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 
+/** The first duplicate delivery (and the service restart right after it) comes this long after the first arrival. */
+private const val FIRST_DUPLICATE_AFTER_MS = 5_000L
+/**
+ * How late the missed state may be seen, measured from just before the first delivery. A timer that a duplicate or the restart re-armed would start its 45 s no
+ * earlier than that first duplicate, so it would miss at [FIRST_DUPLICATE_AFTER_MS] + 45,000 = 50,000 ms or later. The limit stays 1,000 ms below that:
+ * 49,000 ms leaves a correct run 4,000 ms over its 45,000 ms for delivery, the alarm and a loaded emulator (46,073 ms was seen), and still fails a re-armed timer.
+ * The lower bound (44,500 ms, a real transition and not a pre-expired fixture) is unchanged.
+ */
+private const val MISSED_AT_MOST_MS = FIRST_DUPLICATE_AFTER_MS + 45_000L - 1_000L
+
 @RunWith(AndroidJUnit4::class)
 class IncomingDeadlineTest {
     @Test fun realDeviceElapsedClockDoesNotRestartACopiedInvitation() {
@@ -77,25 +87,28 @@ class IncomingDeadlineTest {
                 assertTrue(original!!.extras.getBoolean("android.requestPromotedOngoing"))
                 if(manager.canPostPromotedNotifications()) assertTrue(original!!.hasPromotableCharacteristics())
             }
-            waitUntil(arrival+5000)
+            waitUntil(arrival+FIRST_DUPLICATE_AFTER_MS)
             receivePush(app,data)
             assertEquals(first,app.push.deadlineInvitation(source,event))
             assertEquals(first,dev.hermes.android.push.PushManager(app).deadlineInvitation(source,event))
             ContextCompat.startForegroundService(app,Intent(app,IncomingRingtoneService::class.java)
                 .putExtra("push_source",source).putExtra("push_event",event).putExtra("notification",original))
-            await(2000) { manager.activeNotifications.firstOrNull { it.id==42 }?.notification?.timeoutAfter?.let { it in 1..41000 }==true }
+            // Root ruling (msg_0ccbf1b46ebe): was 2000. The restarted service re-posts its card from onStartCommand; on a loaded emulator that took more than 2 s (fl6-base-1).
+            // A re-armed 45 s card shows timeoutAfter 45000, never in 1..41000, however long this waits, so a longer wait does not weaken the check.
+            await(10_000) { manager.activeNotifications.firstOrNull { it.id==42 }?.notification?.timeoutAfter?.let { it in 1..41000 }==true }
             val remaining=manager.activeNotifications.single { it.id==42 }.notification.timeoutAfter
             assertTrue("A restarted foreground card cannot receive a new forty-five-second timeout",remaining in 1..41000)
             waitUntil(arrival+44000)
             receivePush(app,data)
             assertEquals(first,app.push.deadlineInvitation(source,event))
             var missedAt=0L
-            await(2500) {
+            // Until the same limit the assertion below states, counted from the first delivery (it was 2,500 ms after the 44 s mark, about 46.5 s).
+            await((arrival+MISSED_AT_MOST_MS-SystemClock.elapsedRealtime()).coerceAtLeast(1)) {
                 if(app.push.missedInvitation(source,event)!=null) { missedAt=SystemClock.elapsedRealtime();true } else false
             }
             val measured=missedAt-arrival
             assertTrue("Must observe a real forty-five-second transition, not a pre-expired fixture",measured>=44500)
-            assertTrue("Missed state must not be postponed by duplicate delivery or restart: $measured ms",measured<=46000)
+            assertTrue("Missed state must not be postponed by duplicate delivery or restart: $measured ms (limit $MISSED_AT_MOST_MS)",measured<=MISSED_AT_MOST_MS)
             await(1000) { manager.activeNotifications.none { it.id==42 } }
             val cards=manager.activeNotifications.filter { it.tag==first.key }
             assertEquals(1,cards.size);assertEquals(2,cards.single().id)

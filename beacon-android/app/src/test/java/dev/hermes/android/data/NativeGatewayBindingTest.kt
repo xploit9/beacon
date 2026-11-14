@@ -599,6 +599,47 @@ class NativeGatewayBindingTest {
         } finally { wire.client.closeNative() }
     }
 
+    @Test(timeout = 15_000) fun aThreadOnAnAuthorityGatewayIsMadeAsATitledChatAndMarkedAtOnce() = runBlocking {
+        ThreadMarks.reset()
+        // The installed authority refuses any source that is not one of its surfaces (strictCanonicalCreate mirrors gateway/session_policy.py SURFACES).
+        val wire = Wire().apply { canonical = true; strictCanonicalCreate = true }
+        try {
+            val created = wire.client.post("/api/session/new", json("title" to "News", "thread" to true))
+            val params = wire.acceptedCreates.single()
+            assertFalse("The authority must not be sent the thread source", params.has("source"))
+            assertEquals("News", params.getString("title"))
+            assertEquals("The thread is a thread in the list from the start", "android_thread", created.getString("source"))
+            assertEquals("News", created.getString("title"))
+            assertEquals(setOf("stored-a"), ThreadMarks.ids(wire.client.scope))
+            assertTrue("The plugin keeps the mark for the owner's other phones",
+                wire.httpRequests.any { it.method == "POST" && it.url.encodedPath == "/api/plugins/beacon/mobile/sessions/stored-a/thread" })
+            assertEquals("Created once", 1, wire.methods.count { it == "session.create" })
+        } finally { wire.client.closeNative(); ThreadMarks.reset() }
+    }
+
+    @Test(timeout = 15_000) fun aThreadOnAGatewayThatStoresTheSourceKeepsItAndNeedsNoMark() = runBlocking {
+        ThreadMarks.reset()
+        val wire = Wire()
+        try {
+            val created = wire.client.post("/api/session/new", json("title" to "News", "thread" to true))
+            assertEquals("android_thread", wire.acceptedCreates.single().getString("source"))
+            assertEquals("android_thread", created.getString("source"))
+            assertTrue(ThreadMarks.ids(wire.client.scope).isEmpty())
+            assertTrue(wire.httpRequests.none { it.url.encodedPath.endsWith("/thread") })
+        } finally { wire.client.closeNative(); ThreadMarks.reset() }
+    }
+
+    @Test(timeout = 15_000) fun aRefusedThreadCreateIsNeverReportedAsAnUnreachableHermes() = runBlocking {
+        val wire = Wire().apply { canonical = true; strictCanonicalCreate = true }
+        try {
+            val error = runCatching { wire.client.nativeCreate(json("title" to "News", "source" to "android_thread")) }.exceptionOrNull()
+            assertTrue(error is NativeThreadUnsupported)
+            assertEquals(THREAD_UNSUPPORTED_ERROR, appErrorText(error!!))
+            assertNotEquals(APP_CONNECTION_ERROR, appErrorText(error))
+            assertEquals(0, wire.methods.count { it == "session.create" })
+        } finally { wire.client.closeNative() }
+    }
+
     @Test(timeout = 15_000) fun createWaitsForTheIssuingSocketReadyBeforeSending() = runBlocking {
         val wire = Wire().apply { canonical = true; strictCanonicalCreate = true; advertiseReady = false }
         val created = async { runCatching { wire.client.nativeCreate(json("title" to "Fixture")) } }

@@ -140,7 +140,7 @@ internal fun ApprovalCardOnScreen(requestId: String, report: (String, Boolean) -
 /** "Calling in 3": announced as it changes. */
 @Composable
 internal fun PhoneCountdownTitle(run: CountdownRun) {
-    Text(PhoneLine(uiText("Calling in {0}"), listOf(run.left.toString())).text(),
+    Text(PhoneLine(uiText("Calling in {0} s"), listOf(run.left.toString())).text(),
         Modifier.semantics { liveRegion = LiveRegionMode.Polite }.testTag("phone-countdown-title"))
 }
 
@@ -151,7 +151,7 @@ internal fun PhoneCountdownDetails(approval: CallToolApproval, card: PhoneApprov
         Text(card.action, style = MaterialTheme.typography.titleLarge, modifier = Modifier.testTag("phone-countdown-who"))
         if (card.target.isNotBlank()) Text(card.target, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.testTag("phone-countdown-number"))
         if (card.details.isNotBlank()) Text(card.details, style = MaterialTheme.typography.bodyMedium)
-        LinearProgressIndicator(progress = { (run.elapsed / (run.seconds * 1000f)).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+        LinearProgressIndicator(progress = { 1f - (run.elapsed / (run.seconds * 1000f)).coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth().heightIn(min = 8.dp))
         if (approval.error.isNotBlank()) Text(callToolApprovalErrorMessage(approval.error), color = MaterialTheme.colorScheme.error)
     }
 }

@@ -101,7 +101,7 @@ class BotTeammatesUiTest {
         compose.onNodeWithTag("space-action-rename").assertIsEnabled()
         compose.onNodeWithTag("space-action-members").assertIsDisplayed()
         compose.onNodeWithTag("space-action-delete").assertIsNotEnabled()
-        compose.onNodeWithText("Deletion unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Can't delete").assertIsDisplayed()
         compose.onNodeWithTag("space-action-members").performClick()
         compose.runOnIdle { assertEquals(listOf("members"), calls) }
     }

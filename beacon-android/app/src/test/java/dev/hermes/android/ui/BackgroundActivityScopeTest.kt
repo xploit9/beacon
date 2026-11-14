@@ -182,7 +182,7 @@ class BackgroundActivityScopeTest {
             val current = fetchBackgroundActivity(fixture.client, "default", "stored-b")
             assertFalse(current.available)
             assertEquals(1, current.processes)
-            assertEquals("1 process · More may be active", backgroundActivityStatus(current))
+            assertEquals("1 process", backgroundActivityStatus(current))
         }
     }
 

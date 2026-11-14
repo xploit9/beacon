@@ -71,6 +71,6 @@ class SettingsPreferencesTest {
     @Test fun errorPresentationDoesNotDisplayJsonNullAsAProblem() {
         assertEquals("", recordError(JSONObject().put("_error", JSONObject.NULL).put("error", JSONObject.NULL)))
         assertEquals("Unavailable", recordError(JSONObject().put("success", false).put("error", "Unavailable")))
-        assertEquals("The server could not load this content. Try again.", recordError(JSONObject().put("success", false).put("message", JSONObject.NULL)))
+        assertEquals("Hermes couldn't load this. Try again.", recordError(JSONObject().put("success", false).put("message", JSONObject.NULL)))
     }
 }

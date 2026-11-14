@@ -16,7 +16,7 @@ internal fun displayedBoolean(field: Field, stored: String) = if (field.inverse)
 internal fun storedBoolean(field: Field, displayed: Boolean) = (if (field.inverse) !displayed else displayed).toString()
 /** The texts a page's error row can show without the server saying anything: the offline answer of `BeaconViewModel.load` and [recordError]'s default. Pages show them through uiText. */
 internal const val OfflineReadError = "Reconnect to refresh this page."
-internal const val DefaultReadError = "The server could not load this content. Try again."
+internal const val DefaultReadError = "Hermes couldn't load this. Try again."
 internal fun recordError(value: JSONObject?): String = when {
     value == null -> ""
     value.string("_error").isNotBlank() -> value.string("_error")

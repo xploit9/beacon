@@ -16,7 +16,7 @@ import org.junit.Test
 
 /**
  * Providers & models on a device: the page's two rows and the model sheet it opens. The ViewModel has no client, so a tap that would change
- * the chat or ask Hermes for models stops at "Open a conversation before continuing." (a notice), which is how these tests see that the tap arrived.
+ * the chat or ask Hermes for models stops at "Open a chat first." (a notice), which is how these tests see that the tap arrived.
  */
 class ProvidersModelsGapsUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()

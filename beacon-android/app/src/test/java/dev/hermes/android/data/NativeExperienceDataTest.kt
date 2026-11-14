@@ -34,7 +34,10 @@ class NativeExperienceDataTest {
         assertEquals("Choose a valid timezone", nativeErrorMessage(json("detail" to "Choose a valid timezone"), 422))
         val validation = JSONArray().put(json("msg" to "Invalid time")).put(json("msg" to "Missing title"))
         assertEquals("Invalid time; Missing title", nativeErrorMessage(json("detail" to validation), 422))
-        assertEquals("Server returned 500", nativeErrorMessage(json(), 500))
+        // No "Server returned 500": an empty answer has no detail, and the screen shows the plain line for its status.
+        assertEquals("", nativeErrorMessage(json(), 500))
+        assertEquals("Hermes couldn't do that. Try again.", appErrorText(ApiFailure(500, nativeErrorMessage(json(), 500))))
+        assertEquals("Sign in with Hermes again, then try again.", appErrorText(ApiFailure(401, nativeErrorMessage(json(), 401))))
         // Bare Hermes machine codes never reach the screen.
         assertEquals("This chat changed. Refresh and try again.", nativeErrorMessage(json("detail" to "mutation_identity_required"), 409))
         assertEquals("This chat is busy with a reply. Try again when it finishes.", nativeErrorMessage(json("detail" to "session_busy"), 409))

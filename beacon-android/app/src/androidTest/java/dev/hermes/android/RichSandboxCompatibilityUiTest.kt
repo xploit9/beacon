@@ -32,7 +32,8 @@ class RichSandboxCompatibilityUiTest {
         val latch = CountDownLatch(1)
         var result = ""
         compose.runOnUiThread { requireNotNull(web()).evaluateJavascript(script) { result = it; latch.countDown() } }
-        assertTrue("WebView evaluation timed out", latch.await(3, TimeUnit.SECONDS))
+        // The WebView answers a script from its own renderer process; on a loaded emulator that took more than 3 s (INT r16), so the callback gets up to 10 s.
+        assertTrue("WebView evaluation timed out", latch.await(10, TimeUnit.SECONDS))
         return result
     }
 
@@ -94,6 +95,6 @@ class RichSandboxCompatibilityUiTest {
 
     @Test fun invalidDiagramShowsTheExistingReadableFallback() {
         render("not-a-diagram")
-        assertEquals("true", evaluate("!document.querySelector('svg') && document.querySelector('.mermaid').textContent.includes('Diagram could not be rendered')"))
+        assertEquals("true", evaluate("!document.querySelector('svg') && document.querySelector('.mermaid').textContent.includes('draw this diagram. Tap Source to read it.')"))
     }
 }

@@ -32,6 +32,9 @@ class NativeOperationsTest {
         var reasoning = "medium"
         var pending = JSONArray()
         var prompts = JSONArray()
+        /** What a gateway without session authority answers to `approval.pending` (its open approvals) and lists as `open_requests` on resume. */
+        var legacyApprovals = JSONArray()
+        var openRequests = JSONArray()
         var snapshotOverride: JSONObject? = null
         var modelInventoryOverride: JSONObject? = null
         var mutationOverride: JSONObject? = null
@@ -103,6 +106,7 @@ class NativeOperationsTest {
                                 if (agentBuilt) put("yolo", yolo)
                             }).apply {
                                 if (canonical) put("revision", revision).put("execution_generation", generation).put("running", running).put("pending", pending).put("prompts", prompts)
+                                else if (openRequests.length() > 0) put("open_requests", openRequests)
                             }
                         "approval.pending" -> {
                             if (refuseBuild) {
@@ -110,7 +114,7 @@ class NativeOperationsTest {
                                 return true
                             }
                             agentBuilt = true
-                            json("approvals" to JSONArray())
+                            json("approvals" to legacyApprovals)
                         }
                         "config.set" -> {
                             builtAtWrite = agentBuilt
@@ -164,6 +168,9 @@ class NativeOperationsTest {
             return socket
         }
         fun emitToken(text: String, type: String = "token") = listener.onMessage(socket, json("method" to "event", "params" to json("session_id" to "runtime-a", "seq" to 1, "type" to type, "payload" to json("text" to text))).toString())
+        /** One canonical event frame as Hermes' session_events.publish writes it (method/params/type/session_id/payload/replay_epoch/seq). */
+        fun emitEvent(session: String, seq: Int, type: String, payload: JSONObject) = listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event",
+            "params" to json("session_id" to session, "seq" to seq, "type" to type, "payload" to payload, "replay_epoch" to "fixture")).toString())
     }
 
     private suspend fun pick(fixture: Fixture) =
@@ -340,5 +347,41 @@ class NativeOperationsTest {
         try {
             assertNotNull(runCatching { yoloOff(fixture) }.exceptionOrNull())
         } finally { fixture.client.closeNative() }
+    }
+
+    // The phone rebuilds its queue of open prompts from what Hermes answers to "what is pending": the first one and the ones behind it. A gateway without session authority
+    // answers from its own lists (open approvals, open requests), so the same `waiting` has to come out of them.
+    private fun legacyApproval(id: String) = json("request_id" to id, "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+    private fun legacyQuestion(id: String) = json("id" to id, "method" to "clarify", "params" to json("questions" to JSONArray().put(json("qid" to "q-$id", "question" to "Synthetic $id"))))
+
+    @Test fun aGatewayWithoutAuthorityListsTheApprovalsBehindTheFirstAsWaiting() = runBlocking {
+        val fixture = Fixture().apply { legacyApprovals = JSONArray().put(legacyApproval("req-1")).put(legacyApproval("req-2")).put(legacyApproval("req-3")) }
+        try {
+            val answer = fixture.client.get("/api/approval/pending", mapOf("session_id" to "stored-a"))
+            assertEquals("req-1", answer.getJSONObject("pending").string("approval_id"))
+            assertEquals(listOf("req-2", "req-3"), answer.rows("waiting").map { it.string("approval_id") })
+        } finally { fixture.client.closeNative() }
+    }
+
+    @Test fun aGatewayWithoutAuthorityListsTheQuestionsBehindTheFirstAsWaitingAndLeavesOutOtherRequests() = runBlocking {
+        val fixture = Fixture().apply { openRequests = JSONArray().put(legacyQuestion("wire-q1")).put(json("id" to "wire-a", "method" to "approval", "params" to json("request_id" to "req-1"))).put(legacyQuestion("wire-q2")) }
+        try {
+            val answer = fixture.client.get("/api/clarify/pending", mapOf("session_id" to "stored-a"))
+            assertEquals("wire-q1", answer.getJSONObject("pending").string("clarify_id"))
+            assertEquals(listOf("wire-q2"), answer.rows("waiting").map { it.string("clarify_id") })
+        } finally { fixture.client.closeNative() }
+    }
+
+    @Test fun aGatewayWithoutAuthorityWithOneOrNoApprovalListsNothingWaiting() = runBlocking {
+        val none = Fixture()
+        val one = Fixture().apply { legacyApprovals = JSONArray().put(legacyApproval("req-1")) }
+        try {
+            val empty = none.client.get("/api/approval/pending", mapOf("session_id" to "stored-a"))
+            assertTrue(empty.isNull("pending"))
+            assertTrue(empty.rows("waiting").isEmpty())
+            val single = one.client.get("/api/approval/pending", mapOf("session_id" to "stored-a"))
+            assertEquals("req-1", single.getJSONObject("pending").string("approval_id"))
+            assertTrue(single.rows("waiting").isEmpty())
+        } finally { none.client.closeNative(); one.client.closeNative() }
     }
 }

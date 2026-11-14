@@ -67,7 +67,7 @@ internal fun memoryCounterVisible(length: Int, limit: Int): Boolean = limit > 0 
         val off = current != null && !current.enabled
         if (recallNotReady || off || state.message.isNotBlank()) item(key = "status") {
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (recallNotReady) SettingsStatusPill(SettingsStatus.Attention, uiText("Recall not ready"), testTag = "memory-recall-pill")
+                if (recallNotReady) SettingsStatusPill(SettingsStatus.Attention, uiText("Memory not ready"), testTag = "memory-recall-pill")
                 if (off) SettingsStatusPill(SettingsStatus.Off, uiText("Off for new chats"), testTag = "memory-off-pill")
                 if (state.message.isNotBlank()) SettingsStatusPill(SettingsStatus.Ok, uiText(state.message))
             }

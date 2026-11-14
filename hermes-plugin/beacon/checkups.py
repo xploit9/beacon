@@ -1,11 +1,14 @@
 """A native cron script gate: no timer, agent loop, or catch-up callbacks."""
 import hashlib
+import logging
 import random
 import time
 import uuid
 import importlib.util
 from pathlib import Path
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def _profile_now(profile):
@@ -48,12 +51,22 @@ def slots(owner,profile,day,every='random'):
     return sorted(600+i*width+rng.randrange(width) for i in range(count))
 
 
+def _unresolved_stored(mobile,owner,profile,stored):
+    # One content-free incident per stored chat: the owner's chat is left untouched, and later ticks skip quietly.
+    marker='checkup-stale:'+hashlib.sha256('\0'.join((owner,profile,stored)).encode('utf-8')).hexdigest()
+    with mobile.LOCK,mobile.connect() as conn:
+        created=conn.execute('INSERT OR IGNORE INTO meta(key,value) VALUES(?,?)',(marker,b'logged')).rowcount==1
+    if created: logger.warning('checkup_stored_conversation_unresolved')
+
+
 def tick(mobile,native,cfg,profile,now):
     owner=cfg.get('owner_id');provider=cfg.get('owner_provider')
     stored=cfg.get('scheduled_callback_conversation_id')
-    if (cfg.get('scheduled_callbacks_enabled') is not True or not owner or not provider or not stored
+    if (cfg.get('scheduled_callbacks_enabled') is not True or not owner or not provider
             or 'profiles' in cfg and (not isinstance(cfg['profiles'],list) or profile not in cfg['profiles'])):
         raise ValueError('Configure an owned callback conversation before enabling check-ups')
+    # No saved chat (never chosen, or cleared after it stopped resolving): quiet until one is saved again, so the job never fails every run.
+    if not stored: return {'state':'no_conversation'}
     minute=now.hour*60+now.minute
     due=[slot for slot in slots(owner,profile,now.date().isoformat(),cadence(mobile,owner,profile)) if 0<=minute-slot<DUE_MINUTES]
     if not due: return {'state':'no_opportunity'}
@@ -65,7 +78,12 @@ def tick(mobile,native,cfg,profile,now):
     if (now.tzinfo is None or now.utcoffset() is None
             or (getattr(now.tzinfo,'key',None) or now.tzname())!=profile_timezone):
         raise ValueError('Check-up time must match the profile timezone')
-    native.verify(owner,provider,profile,stored)
+    try: native.verify(owner,provider,profile,stored)
+    except LookupError:
+        # The saved chat no longer resolves for this owner: forget that binding once (the owner's chat itself stays) and log one incident.
+        cleared=mobile.clear_scheduled_callback_conversation(owner,provider,profile,stored)
+        _unresolved_stored(mobile,owner,profile,stored)
+        return {'state':'stale_conversation_cleared' if cleared else 'stale_conversation'}
     # Keyed by the check-in's own time: a later tick inside its window finds it considered.
     key='checkup:'+owner+':'+profile+':'+now.date().isoformat()+':'+str(slot)
     with mobile.LOCK,mobile.connect() as conn:

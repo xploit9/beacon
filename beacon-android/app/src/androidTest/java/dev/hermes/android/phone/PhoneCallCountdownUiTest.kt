@@ -46,7 +46,7 @@ class PhoneCallCountdownUiTest {
         show()
         compose.onNodeWithTag("phone-countdown-who").assertIsDisplayed().assertTextEquals("Call Mona Test")
         compose.onNodeWithTag("phone-countdown-number").assertIsDisplayed().assertTextEquals("+966501234567")
-        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 3")
+        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 3 s")
         compose.onNodeWithTag("phone-countdown-cancel").assertIsDisplayed().assertTextContains("Cancel")
         compose.onNodeWithTag("phone-countdown-now").assertIsDisplayed().assertTextContains("Call now")
     }
@@ -54,9 +54,9 @@ class PhoneCallCountdownUiTest {
     @Test fun theCountdownReadsThreeTwoOneAndThenAnswersYesOnce() {
         show()
         compose.mainClock.advanceTimeBy(1_100)
-        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 2")
+        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 2 s")
         compose.mainClock.advanceTimeBy(1_000)
-        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 1")
+        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 1 s")
         assertEquals("not before the end", emptyList<String>(), answers)
         compose.mainClock.advanceTimeBy(1_200)
         assertEquals(listOf("approve"), answers)
@@ -133,6 +133,6 @@ class PhoneCallCountdownUiTest {
     @Test fun aNumberWithoutAContactNameStillShowsInFull() {
         show(approval.copy(phone = PhoneApprovalText("Call +442071234567", "", "Opens the dialer. You press call.", "", countdown = 3, askedAt = asked)))
         compose.onNodeWithTag("phone-countdown-who").assertTextEquals("Call +442071234567")
-        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 3")
+        compose.onNodeWithTag("phone-countdown-title").assertTextEquals("Calling in 3 s")
     }
 }

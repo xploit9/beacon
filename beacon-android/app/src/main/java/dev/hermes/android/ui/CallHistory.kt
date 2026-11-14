@@ -95,8 +95,15 @@ private fun callDirectionText(direction: CallDirection): String = when (directio
 private val whitespaceRun = Regex("\\s+")
 
 /** What a call is called: the reason Hermes gave, else the first thing the user said, else null so the row falls back to its direction. */
-internal fun callRowTitle(reason: String?, firstUserLine: String?): String? =
-    listOf(reason, firstUserLine).firstNotNullOfOrNull { it?.replace(whitespaceRun, " ")?.trim()?.take(140)?.takeIf(String::isNotBlank) }
+/** The reasons the plugin stores for its own calls, in the words the rest of the app uses; any other reason is shown as it is. [text] translates. */
+internal fun callReasonWords(reason: String?, text: (String) -> String = { it }): String? = when {
+    reason == "Owner-requested check-up" -> text("Check-in call")
+    reason != null && reason.startsWith("Missed scheduled callback: ") -> text("Missed call back: {0}").replace("{0}", reason.removePrefix("Missed scheduled callback: "))
+    else -> reason
+}
+internal val CallReasonStrings = listOf("Check-in call", "Missed call back: {0}")
+internal fun callRowTitle(reason: String?, firstUserLine: String?, text: (String) -> String = { it }): String? =
+    listOf(callReasonWords(reason, text), firstUserLine).firstNotNullOfOrNull { it?.replace(whitespaceRun, " ")?.trim()?.take(140)?.takeIf(String::isNotBlank) }
 
 /** The first thing the user said in [callId], from the transcript lines of the open conversation. */
 internal fun firstUserCallLine(callId: String, lines: List<CallTranscript>): String? =
@@ -319,7 +326,8 @@ private fun CallRowContent(call: CallHistoryEntry, title: String?, details: Stri
 
 @Composable
 private fun CallHistoryRow(call: CallHistoryEntry, firstUserLine: String?, feedbackStatus: String?, onFeedback: (String) -> Unit, onOpen: () -> Unit) {
-    val title = callRowTitle(call.reason, firstUserLine)
+    val strings = uiTextLookup()
+    val title = callRowTitle(call.reason, firstUserLine, strings)
     Column(Modifier.fillMaxWidth()) {
         CallRowContent(call, title, callDetails(call), Modifier.clickable(role = Role.Button, onClick = onOpen).testTag("call-history-row:${call.id}"))
         if (call.emailNoticeId != null) {
@@ -340,7 +348,8 @@ private fun CallHistoryRow(call: CallHistoryEntry, firstUserLine: String?, feedb
 private fun CallAttemptsRows(item: CallHistoryItem.Attempts, titleLine: (CallHistoryEntry) -> String?, onOpen: (CallHistoryEntry) -> Unit) {
     var expanded by rememberSaveable(item.key) { mutableStateOf(false) }
     val newest = item.calls.first()
-    val title = callRowTitle(newest.reason, titleLine(newest))
+    val strings = uiTextLookup()
+    val title = callRowTitle(newest.reason, titleLine(newest), strings)
     val count = uiText("{0} attempts").replace("{0}", "${item.calls.size}")
     val state = uiText(if (expanded) "Expanded" else "Collapsed")
     Column(Modifier.fillMaxWidth()) {

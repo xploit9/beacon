@@ -8,6 +8,8 @@ internal fun settingsLabel(route: String): String = when (route) {
     "Licenses" -> "About & licenses"
     "Tools & commands" -> "Tools"
     "Session checkpoints" -> "File backups"
+    "Devices" -> "Phones"
+    "Session usage" -> "Chat usage"
     else -> route
 }
 
@@ -20,7 +22,7 @@ private val settingsSearchKeywords = mapOf(
     "Chat" to "while replying steer queue change the reply send after",
     "Voice & calls" to "API key Voice provider and calls",
     "Notifications" to "Notification delivery keep connected",
-    "Devices" to "Manage linked phones",
+    "Phones" to "Manage linked phones",
     "Appearance" to "Theme and color style dark light",
     "Memory" to "What Hermes knows about you",
     "Phone access" to "Calendar reminders alarms timers contacts calls messages text SMS permissions Hermes activity",
@@ -67,7 +69,7 @@ internal val settingsDescriptions = mapOf(
     "Phone access" to "Calendar, contacts and calls",
     "Appearance" to "Theme and colors",
     "Profiles & model" to "Profiles and models",
-    "Tools & MCP" to "Tool groups and MCP servers",
+    "Tools & MCP" to "Tools and MCP servers",
     "Server" to "Health, logs and updates",
     "About & licenses" to LicensesDescription,
     "Profiles" to "Defaults and behavior",
@@ -75,10 +77,10 @@ internal val settingsDescriptions = mapOf(
     "Beacon" to VoiceDescription,
     "Notifications" to NotificationsDescription,
     "App updates" to "Latest Beacon",
-    "Providers & models" to "Models for chats and bots", "Tools & commands" to "Tool groups and commands",
+    "Providers & models" to "Models for chats and bots", "Tools & commands" to "Tools and commands",
     "Skills" to "Installed skills", "Memory" to "Notes Hermes keeps",
     "MCP servers" to "Services Hermes can use",
-    "Health" to "Check the dashboard and agent", "Logs" to "Recent server activity",
+    "Health" to "How Hermes is running", "Logs" to "Recent server activity",
     "Server updates" to "Check and update Hermes", "Session checkpoints" to "Earlier file versions", "Licenses" to LicensesDescription,
 )
 
@@ -93,7 +95,7 @@ internal val settingsHubRoutes = settingsHubSections.values.flatten()
 /** Search includes both the hub and its focused destinations. */
 internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten() + listOf("Devices", "Memory")
 // Skills, Memory and Server updates are native Hermes routes; only plugin-backed pages are gated.
-private val pluginSettingsRoutes = setOf("Notifications", "Bots", "Vault")
+private val pluginSettingsRoutes = setOf("Notifications", "Bots")
 internal fun settingsNeedsBeaconPlugin(page: String, pluginStatus: String): Boolean = pluginStatus == "absent" && page in pluginSettingsRoutes
 
 /** The exact `BeaconViewModel.more` argument for a row; categories open their own list, everything else opens its page. */
@@ -119,14 +121,14 @@ internal val settingsThemeLabels = mapOf("system" to "System", "dark" to "Dark",
 
 /** The short pill words of the hub rows, which reach uiText through a summary part rather than a literal. */
 internal val settingsPillWords = listOf("Connected", "Offline", "Sign in", "Key saved", "Add key", "Keep connected is on", "Keep connected is off", "Update ready", "Update available",
-    "Update the Beacon plugin", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles", "Off")
+    "Update Beacon on Hermes", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles", "Off")
 
 /**
  * The fixed texts that reach uiText through variables and so are checked by the translation test: the hub's row names and descriptions, section and
  * category titles, theme names and search words, the reasoning words and sentences, the offline and default error texts and the call card's title words.
  */
 internal val SettingsStrings = (settingsSearchRoutes.map(::settingsLabel) + settingsDescriptions.values + settingsHubSections.keys.filter(String::isNotBlank) +
-    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Change the reply", "Send after") + settingsPillWords + settingsSearchKeywords.values +
+    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Send now", "Queue") + settingsPillWords + settingsSearchKeywords.values +
     ReasoningStrings + listOf(OfflineReadError, DefaultReadError) + CallTitleStrings).distinct()
 
 /**
@@ -140,6 +142,7 @@ internal val SettingsStrings = (settingsSearchRoutes.map(::settingsLabel) + sett
 internal data class SettingsSnapshot(
     val connected: Boolean = false, /** The phone is reconnecting or restoring its sign-in (the Connection page reads Reconnecting…). */ val connecting: Boolean = false, val profile: String = "",
     val sendKey: String = "", val formatMessages: Boolean? = null, val showThinking: Boolean? = null,
+    /** A hardware keyboard is attached; only its Enter key reaches the composer as a key event. */ val hardwareKeyboard: Boolean = false,
     val theme: String = "", /** Stored skin key, not its label. */ val colorStyle: String = "",
     val installedVersion: String = "", val updateName: String = "", val updateReady: Boolean = false,
     val voiceProviderId: String = "", val voiceKeySaved: Boolean? = null,
@@ -148,7 +151,7 @@ internal data class SettingsSnapshot(
     val assistantName: String = "", val assistantProfile: String = "",
     /** The signed-in account, verbatim. */ val account: String = "",
     /** True once an address is saved but its sign-in is gone. */ val signedOut: Boolean = false,
-    /** "Update the Beacon plugin", "Restart Hermes" or "Restart dashboard" while the update screen has a pending plugin step, else blank. */ val pluginAction: String = "",
+    /** "Update Beacon on Hermes", "Restart Hermes" or "Restart dashboard" while the update screen has a pending plugin step, else blank. */ val pluginAction: String = "",
     val profileCount: Int? = null, val skillsOn: Int? = null, val toolsOn: Int? = null, val mcpServers: Int? = null,
     val serverHealthy: Boolean? = null, /** Hermes' own overall word ("ok", "degraded", …); wins over [serverHealthy] and maps like the Health page. */ val serverOverall: String = "", val serverUpdateAvailable: Boolean? = null, val checkpointSize: String = "",
     /** The Phone access switches that are on and usable, by their English names; empty is a known "none", null is unread. */ val phoneAccess: List<String>? = null,
@@ -159,9 +162,9 @@ internal data class SettingsSnapshot(
  * so a stored `shift_enter` (not matched by the composer) is left unknown instead of being described as a shortcut.
  */
 internal fun settingsSendKeyLabel(sendKey: String): String? = when (sendKey) {
-    "enter" -> "Enter to send"
-    "ctrl_enter", "ctrl+enter" -> "Ctrl + Enter to send"
-    "shift+enter" -> "Shift + Enter to send"
+    "enter" -> "Enter sends"
+    "ctrl_enter", "ctrl+enter" -> "Enter adds a line"
+    "shift+enter" -> "Enter adds a line"
     else -> null
 }
 
@@ -215,7 +218,7 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
         "Profiles & model" -> listOfNotNull(literal(s.profile))
         "Profiles" -> listOfNotNull(literal(s.profile), if (s.profile.isBlank()) null else count("{0} profiles", s.profileCount))
         "Chat", "Settings" -> listOfNotNull(
-            settingsSendKeyLabel(s.sendKey)?.let { SettingsSummaryPart(it) },
+            settingsSendKeyLabel(s.sendKey)?.takeIf { s.hardwareKeyboard }?.let { SettingsSummaryPart(it) },
             s.showThinking?.let { SettingsSummaryPart(if (it) "Thinking shown" else "Thinking hidden") },
         )
         "Appearance" -> listOfNotNull(

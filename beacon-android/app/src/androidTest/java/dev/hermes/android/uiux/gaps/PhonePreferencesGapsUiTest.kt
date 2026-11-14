@@ -34,6 +34,7 @@ class PhonePreferencesGapsUiTest {
         compose.onNodeWithContentDescription("Refresh memory").assertIsNotEnabled()
         compose.onNodeWithTag("memory-page").assertDoesNotExist()
         compose.onNodeWithText("No notes yet").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Back").assertDoesNotExist()
+        // 8a344aec: Memory is a page under Settings (Profiles), no longer a top-level tile, so it has a Back arrow like Skills with an open skill.
+        compose.onNodeWithContentDescription("Back").assertIsDisplayed()
     }
 }

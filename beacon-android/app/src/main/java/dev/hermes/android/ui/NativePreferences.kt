@@ -14,6 +14,12 @@ internal fun nativeLanguageFor(locale: java.util.Locale): String {
 // One shared empty dictionary: English and a catalog still loading look nothing up.
 private val NoStrings = JSONObject()
 private val LocalUiStrings = staticCompositionLocalOf { NoStrings }
+/** The language the screen is shown in, set by [NativeLocalization]; blank outside it. */
+private val LocalUiLanguage = staticCompositionLocalOf { "" }
+/** The locale a date or time is drawn in: the shown language, keeping the device's own region when the device is set to that language (British English stays "12 Nov"). */
+internal fun uiLocaleFor(language: String, device: java.util.Locale): java.util.Locale =
+    if (language.isBlank() || nativeLanguageFor(device) == language) device else java.util.Locale.forLanguageTag(language)
+@Composable fun uiLocale(): java.util.Locale = uiLocaleFor(LocalUiLanguage.current, androidx.compose.ui.platform.LocalConfiguration.current.locales[0])
 internal val nativeAliases = mapOf("Conversations" to "Sessions", "Spaces" to "Workspaces", "Connect securely" to "Sign in", "Beacon password" to "Password", "Model & provider" to "Model", "Providers & models" to "Providers", "Tools & commands" to "Tools", "App updates" to "Updates", "Search conversations" to "Search sessions", "New conversation" to "New chat", "Search this conversation" to "Search in conversation", "Undo last turn" to "Undo", "Retry last turn" to "Retry", "Attach a file" to "Attach file", "Stop response" to "Stop", "Dictate message" to "Dictate", "Toolsets" to "Toolsets")
 private val whitespace = Regex("\\s+")
 internal fun normalized(value: String) = value.lowercase().replace("…", "...").replace(whitespace, " ").trim()
@@ -26,7 +32,7 @@ internal fun normalized(value: String) = value.lowercase().replace("…", "...")
     val catalogs by produceState(app.cachedTranslations, app, language) {
         if (value == null && language != "en") value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { app.readTranslations() }
     }
-    CompositionLocalProvider(LocalUiStrings provides (catalogs?.optJSONObject(language)?.takeIf { language != "en" } ?: NoStrings), content = content)
+    CompositionLocalProvider(LocalUiStrings provides (catalogs?.optJSONObject(language)?.takeIf { language != "en" } ?: NoStrings), LocalUiLanguage provides language, content = content)
 }
 /** The assistant's display name from Settings › Assistant (the app itself stays Beacon). */
 val LocalAssistantName = staticCompositionLocalOf { dev.hermes.android.data.DEFAULT_ASSISTANT_NAME }
@@ -45,3 +51,5 @@ internal fun translateUi(dictionary: JSONObject, value: String): String {
 }
 internal val EmptyUiStrings: JSONObject get() = NoStrings
 @Composable fun uiText(value: String): String = translateUi(LocalUiStrings.current, value)
+/** A translator for code that picks its text outside a composable: the current language's table, read once here. */
+@Composable internal fun uiTextLookup(): (String) -> String { val strings = LocalUiStrings.current; return { translateUi(strings, it) } }

@@ -36,7 +36,7 @@ def harness():
     def verify(*args):
         calls.append(('verify', *args))
         if results.get('verify_error'): raise LookupError()
-    app = FastAPI(); app.include_router(api.build_router(identity, body, SimpleNamespace(rpc=rpc, verify=verify)))
+    app = FastAPI(); app.include_router(api.build_router(identity, body, SimpleNamespace(rpc=rpc, verify=verify), lambda *args: None))
     return TestClient(app, headers={'x-owner': 'owner'}), calls, results
 
 def test_unauthenticated_cannot_reach_native(harness):

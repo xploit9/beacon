@@ -1,7 +1,11 @@
 package dev.hermes.android.ui
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TimePicker
@@ -16,9 +20,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.beaconOwnerSetupMessage
 import dev.hermes.android.core.json
+import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
 import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.ApiFailure
@@ -35,7 +42,15 @@ import java.util.Locale
 
 private val proactiveTimePattern = Regex("(?:[01]\\d|2[0-3]):[0-5]\\d")
 private val proactiveHealthTime = DateTimeFormatter.ofPattern("HH:mm")
-private val proactiveHealthDay = DateTimeFormatter.ofPattern("d MMM, HH:mm")
+
+/** The plain words for a failed watch check (Ponytail review 1134, N2): a cause only when the note names it unambiguously. */
+internal const val WATCH_SOURCE_SIGN_IN = "A connected source needs you to sign in again in Hermes."
+internal const val WATCH_SOURCE_NO_ANSWER = "A source did not answer."
+internal const val WATCH_CHECK_FAILED = "Couldn't check. Trying again next time."
+/** A failed setup, shown under the Refresh action, so it does not promise a retry. */
+internal const val WATCH_SETUP_FAILED = "Setup didn't finish. Refresh to see its status."
+/** The failed watch check's action: it reads the status again, so it is labelled for that. */
+internal const val PROACTIVE_FAILURE_ACTION = "Refresh"
 
 internal fun proactiveSettingsBody(
     enabled: Boolean,
@@ -44,6 +59,8 @@ internal fun proactiveSettingsBody(
     quietStart: String,
     quietEnd: String,
     preferences: AppPreferences,
+    /** The watch's chosen model as a picker key ("provider\tmodel"); blank, or the assistant's own model, is "Same as assistant". */
+    watchModelKey: String = "",
 ): JSONObject = json(
     "enabled" to enabled,
     "delivery" to delivery,
@@ -52,9 +69,42 @@ internal fun proactiveSettingsBody(
     "quiet_end" to quietEnd,
 ).apply {
     require(proactiveSettingsValid(this)) { "Choose a valid delivery, check interval, and quiet-hours time." }
+    // model stays the assistant's: nightly memory upkeep keeps it, and the watch uses it until it has a model of its own.
     if (preferences.assistantModel.isNotBlank()) put("model", preferences.assistantModel)
     if (preferences.assistantProvider.isNotBlank()) put("provider", preferences.assistantProvider)
+    // The watch's own model. "Same as assistant" saves blank, so the watch follows the assistant's model.
+    val (watchModel, watchProvider) = proactiveModelFromKey(proactiveWatchModelChoice(watchModelKey, proactiveModelKey(preferences.assistantModel, preferences.assistantProvider)))
+    put("watch_model", watchModel)
+    put("watch_provider", watchProvider)
 }
+
+/** A model and its provider as one picker key ("provider\tmodel"); blank when there is no model, which is "Same as assistant". */
+internal fun proactiveModelKey(model: String, provider: String): String = if (model.isBlank()) "" else "$provider\t$model"
+
+/** The model and provider a picker key stands for, as (model, provider); both blank for "Same as assistant". */
+internal fun proactiveModelFromKey(key: String): Pair<String, String> =
+    if (!key.contains('\t')) "" to "" else key.substringAfter('\t') to key.substringBefore('\t')
+
+/** The row's choice for a saved model: "Same as assistant" (blank) when the saved model is the assistant's own, else the saved key. */
+internal fun proactiveWatchModelChoice(savedKey: String, assistantKey: String): String = if (savedKey == assistantKey) "" else savedKey
+
+/** The watch row's readable options from the profile's model list, keyed like the picker ("provider\tid"): the provider, then the model's name. */
+internal fun proactiveModelLabels(groups: List<JSONObject>): Map<String, String> = groups.flatMap { group ->
+    val provider = group.string("provider_id")
+    val providerLabel = shortProviderLabel(group.string("provider", group.string("label", provider)))
+    group.rows("models").map { model ->
+        val id = model.string("id")
+        proactiveModelKey(id, provider) to "$providerLabel · ${modelTitle(model.string("label"), id)}"
+    }
+}.toMap()
+
+/**
+ * What the watch model row reads for each choice: [sameAsAssistant] for blank, each listed model as "provider · name", and a saved pick the list does not
+ * hold (not loaded yet, or no longer offered) by its own readable name, so the row never shows a raw id.
+ */
+internal fun proactiveWatchModelLabels(sameAsAssistant: String, listed: Map<String, String>, choice: String): Map<String, String> =
+    mapOf("" to sameAsAssistant) + listed +
+        (choice.takeIf { it.isNotBlank() && it !in listed }?.let { mapOf(it to modelTitle("", proactiveModelFromKey(it).first)) }.orEmpty())
 
 internal fun proactiveSettingsValid(settings: JSONObject): Boolean =
     settings.string("delivery") in setOf("notify", "call") &&
@@ -80,14 +130,48 @@ internal fun proactiveHealthState(proactive: JSONObject?, checking: Boolean): Pr
     else -> ProactiveHealthState.NotYet
 }
 
-/** When the watch last checked, in Hermes' clock ("21:55"); null before the first check. */
-internal fun proactiveLastCheck(proactive: JSONObject?): String? {
+/**
+ * When the watch last checked, in Hermes' zone and the phone's clock (12 or 24 hours, its locale); null before the first check.
+ * An old check carries its day, so an outage of days never reads as this afternoon.
+ */
+internal fun proactiveLastCheck(proactive: JSONObject?, is24Hour: Boolean = true, locale: Locale = Locale.getDefault()): String? {
     val checkedAt = proactive?.optJSONObject("health")?.optLong("checked_at") ?: return null
     if (checkedAt <= 0) return null
     val timezone = runCatching { ZoneId.of(proactive.string("timezone")) }.getOrDefault(ZoneId.systemDefault())
     val checked = Instant.ofEpochSecond(checkedAt).atZone(timezone)
-    // An old check carries its day, so an outage of days never reads as this afternoon.
-    return if (checked.toLocalDate() == java.time.LocalDate.now(timezone)) checked.format(proactiveHealthTime) else checked.format(proactiveHealthDay)
+    val clock = nativeClockPattern(locale, is24Hour)
+    val time = runCatching { checked.format(DateTimeFormatter.ofPattern(clock, locale)) }.getOrElse { checked.format(proactiveHealthTime) }
+    return if (checked.toLocalDate() == java.time.LocalDate.now(timezone)) time
+    else runCatching { checked.format(DateTimeFormatter.ofPattern("d MMM, $clock", locale)) }.getOrElse { "${checked.format(DateTimeFormatter.ofPattern("d MMM", locale))}, $time" }
+}
+
+/**
+ * Why the last watch check failed, in plain words: the sentence for a known kind of failure, else a generic one. The watch's
+ * note is free text the model wrote, so its own words never show (Ponytail review 1134, finding 8). Blank unless the check failed.
+ */
+internal fun proactiveFailureReason(proactive: JSONObject?): String {
+    val health = proactive?.optJSONObject("health")?.takeIf { it.string("state") == "error" } ?: return ""
+    // A failed setup writes no check time; its message is for the plugin, not the owner.
+    if (health.optLong("checked_at") <= 0) return WATCH_SETUP_FAILED
+    return proactiveNoteFailureKind(health.string("message"))
+}
+
+/**
+ * The plain sentence for a failed check's note. A cause is named only when the note names it unambiguously: a sign-in that
+ * has expired or a source that did not answer. Anything else, a 403 included (it can mean a missing permission), gets the generic one.
+ */
+internal fun proactiveNoteFailureKind(note: String): String {
+    val words = note.lowercase()
+    return when {
+        // A status code counts only in an error form (HTTP 401, status 503, 401 Unauthorized): a bare number is a count.
+        Regex("sign.?in (?:has )?expired|sign.?in again|log.?in again|re-?auth|token (?:has )?expired|invalid_grant|" +
+            "(?:http|status|error|code)[ :]+401\\b|\\b401 unauthori[sz]ed")
+            .containsMatchIn(words) -> WATCH_SOURCE_SIGN_IN
+        Regex("timed? ?out|unreachable|did not respond|no response|connection refused|" +
+            "(?:http|status|error|code)[ :]+50[234]\\b|\\b50[234] (?:bad gateway|service unavailable|gateway timeout)")
+            .containsMatchIn(words) -> WATCH_SOURCE_NO_ANSWER
+        else -> WATCH_CHECK_FAILED
+    }
 }
 
 /** How a watch state reads as a Settings status: checking moves, OK is good, quiet and not-yet are off, a failed check is an error. */
@@ -109,11 +193,32 @@ internal fun proactiveHealthStatus(state: ProactiveHealthState): SettingsStatus 
     }, modifier, testTag = "proactive-health-${state.name.lowercase()}")
 }
 
+/** Only a failed watch check shows its reason and Retry; every other state shows neither. */
+internal fun proactiveFailureDetailShown(state: ProactiveHealthState): Boolean = state == ProactiveHealthState.Failed
+
+/** The reason a failed check shows, trimmed; blank for any other state or when the check gave no reason. */
+internal fun proactiveFailureReasonShown(state: ProactiveHealthState, reason: String): String =
+    if (proactiveFailureDetailShown(state)) reason.trim() else ""
+
+/** A failed watch check's plain reason, with Refresh to read the status again; nothing for any other state. */
+@Composable internal fun ProactiveFailureDetail(state: ProactiveHealthState, reason: String, onRetry: () -> Unit, modifier: Modifier = Modifier) {
+    if (!proactiveFailureDetailShown(state)) return
+    val shown = proactiveFailureReasonShown(state, reason)
+    Column(modifier.testTag("proactive-failure-detail"), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        if (shown.isNotBlank()) Text(uiText(shown), Modifier.testTag("proactive-failure-reason"), style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        TextButton(onClick = onRetry, Modifier.heightIn(min = 48.dp).testTag("proactive-failure-retry")) { Text(uiText(PROACTIVE_FAILURE_ACTION)) }
+    }
+}
+
+/** The plugin refuses until Hermes has saved the assistant's chat, which happens at its first message; the error is built with the plugin's sentence already mapped. */
+private val noAssistantChatYet = setOf("Choose an owned assistant conversation before enabling Proactive", "Open your assistant's chat first.")
+
 internal fun proactiveErrorMessage(error: Throwable, fallback: String): String =
     beaconOwnerSetupMessage(error)
-        ?: if ((error as? ApiFailure)?.message == "Choose an owned assistant conversation before enabling Proactive")
+        ?: if ((error as? ApiFailure)?.message in noAssistantChatYet)
             "Send ${dev.hermes.android.data.currentAssistantName} a message first, then turn this on." else null
-        ?: if (isMissingBeaconPluginRoute(error)) "Update the Beacon plugin on Hermes to use Proactive."
+        ?: if (isMissingBeaconPluginRoute(error)) "Update Beacon on Hermes to use this."
         else (error as? ApiFailure)?.message?.takeIf(String::isNotBlank) ?: error.message?.takeIf(String::isNotBlank) ?: fallback
 
 internal fun proactiveLearnedNotes(proactive: JSONObject): List<String> {
@@ -200,6 +305,24 @@ internal suspend fun fetchProactiveSettings(source: BeaconClient, profile: Strin
 /** A stored "HH:mm" as the phone writes a time of day (24-hour or 12-hour); anything that does not parse stays as it is. */
 internal fun proactiveClockLabel(value: String, pattern: String, locale: Locale = Locale.getDefault()): String =
     runCatching { LocalTime.parse(value).format(DateTimeFormatter.ofPattern(pattern, locale)) }.getOrDefault(value)
+
+/** Beacon's check-in calls come between these times of day in the profile's clock (the plugin's checkups window). */
+private const val CHECKIN_WINDOW_START = "10:00"
+private const val CHECKIN_WINDOW_END = "22:00"
+
+/** The check-in window ("10:00–22:00" or "10:00 AM–10:00 PM") written the way the phone writes times, so it reads like the quiet hours beside it. */
+internal fun checkinWindowLabel(is24Hour: Boolean, locale: Locale = Locale.getDefault()): String {
+    val pattern = nativeClockPattern(locale, is24Hour)
+    return isolateBidi(proactiveClockLabel(CHECKIN_WINDOW_START, pattern, locale) + "–" + proactiveClockLabel(CHECKIN_WINDOW_END, pattern, locale))
+}
+
+/** A translated sentence that names the window as "10:00" and "22:00", with those two times written the way the phone writes them. */
+internal fun checkinSentenceInPhoneClock(sentence: String, is24Hour: Boolean, locale: Locale = Locale.getDefault()): String {
+    val pattern = nativeClockPattern(locale, is24Hour)
+    // A time the phone writes the same way stays as the sentence has it; a changed one is isolated so "10:00 PM" keeps its order in right-to-left text.
+    fun written(time: String) = proactiveClockLabel(time, pattern, locale).let { if (it == time) it else isolateBidi(it) }
+    return sentence.replace(CHECKIN_WINDOW_START, written(CHECKIN_WINDOW_START)).replace(CHECKIN_WINDOW_END, written(CHECKIN_WINDOW_END))
+}
 
 /**
  * A quiet-hours time as a Settings row whose value is the time the way the phone writes it; a tap opens the clock. [tagLabel] keeps

@@ -18,7 +18,7 @@ import org.junit.Test
 class ProfilesModelEditorGapsUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
-    private val work = NativeBot("work", "Work bot", "Route work tasks", "Use the approved work inbox.", "provider-a", "model-a", "rev")
+    private val work = NativeBot("work", "Work bot", "Route work tasks", "Use the approved work inbox.", "provider-a", "model-a")
     private val profiles = listOf(NativeBotSummary("default", "Default", "Daily help"), NativeBotSummary("work", "Work", ""))
     private class Calls { var refresh = 0; var cancel = 0; var save = 0; val drafts = mutableListOf<Pair<String, String>>() }
 

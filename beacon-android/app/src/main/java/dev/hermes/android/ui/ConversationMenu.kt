@@ -69,7 +69,7 @@ import org.json.JSONObject
 }
 
 @Composable internal fun DeleteConversationDialog(vm: BeaconViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
-    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete conversation?")) }, text = { Text(title.ifBlank { uiText("Untitled conversation") } + "\n\n" + uiText("This deletes it from Hermes on every device. It can’t be undone.")) },
+    AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Delete chat?")) }, text = { Text(title.ifBlank { uiText("Untitled chat") } + "\n\n" + uiText("This deletes it from Hermes on every device. It can’t be undone.")) },
         confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/delete", done = "Deleted", profile = profile) }, modifier = Modifier.testTag("conversation-delete-confirm")) { Text(uiText("Delete"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }
@@ -80,15 +80,5 @@ import org.json.JSONObject
         HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
         Text(label, Modifier.padding(horizontal = 12.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         HorizontalDivider(Modifier.weight(1f), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .5f))
-    }
-}
-
-/** Relay's empty-chat starters; a tap fills the composer so the prompt can still be edited. */
-@Composable internal fun StarterPrompts(onPick: (String) -> Unit) {
-    androidx.compose.foundation.layout.FlowRow(Modifier.fillMaxWidth().testTag("starter-prompts"), horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp, androidx.compose.ui.Alignment.CenterHorizontally), verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(8.dp)) {
-        listOf("What can you do?", "Plan my day", "Explain something simply").forEach { prompt ->
-            val text = uiText(prompt)
-            SuggestionChip(onClick = { onPick(text) }, label = { Text(text) })
-        }
     }
 }

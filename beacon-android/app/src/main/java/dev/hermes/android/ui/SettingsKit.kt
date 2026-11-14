@@ -78,6 +78,8 @@ internal object SettingsKit {
     val PillIconMin: Dp = 16.dp
     /** What a segment spends besides its word: padding on both sides, the check and the gap after it. */
     val SegmentChrome: Dp = 52.dp
+    /** What a segment spends with no check mark: its padding on both sides and its border. */
+    val SegmentChromeBare: Dp = 28.dp
 }
 
 /** The pill's glyph is one line of its label tall, so it grows with the text size, and is never below [SettingsKit.PillIconMin]. */
@@ -85,6 +87,12 @@ internal fun settingsPillIconSize(labelLine: Dp): Dp = maxOf(labelLine, Settings
 
 /** Whether [count] equal segments, the widest holding [widestLabel], fit side by side in [available]. */
 internal fun settingsSegmentsFit(widestLabel: Dp, count: Int, available: Dp): Boolean = count > 0 && widestLabel + SettingsKit.SegmentChrome <= available / count
+
+/**
+ * Whether [count] equal segments that draw no check mark fit side by side in [available]: the widest word plus the segment's own padding. When they do
+ * not, the History filter sizes its choices by their text and wraps, so no label is ever cut.
+ */
+internal fun historyFilterFits(widestLabel: Dp, count: Int, available: Dp): Boolean = count > 0 && widestLabel + SettingsKit.SegmentChromeBare <= available / count
 
 /** Where a setting stands: working, needs the user, failed, deliberately off or unknown, or still checking. */
 internal enum class SettingsStatus { Ok, Attention, Error, Off, Working }
@@ -241,8 +249,9 @@ private fun Modifier.kitTag(tag: String): Modifier = if (tag.isBlank()) this els
             trailing?.invoke(this)
         }
         Glass(Modifier.fillMaxWidth()) { Column(Modifier.fillMaxWidth(), content = content) }
+        // A footer is a sentence the person has to read (what happens before anything is changed): it wraps at every font size.
         if (footer.isNotBlank()) Text(footer, Modifier.padding(horizontal = 4.dp), style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
 
@@ -511,16 +520,25 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     anchorTestTag: String = "",
     valueTestTag: String = "",
     fitSegments: Boolean = false,
+    hint: String = "",
 ) {
     val labels = options.map { translatedChoiceLabel(it, optionLabels, true) }
     val segmented = resolveChoiceStyle(style, labels, LocalDensity.current.fontScale) == ChoiceStyle.Segmented
-    if (segmented && fitSegments) {
-        // The row pads 16dp on both sides; the width left is what the segments share.
-        BoxWithConstraints(modifier.fillMaxWidth()) {
-            val fits = settingsSegmentsFit(widestLabelWidth(labels), labels.size, maxWidth - 32.dp)
-            SettingsChoiceBody(label, selected, options, labels, onSelect, Modifier, icon, optionLabels, optionIcons, optionTestTags, enabled, fits, anchorTestTag, valueTestTag)
-        }
-    } else SettingsChoiceBody(label, selected, options, labels, onSelect, modifier, icon, optionLabels, optionIcons, optionTestTags, enabled, segmented, anchorTestTag, valueTestTag)
+    @Composable fun choice(rowModifier: Modifier) {
+        if (segmented && fitSegments) {
+            // The row pads 16dp on both sides; the width left is what the segments share.
+            BoxWithConstraints(rowModifier.fillMaxWidth()) {
+                val fits = settingsSegmentsFit(widestLabelWidth(labels), labels.size, maxWidth - 32.dp)
+                SettingsChoiceBody(label, selected, options, labels, onSelect, Modifier, icon, optionLabels, optionIcons, optionTestTags, enabled, fits, anchorTestTag, valueTestTag)
+            }
+        } else SettingsChoiceBody(label, selected, options, labels, onSelect, rowModifier, icon, optionLabels, optionIcons, optionTestTags, enabled, segmented, anchorTestTag, valueTestTag)
+    }
+    // [hint] is one short line under the choice that says what the options do (pass it through uiText).
+    if (hint.isBlank()) choice(modifier)
+    else Column(modifier.fillMaxWidth()) {
+        choice(Modifier)
+        Text(hint, Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp).testTag("choice-hint:$label"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
 }
 
 /** The width of the widest label in the segment's own text style, so the fit follows the language and the text size. */

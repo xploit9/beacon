@@ -358,14 +358,14 @@ private fun capabilitySummary(capability: PhoneCapability) = when (capability) {
     PhoneCapability.Calendar -> "Read, add and change events"
     PhoneCapability.Alarms -> "Set alarms and timers"
     PhoneCapability.Contacts -> "Find names and numbers"
-    PhoneCapability.Calls -> "Call saved contacts after 3 seconds"
+    PhoneCapability.Calls -> "Call saved contacts. 3 seconds to cancel."
     PhoneCapability.Messages -> "Write message drafts"
 }
 
 /** The page's fixed words that reach uiText through a variable. */
 internal val PhoneAccessLabels = listOf(
     "Calendar & reminders", "Alarms & timers", "Contacts", "Phone calls", "Messages",
-    "Read, add and change events", "Set alarms and timers", "Find names and numbers", "Call saved contacts after 3 seconds", "Write message drafts",
+    "Read, add and change events", "Set alarms and timers", "Find names and numbers", "Call saved contacts. 3 seconds to cancel.", "Write message drafts",
 )
 
 @Composable private fun ActivityRow(entry: PhoneActivityEntry) {

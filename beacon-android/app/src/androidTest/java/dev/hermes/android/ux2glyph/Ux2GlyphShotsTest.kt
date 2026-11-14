@@ -122,7 +122,7 @@ class Ux2GlyphShotsTest {
         Shot("1-appearance") { AppearanceContent("system", NativeSkins.first(), rememberAppearanceSwatches(), {}, {}) },
         Shot("2-missing-plugin") { Column(Modifier.fillMaxWidth().padding(top = 24.dp)) { MissingBeaconPluginState() } },
         Shot("3-old-plugin") { Column(Modifier.fillMaxWidth().padding(top = 24.dp)) { MissingBeaconPluginState(update = true) } },
-        Shot("4-stepper-active") { AppUpdateContent(stepper, "1.1.22", false, now, onCheck = {}, onUpdate = {}, onRetry = {}, onCancel = {}, onAllow = {}, onReview = {}) },
+        Shot("4-stepper-active") { AppUpdateContent(stepper, "1.1.22", false, now, onCheck = {}, onUpdate = {}, onRetry = {}, onCancel = {}, onAllow = {}) },
         Shot("7-presence-working") { Column(Modifier.fillMaxWidth().padding(top = 16.dp)) { BeaconPresenceCard("Beacon", "Hasn't checked yet", BeaconPresence.Working, false, false, true, {}) } },
         Shot("5-reasoning-skeleton") { Column(Modifier.fillMaxWidth().padding(16.dp)) { ReasoningSkeleton() } },
         Shot("6-settings-working") {
@@ -190,8 +190,8 @@ class Ux2GlyphShotsTest {
         }
     }
 
-    @Test(timeout = 300_000) fun fivePlacesInDark() = shoot(Look("dark", true, "en", false, 1f, "System", "Add the Beacon plugin to Hermes"))
-    @Test(timeout = 300_000) fun fivePlacesInLight() = shoot(Look("light", false, "en", false, 1f, "System", "Add the Beacon plugin to Hermes"))
-    @Test(timeout = 300_000) fun fivePlacesInArabicDarkRightToLeft() = shoot(Look("ar-dark", true, "ar", true, 1f, "النظام", "أضِف ملحق Beacon إلى Hermes"))
-    @Test(timeout = 300_000) fun fivePlacesAtLargeTextInLight() = shoot(Look("large-light", false, "en", false, 1.3f, "System", "Add the Beacon plugin to Hermes"))
+    @Test(timeout = 300_000) fun fivePlacesInDark() = shoot(Look("dark", true, "en", false, 1f, "System", "Add Beacon to Hermes"))
+    @Test(timeout = 300_000) fun fivePlacesInLight() = shoot(Look("light", false, "en", false, 1f, "System", "Add Beacon to Hermes"))
+    @Test(timeout = 300_000) fun fivePlacesInArabicDarkRightToLeft() = shoot(Look("ar-dark", true, "ar", true, 1f, "النظام", "أضِف Beacon إلى Hermes"))
+    @Test(timeout = 300_000) fun fivePlacesAtLargeTextInLight() = shoot(Look("large-light", false, "en", false, 1.3f, "System", "Add Beacon to Hermes"))
 }

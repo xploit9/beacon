@@ -10,7 +10,9 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.assertHasNoClickAction
 import androidx.compose.ui.test.assertHeightIsAtLeast
+import androidx.compose.ui.test.hasAnyAncestor
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -70,7 +72,8 @@ import org.junit.Test
 class BotModeDrawerUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
-    private val tiles = listOf("skills", "vault", "cron", "files", "projects", "kanban", "settings")
+    // The same eight slots as the normal drawer; Memory takes the Projects slot and Cron reads Routines.
+    private val tiles = listOf("skills", "vault", "cron", "files", "memory", "kanban", "settings")
     private val twoBots = listOf(BotModeBot("default", "Default", "Your main assistant"), BotModeBot("coder", "Coder", "Reviews code"))
     private val oneSpace = listOf(BotModeSpace("room-1", "Review room", listOf("default", "coder"), updatedAt = 1_700_000_000L, last = BotModePreview("coder", "Looks good to me")))
 
@@ -113,7 +116,8 @@ class BotModeDrawerUiTest {
             }
             // The sidebar reads the roster once when it opens (and, with no Hermes behind it, clears it); the roster is set after that.
             compose.waitForIdle()
-            compose.runOnIdle { roster(vm).value = state }
+            // An injected list stands for one Hermes answered, as the controller marks it.
+            compose.runOnIdle { roster(vm).value = state.copy(loaded = true) }
             compose.waitForIdle()
             block(vm)
         } finally {
@@ -148,10 +152,15 @@ class BotModeDrawerUiTest {
         // The same tiles as the normal drawer, under the buttons.
         tiles.forEach { compose.onNodeWithTag("navigation-$it").assertExists() }
         compose.onNodeWithTag("navigation-vault").assertIsEnabled().assertTextContains("Vault").assertHeightIsAtLeast(48.dp)
-        compose.onAllNodesWithTag("navigation-memory").assertCountEquals(0)
+        // Bot Mode's own tiles: the schedules are the bots' routines, and Memory takes the Projects slot.
+        compose.onNodeWithTag("navigation-cron").assertTextContains("Schedules")
+        compose.onNodeWithTag("navigation-memory").assertIsEnabled().assertTextContains("Memory").assertHeightIsAtLeast(48.dp)
+        compose.onAllNodesWithTag("navigation-projects").assertCountEquals(0)
         assertTrue("The tiles sit under the buttons", bounds("navigation-skills").top >= newSpace.bottom)
-        // One layout in both modes: the profile pill stays, and New bot and New space take the chat buttons' place.
-        compose.onNodeWithTag("navigation-profile").assertExists()
+        // One layout in both modes: a profile does not switch here, so the Bot Mode header takes the pill's place, and New bot and New space take the chat buttons' place.
+        compose.onAllNodesWithTag("navigation-profile").assertCountEquals(0)
+        compose.onNodeWithTag("bot-mode-header").assertIsDisplayed().assertTextContains("Bot Mode").assertHasNoClickAction()
+        assertTrue("The header is above the buttons", bounds("bot-mode-header").bottom <= newBot.top)
         listOf("navigation-new-chat", "navigation-new-thread").forEach { compose.onAllNodesWithTag(it).assertCountEquals(0) }
         // The Bots tile shows Bot Mode is on; a tap on it leaves.
         compose.onNodeWithTag("navigation-bots").assertIsDisplayed().assertIsSelected().assertHeightIsAtLeast(48.dp).assertTextContains("Bots")
@@ -184,13 +193,13 @@ class BotModeDrawerUiTest {
     ) { vm ->
         // The coder is typing in the open space; the default bot is in one shared space.
         compose.onNodeWithTag("bot-row-coder").assertTextContains("Reviews code").assertTextContains("Typing…")
-        compose.onNodeWithTag("bot-row-default").assertTextContains("Your main assistant").assertTextContains("Spaces: 1")
+        compose.onNodeWithTag("bot-row-default").assertTextContains("Your main assistant").assertTextContains("In 1 space")
         compose.runOnIdle { roster(vm).value = roster(vm).value.copy(typing = emptyList()) }
-        compose.onNodeWithTag("bot-row-coder").assertTextContains("Spaces: 1")
+        compose.onNodeWithTag("bot-row-coder").assertTextContains("In 1 space")
         // The recent-spaces list is cut: a count would be too low, so none is shown.
         compose.runOnIdle { roster(vm).value = roster(vm).value.copy(moreSpaces = true) }
         compose.onNodeWithTag("bot-row-default").assertTextContains("Your main assistant")
-        compose.onAllNodesWithText("Spaces: 1", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("In 1 space", substring = true).assertCountEquals(0)
     }
 
     @Test fun aSpaceRowShowsItsNameMembersAndNewestLine() = withDrawer { _ ->
@@ -230,6 +239,27 @@ class BotModeDrawerUiTest {
         }
     }
 
+    @Test fun theHeaderIsBeaconsMarkAndTheWordsBotModeAndIsATitleNotAButton() = withDrawer { _ ->
+        val header = compose.onNodeWithTag("bot-mode-header").assertIsDisplayed().assertHasNoClickAction().assertHeightIsAtLeast(56.dp)
+        header.assertTextContains("Bot Mode")
+        // Beacon's dust mark stands beside the words; the bots' own avatars are in the list below, not in the header, and nothing here switches a profile.
+        compose.onNodeWithTag("bot-mode-header-mark", useUnmergedTree = true).assertExists()
+        compose.onAllNodes(hasTestTag("group-avatars") and hasAnyAncestor(hasTestTag("bot-mode-header")), useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodesWithTag("navigation-profile-menu").assertCountEquals(0)
+    }
+
+    @Test fun anEmptyRosterKeepsTheSameHeader() = withDrawer(NativeBotModeState()) { _ ->
+        compose.onNodeWithTag("bot-mode-header").assertIsDisplayed().assertTextContains("Bot Mode")
+        compose.onNodeWithTag("bot-mode-header-mark", useUnmergedTree = true).assertExists()
+    }
+
+    @Test fun theMemoryTileOpensMemoryAndRoutinesOpensTheSchedules() = withDrawer { vm ->
+        compose.onNodeWithTag("navigation-memory").performClick()
+        compose.waitUntil(5_000) { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Memory" }
+        compose.onNodeWithTag("navigation-cron").performClick()
+        compose.waitUntil(5_000) { vm.ui.value.tab == "Tasks" }
+    }
+
     @Test fun theControlsAreOffWhileBotModeSwitches() = withDrawer { vm ->
         compose.runOnIdle { ui(vm).value = ui(vm).value.copy(botModeSwitching = true) }
         compose.onNodeWithTag("navigation-bots").assertIsNotEnabled()
@@ -244,7 +274,8 @@ class BotModeDrawerUiTest {
         assertEquals(newBot.left.value, newSpace.left.value, 0.5f)
         assertEquals(newBot.width.value, newSpace.width.value, 0.5f)
         // At large text the grid keeps its four main tiles and More, as in the normal drawer.
-        listOf("cron", "files", "projects", "settings", "more").forEach { compose.onNodeWithTag("navigation-$it").assertExists() }
+        listOf("cron", "files", "memory", "settings", "more").forEach { compose.onNodeWithTag("navigation-$it").assertExists() }
+        compose.onAllNodesWithTag("navigation-projects").assertCountEquals(0)
         assertTrue("The tiles are under New space", newSpace.bottom <= bounds("navigation-cron").top)
         listOf("New bot", "New space").forEach(::assertSingleUnclippedLine)
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-suggested-roles"))

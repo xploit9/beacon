@@ -63,7 +63,7 @@ internal fun restampableKeepConnectedSource(existing: JSONObject, scope: Scope, 
 internal fun pushTargetRetained(target: String, bindings: List<JSONObject>): Boolean = bindings.any { it.string("target") == target }
 internal fun pushDeviceAuthorized(removed: Boolean, registeredDevice: String, currentDevice: String?): Boolean =
     !removed && (registeredDevice.isBlank() || registeredDevice == currentDevice)
-private const val ADD_PHONE_AGAIN = "Add this phone again in Settings › Connection before turning on notifications"
+private const val ADD_PHONE_AGAIN = "Sign in again in Settings › Connection to turn on notifications."
 /**
  * A push registration from a phone Hermes no longer knows is a 403 `device_required`: link again and retry once. ApiFailure
  * carries that code as plain words, so compare through the same mapping; a removed phone (`device_removed`) maps to other words and is refused.
@@ -174,7 +174,7 @@ class PushManager(private val app: BeaconApplication) {
     }
     private suspend fun registerCurrent(client: BeaconClient, rotatedToken: String?): String {
         require(app.firebaseConfigured) { "Firebase is not configured in this build. Set the owner Firebase project before enabling background push." }
-        require(app.auth.read(client.auth.origin).authorizesPushSource(client.scope)) { "Sign in to this owner account before registering notifications" }
+        require(app.auth.read(client.auth.origin).authorizesPushSource(client.scope)) { "Sign in to this account to get notifications." }
         // The plugin takes a push target only from a linked phone, so link first; an automatic link leaves a removed phone alone (null).
         var deviceId: String = requireNotNull(NativePairing.deviceId(app, client.scope)
             ?: if (privatePrefs.getBoolean(removedKey(client.scope), false)) null else NativePairing.link(app, client, explicit = false)) { ADD_PHONE_AGAIN }
@@ -443,7 +443,7 @@ class PushManager(private val app: BeaconApplication) {
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val callback = PendingIntent.getActivity(app, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         try { manager.notify(invite.key, 2, NotificationCompat.Builder(app, alertingChannel(manager, "hermes-messages")).setSmallIcon(R.drawable.ic_beacon_notification)
-            .setContentTitle("Beacon · Missed call").setContentText("Open Beacon to call back or view its history.")
+            .setContentTitle("Beacon · Missed call").setContentText("Tap to call back.")
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setSilent(true).setAutoCancel(true).setContentIntent(callback)
             .addAction(R.drawable.ic_beacon_logo, "Call back", callback).build()) } catch (_: SecurityException) { /* Notification permission was revoked. */ }
     }

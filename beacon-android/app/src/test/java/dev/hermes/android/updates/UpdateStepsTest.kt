@@ -24,7 +24,7 @@ class UpdateStepsTest {
         var read = 0
         val calls = mutableListOf<String>()
         override suspend fun version(): PluginVersions = reads[minOf(read++, reads.lastIndex)].also { calls += "version" }
-        override suspend fun update(acceptCapabilities: Boolean): JSONObject { calls += "update"; return update() }
+        override suspend fun update(): JSONObject { calls += "update"; return update.invoke() }
         override suspend fun restart(last: RestartMemo, remember: (RestartMemo) -> Unit): RestartResult { calls += "gateway"; return gateway }
         override suspend fun restartDashboard(onReconnecting: (Boolean) -> Unit): DashboardRestartResult {
             calls += "dashboard"
@@ -38,7 +38,7 @@ class UpdateStepsTest {
     private fun run(endpoint: PluginEndpoint, restartOnly: Boolean = false, memo: RestartMemo = RestartMemo()): Run {
         val history = mutableListOf<List<StepRow>>()
         val tracker = StepTracker { history += it }
-        val row = runBlocking { runPluginUpdate(endpoint, target, accept = false, restartOnly = restartOnly, memo = memo, steps = tracker, pause = {}) }
+        val row = runBlocking { runPluginUpdate(endpoint, target, restartOnly = restartOnly, memo = memo, steps = tracker, pause = {}) }
         return Run(row, history, tracker.rows)
     }
 
@@ -103,7 +103,7 @@ class UpdateStepsTest {
         assertTrue(PluginRowStrings.containsAll(StepNote.all))
         assertTrue(PluginRowStrings.containsAll(StepStateText.all))
         assertTrue(PluginRowStrings.containsAll(HeroActionStrings))
-        assertEquals(setOf("Downloading", "Installing", "Verifying", "Restarting Hermes gateway", "Restarting Hermes dashboard", "Done"), UpdateStepStrings.toSet())
+        assertEquals(setOf("Downloading", "Installing", "Verifying", "Restarting Hermes", "Restarting the dashboard", "Done"), UpdateStepStrings.toSet())
     }
 
     // ---- a plugin update, step by step
@@ -243,13 +243,6 @@ class UpdateStepsTest {
         assertEquals(PluginStatus.Failed, result.row.status)
         assertEquals(UpdateStep.PluginInstall, result.steps.failed?.step)
         assertEquals(StepState.Done, result.steps.state(UpdateStep.PluginDownload))
-    }
-
-    @Test fun anUpdateThatNeedsReviewShowsNoStepsAtAll() {
-        val endpoint = Fake(listOf(versions("1.1.22", "1.1.22")), update = { JSONObject().put("consent_required", true) })
-        val result = run(endpoint)
-        assertEquals(PluginStatus.NeedsReview, result.row.status)
-        assertTrue(result.steps.isEmpty())
     }
 
     @Test fun anUpToDatePluginHasNothingToWalkThrough() {

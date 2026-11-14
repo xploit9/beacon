@@ -54,12 +54,16 @@ class NativeGatewayProtocolTest {
         var activeListFailure = false
         var replayEpoch = "epoch-a"
         var replayTruncated = false
-        var securePrompts = false
+        var openRequests = JSONArray()
         var emitReady = true
         var readyPayload: JSONObject? = json()
+        /** Hermes' `commands.catalog` answer; null keeps the one-command default. */
+        var catalog: JSONObject? = null
+        /** A shared gateway's resume: one id for the chat (gateway/session_controls.py), as a canonical binding requires. */
+        var canonicalResume = false
+        /** A JSON-RPC error (code, message) Hermes answers a method with instead of a result. */
+        val rpcErrors = mutableMapOf<String, Pair<Int, String>>()
         val opened = CompletableDeferred<Unit>()
-        var capabilityEntered: java.util.concurrent.CountDownLatch? = null
-        var capabilityRelease: java.util.concurrent.CountDownLatch? = null
         var legacyPhotoHistory = false
         var historyProfile = "work"
         var historyMessages = JSONArray()
@@ -85,6 +89,9 @@ class NativeGatewayProtocolTest {
                 override fun send(text: String): Boolean {
                     val call = JSONObject(text); sent.add(call)
                     if (!call.has("method")) return true
+                    rpcErrors[call.getString("method")]?.let { (code, message) ->
+                        listener.onMessage(this, json("jsonrpc" to "2.0", "id" to call.getString("id"), "error" to json("code" to code, "message" to message)).toString()); return true
+                    }
                     if (failPrompt && call.getString("method") == "prompt.submit") {
                         listener.onFailure(this, IOException("Lost response"), null); return true
                     }
@@ -94,7 +101,7 @@ class NativeGatewayProtocolTest {
                             "messages" to JSONArray((0 until historyMessages.length()).map { index -> historyMessages.getJSONObject(index).let { row ->
                                 json("role" to row.string("role"), "text" to displayText(row, call.getJSONObject("params").optBoolean("inline_images", true)), "row_id" to row.opt("id")).apply { if (row.has("display_kind")) put("display_kind", row.opt("display_kind")) }
                             } })).apply { if (resumeWorking) put("running", true).put("status", "working").put("inflight", json("user" to "Existing turn")) }
-                        "session.events.since" -> json("epoch" to replayEpoch, "latest_seq" to 2, "events" to replayEvents, "truncated" to replayTruncated)
+                        "session.events.since" -> json("epoch" to replayEpoch, "latest_seq" to 2, "events" to replayEvents, "truncated" to replayTruncated, "open_requests" to openRequests)
                         "session.history" -> if (legacyPhotoHistory) json("messages" to JSONArray().put(json("role" to "user", "text" to
                             "data:image/jpeg;base64," + java.util.Base64.getEncoder().encodeToString(ByteArray(7 * 1024 * 1024))))) else JSONObject()
                         "session.active_list" -> { if (activeListFailure) throw IllegalArgumentException("Synthetic status failure"); json("sessions" to activeSessions) }
@@ -112,11 +119,12 @@ class NativeGatewayProtocolTest {
                             if (key == "yolo" && !ignoreYoloWrite && echo == (if (value in setOf("1", "on")) "1" else "0")) savedYolo = value in setOf("1", "on", "true")
                             json("key" to key, "value" to echo)
                         }
-                        "commands.catalog" -> json("pairs" to JSONArray().put(JSONArray().put("/help").put("Help")))
+                        "commands.catalog" -> catalog ?: json("pairs" to JSONArray().put(JSONArray().put("/help").put("Help")))
                         "session.set_hidden" -> json("session_key" to call.getJSONObject("params").string("session_id"), "hidden" to call.getJSONObject("params").getBoolean("hidden"))
                         "session.archive" -> { savedArchived = call.getJSONObject("params").getBoolean("archived"); json("session_key" to call.getJSONObject("params").string("session_id"), "archived" to savedArchived) }
                         else -> JSONObject()
                     }
+                    if (canonicalResume && call.getString("method") == "session.resume") result.put("session_id", "stored-a").put("stored_session_id", "stored-a")
                     listener.onMessage(this, json("jsonrpc" to "2.0", "id" to call.getString("id"), "result" to result).toString())
                     return true
                 }
@@ -149,11 +157,6 @@ class NativeGatewayProtocolTest {
             val payload = when {
                 path == CANONICAL_TICKET_PATH -> json("detail" to "Not Found")
                 voice -> json("session_id" to "stored-a", "profile" to "work", "events" to JSONArray())
-                path == "/api/plugins/beacon/mobile/vault/capabilities" -> {
-                    wire?.capabilityEntered?.countDown()
-                    wire?.capabilityRelease?.await(3, java.util.concurrent.TimeUnit.SECONDS)
-                    json("capabilities" to json("secure_prompts" to (wire?.securePrompts == true)))
-                }
                 path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "work", "title" to "Fixture title", "message_count" to 0, "model" to wire?.profileModel,
                     "archived" to if (wire?.savedArchived == true) 1 else 0,
                     "model_config" to json("yolo_mode" to (wire?.savedYolo ?: (wire?.sessionBypass == true))).toString())
@@ -548,6 +551,66 @@ class NativeGatewayProtocolTest {
         assertTrue(runCatching { c.post("/api/chat/start", json("message" to "missing selection")) }.isFailure)
         assertTrue(wire.sent.none { it.getString("method") == "session.create" })
     }
+    /** Hermes' catalog for one profile: built-ins, a quick command, a plugin command and a skill (tui_gateway/command_discovery.py `command_catalog`). */
+    private fun hermesCatalog() = json(
+        "pairs" to JSONArray(listOf(listOf("/help", "Show available commands"), listOf("/new", "Start a new session"), listOf("/history", "Show conversation history"),
+            listOf("/model", "Switch model"), listOf("/queue", "Queue a prompt"), listOf("/usage", "Show token usage"), listOf("/logs", "Show recent gateway log lines"),
+            listOf("/standup", "exec: ./standup.sh"), listOf("/deploy", "Ship it"), listOf("/research", "Research a topic")).map { JSONArray(it) }),
+        "categories" to JSONArray().put(json("name" to "User commands", "pairs" to JSONArray().put(JSONArray(listOf("/standup", "exec: ./standup.sh")))))
+            .put(json("name" to "Plugin commands", "pairs" to JSONArray().put(JSONArray(listOf("/deploy", "Ship it"))))),
+        "skills" to json("/research" to json("usage" to 1, "origin" to "local")),
+    )
+    @Test fun onASharedGatewayTheCatalogMarksTheBuiltInsItWillNotRunForThePhone() = runBlocking<Unit> {
+        val wire = Wire().apply { readyPayload = json("session_authority" to true); catalog = hermesCatalog() }; val c = client(wire)
+        try {
+            val rows = c.get("/api/commands/catalog").getJSONArray("commands").let { list -> (0 until list.length()).map { list.getJSONObject(it) } }.associateBy { it.string("name") }
+            // gateway/session_commands.py runs help and usage and refuses new, history and the terminal extra logs; the phone runs model and queue itself.
+            assertEquals(setOf("new", "history", "logs"), rows.filterValues { it.has("runs") && !it.optBoolean("runs") }.keys)
+            for (own in listOf("standup", "deploy", "research")) assertTrue(own, rows.getValue(own).optBoolean("own") && !rows.getValue(own).has("runs"))
+        } finally { c.closeNative() }
+    }
+    @Test fun withoutASharedGatewayHermesRunsEveryBuiltInSoNoneIsMarked() = runBlocking<Unit> {
+        val wire = Wire().apply { catalog = hermesCatalog() }; val c = client(wire)
+        try {
+            val rows = c.get("/api/commands/catalog").getJSONArray("commands")
+            assertEquals(10, rows.length())
+            assertTrue((0 until rows.length()).none { rows.getJSONObject(it).has("runs") })
+        } finally { c.closeNative() }
+    }
+    @Test fun onASharedGatewayACommandRunsThroughSlashExecLikeHermesOwnClients() = runBlocking<Unit> {
+        val wire = Wire().apply { readyPayload = json("session_authority" to true); canonicalResume = true }; val c = client(wire)
+        try {
+            c.post("/api/commands/exec", json("session_id" to "stored-a", "name" to "help", "argument" to ""))
+            c.post("/api/commands/exec", json("session_id" to "stored-a", "name" to "/usage", "argument" to "  "))
+            c.post("/api/commands/exec", json("session_id" to "stored-a", "name" to "title", "argument" to "Trip plan"))
+            val runs = wire.sent.filter { it.string("method") == "slash.exec" }.map { it.getJSONObject("params") }
+            assertEquals(listOf("help", "usage", "title Trip plan"), runs.map { it.string("command") })
+            assertTrue(runs.all { it.string("session_id") == "stored-a" })
+            assertTrue(wire.sent.none { it.string("method") == "command.dispatch" })
+        } finally { c.closeNative() }
+    }
+    /** Review R26 Should 1: without a shared gateway, slash.exec would run a client-run command such as /new in Hermes' slash worker, not in this chat. */
+    @Test fun withoutASharedGatewayACommandGoesToCommandDispatchNeverToTheSlashWorker() = runBlocking<Unit> {
+        val wire = Wire(); val c = client(wire)
+        try {
+            c.post("/api/commands/exec", json("session_id" to "stored-a", "name" to "new", "argument" to ""))
+            c.post("/api/commands/exec", json("session_id" to "stored-a", "name" to "research", "argument" to "tides"))
+            val dispatched = wire.sent.filter { it.string("method") == "command.dispatch" }.map { it.getJSONObject("params") }
+            assertEquals(listOf("new" to "", "research" to "tides"), dispatched.map { it.string("name") to it.string("arg") })
+            assertTrue(dispatched.all { it.string("session_id") == "runtime-a" })
+            assertTrue(wire.sent.none { it.string("method") == "slash.exec" })
+        } finally { c.closeNative() }
+    }
+    @Test fun aCommandHermesRefusesIsNotAskedAgainAndSaysItWorksOnlyOnAComputer() = runBlocking<Unit> {
+        // A shared gateway refuses what it does not run with unsupported_command, code 4001 (gateway/session_commands.py:456-458, session_controls.py:369-373).
+        val wire = Wire().apply { readyPayload = json("session_authority" to true); canonicalResume = true; rpcErrors["slash.exec"] = 4001 to "unsupported_command" }; val c = client(wire)
+        try {
+            val error = runCatching { c.post("/api/commands/exec", json("session_id" to "stored-a", "name" to "history", "argument" to "")) }.exceptionOrNull()
+            assertTrue("$error", error is ApiFailure)
+            assertEquals("This command works only on a computer.", appErrorText(error!!))
+            assertTrue(wire.sent.none { it.string("method") == "command.dispatch" })
+        } finally { c.closeNative() }
+    }
     @Test fun catalogBrowsingDoesNotCreateAndArchivedSearchUsesBoundedIdentities() = runBlocking<Unit> {
         val wire = Wire(); val c = client(wire)
         val catalog = c.get("/api/commands/catalog")
@@ -563,7 +626,7 @@ class NativeGatewayProtocolTest {
         assertTrue(wire.sent.none { it.getString("method") == "session.create" })
     }
     @Test(timeout = 10000) fun aVerifiedSecurePromptUsesItsOriginalSocketOnlyOnce() = runBlocking {
-        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
         val binding = gateway.session("stored-a")
         val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
@@ -589,29 +652,92 @@ class NativeGatewayProtocolTest {
         } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
     }
 
-    @Test(timeout = 10000) fun securePromptCapabilityMustBeExplicitAndCancellationRetiresTheRequest() = runBlocking {
-        for (allowed in listOf(false, true)) {
-            val wire = Wire().apply { securePrompts = allowed }; val c = client(wire); val gateway = NativeGateway(c, wire)
-            val binding = gateway.session("stored-a")
-            val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
-            val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+    @Test(timeout = 10000) fun aSecurePromptNeedsNoPluginRouteAndCancellationRetiresTheRequest() = runBlocking {
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("secure-cancel", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+            val shown = withTimeoutOrNull(1500) { prompts.receive() }
+            assertNotNull("Hermes' own question reaches the phone with no plugin route involved", shown)
+            assertTrue("The app asked no plugin route", wire.httpRequests.none { it.url.encodedPath.startsWith("/api/plugins/beacon/mobile/vault") })
+            wire.cancelRequest("secure-cancel", "vault.code")
+            val marker = shown!!.getJSONObject("params").optString("secure_connection")
+            assertTrue(runCatching { gateway.answerServerRequest("vault.code", "secure-cancel", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to marker)) }.isFailure)
+            assertTrue(wire.sent.none { !it.has("method") && it.optString("id") == "secure-cancel" && it.has("result") })
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun eachSecurePromptKeepsHermesOwnWindowNotAShorterOne() = runBlocking {
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        val collector = launch { gateway.events { if (it.optString("method").startsWith("vault.")) prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            val windows = mapOf("vault.save_login" to 180_000L, "vault.code" to 180_000L, "vault.unlock_prompt" to 120_000L)
+            windows.entries.forEachIndexed { index, (method, expected) ->
+                val params = json("session_id" to binding.runtimeSessionId)
+                when (method) {
+                    "vault.save_login" -> params.put("origin", "https://example.test").put("site", "example.test")
+                    "vault.code" -> params.put("site", "example.test")
+                    else -> params.put("backend", "onepassword").put("display_name", "1Password")
+                }
+                val before = System.nanoTime() / 1_000_000
+                wire.secureRequest("window-$index", method, params)
+                val left = withTimeout(3000) { prompts.receive() }.getJSONObject("params").getLong("secure_expires_ms") - before
+                assertTrue("$method keeps Hermes' ${expected / 1000} s, not a shorter one (left $left ms)", left in (expected - 5_000)..(expected + 1_000))
+            }
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun aQuestionOpenWhenTheScreenStopsListeningComesBackOnReplayWithItsOriginalDeadline() = runBlocking {
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        var collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+        try {
+            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
+            wire.secureRequest("held-1", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
+            val first = withTimeout(3000) { prompts.receive() }.getJSONObject("params")
+            collector.cancelAndJoin() // the app leaves the screen: the chat stops collecting
+            assertTrue("A question nobody can see cannot be answered", runCatching { gateway.answerServerRequest("vault.code", "held-1", binding.runtimeSessionId,
+                json("value" to "123456", "secure_connection" to first.getString("secure_connection"))) }.isFailure)
+            assertTrue("Hermes was not told 'no'", wire.sent.none { !it.has("method") && it.optString("id") == "held-1" })
+            delay(30)
+            wire.openRequests = JSONArray().put(json("id" to "held-1", "method" to "vault.code", "params" to json("session_id" to binding.runtimeSessionId, "site" to "example.test")))
+            collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
+            val again = withTimeout(3000) { prompts.receive() }.getJSONObject("params")
+            assertEquals("The same question returns", "example.test", again.getString("site"))
+            assertEquals("It keeps Hermes' original deadline", first.getLong("secure_expires_ms"), again.getLong("secure_expires_ms"))
+            assertTrue(gateway.answerServerRequest("vault.code", "held-1", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to again.getString("secure_connection"))).optBoolean("ok"))
+            assertEquals(1, wire.sent.count { !it.has("method") && it.optString("id") == "held-1" && it.has("result") })
+        } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
+    }
+
+    @Test(timeout = 10000) fun aQuestionThatArrivesWhileNoScreenListensTellsTheAppOnceAndWaitsInTheQueue() = runBlocking {
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
+        val binding = gateway.session("stored-a")
+        val told = java.util.concurrent.CopyOnWriteArrayList<String>()
+        NativeGateway.secureAwaiting = { _, method -> told += method }
+        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        try {
+            wire.secureRequest("away-1", "vault.save_login", json("session_id" to binding.runtimeSessionId, "origin" to "https://example.test", "site" to "example.test"))
+            withTimeout(3000) { while (told.isEmpty()) yield() }
+            assertEquals(listOf("vault.save_login"), told.toList())
+            val collector = launch { gateway.events { if (it.optString("method") == "vault.save_login") prompts.send(it) } }
             try {
-                withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
-                wire.secureRequest("secure-cancel", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
-                val shown = withTimeoutOrNull(1000) { prompts.receive() }
-                if (allowed) {
-                    assertNotNull("A verified request must reach its own session", shown)
-                    wire.cancelRequest("secure-cancel", "vault.code")
-                } else assertNull("A server without verified secure prompts cannot ask for a secret", shown)
-                val marker = shown?.getJSONObject("params")?.optString("secure_connection").orEmpty()
-                assertTrue(runCatching { gateway.answerServerRequest("vault.code", "secure-cancel", binding.runtimeSessionId, json("value" to "123456", "secure_connection" to marker)) }.isFailure)
-                assertTrue(wire.sent.none { !it.has("method") && it.optString("id") == "secure-cancel" && it.has("result") })
-            } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
-        }
+                val shown = withTimeout(3000) { prompts.receive() }.getJSONObject("params")
+                assertEquals("The queued question is delivered when the app returns", "https://example.test", shown.getString("origin"))
+                assertEquals("Being listened to, it does not tell the app again", 1, told.size)
+            } finally { collector.cancelAndJoin() }
+        } finally { NativeGateway.secureAwaiting = null; gateway.close(); c.closeNative() }
     }
 
     @Test(timeout = 10000) fun sameIdOnTwoSocketsCanOnlyBeAnsweredOnTheMarkedOriginalSocket() = runBlocking {
-        val firstWire = Wire().apply { securePrompts = true }; val secondWire = Wire().apply { securePrompts = true }
+        val firstWire = Wire(); val secondWire = Wire()
         val firstClient = client(firstWire); val secondClient = client(secondWire)
         val first = NativeGateway(firstClient, firstWire); val second = NativeGateway(secondClient, secondWire)
         val firstBinding = first.session("stored-a"); val secondBinding = second.session("stored-a")
@@ -644,8 +770,8 @@ class NativeGatewayProtocolTest {
     }
 
     @Test(timeout = 15000) fun idlePeersCannotHideOriginalSocketPrompts() = runBlocking {
-        val c = client(Wire().apply { securePrompts = true })
-        val peers = List(160) { Wire().apply { securePrompts = true }.let { wire -> NativeGateway(c, wire) to wire } }
+        val c = client(Wire())
+        val peers = List(160) { Wire().let { wire -> NativeGateway(c, wire) to wire } }
         val byGateway = peers.toMap()
         val field = NativeGateway::class.java.getDeclaredField("gateways").apply { isAccessible = true }
         @Suppress("UNCHECKED_CAST") val registry = field.get(null) as MutableSet<NativeGateway>
@@ -680,7 +806,7 @@ class NativeGatewayProtocolTest {
     }
 
     @Test(timeout = 10000) fun anAlreadyExpiredServerPromptIsNeverPresentedOrAnswered() = runBlocking {
-        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
         val binding = gateway.session("stored-a")
         val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
@@ -694,7 +820,7 @@ class NativeGatewayProtocolTest {
     }
 
     @Test(timeout = 10000) fun closingTheOriginalSocketRemovesItsPendingSecurePrompt() = runBlocking {
-        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
         val binding = gateway.session("stored-a")
         val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         val collector = launch { try { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } } catch (_: IOException) { } }
@@ -718,7 +844,7 @@ class NativeGatewayProtocolTest {
         val store = AuthStore(object : android.content.ContextWrapper(null) {
             override fun getSharedPreferences(name: String, mode: Int) = prefs
         }, AppCipher())
-        val wire = Wire().apply { securePrompts = true }; val c = client(wire, authStore = store); val gateway = NativeGateway(c, wire)
+        val wire = Wire(); val c = client(wire, authStore = store); val gateway = NativeGateway(c, wire)
         val binding = gateway.session("stored-a")
         val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
@@ -743,25 +869,8 @@ class NativeGatewayProtocolTest {
         } finally { collector.cancelAndJoin(); gateway.close(); c.closeNative() }
     }
 
-    @Test(timeout = 10000) fun cancellationWhileCheckingSecureCapabilityCannotResurrectThePrompt() = runBlocking {
-        val entered = java.util.concurrent.CountDownLatch(1); val release = java.util.concurrent.CountDownLatch(1)
-        val wire = Wire().apply { securePrompts = true; capabilityEntered = entered; capabilityRelease = release }
-        val c = client(wire); val gateway = NativeGateway(c, wire); val binding = gateway.session("stored-a")
-        val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
-        val collector = launch { gateway.events { if (it.optString("method") == "vault.code") prompts.send(it) } }
-        try {
-            withTimeout(3000) { while (wire.sent.none { it.optString("method") == "session.events.since" }) yield() }
-            wire.secureRequest("cancel-probe", "vault.code", json("session_id" to binding.runtimeSessionId, "site" to "example.test"))
-            assertTrue(withTimeoutOrNull(3000) { while (entered.count != 0L) delay(10); true } == true)
-            wire.cancelRequest("cancel-probe", "vault.code"); release.countDown()
-            assertNull("A cancelled prompt is not presented after the capability returns", withTimeoutOrNull(500) { prompts.receive() })
-            assertTrue(runCatching { gateway.answerServerRequest("vault.code", "cancel-probe", binding.runtimeSessionId,
-                json("value" to "123456", "secure_connection" to "stale")) }.isFailure)
-        } finally { release.countDown(); collector.cancelAndJoin(); gateway.close(); c.closeNative() }
-    }
-
     @Test(timeout = 10000) fun eachVerifiedSecureMethodSendsOnlyItsValueAndDropsUnknownPromptFields() = runBlocking {
-        val wire = Wire().apply { securePrompts = true }; val c = client(wire); val gateway = NativeGateway(c, wire)
+        val wire = Wire(); val c = client(wire); val gateway = NativeGateway(c, wire)
         val binding = gateway.session("stored-a")
         val prompts = kotlinx.coroutines.channels.Channel<JSONObject>(kotlinx.coroutines.channels.Channel.UNLIMITED)
         val methods = listOf("vault.save_login", "vault.code", "vault.unlock_prompt", "secret")

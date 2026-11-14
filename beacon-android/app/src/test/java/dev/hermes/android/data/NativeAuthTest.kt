@@ -225,7 +225,7 @@ class NativeAuthTest {
         val error = assertThrows(NativeAuthException::class.java) {
             runBlocking { auth.refresh(current, { current }, { _, _ -> true }) }
         }
-        assertEquals("Couldn't reach Hermes. Check Tailscale or VPN, then try again.", error.message)
+        assertEquals("Couldn't reach Hermes. Check your network or VPN, then try again.", error.message)
         assertFalse(error.message.orEmpty().contains("Broken pipe"))
     }
 
@@ -335,7 +335,7 @@ class NativeAuthTest {
 
             val error = runCatching { exchange.await() }.exceptionOrNull()
             assertTrue(error is NativeAuthException)
-            assertEquals("Couldn't reach Hermes. Check Tailscale or VPN, then try again.", error?.message)
+            assertEquals("Couldn't reach Hermes. Check your network or VPN, then try again.", error?.message)
             assertEquals(2, requests.size)
             assertTrue(requests.all { it.url.encodedPath == "/auth/native/token" })
         }

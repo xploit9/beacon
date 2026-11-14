@@ -80,7 +80,7 @@ class AssistantVoiceSettingsUiTest {
             show { page(voiceKeyPage(provider, onKeySaved = {}, onVerified = {}, onContinueAnyway = {}, onBack = {}, removable = true, onRemoved = { removed = true })) }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("••••AB12").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithText("Saved").assertIsDisplayed()
-            compose.onNodeWithText("Your provider hears you and speaks the replies").assertIsDisplayed()
+            compose.onNodeWithText("Your provider hears you and speaks the replies").assertDoesNotExist()
             compose.onNodeWithTag("voice-key-get").assertHasClickAction()
             compose.onNodeWithTag("voice-key-test").assertIsEnabled()
             compose.onNodeWithTag("voice-key-remove").performScrollTo().performClick()
@@ -109,7 +109,8 @@ class AssistantVoiceSettingsUiTest {
             show { page(voiceChoicesPage(settingsMode = true)) }
             compose.waitUntil(5_000) { compose.onAllNodesWithText("Key saved").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("voice-hero-title").assertTextEquals("Gemini Live")
-            compose.onNodeWithText("Key on this phone").assertIsDisplayed()
+            // One chip says the key is saved; the second, "Key on this phone", is gone.
+            compose.onNodeWithText("Key on this phone").assertDoesNotExist()
             compose.onNodeWithTag("voice-provider-change").assertHasClickAction()
             compose.onAllNodesWithTag("voice-add-key").assertCountEquals(0)
             // Eight built-in voices: six cards and "More voices (2)", unless the saved voice sits further down.

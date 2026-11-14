@@ -200,11 +200,17 @@ private fun LazyListScope.serverHealth(context: Context, state: NativeServerStat
         val title = when (status) {
             SettingsStatus.Ok -> uiText("Hermes is healthy")
             SettingsStatus.Attention -> uiText("Some parts of Hermes need attention")
-            SettingsStatus.Working -> uiText("Checking...")
+            SettingsStatus.Working -> uiText("Checking…")
             else -> uiText("Health isn't available right now.")
         }
         val line = if (state.version.isBlank()) uiText("Hermes server") else uiText("Hermes {0}").replace("{0}", state.version)
         SettingsStatusHero(status, title, line = line, testTag = "server-health-hero")
+    }
+    // Hermes' own verdict can read healthy while its log shows a refused write; the newest error is said once, under the verdict.
+    if (state.recentError.isNotBlank()) item {
+        SettingsSection(testTag = "server-recent-error") {
+            SettingsValueRow(label = uiText("Hermes reported an error"), icon = Icons.Rounded.ErrorOutline, value = state.recentError, valueMaxLines = 3, testTag = "server-recent-error-row")
+        }
     }
     val components = serverComponentsShown(state.components)
     if (serverHasCache("Health", state)) item {
@@ -385,7 +391,7 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
             }
             update == null -> {
                 status = if (state.loading) SettingsStatus.Working else SettingsStatus.Off
-                title = if (state.loading) uiText("Checking...") else uiText("No update result was reported.")
+                title = if (state.loading) uiText("Checking…") else uiText("No update result was reported.")
                 line = ""
             }
             available -> {
@@ -402,7 +408,7 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
         val reviewable = requested && state.outcome == "unconfirmed" && state.canReviewUnknown
         val primary = when {
             running -> null
-            reviewable -> SettingsAction(uiText("Review unconfirmed update"), onReviewUnknown, testTag = "server-review")
+            reviewable -> SettingsAction(uiText("Check the update"), onReviewUnknown, testTag = "server-review")
             available && canApplyOnServer -> SettingsAction(uiText("Update Hermes"), onApplyUpdate, enabled = state.canApply, testTag = "server-update-apply")
             else -> null
         }
@@ -411,7 +417,7 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
     }
     if (running) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
     if (state.updateStatusFresh && state.hostBusy && !running) item {
-        SettingsSection(testTag = "server-update-busy") { SettingsValueRow(uiText("Hermes is busy with an update. New updates are blocked."), icon = Icons.Rounded.Info) }
+        SettingsSection(testTag = "server-update-busy") { SettingsValueRow(uiText("Hermes is updating. Try again when it's done."), icon = Icons.Rounded.Info) }
     }
     if (warnings.isNotEmpty()) item {
         SettingsSection(testTag = "server-update-warnings") {
@@ -432,7 +438,7 @@ private fun LazyListScope.serverUpdates(context: Context, state: NativeServerSta
         SettingsSection(testTag = "server-update-message") { SettingsValueRow(uiText(message), icon = Icons.Rounded.Info) }
     }
     if (requested && recent.isNotEmpty()) item {
-        SettingsSection(testTag = "server-update-diagnostics") { Disclosure("Update diagnostics", recent.joinToString("\n").takeLast(6000)) }
+        SettingsSection(testTag = "server-update-diagnostics") { Disclosure("Details", recent.joinToString("\n").takeLast(6000), tag = "Update diagnostics") }
     }
 }
 
@@ -441,7 +447,7 @@ private fun LazyListScope.serverCheckpoints(context: Context, state: NativeServe
         SettingsSection(testTag = "server-checkpoint-metrics") {
             SettingsMetricRow(listOf(
                 uiText("Stored") to Formatter.formatShortFileSize(context, state.checkpointBytes),
-                uiText("Sessions") to "${state.checkpoints.size}",
+                uiText("Chats") to "${state.checkpoints.size}",
             ))
         }
     }

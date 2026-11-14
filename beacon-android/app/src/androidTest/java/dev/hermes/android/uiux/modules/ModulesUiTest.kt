@@ -58,7 +58,7 @@ class ModulesUiTest {
         showSpace()
         compose.onNodeWithTag("space-empty").assertIsDisplayed()
         compose.onNodeWithText("No messages yet").assertIsDisplayed()
-        compose.onNodeWithText("Send the bots a task to start the discussion.").assertIsDisplayed()
+        compose.onNodeWithText("Send the bots a task to start the discussion.").assertDoesNotExist()
     }
 
     private fun showSchedule(paused: Boolean, calls: MutableList<String>) = compose.setContent {

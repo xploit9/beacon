@@ -1,12 +1,16 @@
 package dev.hermes.android.data
 
 import dev.hermes.android.core.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+
+private val projectCreation = Mutex()
 
 /** Native project records own membership and explicit exclusions; folders remain native. */
 internal class NativeProjects(private val client: BeaconClient) {
     private suspend fun folder(path: String): String {
-        require(path.isNotBlank() && path.length <= 4096 && path.none { it.isISOControl() }) { "Choose an existing PC folder" }
+        require(path.isNotBlank() && path.length <= 4096 && path.none { it.isISOControl() }) { "Choose a folder on the computer" }
         return client.nativeGet("/api/files", mapOf("path" to path), maxBytes = 4 * 1024 * 1024).getString("path")
     }
     /** The project that owns the chat's folder, as Hermes files it (projects.for_cwd); null when none does. */
@@ -15,10 +19,26 @@ internal class NativeProjects(private val client: BeaconClient) {
         val cwd = client.nativeGet("/api/sessions/$stored", mapOf("profile" to client.auth.profile)).string("cwd")
         return if (cwd.isBlank()) null else client.nativeRpc("projects.for_cwd", json("cwd" to cwd)).optJSONObject("project")
     }
+    /**
+     * Hermes' own projects.create never refuses a taken slug: projects_db._unique_slug quietly files a second project as "<slug>-2". So the project of one
+     * request (slug phone-<request id>) is found in projects.list (archived ones included) before it is made, and the two steps are one unit: a double tap
+     * waits for the first and gets that project back.
+     */
+    private suspend fun createOnce(request: String, name: String, description: String): JSONObject = projectCreation.withLock {
+        val slug = "phone-$request"
+        val projects = client.nativeRpc("projects.list").optJSONArray("projects") ?: error("Native project listing unavailable")
+        for (index in 0 until projects.length()) {
+            val project = projects.optJSONObject(index) ?: continue
+            if (project.string("slug") != slug) continue
+            require(project.string("name") == name && project.string("description") == description) { "This project already exists. Refresh to edit it; your draft is kept." }
+            return@withLock json("project" to project)
+        }
+        client.nativeRpc("projects.create", json("name" to name, "description" to description, "slug" to slug))
+    }
     suspend fun call(path: String, method: String, data: JSONObject): JSONObject {
         val id = data.string("id")
         fun identity(): JSONObject { require(id.matches(Regex("p_[A-Za-z0-9_-]{1,100}"))) { "Choose a saved project" }; return json("id" to id) }
-        fun description(): String = data.string("description").also { require(it.length <= 2000) { "Keep the project description under 2,000 characters. Your draft is retained." } }
+        fun description(): String = data.string("description").also { require(it.length <= 2000) { "Keep the description under 2,000 characters. Your draft is kept." } }
         fun name(): String = data.string("name").trim().also { require(it.isNotEmpty() && it.length <= 120 && it.none(Char::isISOControl)) { "Enter a project name of up to 120 characters" } }
         when (path) {
             "/api/projects" -> {
@@ -35,7 +55,7 @@ internal class NativeProjects(private val client: BeaconClient) {
                 require(method == "POST")
                 val request = data.string("request_id")
                 require(runCatching { java.util.UUID.fromString(request).toString() == request }.getOrDefault(false)) { "Reopen New project before saving" }
-                return client.nativeRequest("/api/plugins/beacon/mobile/projects", "POST", json("request_id" to request, "name" to name(), "description" to description()))
+                return createOnce(request, name(), description())
             }
             "/api/projects/update" -> {
                 require(method == "POST")

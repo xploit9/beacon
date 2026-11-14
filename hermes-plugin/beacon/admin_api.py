@@ -1,18 +1,15 @@
-"""Authorized bot reading and revision-protected native model selection."""
+"""Authorized bot list and model capabilities, plus the restart routes Hermes has no route for."""
 import asyncio
-import hashlib
 import importlib.util
 import json
+import logging
 from pathlib import Path
 import re
 import sys
+import threading
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.background import BackgroundTask
-
-
-def revision(value):
-    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()
 
 
 def reasoning_options(row):
@@ -63,62 +60,6 @@ def model_capabilities(profile, provider, model):
         return {'model': model, 'provider': provider, 'reasoning_options': options or [], 'reasoning_known': options is not None}
 
 
-def snapshot(profile):
-    from hermes_cli.web_server_profiles import _config_profile_scope
-    from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
-    with _config_profile_scope(profile), _CONFIG_MUTATION_LOCK:
-        return _snapshot_locked(profile)
-
-
-def _snapshot_locked(profile):
-    from hermes_cli.config import load_config
-    from hermes_cli.web_server_profiles import _resolve_profile_dir
-    from hermes_cli.web_routers.profiles import _profile_to_dict
-    from hermes_cli import profiles
-    model = load_config().get('model', {})
-    root = _resolve_profile_dir(profile)
-    soul = root / 'SOUL.md'
-    if soul.is_symlink() or getattr(soul, 'is_junction', lambda: False)():
-        raise HTTPException(409, 'Linked bot instructions cannot be read here')
-    try:
-        if soul.exists() and soul.stat().st_size > 128 * 1024:
-            raise HTTPException(413, 'Bot instructions are too large for the phone')
-        content = soul.read_text(encoding='utf-8-sig') if soul.exists() else ''
-    except UnicodeDecodeError:
-        raise HTTPException(409, 'Bot instructions have invalid text encoding; repair them on the computer') from None
-    except OSError:
-        raise HTTPException(503, 'Bot instructions could not be read; check them on the computer') from None
-    info = next((p for p in profiles.list_profiles(lazy_skill_count=True) if p.name == profile), None)
-    if info is None:
-        raise HTTPException(404, 'Authorized bot profile not found')
-    row = _profile_to_dict(info)
-    return {'profile': profile, 'title': row.get('bot_title') or row.get('display_name') or profile,
-            'description': row['description'], 'soul': content, 'provider': row['provider'] or '',
-            'model': row['model'] or '', 'revision': revision(model)}
-
-
-def save_model(profile, payload):
-    from hermes_cli.config import load_config, require_readable_config_before_write
-    from hermes_cli.web_server_profiles import _config_profile_scope, _resolve_profile_dir
-    from hermes_cli.web_routers._common import _CONFIG_MUTATION_LOCK
-    from hermes_cli.web_routers.profiles import _write_profile_model
-    provider, model, expected = (payload.get(key) for key in ('provider', 'model', 'revision'))
-    if any(not isinstance(value, str) or not value.strip() for value in (provider, model, expected)):
-        raise HTTPException(400, 'Provider, model and original revision are required')
-    if len(provider) > 200 or len(model) > 500 or len(expected) != 64:
-        raise HTTPException(400, 'Invalid model selection')
-    with _config_profile_scope(profile), _CONFIG_MUTATION_LOCK:
-        try:
-            require_readable_config_before_write()
-        except Exception:
-            raise HTTPException(409, 'Native configuration cannot be read safely. Repair it on the computer before saving.') from None
-        if revision(load_config().get('model', {})) != expected:
-            raise HTTPException(409, 'Bot model changed elsewhere. Reload and review before saving.')
-        _write_profile_model(_resolve_profile_dir(profile), provider.strip(), model.strip())
-        return {'ok': True, 'bot': _snapshot_locked(profile)}
-
-
-
 def summaries(allowed):
     from hermes_cli import profiles
     from hermes_cli.web_routers.profiles import _profile_to_dict
@@ -143,39 +84,6 @@ def update_in_progress():
         return bool(_native_update_in_progress())  # Hermes defaults to the checkout this process runs from
     except Exception:
         return False
-
-
-async def native_update():
-    from hermes_cli.web_routers.actions import update_hermes
-    return await update_hermes()
-
-
-async def native_update_status(action_id=''):
-    from hermes_cli.web_routers.actions import get_action_status, get_update_receipt
-    action = await get_action_status('hermes-update', lines=100)
-    receipt = None
-    reader = None
-    if action_id:
-        try:
-            from hermes_cli.update_receipt import read_receipt_for_action
-            reader = read_receipt_for_action
-        except ImportError:  # Older native versions expose only the latest-receipt endpoint.
-            pass
-    if reader is not None:
-        row = await asyncio.to_thread(reader, action_id)
-        if isinstance(row, dict) and row.get('action_id') == action_id:
-            receipt = {'receipt': row}
-    else:
-        try:
-            receipt = await get_update_receipt()
-        except HTTPException as error:
-            if error.status_code != 404:
-                raise
-        if action_id and (not isinstance(receipt, dict) or
-                          not isinstance(receipt.get('receipt'), dict) or receipt['receipt'].get('action_id') != action_id):
-            receipt = None
-    busy = bool(isinstance(action, dict) and action.get('running')) or await asyncio.to_thread(update_in_progress)
-    return {'action': action, 'receipt': receipt, 'host_busy': busy}
 
 
 def restart_error_code(result):
@@ -215,32 +123,72 @@ def dashboard_restarter():
     return module
 
 
-def current_receipt(state, requested_at, action_id):
-    from datetime import datetime
-    if not requested_at or not action_id:
-        return False
+# Turning Beacon on for another profile. Hermes gates a plugin per profile (its own plugins.enabled) and has no profile-scoped enable route; its name
+# resolver only sees the active profile's plugins, so the key is resolved here, where Beacon is installed (the dashboard's profile), and Hermes' own
+# activation (the config part of `hermes plugins enable`, the PM transaction every enable surface goes through) runs inside that one profile's scope.
+# The plugin writes no file and uses no other Hermes call; compat.py and the contract test watch these private names.
+PROFILE_PLUGIN_KEY = 'beacon'
+PROFILE_PLUGIN_LOCK = threading.Lock()
+PROFILE_PLUGIN_SECONDS = 120
+log = logging.getLogger(__name__)
+
+
+class ProfilePluginBusy(Exception):
+    pass
+
+
+class ProfilePluginUnavailable(Exception):
+    pass
+
+
+class ProfilePluginMissing(Exception):
+    """Hermes found no `beacon` plugin in the dashboard's profile. Private on purpose: a KeyError or IndexError from inside Hermes is a failure, not this."""
+
+
+def enable_plugin_for_profile(profile):
+    """Beacon on for `profile` only; True when this call changed the selection, False when it was already on. Runs in a worker thread."""
+    if not PROFILE_PLUGIN_LOCK.acquire(blocking=False):
+        raise ProfilePluginBusy()
     try:
-        requested = datetime.fromisoformat(requested_at.replace('Z', '+00:00'))
-        response, action = state.get('receipt'), state.get('action')
-        candidates = [response.get('receipt') if isinstance(response, dict) else None,
-                      action.get('receipt') if isinstance(action, dict) else None]
-        for receipt in candidates:
-            if isinstance(receipt, dict) and receipt.get('action_id') == action_id:
-                try:
-                    started = datetime.fromisoformat(str(receipt.get('started_at') or '').replace('Z', '+00:00'))
-                    if started >= requested:
-                        return True
-                except (ValueError, TypeError):
-                    continue
-        return False
-    except (ValueError, TypeError, KeyError):
-        return False
-
-# Two taps at once clear and start in turn, so the second one sees the first update running.
-_update_gate = asyncio.Lock()
+        try:
+            from hermes_cli.web_server_profiles import _config_profile_scope
+            from hermes_cli import plugins_cmd
+            resolve, activate, enabled_set = plugins_cmd._resolve_plugin_key, plugins_cmd._activate_key, plugins_cmd._get_enabled_set
+        except (ImportError, AttributeError):
+            raise ProfilePluginUnavailable() from None
+        key = resolve(PROFILE_PLUGIN_KEY)
+        if key is None:
+            raise ProfilePluginMissing()
+        with _config_profile_scope(profile):
+            changed = bool(activate(key, enable=True))
+            if key not in enabled_set():
+                raise RuntimeError('Hermes did not record the selection')
+        return changed
+    finally:
+        PROFILE_PLUGIN_LOCK.release()
 
 
-def build_router(identity, read_body):
+async def read_object(request, limit):
+    """The JSON object a small request carries; refuses more than `limit` bytes, a broken body and anything that is not an object."""
+    from starlette.requests import ClientDisconnect
+    raw = bytearray()
+    try:
+        async for part in request.stream():
+            raw.extend(part)
+            if len(raw) > limit:
+                raise HTTPException(413, 'Request too large')
+    except ClientDisconnect:
+        raise HTTPException(400, 'Request disconnected before body was received') from None
+    try:
+        value = json.loads(raw or b'{}')
+    except Exception:
+        raise HTTPException(400, 'Invalid JSON') from None
+    if not isinstance(value, dict):
+        raise HTTPException(400, 'Expected object')
+    return value
+
+
+def build_router(identity):
     router = APIRouter()
 
     @router.post('/admin/plugin/restart')
@@ -305,6 +253,46 @@ def build_router(identity, read_body):
             host = None
         return restarter.public_status(restarter.read_status(restarter.status_path(mobile.home())), id, host)
 
+    @router.post('/admin/profile-plugin/enable')
+    async def enable_profile_plugin(request: Request):
+        """The owner turns Beacon on for one profile (the app asks after Hermes refused the plugin there). Idempotent; changes only that profile's plugins.enabled.
+
+        One status, one meaning, because the app acts on the status: 400 no single profile chosen; 403 profile not in the owner's list; 404 is never
+        answered here (it can only mean this plugin has no such route); 409 another turn-on is running; 422 Hermes does not know the profile; 500 Hermes
+        failed or refused; 501 this plugin or Hermes cannot do it (Beacon is not installed in the dashboard profile, or Hermes lacks the enable names);
+        503 Hermes is updating; 504 it took longer than the budget (the worker may still finish).
+        """
+        _, _, _, cfg = identity(request, owner_only=True)
+        value = await read_object(request, 512)
+        profile = value.get('profile')
+        if set(value) != {'profile'} or not isinstance(profile, str) or not 0 < len(profile) <= 80:
+            raise HTTPException(400, 'Choose one profile')
+        if profile not in cfg['profiles']:
+            raise HTTPException(403, 'Profile not authorized')
+        if await asyncio.to_thread(update_in_progress):
+            raise HTTPException(503, 'Update in progress')
+        try:
+            changed = await asyncio.wait_for(asyncio.to_thread(enable_plugin_for_profile, profile), PROFILE_PLUGIN_SECONDS)
+        except asyncio.TimeoutError:
+            raise HTTPException(504, 'Turning Beacon on is taking longer than expected. Check again in a minute.') from None
+        except ProfilePluginBusy:
+            raise HTTPException(409, 'Another change is running. Try again in a moment.') from None
+        except ProfilePluginUnavailable:
+            raise HTTPException(501, 'Turning Beacon on for a profile needs a Beacon update for this Hermes') from None
+        except ProfilePluginMissing:
+            raise HTTPException(501, 'Beacon is not installed in the dashboard profile') from None
+        except HTTPException as error:
+            # Hermes' own profile checks (unknown or invalid name); its text names nothing more than the profile.
+            if error.status_code in (400, 404):
+                raise HTTPException(422, 'Unknown profile') from None
+            log.warning('Turning Beacon on for profile %r failed: Hermes answered HTTP %s', profile, error.status_code)
+            raise HTTPException(500, 'Hermes could not turn Beacon on for this profile') from None
+        except Exception as error:
+            log.warning('Turning Beacon on for profile %r failed: %s', profile, type(error).__name__)
+            raise HTTPException(500, 'Hermes could not turn Beacon on for this profile') from None
+        log.info('Beacon turned on for profile %r (changed=%s)', profile, changed)
+        return {'ok': True, 'profile': profile, 'enabled': True, 'changed': changed}
+
     @router.get('/admin/model-capabilities')
     async def capabilities(request: Request, model: str, provider: str = ''):
         _, _, profile, _ = identity(request)
@@ -315,52 +303,9 @@ def build_router(identity, read_body):
         except Exception:
             raise HTTPException(503, 'Model capabilities could not be read. Refresh the model selection.') from None
 
-    @router.post('/admin/update')
-    async def start_update(request: Request):
-        from datetime import datetime, timezone
-        identity(request, owner_only=True)
-        async with _update_gate:
-            requested_at = datetime.now(timezone.utc).isoformat()
-            result = await native_update()
-        if result.get('already_running'):
-            return {**result, 'ok': False, 'accepted': False, 'requested_at': None,
-                    'error': 'update_already_running',
-                    'message': 'A server update is already running. Refresh its status; no new update was started.'}
-        return {**result, 'accepted': bool(result.get('ok')), 'requested_at': requested_at if result.get('ok') else None}
-
-    @router.get('/admin/update/status')
-    async def update_status(request: Request):
-        from datetime import datetime, timezone
-        identity(request, owner_only=True)
-        requested_at = request.query_params.get('requested_at', '')
-        action_id = request.query_params.get('action_id', '')
-        if len(requested_at) > 80 or len(action_id) > 128:
-            raise HTTPException(400, 'Invalid update correlation')
-        if requested_at:
-            try:
-                parsed = datetime.fromisoformat(requested_at.replace('Z', '+00:00'))
-                if parsed.tzinfo is None:
-                    raise ValueError()
-            except ValueError:
-                raise HTTPException(400, 'Update timestamp must include its time zone') from None
-        state = await native_update_status(action_id)
-        return {**state, 'server_now': datetime.now(timezone.utc).isoformat(),
-                'receipt_current': current_receipt(state, requested_at, action_id)}
-
     @router.get('/admin/bots')
     async def list_bots(request: Request):
         _, _, _, cfg = identity(request, owner_only=True)
         return await asyncio.to_thread(summaries, cfg['profiles'])
-
-    @router.get('/admin/bot')
-    async def read(request: Request):
-        _, _, profile, _ = identity(request)
-        return await asyncio.to_thread(snapshot, profile)
-
-    @router.put('/admin/bot')
-    async def write(request: Request):
-        payload = await read_body(request, limit=4096)
-        _, _, profile, _ = identity(request)
-        return await asyncio.to_thread(save_model, profile, payload)
 
     return router

@@ -40,7 +40,7 @@ class CallCleanupTest {
             cleanups++;ended=ended.afterTerminalControls(failure)
         })
         assertEquals(1,cleanups);assertTrue(ended.error.contains("Voice connection lost"))
-        assertTrue(ended.error.contains("Call stop fence failed"));assertFalse(ended.error.contains("private failure detail"))
+        assertTrue(ended.error.contains("Some of it may not be saved"));assertFalse(ended.error.contains("fence"));assertFalse(ended.error.contains("private failure detail"))
         assertFalse(finishCallOnce(closed) { cleanups++ });assertEquals(1,cleanups)
     }
     @Test fun immediateRedialWaitsForOldServiceDestructionAfterDelayedCleanup() = runBlocking {
@@ -73,7 +73,7 @@ class CallCleanupTest {
     @Test fun oldCleanupCannotOverwriteNewCallState() {
         val newCall = CallState(active = true, state = "listening", startedAt = 200)
         assertSame(newCall, newCall.afterOwnedCleanupFailure(IOException("Old DELETE failed"), false))
-        assertEquals("Call ended locally; PC call cleanup is unconfirmed", CallState().afterOwnedCleanupFailure(IOException("Current DELETE failed"), true).error)
+        assertEquals("Call ended.", CallState().afterOwnedCleanupFailure(IOException("Current DELETE failed"), true).error)
     }
     @Test fun normalHangupWinsOnceAndLateSocketFailureCannotOverwriteEndedState() {
         val closed = AtomicBoolean(false)
@@ -110,7 +110,7 @@ class CallCleanupTest {
             assertTrue(result.hostCleanupPending)
             assertEquals("idle", result.state)
             assertEquals(ended.transcript, result.transcript)
-            assertEquals("Call ended locally; PC call cleanup is unconfirmed", result.error)
+            assertEquals("Call ended.", result.error)
         }
     }
 }

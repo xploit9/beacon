@@ -57,6 +57,8 @@ class GitHubReleasesTest {
         routes[latestPath] = { MockResponse().setBody(answer.toString()).apply { if (etag != null) setHeader("ETag", etag) } }
         routes["/dl/Beacon-1.1.3.json"] = { MockResponse().setBody(meta.toString()) }
         routes["/dl/Beacon-1.1.3.apk"] = { MockResponse().setBody(Buffer().write(apk)) }
+        // The check that finds the release also asks which commit its tag names (a test that needs another answer calls serveCommit again).
+        serveCommit()
     }
 
     private fun found(from: GitHubReleases = source(), etag: String? = null) = (runBlocking { from.latest(etag) } as LatestRelease.Found)
@@ -66,11 +68,78 @@ class GitHubReleasesTest {
     private fun announced(url: String = server.url("/dl/Beacon-1.1.3.apk").toString(), size: Long = apk.size.toLong(), digest: String = sha) =
         Release(113, "1.1.3", "dev.hermes.android.stable", url, digest, size, "a".repeat(64), "1.1.3")
 
+    private val commitSha = "0123456789abcdef0123456789abcdef01234567"
+    /** The requests the server has received for [prefix], drained so a later look sees only newer ones. */
+    private fun MockWebServer.takeRequestsMatching(prefix: String): List<String> {
+        val seen = mutableListOf<String>()
+        while (true) { val request = takeRequest(50, java.util.concurrent.TimeUnit.MILLISECONDS) ?: break; request.path?.takeIf { it.startsWith(prefix) }?.let(seen::add) }
+        return seen
+    }
+    private fun serveCommit(tag: String = "v1.1.3", code: Int = 200, body: String = commitSha) {
+        routes["/repos/xploit9/beacon/commits/$tag"] = { MockResponse().setResponseCode(code).setBody(body) }
+    }
+
+    @Test fun theCommitOfTheLatestReleaseIsItsTagsCommitAskedAsABareSha() {
+        serve(); serveCommit()
+        assertEquals(PublishedCommit("1.1.3", commitSha), runBlocking { source().latestCommit() })
+        assertEquals(latestPath, server.takeRequest().path)
+        val second = server.takeRequest()
+        assertEquals("/repos/xploit9/beacon/commits/v1.1.3", second.path)
+        assertEquals("application/vnd.github.sha", second.getHeader("Accept"))
+        assertEquals("Beacon-Test", second.getHeader("User-Agent"))
+    }
+
+    @Test fun anUpdateTakesOnlyTheCommitOfTheReleaseItIsFor() {
+        serve(); serveCommit()
+        assertEquals(commitSha, runBlocking { source().latestCommit("1.1.3") }.commit)
+        refuses(UpdateException.Kind.Verification) { source().latestCommit("1.1.2") }
+        refuses(UpdateException.Kind.Verification) { source().latestCommit("") }
+    }
+
+    @Test fun anythingThatIsNotAFullLowercaseCommitFailsClosed() {
+        serve()
+        for (bad in listOf("", "main", commitSha.uppercase(), commitSha + "0", commitSha.take(39), "{\"sha\":\"$commitSha\"}", "$commitSha\n$commitSha")) {
+            serveCommit(body = bad)
+            refuses(UpdateException.Kind.Verification) { source().latestCommit() }
+        }
+        serveCommit(body = commitSha + "\n")
+        assertEquals("a trailing newline is not part of the answer", commitSha, runBlocking { source().latestCommit() }.commit)
+    }
+
+    @Test fun noReleaseADraftAPrereleaseOrAnOddTagInstallsNothing() {
+        serveCommit()
+        routes[latestPath] = { MockResponse().setResponseCode(404) }
+        refuses(UpdateException.Kind.Verification) { source().latestCommit() }
+        for (answer in listOf(announcement(complete, draft = true), announcement(complete, prerelease = true), announcement(complete).put("tag_name", ""),
+                announcement(complete).put("tag_name", "latest"), announcement(complete).put("tag_name", "../evil"), announcement(complete).put("tag_name", "v1.1.3/../x"),
+                announcement(complete).put("tag_name", "v1.1"), announcement(complete).put("tag_name", JSONObject.NULL))) {
+            serve(answer = answer)
+            refuses(UpdateException.Kind.Verification) { source().latestCommit() }
+        }
+        routes[latestPath] = { MockResponse().setBody("not json") }
+        refuses(UpdateException.Kind.Verification) { source().latestCommit() }
+    }
+
+    @Test fun aTagWithNoCommitIsRefusedAndAGitHubOutageIsANetworkFailure() {
+        serve()
+        for (code in listOf(404, 422)) { serveCommit(code = code, body = "{}"); refuses(UpdateException.Kind.Verification) { source().latestCommit() } }
+        serveCommit(code = 500, body = "{}")
+        refuses(UpdateException.Kind.Network) { source().latestCommit() }
+        routes[latestPath] = { MockResponse().setResponseCode(503) }
+        refuses(UpdateException.Kind.Network) { source().latestCommit() }
+    }
+
+    @Test fun theCommitIsAskedOnlyOverHttps() {
+        serve(); serveCommit()
+        // The real defaults refuse plain HTTP.
+        refuses(UpdateException.Kind.Verification) { source(secure = true).latestCommit() }
+    }
+
     @Test fun theLatestReleaseBecomesOneUpdateAndOtherAssetsAreIgnored() {
         serve()
         val result = found()
         val release = result.release!!
-        assertEquals(Release(113, "1.1.3", "dev.hermes.android.stable", server.url("/dl/Beacon-1.1.3.apk").toString(), sha, apk.size.toLong(), "a".repeat(64), "1.1.3", "## What's new\n- Faster updates", "2026-10-24T09:00:00Z"), release)
+        assertEquals(Release(113, "1.1.3", "dev.hermes.android.stable", server.url("/dl/Beacon-1.1.3.apk").toString(), sha, apk.size.toLong(), "a".repeat(64), "1.1.3", "## What's new\n- Faster updates", "2026-10-24T09:00:00Z", commitSha), release)
         assertEquals("\"v1\"", result.etag)
         val request = server.takeRequest()
         assertEquals(latestPath, request.path)
@@ -138,13 +207,72 @@ class GitHubReleasesTest {
         serve(); assertNotNull(found().release)
     }
 
-    @Test fun anUnreadableAnswerIsRefusedAndRateLimitingIsANetworkProblem() {
+    @Test fun anUnreadableAnswerIsRefusedAndGitHubSayingNotNowIsBusyNotNoRelease() {
         routes[latestPath] = { MockResponse().setBody("not json") }
         refuses(UpdateException.Kind.Verification) { source().latest(null) }
-        routes[latestPath] = { MockResponse().setResponseCode(403) }
-        refuses(UpdateException.Kind.Network) { source().latest(null) }
+        // The unauthenticated rate limit is a 403 (a secondary limit a 429): GitHub is busy, which is not "no release" and not "no connection".
+        for (code in listOf(403, 429)) {
+            routes[latestPath] = { MockResponse().setResponseCode(code) }
+            refuses(UpdateException.Kind.Busy) { source().latest(null) }
+            refuses(UpdateException.Kind.Busy) { source().latestCommit() }
+        }
         routes[latestPath] = { MockResponse().setResponseCode(500) }
         refuses(UpdateException.Kind.Network) { source().latest(null) }
+    }
+
+    @Test fun theCheckThatFindsTheReleaseAlsoFindsItsCommitSoATapAsksGitHubForNothing() {
+        serve()
+        val release = found().release!!
+        assertEquals(commitSha, release.commit)
+        // Latest release, its metadata, then the commit its tag names asked as a bare SHA: three calls, all in the check.
+        assertEquals(latestPath, server.takeRequest().path)
+        assertEquals("/dl/Beacon-1.1.3.json", server.takeRequest().path)
+        val ask = server.takeRequest()
+        assertEquals("/repos/xploit9/beacon/commits/v1.1.3", ask.path)
+        assertEquals("application/vnd.github.sha", ask.getHeader("Accept"))
+        assertEquals("Beacon-Test", ask.getHeader("User-Agent"))
+        assertNull(ask.getHeader("Authorization"))
+        assertEquals(3, server.requestCount)
+        // Kept with the release on the phone, so the next launch and the tap after it need no GitHub call either.
+        assertEquals(release, Release.decode(release.encode()))
+        assertEquals(commitSha, Release.decode(release.encode())!!.commit)
+    }
+
+    @Test fun aCommitThatIsNotAFullLowercaseShaFailsTheWholeCheckAndNothingIsKept() {
+        for (bad in listOf("", "main", commitSha.uppercase(), commitSha + "0", commitSha.take(39), "{\"sha\":\"$commitSha\"}")) {
+            serve(); serveCommit(body = bad)
+            refuses(UpdateException.Kind.Verification) { source().latest(null) }
+        }
+        serve(); serveCommit(body = commitSha + "\n")
+        assertEquals("a trailing newline is not part of the answer", commitSha, found().release!!.commit)
+    }
+
+    @Test fun aTagGitHubWillNotNameOrAnswerForFailsTheCheckForTheRightReason() {
+        serve()
+        for (code in listOf(404, 422)) { serveCommit(code = code, body = "{}"); refuses(UpdateException.Kind.Verification) { source().latest(null) } }
+        for (code in listOf(403, 429)) { serveCommit(code = code, body = "{}"); refuses(UpdateException.Kind.Busy) { source().latest(null) } }
+        serveCommit(code = 500, body = "{}"); refuses(UpdateException.Kind.Network) { source().latest(null) }
+    }
+
+    @Test fun aReleaseWhoseTagDoesNotNameItsVersionIsRefusedBeforeAnyCommitIsTaken() {
+        // One release is one version: a tag for another version names the wrong plugin.
+        for (tag in listOf("v1.1.4", "1.1.4", "v1.1.2", "latest", "v1.1.3/../x", "")) {
+            serve(announcement(complete).put("tag_name", tag))
+            refuses(UpdateException.Kind.Verification) { source().latest(null) }
+            assertTrue(tag, server.takeRequestsMatching("/repos/xploit9/beacon/commits/").isEmpty())
+        }
+        // The same version with or without the "v" is the same release.
+        serve(announcement(complete).put("tag_name", "1.1.3")); routes["/repos/xploit9/beacon/commits/1.1.3"] = { MockResponse().setBody(commitSha) }
+        assertEquals(commitSha, found().release!!.commit)
+    }
+
+    @Test fun aStoredReleaseKeepsItsCommitAndOneFromAnEarlierBuildOrAMangledOneHasNone() {
+        val kept = announced().copy(commit = commitSha)
+        assertEquals(commitSha, Release.decode(kept.encode())!!.commit)
+        assertEquals("a release stored before commits were kept", "", Release.decode(announced().encode().let { JSONObject(it).apply { remove("commit") }.toString() })!!.commit)
+        for (bad in listOf("main", commitSha.uppercase(), commitSha.take(39), commitSha + "0", "")) {
+            assertEquals(bad, "", Release.decode(JSONObject(kept.encode()).put("commit", bad).toString())!!.commit)
+        }
     }
 
     @Test fun addressesOutsideTheAllowedHostsOrWithoutHttpsAreNeverUsed() {

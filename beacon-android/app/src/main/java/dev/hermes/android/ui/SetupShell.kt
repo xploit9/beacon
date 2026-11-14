@@ -37,6 +37,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
@@ -51,6 +52,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -101,16 +103,19 @@ private val SetupMuted = Color(0xffb3c3ca)
 private val SetupGold = Color(0xffe7b579)
 private val SetupError = Color(0xfff2a49c)
 
-internal fun setupColorScheme(base: ColorScheme): ColorScheme = base.copy(
-    background = SetupSea, onBackground = SetupInk,
-    surface = SetupSurface, onSurface = SetupInk, surfaceVariant = Color(0xff172b35), onSurfaceVariant = SetupMuted,
-    surfaceContainerLowest = Color(0xff0b1d27), surfaceContainerLow = SetupSurface,
-    surfaceContainer = SetupSurface, surfaceContainerHigh = Color(0xff142934), surfaceContainerHighest = SetupSurfaceHighest,
-    outline = SetupMuted.copy(alpha = .62f), outlineVariant = SetupMuted.copy(alpha = .3f),
-    primary = SetupGold, onPrimary = SetupSea,
-    error = SetupError, onError = SetupSea,
-    primaryContainer = Color(0xff35412c), onPrimaryContainer = SetupInk,
-)
+internal fun setupColorScheme(base: ColorScheme): ColorScheme =
+    // A light theme would leave its own light roles in every slot below that the wizard does not set (the secondary, tertiary and error
+    // containers, the dim and bright surfaces, the tint). Status chips read their ink against all of them, so none then read on the dark card.
+    (if (base.background.luminance() > .5f) darkColorScheme() else base).copy(
+        background = SetupSea, onBackground = SetupInk,
+        surface = SetupSurface, onSurface = SetupInk, surfaceVariant = Color(0xff172b35), onSurfaceVariant = SetupMuted,
+        surfaceContainerLowest = Color(0xff0b1d27), surfaceContainerLow = SetupSurface,
+        surfaceContainer = SetupSurface, surfaceContainerHigh = Color(0xff142934), surfaceContainerHighest = SetupSurfaceHighest,
+        outline = SetupMuted.copy(alpha = .62f), outlineVariant = SetupMuted.copy(alpha = .3f),
+        primary = SetupGold, onPrimary = SetupSea, surfaceTint = SetupGold,
+        error = SetupError, onError = SetupSea,
+        primaryContainer = Color(0xff35412c), onPrimaryContainer = SetupInk,
+    )
 
 /** What the header's Close setup button does and whether it can right now. Null where there is nothing to close back to (before the first sign-in). */
 internal class SetupClose(val enabled: Boolean, val onClose: () -> Unit)

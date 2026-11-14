@@ -185,7 +185,7 @@ internal fun PhoneApprovalCard(
         },
         confirmButton = {
             if (expired) TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-close")) { Text(uiText("Done")) }
-            else TextButton(onClick = onAllow, enabled = !locked && !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-allow")) { Text(uiText("Allow")) }
+            else TextButton(onClick = onAllow, enabled = !locked && !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-allow")) { Text(uiText("Allow once")) }
         },
         dismissButton = {
             if (!expired) TextButton(onClick = onDeny, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-deny")) { Text(uiText("Deny")) }

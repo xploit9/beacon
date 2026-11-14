@@ -454,6 +454,144 @@ class VoiceConnectTest {
         }
     }
 
+    private fun discoverCall(c: Call, id: String = "discover-1") = c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
+        json("id" to id, "name" to "discover_tools", "args" to json("query" to "check my email"))))))
+
+    private suspend fun lastToolResponse(c: Call, count: Int = 1): JSONObject {
+        assertTrue("The model receives the tool result", waitFor { c.provider.frames.count { it.has("toolResponse") } >= count })
+        return c.provider.frames.last { it.has("toolResponse") }.getJSONObject("toolResponse")
+            .getJSONArray("functionResponses").getJSONObject(0).getJSONObject("response")
+    }
+
+    private fun declaredTools(c: Call): Set<String> {
+        val declarations = c.provider.setups().first().getJSONObject("setup").getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
+        return (0 until declarations.length()).map { declarations.getJSONObject(it).getString("name") }.toSet()
+    }
+
+    @Test(timeout = 15000) fun aFirstToolSearchThatTimesOutIsRetriedOnceAndTheModelGetsTheTools() = runBlocking {
+        val searches = AtomicInteger()
+        val c = Call(client = lookupClient({
+            if (searches.incrementAndGet() == 1) 504 to json("detail" to "Tool lookup still settling")
+            else 200 to json("tools" to JSONArray().put(json("name" to "search_mail", "tool_id" to "a".repeat(64))))
+        }, CopyOnWriteArrayList()), streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); discoverCall(c)
+            val result = lastToolResponse(c)
+            assertEquals("one retry after the first answer failed", 2, searches.get())
+            assertEquals("search_mail", result.getJSONArray("tools").getJSONObject(0).getString("name"))
+            assertNotEquals("unavailable", result.optString("status"))
+            assertFalse("The owner is not shown a failed search for a catalogue that was only starting",
+                c.events.any { it.optString("type") == "tool_receipt" && it.optString("tool_name") == "discover_tools" && it.optString("status") == "failed" })
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 15000) fun aCatalogueThatIsStillStartingIsRetriedOnceAndThenSaidToBeStartingNotUnavailable() = runBlocking {
+        val searches = AtomicInteger()
+        val c = Call(client = lookupClient({ searches.incrementAndGet(); 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0) }, CopyOnWriteArrayList()),
+            streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); discoverCall(c)
+            val result = lastToolResponse(c)
+            assertEquals(2, searches.get())
+            assertEquals("starting", result.getString("status"))
+            assertTrue(result.getString("message").contains("hermes_work"))
+            assertNotEquals("unavailable", result.optString("status"))
+        } finally { c.close() }
+    }
+
+    // Ponytail review, 7 Nov 2026 (finding 7): "still starting" must end, or a hung MCP server leaves the call asking for ever.
+    @Test(timeout = 25000) fun theSecondStillStartingAnswerInARowIsAFailureSoTheModelHandsOffInsteadOfAskingAgain() = runBlocking {
+        val searches = AtomicInteger()
+        val c = Call(client = lookupClient({ searches.incrementAndGet(); 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0) }, CopyOnWriteArrayList()),
+            streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
+            discoverCall(c, "discover-1")
+            assertEquals("starting", lastToolResponse(c, 1).getString("status"))
+            discoverCall(c, "discover-2")
+            val second = lastToolResponse(c, 2)
+            assertEquals("unavailable", second.getString("status"))
+            assertEquals("hermes_work", second.getString("fallback_tool"))
+            assertTrue(second.getString("message").contains("Call hermes_work now"))
+            assertEquals("each search looked twice, no more", 4, searches.get())
+        } finally { c.close() }
+    }
+
+    private fun discoverCalls(c: Call, vararg ids: String) = c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().also { calls ->
+        ids.forEach { calls.put(json("id" to it, "name" to "discover_tools", "args" to json("query" to "check $it"))) } })))
+
+    /** Every tool result the model has received so far, by function call id, once at least [count] responses are in. */
+    private suspend fun toolResponses(c: Call, count: Int): Map<String, JSONObject> {
+        assertTrue("The model receives $count tool results", waitFor { c.provider.frames.count { it.has("toolResponse") } >= count })
+        return c.provider.frames.filter { it.has("toolResponse") }.flatMap { frame ->
+            val responses = frame.getJSONObject("toolResponse").getJSONArray("functionResponses")
+            (0 until responses.length()).map { responses.getJSONObject(it) }
+        }.associate { it.getString("id") to it.getJSONObject("response") }
+    }
+
+    // Ponytail re-review, 7 Nov 2026 (N3): the count means two rounds of asking over time, not two searches of one turn.
+    @Test(timeout = 25000) fun twoSearchesAskedInTheSameTurnAreOneStillStartingRoundNotTwo() = runBlocking {
+        val c = Call(client = lookupClient({ 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0) }, CopyOnWriteArrayList()),
+            streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
+            discoverCalls(c, "mail-1", "calendar-1")
+            val together = toolResponses(c, 2)
+            assertEquals("the mail search is told to try once more", "starting", together.getValue("mail-1").getString("status"))
+            assertEquals("and so is the calendar search, it is not handed off early", "starting", together.getValue("calendar-1").getString("status"))
+            discoverCalls(c, "mail-2")
+            val later = toolResponses(c, 3).getValue("mail-2")
+            assertEquals("the model's own second try after that answer is the one that hands off", "unavailable", later.getString("status"))
+            assertEquals("hermes_work", later.getString("fallback_tool"))
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 15000) fun theCallInstructionSaysWhenToStopAskingForTheToolList() = runBlocking {
+        val c = Call(client = lookupClient({ 200 to json("tools" to JSONArray()) }, CopyOnWriteArrayList()), streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
+            assertTrue(c.provider.setups().first().toString().contains("do not ask again: call hermes_work"))
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 25000) fun aSearchThatFindsTheToolsStartsTheStillStartingCountAgain() = runBlocking {
+        val searches = AtomicInteger()
+        val c = Call(client = lookupClient({
+            if (searches.incrementAndGet() == 3) 200 to json("tools" to JSONArray().put(json("name" to "search_mail", "tool_id" to "a".repeat(64))))
+            else 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0)
+        }, CopyOnWriteArrayList()), streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
+            discoverCall(c, "discover-1")
+            assertEquals("starting", lastToolResponse(c, 1).getString("status"))
+            discoverCall(c, "discover-2")
+            assertEquals("search_mail", lastToolResponse(c, 2).getJSONArray("tools").getJSONObject(0).getString("name"))
+            discoverCall(c, "discover-3")
+            assertEquals("a later cold start is told once again, not failed at once", "starting", lastToolResponse(c, 3).getString("status"))
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 15000) fun theHandOffToolIsDeclaredFromTheFirstSecondAndNamedWhenToolSearchKeepsFailing() = runBlocking {
+        val searches = AtomicInteger()
+        val c = Call(client = lookupClient({ searches.incrementAndGet(); 504 to json("detail" to "Tool lookup still settling") }, CopyOnWriteArrayList()),
+            streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
+            // Declared in the session setup itself, before any search: it does not depend on the tool list.
+            assertTrue("hermes_work", "hermes_work" in declaredTools(c))
+            assertTrue("hermes_follow", "hermes_follow" in declaredTools(c))
+            val instruction = c.provider.setups().first().toString()
+            assertTrue(instruction.contains("hermes_work is always available"))
+            assertTrue(instruction.contains("Never say you are routing, handing off or sending something to Hermes unless you call hermes_work"))
+            discoverCall(c)
+            val result = lastToolResponse(c)
+            assertEquals(2, searches.get())
+            assertEquals("unavailable", result.getString("status"))
+            assertEquals("hermes_work", result.getString("fallback_tool"))
+            assertTrue(result.getString("message").contains("Call hermes_work now"))
+        } finally { c.close() }
+    }
+
     @Test(timeout = 10000) fun aSuccessfulEmptyCatalogueReallyIsANoMatch() = runBlocking {
         val invocations = CopyOnWriteArrayList<JSONObject>()
         val c = Call(client = lookupClient({ 200 to json("tools" to JSONArray()) }, invocations), streamsMicrophone = false)

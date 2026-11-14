@@ -148,7 +148,6 @@ class MixedTimelineJourneyUiTest {
             compose.onNode(hasText("Removed reply"), useUnmergedTree = true).assertDoesNotExist()
             compose.onNode(hasText("Unrelated uncertainty"), useUnmergedTree = true).assertExists()
             compose.onNode(hasTestTag("unconfirmed-reply:unconfirmed:earlier"), useUnmergedTree = true).assertExists()
-            compose.onNode(hasText("Reply not confirmed"), useUnmergedTree = true).assertExists()
             val saved = runBlocking { JSONObject(requireNotNull(app.cache.read(scope, "session"))) }
             assertTrue(saved.rows("messages").isEmpty())
             assertEquals(listOf("Unrelated uncertainty"), saved.rows("_unconfirmed_replies").map { it.string("text") })

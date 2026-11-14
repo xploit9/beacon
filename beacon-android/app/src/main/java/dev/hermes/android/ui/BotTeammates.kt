@@ -85,9 +85,9 @@ internal fun botsReplying(typing: List<String>, roster: List<BotModeMember>): Se
 /** How many of [spaces] each bot is in. */
 internal fun botSpaceCounts(spaces: List<BotModeSpace>): Map<String, Int> = spaces.flatMap { it.members.distinct() }.groupingBy { it }.eachCount()
 
-/** A bot row's status: typing now, else the shared spaces it is in ([spacesText] is the translated "Spaces: {0}"), else nothing. */
-internal fun botStatus(replying: Boolean, spaces: Int, typingText: String, spacesText: String): String =
-    if (replying) typingText else if (spaces > 0) spacesText.replace("{0}", "$spaces") else ""
+/** A bot row's status: typing now, else the shared spaces it is in ([spacesText] is the translated "In {0} spaces", [oneSpaceText] "In 1 space"), else nothing. */
+internal fun botStatus(replying: Boolean, spaces: Int, typingText: String, spacesText: String, oneSpaceText: String = spacesText.replace("{0}", "1")): String =
+    if (replying) typingText else if (spaces == 1) oneSpaceText else if (spaces > 0) spacesText.replace("{0}", "$spaces") else ""
 
 /**
  * What each bot row says on its right, for the drawer and the home screen alike: typing now (in the open space), else the shared spaces
@@ -97,8 +97,9 @@ internal fun botStatus(replying: Boolean, spaces: Int, typingText: String, space
     val replying = botsReplying(state.typing, state.roster)
     val inSpaces = remember(state.spaces, state.moreSpaces) { if (state.moreSpaces) emptyMap() else botSpaceCounts(state.spaces) }
     val typingText = uiText("Typing…")
-    val spacesText = uiText("Spaces: {0}")
-    return { profile -> botStatus(profile in replying, inSpaces[profile] ?: 0, typingText, spacesText) }
+    val spacesText = uiText("In {0} spaces")
+    val oneSpaceText = uiText("In 1 space")
+    return { profile -> botStatus(profile in replying, inSpaces[profile] ?: 0, typingText, spacesText, oneSpaceText) }
 }
 
 /** One scheduled run for "Up next": whose it is ([profile]), what it is called and when it runs next ([nextRunAt], Hermes' own timestamp). */
@@ -309,7 +310,7 @@ private val GroupRowAvatarSize = 48.dp / groupAvatarsWidth(2)
     RowAction(uiText("Open"), "space-action-open", onClick = open),
     RowAction(uiText("Rename"), "space-action-rename", enabled = canRename, onClick = rename),
     RowAction(uiText("Members"), "space-action-members", onClick = members),
-    RowAction(uiText(if (canDelete) "Delete" else "Deletion unavailable"), "space-action-delete", danger = true, divider = true, enabled = canDelete, onClick = delete),
+    RowAction(uiText(if (canDelete) "Delete" else "Can't delete"), "space-action-delete", danger = true, divider = true, enabled = canDelete, onClick = delete),
 )
 
 @Composable internal fun botActions(vm: BeaconViewModel, bot: BotModeBot, deletable: Boolean, dialog: MutableState<String>): List<RowAction> = botMenu(deletable,

@@ -315,7 +315,7 @@ class SetupWizardUiTest {
                     )
                 } }
             }
-            compose.onNodeWithText("Make it yours").assertIsDisplayed()
+            compose.onNodeWithText("Call voice").assertIsDisplayed()
             compose.waitUntil(15_000) { compose.onAllNodesWithTag("setup-owner-name").fetchSemanticsNodes().isNotEmpty() }
             compose.onNodeWithTag("setup-owner-name").performScrollTo().assertIsDisplayed().assertTextContains("Maya")
             // One Continue, no duplicate Skip.
@@ -415,7 +415,9 @@ class SetupWizardUiTest {
                     // Seed completed auth/voice prerequisites; keep the real completion callback and root routing.
                     compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(setupStep = "done") }
                 } else {
-                    compose.onNodeWithTag("setup-keep-connected").performScrollTo().performClick()
+                    // On a first setup Keep connected starts on only when notifications are allowed; this pass wants it off, so the owner moves the switch.
+                    val notificationsAllowed = android.os.Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(app, android.Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                    compose.onNodeWithTag("setup-keep-connected").performScrollTo().also { if (notificationsAllowed) it.performClick() }
                 }
                 compose.onNodeWithTag("setup-keep-connected").assertIsOff()
                 compose.onNodeWithTag("setup-finish").performClick()
@@ -520,7 +522,7 @@ class SetupWizardUiTest {
                 SetupWizardScreen(
                     state = state,
                     onProbe = { raw -> reachedOrigin = parseBeaconConnectInput(raw); state = state.copy(origin = reachedOrigin, setupStep = "signin", error = "") },
-                    onSignIn = { state = state.copy(authenticated = true, setupStep = "permission-microphone", setupPluginMessage = "Beacon plugin not installed on this Hermes — chat works; calls need the plugin.") },
+                    onSignIn = { state = state.copy(authenticated = true, setupStep = "permission-microphone", setupPluginMessage = "Calls need Beacon on Hermes.") },
                     onAdvancePermission = { state = state.copy(setupStep = when (state.setupStep) { "permission-microphone" -> "permission-notifications"; "permission-notifications" -> "permission-full-screen"; else -> "done" }) },
                     onFinish = { finished = true; state = state.copy(setupWizard = false, setupStep = "done") },
                     onReopen = { state = state.copy(origin = it, setupStep = "connect") },
@@ -535,12 +537,18 @@ class SetupWizardUiTest {
         compose.onNodeWithTag("setup-connect").performClick()
         assertEquals("https://hermes.example", reachedOrigin)
         compose.onNodeWithTag("setup-signin").performClick()
+        // The permission pages never repeat the add-on notice; the last page says it once.
         compose.onNodeWithText("Microphone").assertIsDisplayed()
+        compose.onNodeWithText("Calls need Beacon on Hermes.").assertDoesNotExist()
         compose.onNodeWithText("Skip for now").performClick()
         compose.onNodeWithText("Notifications").assertIsDisplayed()
+        compose.onNodeWithText("Calls need Beacon on Hermes.").assertDoesNotExist()
         compose.onNodeWithText("Skip for now").performClick()
         compose.onNodeWithText("Full-screen call alerts").assertIsDisplayed()
+        compose.onNodeWithText("Calls need Beacon on Hermes.").assertDoesNotExist()
         compose.onNodeWithText("Skip for now").performClick()
+        compose.onNodeWithText("Chat is ready").assertIsDisplayed()
+        compose.onNodeWithText("Calls need Beacon on Hermes.").assertIsDisplayed()
         compose.onNodeWithTag("setup-finish").performClick()
         assertTrue(finished)
     }
@@ -702,7 +710,7 @@ class SetupWizardUiTest {
             compose.onNodeWithTag("voice-model-grok").performClick()
             compose.onNodeWithTag("setup-voice-continue").performClick()
             compose.waitUntil(5_000) { state.setupStep == "voice-customize" }
-            compose.onNodeWithText("Make it yours").assertIsDisplayed()
+            compose.onNodeWithText("Call voice").assertIsDisplayed()
             assertTrue("and again on the choices page", setupBarPosition() > providerBar)
             assertEquals("grok", store.settings().provider)
             // Back from the choices returns to the providers; Continue again skips the key page.
@@ -735,8 +743,8 @@ class SetupWizardUiTest {
             compose.onNodeWithText("Calls use your $short account.").assertIsDisplayed()
             compose.onNodeWithTag("voice-key-test").assertIsNotEnabled()
             compose.onNodeWithTag("voice-key-get").assertIsDisplayed()
-            // The call-sharing note sits on the page where the key is handed over.
-            compose.onNodeWithText("Your provider hears you and speaks the replies").assertIsDisplayed()
+            // The explaining caption is gone from the key page.
+            compose.onNodeWithText("Your provider hears you and speaks the replies").assertDoesNotExist()
             compose.onNodeWithTag("voice-provider-key").performTextInput("not-a-real-key")
             compose.onNodeWithTag("voice-key-test").assertIsEnabled()
             compose.onNodeWithTag("voice-page-back").assertIsDisplayed()
@@ -962,11 +970,11 @@ class SetupWizardUiTest {
 
     @Test fun unreachableServerShowsRetry() {
         var retries = 0
-        val state = AppState(origin = "https://hermes.example", setupWizard = true, setupStep = "probe", restoringSession = false, error = "Can't reach Hermes. Check Tailscale/VPN is on, then Retry.")
+        val state = AppState(origin = "https://hermes.example", setupWizard = true, setupStep = "probe", restoringSession = false, error = "Can't reach Hermes. Check your network or VPN, then Retry.")
         compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
             SetupWizardScreen(state, onProbe = { retries++ }, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
         } } }
-        compose.onNodeWithText("Can't reach Hermes. Check Tailscale/VPN is on, then Retry.").assertIsDisplayed()
+        compose.onNodeWithText("Can't reach Hermes. Check your network or VPN, then Retry.").assertIsDisplayed()
         compose.onNodeWithTag("setup-probe-retry").performClick()
         assertEquals(1, retries)
     }
@@ -990,12 +998,14 @@ class SetupWizardUiTest {
     }
 
     @Test fun missingPluginMessageIsShownWithoutBlockingSignIn() {
-        val message = "Beacon plugin not installed on this Hermes — chat works; calls need the plugin."
+        val message = "Calls need Beacon on Hermes."
         val state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false, setupPluginMessage = message)
         compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
             SetupWizardScreen(state, onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = {}, onReopen = {}, onCancel = {})
         } } }
+        compose.onNodeWithText("Chat is ready").assertIsDisplayed()
         compose.onNodeWithText(message).assertIsDisplayed()
+        compose.onNodeWithText("You're connected").assertDoesNotExist()
         compose.onNodeWithTag("setup-finish").assertIsDisplayed()
     }
 

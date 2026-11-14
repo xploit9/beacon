@@ -13,9 +13,9 @@ import dev.hermes.android.phone.PhoneAccess
 
 /** The words of each choice in Approvals (owner, 4 Nov 2026: Manual, Auto, Full access), and what it means, one short line each. */
 internal fun approvalChoiceLabel(choice: ApprovalChoice): String = when (choice) {
-    ApprovalChoice.Always -> "Manual"
-    ApprovalChoice.Changes -> "Auto"
-    ApprovalChoice.Never -> "Full access"
+    ApprovalChoice.Always -> "Always ask"
+    ApprovalChoice.Changes -> "Ask for risky ones"
+    ApprovalChoice.Never -> "Don't ask"
 }
 
 internal fun approvalChoiceMeaning(choice: ApprovalChoice): String = when (choice) {
@@ -32,7 +32,7 @@ internal fun approvalChoiceMeaning(choice: ApprovalChoice): String = when (choic
     val context = LocalContext.current
     var choice by remember { mutableStateOf(PhoneAccess.approvalChoice(context)) }
     SettingsChoiceRow(
-        label = uiText("Approvals"), selected = choice.name, options = ApprovalChoice.entries.map { it.name },
+        label = uiText("Phone actions"), selected = choice.name, options = ApprovalChoice.entries.map { it.name },
         onSelect = { id -> ApprovalChoice.valueOf(id).let { PhoneAccess.setApprovalChoice(context, it); choice = it; onChanged(it) } },
         icon = Icons.Rounded.VerifiedUser, optionLabels = ApprovalChoice.entries.associate { it.name to uiText(approvalChoiceLabel(it)) },
         optionTestTags = ApprovalChoice.entries.associate { it.name to "approval-choice-${it.name}" },

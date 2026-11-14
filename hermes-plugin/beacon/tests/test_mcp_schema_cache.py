@@ -379,7 +379,7 @@ def test_a_list_that_still_has_a_server_to_scan_is_rescanned_after_the_short_ttl
     hermes.connections.release.set()
     # Once the scan has written the new server's list, the key follows the cache file and the complete list is the long-lived one.
     assert wait_for(lambda: gateway._catalog_key(gateway.profile) in g.CATALOG_SETTLED)
-    assert gateway._fresh_for(gateway._catalog_key(gateway.profile)) == g.CATALOG_STALE_TTL
+    assert gateway._fresh_for(gateway._catalog_key(gateway.profile)) == g.CATALOG_REFRESH
 
 
 def test_only_a_list_the_backend_itself_built_complete_is_stored_as_settled(gateway, hermes):
@@ -448,6 +448,27 @@ def test_an_entry_past_its_ttl_is_still_listed_at_once_and_refreshed_in_the_back
     gateway.prefetch(gateway.profile)
     time.sleep(0.1)
     assert refreshed == ['server4'], 'once for this entry, not again on every look'
+    assert hermes.connections.log == []
+
+
+def test_an_entry_with_ttl_zero_is_listed_without_ever_being_refreshed(gateway, hermes, monkeypatch):
+    """Owner trial, 7 Nov 2026: a server that wrote ttl 0 made every look 'stale', so each look connected it again and rewrote the file."""
+    hermes.cache('server4', ttl_ms=0)
+    path = hermes.home / 'cache' / 'mcp_schema_cache.json'
+    data = json.loads(path.read_text(encoding='utf-8'))
+    assert data['server4']['ttl_ms'] == 0
+    data['server4']['written_at'] = time.time() - 3600
+    path.write_text(json.dumps(data), encoding='utf-8')
+    refreshed = []
+    from tools import mcp_tool_discovery as discovery
+    monkeypatch.setattr(discovery, '_ensure_lazy_server_connected', lambda name: refreshed.append(name) or True)
+
+    answer = gateway.discover(gateway.profile, 'search server4')
+    assert answer['total_matches'] and 'server4' in answer['sources']
+    gateway.prefetch(gateway.profile)
+    gateway.prefetch(gateway.profile)
+    time.sleep(0.2)
+    assert refreshed == [], 'no refresh, no rewrite of the schema file, no new catalogue key'
     assert hermes.connections.log == []
 
 

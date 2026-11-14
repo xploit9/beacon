@@ -60,7 +60,7 @@ class SettingsHubTest {
         assertEquals(SettingsRowSummary("1.1.23", SettingsStatus.Attention, "Update available"), row("App updates", idle.copy(updateName = "1.1.23")))
         assertEquals(SettingsRowSummary("1.1.23", SettingsStatus.Attention, "Update ready"), row("App updates", idle.copy(updateName = "1.1.23", updateReady = true)))
         // Finding 13: a pending plugin step is visible without opening the update screen.
-        assertEquals(SettingsRowSummary("1.1.22", SettingsStatus.Attention, "Update the Beacon plugin"), row("App updates", idle.copy(pluginAction = "Update the Beacon plugin")))
+        assertEquals(SettingsRowSummary("1.1.22", SettingsStatus.Attention, "Update Beacon on Hermes"), row("App updates", idle.copy(pluginAction = "Update Beacon on Hermes")))
         assertEquals(SettingsRowSummary("1.1.22", SettingsStatus.Attention, "Restart Hermes"), row("App updates", idle.copy(pluginAction = "Restart Hermes")))
         assertEquals("An app update is the louder fact", "Update available", row("App updates", idle.copy(updateName = "1.1.23", pluginAction = "Restart Hermes")).statusLabel)
     }
@@ -69,7 +69,7 @@ class SettingsHubTest {
         val actions = PluginStatus.entries.associateWith { pluginActionWord(PluginRow(it)) }
         for (status in listOf(PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed)) assertEquals("Restart Hermes", actions.getValue(status))
         assertEquals("Restart dashboard", actions.getValue(PluginStatus.DashboardFailed))
-        for (status in listOf(PluginStatus.Available, PluginStatus.NeedsReview, PluginStatus.Busy, PluginStatus.Failed)) assertEquals("Update the Beacon plugin", actions.getValue(status))
+        for (status in listOf(PluginStatus.Available, PluginStatus.Busy, PluginStatus.Failed)) assertEquals("Update Beacon on Hermes", actions.getValue(status))
         for (status in listOf(PluginStatus.Hidden, PluginStatus.Checking, PluginStatus.UpToDate, PluginStatus.Updating, PluginStatus.Updated)) assertEquals("", actions.getValue(status))
     }
 
@@ -110,7 +110,7 @@ class SettingsHubTest {
     @Test fun everyPillIsAShortWord() {
         val everything = SettingsSnapshot(
             connected = false, signedOut = true, account = "maya", profile = "work", installedVersion = "1.1.22", updateName = "1.1.23", updateReady = true,
-            pluginAction = "Update the Beacon plugin", voiceProviderId = "gemini", voiceKeySaved = false, keepConnectedEnabled = false,
+            pluginAction = "Update Beacon on Hermes", voiceProviderId = "gemini", voiceKeySaved = false, keepConnectedEnabled = false,
             serverHealthy = false, serverUpdateAvailable = true,
         )
         for (route in settingsSearchRoutes) {
@@ -174,7 +174,7 @@ class SettingsHubTest {
     @Test fun everyHubStringReadsInAllSixteenLanguages() {
         val added = listOf(
             "Check your network", "Couldn't load chat settings", "Display", "Follow new replies", "Signed out", "Can't reach Hermes", "Offline", "Update ready",
-            "Update the Beacon plugin", "Healthy", "{0} on", "{0} servers", "{0} profiles", "Server, account, phones", "Linked phones", "Voice and provider",
+            "Update Beacon on Hermes", "Healthy", "{0} on", "{0} servers", "{0} profiles", "Server, account, phones", "Linked phones", "Voice and provider",
             "Alerts and calls", "Theme and colors", "Notes Hermes keeps", "Latest Beacon", "Defaults and behavior",
         )
         val languages = catalog.keys().asSequence().toList()

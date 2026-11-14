@@ -62,14 +62,28 @@ internal const val NavigationLargeTextScale = 1.1f
 internal val navigationMainTiles = listOf("Cron", "Files", "Projects", "Settings")
 internal fun navigationCompact(fontScale: Float): Boolean = fontScale > NavigationLargeTextScale
 internal fun navigationColumns(width: Float, fontScale: Float): Int = if (width >= 240 && !navigationCompact(fontScale)) 4 else 2
+/**
+ * Bot Mode keeps the eight slots, their order and their size. Where Beacon's Bot Mode has a tile that serves the bots better, it takes the
+ * slot: Projects (which groups normal chats) shows Memory, the bot's own notes. Every other slot keeps its tile.
+ */
+internal fun navigationBotTile(name: String): String = if (name == "Projects") "Memory" else name
+/** The eight tiles, slot by slot, in normal chats or in Bot Mode. */
+internal fun navigationTilesFor(botMode: Boolean): List<String> = if (botMode) navigationTiles.map(::navigationBotTile) else navigationTiles
 /** The tiles in the grid at [fontScale]: all eight, or the four main ones at a large font. */
-internal fun navigationShown(fontScale: Float): List<String> = if (navigationCompact(fontScale)) navigationMainTiles else navigationTiles
+internal fun navigationShown(fontScale: Float, botMode: Boolean = false): List<String> =
+    (if (navigationCompact(fontScale)) navigationMainTiles else navigationTiles).let { if (botMode) it.map(::navigationBotTile) else it }
 /** The tiles the More sheet lists at [fontScale]; none while the grid shows them all. */
-internal fun navigationMore(fontScale: Float): List<String> = navigationTiles - navigationShown(fontScale).toSet()
+internal fun navigationMore(fontScale: Float, botMode: Boolean = false): List<String> = navigationTilesFor(botMode) - navigationShown(fontScale, botMode).toSet()
 // The tiles are in pairs, so two columns give full rows and no tile stretches alone.
-internal fun navigationRows(columns: Int, fontScale: Float = 1f): List<List<String>> = navigationShown(fontScale).chunked(columns)
+internal fun navigationRows(columns: Int, fontScale: Float = 1f, botMode: Boolean = false): List<List<String>> = navigationShown(fontScale, botMode).chunked(columns)
 /** What a tile says; its name and test tag stay "Cron". */
 internal fun navigationLabel(name: String): String = if (name == "Cron") "Schedules" else name
+/** What a tile says in Bot Mode, where the schedules are the bots' routines. */
+internal fun navigationBotLabel(name: String): String = if (name == "Cron") "Schedules" else navigationLabel(name)
+/** Every word the Bot Mode tiles say, for the translation check. */
+internal val BotModeNavigationStrings = navigationTilesFor(true).map(::navigationBotLabel)
+/** The bot the drawer is on in Bot Mode: the bot whose chat is open, else the bot Bot Mode runs as (the profile it was opened with). */
+internal fun botModeCurrentBot(openBot: String?, using: String): String = openBot?.takeIf { it.isNotBlank() } ?: using
 private fun navigationIcon(name: String): ImageVector = when (name) {
     "Skills" -> Icons.Rounded.AutoAwesome
     "Memory" -> Icons.Rounded.Psychology
@@ -83,12 +97,22 @@ private fun navigationIcon(name: String): ImageVector = when (name) {
 }
 
 /** The tile names the drawer shows through uiText ("Cron" reads Schedules). */
-internal val NavigationStrings = navigationTiles.map(::navigationLabel)
+internal val NavigationStrings = navigationTiles.map { navigationLabel(it) }
+
+/**
+ * Bot Mode's Memory tile: the notes of the bot the drawer is on ([profile]), whatever page or earlier choice the app was on. The page names
+ * that bot (avatar and name), so it always says whose memory it is.
+ */
+internal fun openBotMemory(vm: BeaconViewModel, profile: String) {
+    // more() first puts the app on the Settings area (and drops an older profile choice when it came from another page); the profile follows.
+    vm.more("Memory")
+    vm.openSettingsProfileTool(profile, "Memory")
+}
 
 /** An update waits for the owner: a newer app, or a Hermes plugin that can update, or a download that needs install permission. */
 internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported && when (state.phase) {
     UpdatePhase.NeedsPermission -> true
-    UpdatePhase.Available -> state.release != null || state.plugin.status in setOf(PluginStatus.Available, PluginStatus.NeedsReview, PluginStatus.Restart)
+    UpdatePhase.Available -> state.release != null || state.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart)
     else -> false
 }
 
@@ -107,26 +131,33 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     var moreOpen by rememberSaveable { mutableStateOf(false) }
     if (naming) NewThreadDialog(vm, onDismiss = { naming = false })
     // Bots is the one switch for Bot Mode: a tap turns it on, and off again (navigate("Bots") toggles).
-    val openTile: (String) -> Unit = vm::navigate
+    val openTile: (String) -> Unit = { name ->
+        val bot = if (ui.botModeEnabled && name == "Memory") botModeCurrentBot(vm.botMode.state.value.activeBot?.profile, vm.botMode.usingBot()) else ""
+        if (bot.isNotBlank()) openBotMemory(vm, bot) else vm.navigate(name)
+    }
     val botMode = ui.botModeEnabled
+    // The pill is not shown in Bot Mode: an open profile list must not come back when the mode switches off again.
+    LaunchedEffect(botMode) { if (botMode) profilesOpen = false }
     // New bot and New space open the roster's own dialogs; outside the Bot Mode drawer this row hosts them itself.
     val hostedDialog = LocalBotModeDialog.current
     val ownDialog = rememberSaveable { mutableStateOf("") }
     val botDialog = hostedDialog ?: ownDialog
     if (botMode && hostedDialog == null) BotModeDialogs(vm, ownDialog)
     Column(Modifier.fillMaxWidth().padding(12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        // The drawer keeps one layout in both modes, so switching Bot Mode never moves the tiles.
-        run {
+        // The drawer keeps one layout in both modes, so switching Bot Mode never moves the tiles: the Bot Mode header takes the pill's
+        // place at exactly its height (a profile does not switch on this page; the roster below is the way between bots).
+        if (botMode) BotModeHeader()
+        else {
             Box(Modifier.fillMaxWidth()) {
                 var pillWidth by remember { mutableStateOf(0.dp) }
                 val density = LocalDensity.current
-                OutlinedButton(onClick = { profilesOpen = true; vm.load("navigation-profiles", "/api/profiles", force = false) }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp).onSizeChanged { pillWidth = with(density) { it.width.toDp() } }.testTag("navigation-profile")) {
+                OutlinedButton(onClick = { profilesOpen = true; vm.load("navigation-profiles", "/api/profiles", force = false) }, modifier = Modifier.fillMaxWidth().height(drawerHeaderHeight()).onSizeChanged { pillWidth = with(density) { it.width.toDp() } }.testTag("navigation-profile")) {
                     // The chats' profile, even while the assistant tab uses its own; the avatar is the one Bot Mode shows for it.
                     ChatAvatar(profileDisplayName(currentProfile, profileRows), currentProfile, size = 32.dp)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
                         Text(currentProfileLabel, style = MaterialTheme.typography.titleMedium.contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text(uiText("Switch profile"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(uiText("Switch profile"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     Icon(Icons.Rounded.ExpandMore, null)
                 }
@@ -153,17 +184,17 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
         if (stacked) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.fillMaxWidth()); secondary(Modifier.fillMaxWidth()) }
         else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.weight(1f)); secondary(Modifier.weight(1f)) }
         if (updateReady) UpdateReadyChip(onClick = vm::openAppUpdates)
-        // The same tiles in both modes; in Bot Mode the Bots tile shows on, and a tap on it leaves Bot Mode.
+        // The same eight slots in both modes, so nothing moves; in Bot Mode the Bots tile shows on (a tap on it leaves Bot Mode), and Routines and Memory take the Schedules and Projects slots.
         BoxWithConstraints(Modifier.fillMaxWidth()) {
             val fontScale = LocalDensity.current.fontScale
             val columns = navigationColumns(maxWidth.value, fontScale)
-            val overflow = navigationMore(fontScale)
+            val overflow = navigationMore(fontScale, botMode)
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                navigationRows(columns, fontScale).forEach { row ->
+                navigationRows(columns, fontScale, botMode).forEach { row ->
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                         row.forEach { name ->
                             val route = navigationRoute(name)
-                            NavigationTile(name, active = if (name == "Bots") ui.botModeEnabled else ui.tab == route.tab && ui.morePage == route.page, enabled = name != "Bots" || !ui.botModeSwitching,
+                            NavigationTile(name, botMode, active = if (name == "Bots") ui.botModeEnabled else ui.tab == route.tab && ui.morePage == route.page, enabled = name != "Bots" || !ui.botModeSwitching,
                                 updateReady = name == "Settings" && updateReady, onClick = { openTile(name) }, modifier = Modifier.weight(1f))
                         }
                     }
@@ -171,7 +202,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                 if (overflow.isNotEmpty()) NavigationMoreTile(onClick = { moreOpen = true })
             }
             if (moreOpen && overflow.isNotEmpty()) NavigationMoreSheet(
-                names = overflow, isActive = { name -> if (name == "Bots") ui.botModeEnabled else navigationRoute(name).let { ui.tab == it.tab && ui.morePage == it.page } }, updateReady = updateReady,
+                names = overflow, botMode = botMode, isActive = { name -> if (name == "Bots") ui.botModeEnabled else navigationRoute(name).let { ui.tab == it.tab && ui.morePage == it.page } }, updateReady = updateReady,
                 onPick = { name -> moreOpen = false; openTile(name) }, onDismiss = { moreOpen = false },
             )
         }
@@ -208,7 +239,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     Box(modifier.size(11.dp).clip(CircleShape).background(ink).border(2.dp, ring, CircleShape).testTag("navigation-settings-update-dot"))
 }
 
-@Composable private fun NavigationTile(name: String, active: Boolean, enabled: Boolean, updateReady: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
+@Composable private fun NavigationTile(name: String, botMode: Boolean, active: Boolean, enabled: Boolean, updateReady: Boolean, onClick: () -> Unit, modifier: Modifier = Modifier) {
     val fill = if (active) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh
     val waiting = if (updateReady) uiText("Update ready") else ""
     Surface(
@@ -221,7 +252,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                 Icon(navigationIcon(name), null, Modifier.size(20.dp))
                 if (updateReady) UpdateDot(fill, Modifier.align(Alignment.TopEnd).offset(x = 5.dp, y = (-4).dp))
             }
-            Text(uiText(navigationLabel(name)), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(uiText(if (botMode) navigationBotLabel(name) else navigationLabel(name)), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -241,7 +272,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
 }
 
 /** The tiles that do not fit the large-font grid, one row each; they keep their tags. */
-@Composable private fun NavigationMoreSheet(names: List<String>, isActive: (String) -> Boolean, updateReady: Boolean, onPick: (String) -> Unit, onDismiss: () -> Unit) {
+@Composable private fun NavigationMoreSheet(names: List<String>, botMode: Boolean, isActive: (String) -> Boolean, updateReady: Boolean, onPick: (String) -> Unit, onDismiss: () -> Unit) {
     ModalBottomSheet(onDismissRequest = onDismiss, modifier = Modifier.testTag("navigation-more-sheet")) {
         Column(Modifier.fillMaxWidth().padding(bottom = 24.dp)) {
             names.forEach { name ->
@@ -253,7 +284,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp),
                 ) {
                     Icon(navigationIcon(name), null, Modifier.size(24.dp), tint = if (active) MaterialTheme.colorScheme.primary else LocalContentColor.current)
-                    Text(uiText(navigationLabel(name)), Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
+                    Text(uiText(if (botMode) navigationBotLabel(name) else navigationLabel(name)), Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
                     if (name == "Settings" && updateReady) UpdateDot(MaterialTheme.colorScheme.surfaceContainerLow)
                 }
             }

@@ -230,8 +230,16 @@ def test_live_snapshot_fails_open_when_source_discovery_raises(harness, monkeypa
     live._CACHE.clear()
     monkeypatch.setattr(api.proactive, "enabled", lambda *args: True)
     monkeypatch.setattr(api.proactive, "_setup_complete", lambda *args: True)
-    monkeypatch.setattr(api.proactive, "learned_notes",
-                        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("memory unavailable")))
+    # Source discovery is the registry read in _build_snapshot. (This test once raised from learned_notes, which the snapshot has
+    # not called since email importance became rules; it passed only because the profile-scope import failed in isolation.)
+    from tools.registry import registry
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server_profiles",
+                        SimpleNamespace(_profile_scope=lambda profile: nullcontext()))
+    monkeypatch.setattr(registry, "get_all_entries", lambda: [SimpleNamespace(toolset="mcp-mail")])
+    assert "Other MCP (health unknown): mail" in live.snapshot(api.mobile, "owner", "default", api.proactive), "control: it builds"
+
+    live._CACHE.clear()
+    monkeypatch.setattr(registry, "get_all_entries", lambda: (_ for _ in ()).throw(RuntimeError("tool registry unavailable")))
 
     assert live.snapshot(api.mobile, "owner", "default", api.proactive) is None
 

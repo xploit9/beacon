@@ -224,7 +224,6 @@ private class Arrival {
     val failed = remember(state.events) { state.events.groupBy { it.speaker }.values.any { it.last().failed } }
     if (!routine && state.status.isNotBlank() || failed) SpaceBanner(if (routine) "" else uiText(state.status), failed, onReviewProfiles)
     LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("space-list"), state = list, contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)) {
-        if (state.earlierEventsOmitted) item("earlier") { Text(uiText("Showing the latest messages."), Modifier.fillMaxWidth().padding(vertical = 8.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = androidx.compose.ui.text.style.TextAlign.Center) }
         if (rows.isEmpty() && !state.loading) item("empty") { SpaceEmpty(state.roster, profiles) }
         items(rows, key = { it.key }) { row ->
             when (row) {
@@ -369,7 +368,7 @@ private class Arrival {
 @Composable private fun SpaceEmpty(roster: List<BotModeMember>, profiles: List<JSONObject>) {
     Column(Modifier.fillMaxWidth().padding(top = 24.dp).testTag("space-empty"), horizontalAlignment = Alignment.CenterHorizontally) {
         if (roster.isNotEmpty()) GroupAvatars(roster.map { spaceMemberTitle(it.id, roster, profiles) to it.profile }, size = 56.dp)
-        EmptyState(uiText("No messages yet"), uiText("Send the bots a task to start the discussion."), icon = null, centered = true)
+        EmptyState(uiText("No messages yet"), "", icon = null, centered = true)
     }
 }
 

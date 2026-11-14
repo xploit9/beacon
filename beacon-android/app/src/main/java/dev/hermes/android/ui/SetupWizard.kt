@@ -83,6 +83,22 @@ internal fun handleSetupPermissionResult(granted: Boolean, advance: () -> Unit, 
 
 internal fun setupNeedsBackgroundExemption(isIgnoringBatteryOptimizations: Boolean): Boolean = !isIgnoringBatteryOptimizations
 
+/** The last page's words (English keys, shown through uiText): without the add-on on Hermes it says what works and what calls need, once; "You're connected" only when it is there. */
+internal data class SetupDoneCopy(val title: String, val line: String)
+internal fun setupDoneCopy(addOnMissing: Boolean): SetupDoneCopy =
+    if (addOnMissing) SetupDoneCopy("Chat is ready", "Calls need Beacon on Hermes.") else SetupDoneCopy("You're connected", "Beacon is ready.")
+
+/**
+ * What the Keep connected switch shows on the last setup step (a foreground service, a quiet notification, battery), and so what "Open chat" stores. The owner's own move
+ * wins; otherwise an earlier choice stands (what is stored, so a reopened setup never undoes a later change in Settings); and on a first setup it starts on only when
+ * notifications are allowed, because calls while Beacon is closed are core and a service that cannot alert anyone helps nobody. Nothing else turns it on.
+ */
+internal fun keepConnectedSwitch(moved: Boolean?, stored: Boolean, firstSetup: Boolean, notificationsAllowed: Boolean): Boolean =
+    moved ?: (stored || firstSetup && notificationsAllowed)
+
+/** What finishing setup does to Keep connected: the value to store, or null to leave the stored state alone. */
+internal fun keepConnectedChangeOnFinish(choice: Boolean?, stored: Boolean): Boolean? = choice?.takeIf { it != stored }
+
 /** Keep connected: one line and a switch, with the details one tap away behind the info icon; while Android still restricts Beacon, the one-tap background action follows, and strict phone makers get one more step after it. */
 @Composable
 internal fun KeepConnectedSetupGroup(
@@ -308,12 +324,12 @@ internal fun SetupWizardScreen(
     val settingsRequest = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         reportPermissionResult(permissionAllowed(state.setupStep), state.setupStep)
     }
-    var keepConnected by rememberSaveable(state.setupComplete, state.setupOrigin) {
-        mutableStateOf(if (state.setupComplete) KeepConnectedService.isEnabled(context) else true)
-    }
     var notificationAllowed by remember(context, state.setupStep) {
         mutableStateOf(Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
     }
+    // Only the owner's own move is remembered; the rest is read when the step is shown, after the notification step has had its say.
+    var keepConnectedMoved by rememberSaveable(state.setupComplete, state.setupOrigin) { mutableStateOf<Boolean?>(null) }
+    val keepConnected = keepConnectedSwitch(keepConnectedMoved, KeepConnectedService.isEnabled(context), firstSetup = !state.setupComplete, notificationsAllowed = notificationAllowed)
     var notificationPermissionRequested by rememberSaveable { mutableStateOf(false) }
     val keepConnectedPermissionRequest = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
         notificationAllowed = allowed
@@ -395,7 +411,7 @@ internal fun SetupWizardScreen(
                     onContinue = { provider, hasKey -> if (hasKey) onAdvancePermission() else { voiceKeyProvider = provider; onVoicePage("voice-key") } },
                     onSkip = onSkipVoiceSetup,
                 )
-                SetupShell(step, uiText("Choose a voice provider"), modifier, uiText("Calls use your own account. Change it later in Settings."), page.content, page.actions)
+                SetupShell(step, uiText("Choose a voice provider"), modifier, uiText("Calls use your own account."), page.content, page.actions)
             }
             "voice-key" -> {
                 val provider = voiceKeyProvider.ifBlank { VoiceKeyStore(context.applicationContext).settings().provider }
@@ -412,7 +428,7 @@ internal fun SetupWizardScreen(
                     settingsMode = false, keyWorks = keyWorks, ownerName = ownerName, onOwnerNameChange = onOwnerNameChange,
                     onContinue = onAdvancePermission, onBack = { onVoicePage("voice-provider") },
                 )
-                SetupShell(step, uiText("Make it yours"), modifier, uiText("Pick how calls sound."), page.content, page.actions)
+                SetupShell(step, uiText("Call voice"), modifier, "", page.content, page.actions)
             }
             // KEEP_CONNECTED_STEP_EXTENSION_POINT; kept empty until the connection-service leaf adds its step.
             "permission-microphone", "permission-notifications", "permission-full-screen" -> {
@@ -443,7 +459,6 @@ internal fun SetupWizardScreen(
                     content = {
                         SetupStatusLine(permissionNotice, error = true)
                         SetupStatusLine(state.notice, error = false)
-                        SetupStatusLine(state.setupPluginMessage, error = false)
                     },
                     actions = {
                         SetupPrimaryButton(
@@ -451,7 +466,7 @@ internal fun SetupWizardScreen(
                                 allowed -> uiText("Continue")
                                 permission == "permission-full-screen" -> uiText("Open settings")
                                 permanentDenial -> uiText("Open app settings")
-                                else -> uiText("Allow {0}").replace("{0}", title)
+                                else -> uiText(if (permission == "permission-microphone") "Allow microphone" else "Allow notifications")
                             },
                             { if (allowed) reportPermissionResult(true, permission) else action() },
                             Modifier.testTag("setup-permission-primary"), enabled = !state.loading,
@@ -460,42 +475,45 @@ internal fun SetupWizardScreen(
                     },
                 )
             }
-            "done" -> SetupShell(
-                step, uiText("You're connected"), modifier, assistantText("Beacon is ready."),
-                content = {
-                    SetupStatusLine(state.setupPluginMessage, error = false)
-                    // The message above clears once Beacon is there; until then the same install action as everywhere else.
-                    if (state.setupPluginMessage.isNotBlank()) MissingBeaconPluginState(compact = true, illustration = false)
-                    SetupContainer {
-                        KeepConnectedSetupGroup(
-                            keepConnected = keepConnected,
-                            notificationAllowed = notificationAllowed,
-                            backgroundActionVisible = setupNeedsBackgroundExemption(ignoringBatteryOptimizations),
-                            onKeepConnectedChange = { enabled -> keepConnected = enabled; if (enabled) requestKeepConnectedNotifications() },
-                            onOpenBackgroundSettings = onOpenBackgroundSettings,
-                            autoLaunchVisible = !setupNeedsBackgroundExemption(ignoringBatteryOptimizations) && thisPhoneStrictMaker() != null,
-                            onOpenAutoLaunch = onOpenAutoLaunch,
-                        )
-                    }
-                    // The rest of Beacon, one tap each: the side button (Android's own picker; it works on a locked phone too),
-                    // Phone access and the proactive watch (both open once setup is done).
-                    val context = androidx.compose.ui.platform.LocalContext.current
-                    val assistant = dev.hermes.android.assist.rememberPhoneAssistantState()
-                    val assistantActive = assistant == dev.hermes.android.assist.PhoneAssistantState.Active
-                    SetupContainer {
-                        if (assistant != dev.hermes.android.assist.PhoneAssistantState.Unavailable)
-                            SettingsNavRow(uiText("Phone assistant"), { dev.hermes.android.assist.openAssistantSettings(context) },
-                                value = if (assistantActive) uiText("Opens over any app, even locked") else uiText("Choose Beacon to open it over any app"), valueMaxLines = 2,
-                                status = if (assistantActive) SettingsStatus.Ok else null, statusLabel = if (assistantActive) uiText("Active") else "",
-                                external = true, testTag = "setup-phone-assistant")
-                        SettingsNavRow(uiText("Phone access"), { onFinishThenOpen(keepConnected, "Phone access") },
-                            value = uiText("Calendar, alarms, calls and more"), enabled = state.authenticated, testTag = "setup-phone-access")
-                        SettingsNavRow(uiText("What needs you"), { onFinishThenOpen(keepConnected, "Assistant") },
-                            value = uiText("Alerts when something needs you"), enabled = state.authenticated, testTag = "setup-proactive")
-                    }
-                },
-                actions = { SetupPrimaryButton(uiText("Open chat"), { onFinish(keepConnected) }, Modifier.testTag("setup-finish"), enabled = state.authenticated) },
-            )
+            "done" -> {
+                // The notice clears once Beacon is on Hermes; until then the title and line say it once and the same install action follows.
+                val addOnMissing = state.setupPluginMessage.isNotBlank()
+                val done = setupDoneCopy(addOnMissing)
+                SetupShell(
+                    step, uiText(done.title), modifier, if (addOnMissing) uiText(done.line) else assistantText(done.line),
+                    content = {
+                        if (addOnMissing) MissingBeaconPluginState(compact = true, illustration = false, brief = true)
+                        SetupContainer {
+                            KeepConnectedSetupGroup(
+                                keepConnected = keepConnected,
+                                notificationAllowed = notificationAllowed,
+                                backgroundActionVisible = setupNeedsBackgroundExemption(ignoringBatteryOptimizations),
+                                onKeepConnectedChange = { enabled -> keepConnectedMoved = enabled; if (enabled) requestKeepConnectedNotifications() },
+                                onOpenBackgroundSettings = onOpenBackgroundSettings,
+                                autoLaunchVisible = !setupNeedsBackgroundExemption(ignoringBatteryOptimizations) && thisPhoneStrictMaker() != null,
+                                onOpenAutoLaunch = onOpenAutoLaunch,
+                            )
+                        }
+                        // The rest of Beacon, one tap each: the side button (Android's own picker; it works on a locked phone too),
+                        // Phone access and the proactive watch (both open once setup is done).
+                        val context = androidx.compose.ui.platform.LocalContext.current
+                        val assistant = dev.hermes.android.assist.rememberPhoneAssistantState()
+                        val assistantActive = assistant == dev.hermes.android.assist.PhoneAssistantState.Active
+                        SetupContainer {
+                            if (assistant != dev.hermes.android.assist.PhoneAssistantState.Unavailable)
+                                SettingsNavRow(uiText("Phone assistant"), { dev.hermes.android.assist.openAssistantSettings(context) },
+                                    value = if (assistantActive) uiText("Opens over any app, even locked") else uiText("Choose Beacon to open it over any app"), valueMaxLines = Int.MAX_VALUE,
+                                    status = if (assistantActive) SettingsStatus.Ok else null, statusLabel = if (assistantActive) uiText("Active") else "",
+                                    external = true, testTag = "setup-phone-assistant")
+                            SettingsNavRow(uiText("Phone access"), { onFinishThenOpen(keepConnected, "Phone access") },
+                                value = uiText("Calendar, alarms, calls and more"), valueMaxLines = Int.MAX_VALUE, enabled = state.authenticated, testTag = "setup-phone-access")
+                            SettingsNavRow(uiText("What needs you"), { onFinishThenOpen(keepConnected, "Assistant") },
+                                value = uiText("Alerts when something needs you"), valueMaxLines = Int.MAX_VALUE, enabled = state.authenticated, testTag = "setup-proactive")
+                        }
+                    },
+                    actions = { SetupPrimaryButton(uiText("Open chat"), { onFinish(keepConnected) }, Modifier.testTag("setup-finish"), enabled = state.authenticated) },
+                )
+            }
             else -> SetupShell(
                 step, uiText("Connect to Hermes"), modifier, uiText("Paste the link from your Hermes dashboard."),
                 content = {

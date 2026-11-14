@@ -38,7 +38,11 @@ with log_path.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps([profile, args]) + "\n")
 
 if args == ["plugins", "list", "--json"]:
-    print(json.dumps([{"name": name, "status": "enabled"} for name in state["plugins"]]))
+    print(json.dumps([{"name": name, "status": "disabled" if name in state.get("disabled", []) else "enabled", "version": state.get("versions", {}).get(name, "")} for name in state["plugins"]]))
+elif len(args) == 3 and args[:2] == ["plugins", "enable"]:
+    state["disabled"] = [name for name in state.get("disabled", []) if name != args[2]]
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    print("fake plugin enabled")
 elif args == ["config", "get", "dashboard.public_url", "--json"]:
     print(json.dumps(state.get("public_url", "")))
 elif args == ["config", "get", "dashboard.port", "--json"]:
@@ -47,10 +51,19 @@ elif args == ["dashboard", "--status"]:
     print("1 hermes dashboard/serve process(es) running:" if state.get("dashboard_running") else "No hermes dashboard or serve processes running.")
 elif len(args) >= 3 and args[:2] == ["plugins", "install"]:
     assert args[2] == "xploit9/beacon/hermes-plugin/beacon" and "--enable" in args
+    if "beacon" in state["plugins"] and "--force" not in args:
+        print("Plugin 'beacon' is already installed; use --force to reinstall.", file=sys.stderr)
+        raise SystemExit(1)
     state["plugins"] = sorted(set(state["plugins"] + ["beacon"]))
+    if "--ref" in args:
+        state.setdefault("pinned", {})["beacon"] = args[args.index("--ref") + 1]
     state_path.write_text(json.dumps(state), encoding="utf-8")
     print("fake plugin installed")
 elif args == ["plugins", "update", "beacon"]:
+    # Hermes refuses to pull a plugin that was installed on one commit (hermes_cli/plugins_cmd_update.py).
+    if "beacon" in state.get("pinned", {}):
+        print("Plugin 'beacon' is pinned to a commit; run `hermes plugins install ... --force --ref <sha>` to move it.", file=sys.stderr)
+        raise SystemExit(1)
     print("fake plugin updated")
 elif args == ["dashboard", "--stop"]:
     print("fake dashboard stopped")
@@ -58,6 +71,49 @@ else:
     print("unexpected fake Hermes command: " + repr(args), file=sys.stderr)
     raise SystemExit(2)
 '''
+
+
+COMMIT = "0123456789abcdef0123456789abcdef01234567"
+
+# Runs the installer with GitHub's API answered from FAKE_GITHUB; every other address (the dashboard probe) is untouched.
+GITHUB_WRAPPER = r'''import io, json, os, runpy, sys, urllib.error, urllib.request
+
+facts = json.loads(os.environ["FAKE_GITHUB"])
+real_open = urllib.request.OpenerDirector.open
+
+
+class Answer(io.BytesIO):
+    status = 200
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_open(self, request, *args, **kwargs):
+    url = getattr(request, "full_url", request)
+    if not url.startswith("https://api.github.com/"):
+        return real_open(self, request, *args, **kwargs)
+    with open(os.environ["FAKE_GITHUB_LOG"], "a", encoding="utf-8") as log:
+        log.write(json.dumps([url, request.get_header("Accept")]) + "\n")
+    row = facts["commit"] if "/commits/" in url else facts["latest"]
+    if row["status"] != 200:
+        raise urllib.error.HTTPError(url, row["status"], "fake", {}, io.BytesIO(b""))
+    return Answer(row["body"].encode("utf-8"))
+
+
+urllib.request.OpenerDirector.open = fake_open
+installer, *rest = sys.argv[1:]
+sys.argv = [installer, *rest]
+runpy.run_path(installer, run_name="__main__")
+'''
+
+
+def github(tag: str = "v1.2.0", commit: str = COMMIT, *, latest: int = 200, commits: int = 200, **release: object) -> str:
+    body = {"tag_name": tag, "draft": False, "prerelease": False, **release}
+    return json.dumps({"latest": {"status": latest, "body": json.dumps(body)}, "commit": {"status": commits, "body": commit}})
 
 
 class InstallerTests(unittest.TestCase):
@@ -75,6 +131,7 @@ class InstallerTests(unittest.TestCase):
         self.fake_script = self.bin / "fake_hermes.py"
         self.fake_script.write_text(FAKE_HERMES, encoding="utf-8")
         self.log = self.base / "commands.jsonl"
+        self.github_log = self.base / "github.jsonl"
         self.state_path = self.base / "state.json"
         self.write_state()
         if os.name == "nt":
@@ -110,6 +167,8 @@ class InstallerTests(unittest.TestCase):
         result["HERMES_HOME"] = str(self.home)
         result["FAKE_HERMES_STATE"] = str(self.state_path)
         result["FAKE_HERMES_LOG"] = str(self.log)
+        result["FAKE_GITHUB"] = github()
+        result["FAKE_GITHUB_LOG"] = str(self.github_log)
         for key, value in changes.items():
             if value is None:
                 result.pop(key, None)
@@ -119,7 +178,7 @@ class InstallerTests(unittest.TestCase):
 
     def run_installer(self, *args: str, input_text: str = "", **env_changes: str | None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, str(INSTALLER), *args],
+            [sys.executable, "-c", GITHUB_WRAPPER, str(INSTALLER), *args],
             cwd=ROOT,
             env=self.env(**env_changes),
             input=input_text,
@@ -158,18 +217,114 @@ class InstallerTests(unittest.TestCase):
         self.assertNotIn("Select Hermes home", skipped.stdout)
         self.assertNotIn("Select Hermes profile", skipped.stdout)
 
-    def test_installs_when_missing_and_updates_when_already_installed(self) -> None:
+    PINNED_INSTALL = ["plugins", "install", "xploit9/beacon/hermes-plugin/beacon", "--force", "--ref", COMMIT, "--enable"]
+
+    def test_a_fresh_install_is_pinned_to_the_latest_release(self) -> None:
         install = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
         self.assertEqual(install.returncode, 0, install.stderr + install.stdout)
-        self.assertTrue(any(args[:2] == ["plugins", "install"] for _, args in self.commands()))
-        self.assertFalse(any(args[:2] == ["plugins", "update"] for _, args in self.commands()))
+        run = [args for _, args in self.commands() if args[:2] in (["plugins", "install"], ["plugins", "update"])]
+        self.assertEqual(run, [self.PINNED_INSTALL])
+        asked = [json.loads(line) for line in self.github_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([url for url, _ in asked], ["https://api.github.com/repos/xploit9/beacon/releases/latest",
+                                                      "https://api.github.com/repos/xploit9/beacon/commits/v1.2.0"])
+        self.assertEqual(asked[1][1], "application/vnd.github.sha")
 
-        self.log.unlink()
-        self.write_state(plugins=["beacon"])
-        update = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
-        self.assertEqual(update.returncode, 0, update.stderr + update.stdout)
-        self.assertFalse(any(args[:2] == ["plugins", "install"] for _, args in self.commands()))
-        self.assertIn(["plugins", "update", "beacon"], [args for _, args in self.commands()])
+    def test_an_existing_install_is_reinstalled_pinned_and_never_git_pulled(self) -> None:
+        # Once the app (or this installer) has installed Beacon it is pinned, and Hermes refuses `plugins update` for a pinned plugin.
+        for state in ({"plugins": ["beacon"]}, {"plugins": ["beacon"], "pinned": {"beacon": "f" * 40}}):
+            with self.subTest(pinned="pinned" in state):
+                self.log.unlink(missing_ok=True)
+                self.write_state(**state)
+                update = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+                self.assertEqual(update.returncode, 0, update.stderr + update.stdout)
+                self.assertIn("Paste this link into Beacon: https://beacon.example.test", update.stdout)
+                self.assertFalse(any(args[:2] == ["plugins", "update"] for _, args in self.commands()))
+                self.assertIn(self.PINNED_INSTALL, [args for _, args in self.commands()])
+                self.assertEqual(json.loads(self.state_path.read_text(encoding="utf-8"))["pinned"], {"beacon": COMMIT})
+
+    def test_a_newer_beacon_is_left_alone_and_the_link_is_still_printed(self) -> None:
+        # The owner can be on a candidate build while the latest published release is older; "install Beacon" must not put the older one over it.
+        for installed in ("1.2.1", "1.3.0", "2.0.0", "1.10.0"):
+            with self.subTest(installed=installed):
+                self.log.unlink(missing_ok=True)
+                self.write_state(plugins=["beacon"], versions={"beacon": installed}, pinned={"beacon": "f" * 40})
+                result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n",
+                                            FAKE_GITHUB=github(tag="v1.9.0" if installed == "1.10.0" else "v1.2.0"))
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertFalse(any(args[:2] in (["plugins", "install"], ["plugins", "update"]) for _, args in self.commands()))
+                said = [line for line in result.stdout.splitlines() if "newer than the latest release" in line]
+                self.assertEqual(len(said), 1, result.stdout)
+                self.assertIn(installed, said[0])
+                self.assertNotIn("Beacon plugin installation completed", result.stdout)
+                self.assertIn("Paste this link into Beacon: https://beacon.example.test", result.stdout)
+                self.assertEqual(json.loads(self.state_path.read_text(encoding="utf-8"))["pinned"], {"beacon": "f" * 40})
+
+    def changing_commands(self) -> list[list[str]]:
+        return [args for _, args in self.commands() if args[:2] in (["plugins", "install"], ["plugins", "update"], ["plugins", "enable"])]
+
+    def test_a_newer_beacon_that_is_switched_off_is_switched_on_and_nothing_is_installed(self) -> None:
+        # R11 Nice 8: leaving a newer Beacon alone must not leave it off; the link printed next would point at a dashboard with no Beacon tab.
+        self.write_state(plugins=["beacon"], versions={"beacon": "1.3.0"}, pinned={"beacon": "f" * 40}, disabled=["beacon"])
+        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.changing_commands(), [["plugins", "enable", "beacon"]])
+        self.assertEqual(json.loads(self.state_path.read_text(encoding="utf-8"))["disabled"], [])
+        self.assertEqual(json.loads(self.state_path.read_text(encoding="utf-8"))["pinned"], {"beacon": "f" * 40})
+        self.assertIn("newer than the latest release", result.stdout)
+        self.assertNotIn("Beacon plugin installation completed", result.stdout)
+        self.assertIn("Paste this link into Beacon: https://beacon.example.test", result.stdout)
+
+    def test_a_newer_beacon_that_is_already_on_runs_nothing(self) -> None:
+        self.write_state(plugins=["beacon"], versions={"beacon": "1.3.0"}, pinned={"beacon": "f" * 40})
+        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.changing_commands(), [])
+
+    def test_an_older_beacon_that_is_switched_off_still_gets_only_the_pinned_install(self) -> None:
+        # Only the newer-Beacon branch switches a plugin on by itself; the pinned install already carries --enable.
+        self.write_state(plugins=["beacon"], versions={"beacon": "1.1.33"}, disabled=["beacon"])
+        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        self.assertEqual(self.changing_commands(), [self.PINNED_INSTALL])
+
+    def test_an_equal_older_or_unreadable_version_is_pinned_to_the_release_as_before(self) -> None:
+        for installed in ("1.2.0", "1.1.33", "1.2.0-rc1", "nightly", ""):
+            with self.subTest(installed=installed):
+                self.log.unlink(missing_ok=True)
+                self.write_state(plugins=["beacon"], versions={"beacon": installed})
+                result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn(self.PINNED_INSTALL, [args for _, args in self.commands()])
+                self.assertNotIn("newer than the latest release", result.stdout)
+                self.assertIn("Paste this link into Beacon: https://beacon.example.test", result.stdout)
+
+    def test_the_scan_line_says_what_a_forced_install_still_does(self) -> None:
+        result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n")
+        self.assertIn("Hermes' security scan still runs; a dangerous verdict still stops the install", result.stdout)
+        self.assertNotIn("scan and prompts", result.stdout)
+
+    def test_a_release_that_cannot_be_pinned_stops_before_anything_changes(self) -> None:
+        cases = {
+            "rate limited": (github(latest=403), "GitHub is busy"),
+            "too many requests": (github(commits=429), "GitHub is busy"),
+            "no release": (github(latest=404), "latest Beacon release"),
+            "tag names no commit": (github(commits=422), "latest Beacon release"),
+            "not a commit": (github(commit="main"), "latest Beacon release"),
+            "short commit": (github(commit=COMMIT[:12]), "latest Beacon release"),
+            "upper-case commit": (github(commit=COMMIT.upper()), "latest Beacon release"),
+            "draft": (github(draft=True), "latest Beacon release"),
+            "prerelease": (github(prerelease=True), "latest Beacon release"),
+            "tag that is not a version": (github(tag="nightly"), "latest Beacon release"),
+        }
+        for name, (answers, message) in cases.items():
+            with self.subTest(name):
+                self.log.unlink(missing_ok=True)
+                self.write_state(plugins=["beacon"], pinned={"beacon": "f" * 40})
+                result = self.run_installer("--home", str(self.home), "--profile", "default", input_text="\n", FAKE_GITHUB=answers)
+                self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+                self.assertIn(message, result.stdout)
+                self.assertFalse(any(args[:2] in (["plugins", "install"], ["plugins", "update"]) for _, args in self.commands()))
+                self.assertNotIn("Paste this link", result.stdout)
 
     def test_the_link_to_paste_is_printed_and_nothing_is_paired(self) -> None:
         result = self.run_installer("--home", str(self.home), "--profile", "default")
@@ -219,6 +374,7 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(after, before)
         mutating = (["plugins", "install"], ["plugins", "update"], ["dashboard", "--stop"])
         self.assertFalse(any(args[:2] in mutating for _, args in self.commands()))
+        self.assertFalse(self.github_log.exists(), "a dry run makes no network call")
 
 
 @pytest.fixture
@@ -271,7 +427,8 @@ def test_public_url_is_configured_before_dashboard_restart(installer, tmp_path, 
     monkeypatch.setattr(installer.shutil, 'which', lambda name: 'hermes')
     monkeypatch.setattr(installer, '_select_home', lambda home: tmp_path)
     monkeypatch.setattr(installer, '_select_profile', lambda home, profile: 'default')
-    monkeypatch.setattr(installer, '_plugin_names', lambda *args: {'beacon'})
+    monkeypatch.setattr(installer, '_installed_plugins', lambda *args: {'beacon': ''})
+    monkeypatch.setattr(installer, '_release_commit', lambda: (COMMIT, '1.2.0'))  # no network in these
     monkeypatch.setattr(installer, '_dashboard_running', lambda *args: True)
     monkeypatch.setattr(installer, '_dashboard_port', lambda *args: 9119)
     monkeypatch.setattr(installer, '_public_url', lambda *args: None)
@@ -288,7 +445,8 @@ def test_declining_restart_does_not_publish_new_route(installer, tmp_path, monke
     monkeypatch.setattr(installer.shutil, 'which', lambda name: 'hermes')
     monkeypatch.setattr(installer, '_select_home', lambda home: tmp_path)
     monkeypatch.setattr(installer, '_select_profile', lambda home, profile: 'default')
-    monkeypatch.setattr(installer, '_plugin_names', lambda *args: {'beacon'})
+    monkeypatch.setattr(installer, '_installed_plugins', lambda *args: {'beacon': ''})
+    monkeypatch.setattr(installer, '_release_commit', lambda: (COMMIT, '1.2.0'))  # no network in these
     monkeypatch.setattr(installer, '_dashboard_running', lambda *args: True)
     monkeypatch.setattr(installer, '_dashboard_port', lambda *args: 9119)
     monkeypatch.setattr(installer, '_public_url', lambda *args: None)
@@ -464,13 +622,45 @@ def test_successful_manifest_does_not_hide_an_unchanged_dashboard_process(instal
         hermes='hermes', home=tmp_path, previous_pids={10}) is ready
 
 
+def test_no_document_installs_beacon_without_pinning_the_release():
+    # A bare `plugins install xploit9/beacon...` clones the default branch, whatever is on it: not the published release, and not pinned.
+    documents = [ROOT / "README.md", ROOT / "hermes-plugin" / "beacon" / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+    assert len(documents) >= 3
+    for path in documents:
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "plugins install xploit9/beacon" in line:
+                assert "--ref" in line, f"{path.relative_to(ROOT)}:{number} installs Beacon without --ref"
+
+
+def test_the_plugin_readme_installs_through_the_installer_not_the_default_branch():
+    text = (ROOT / "hermes-plugin" / "beacon" / "README.md").read_text(encoding="utf-8")
+    install = text.split("## Install", 1)[1].split("\n## ", 1)[0]
+    assert "python beacon_install.py" in install
+    assert "plugins install xploit9/beacon/hermes-plugin/beacon --force --ref <commit of the latest release> --enable" in install
+    assert "plugins update beacon" in install and "does not work once Beacon is pinned" in install
+
+
+def test_the_scan_wording_is_true_for_a_forced_install():
+    # `--force` accepts a caution verdict without asking (Hermes tools/plugin_guard.py); only a dangerous verdict stops.
+    said = "Hermes' security scan still runs; a dangerous verdict still stops the install"
+    guide = (ROOT / "docs" / "install-with-agent.md").read_text(encoding="utf-8")
+    script = INSTALLER.read_text(encoding="utf-8")
+    assert said in guide and said in script
+    for name, text in (("guide", guide), ("installer", script)):
+        assert "scan and prompts" not in text, name
+
+
 def test_agent_guide_points_at_the_installer():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     guide = (ROOT / "docs" / "install-with-agent.md").read_text(encoding="utf-8")
     assert "raw.githubusercontent.com/xploit9/beacon/main/hermes-plugin/beacon/install/beacon_install.py" in readme
     assert INSTALLER.is_file()
-    for phrase in ("plugins install xploit9/beacon/hermes-plugin/beacon --enable", "--dry-run"):
+    for phrase in ("plugins install xploit9/beacon/hermes-plugin/beacon --force --ref", "--dry-run"):
         assert phrase in guide, phrase
+    # A pinned plugin cannot be pulled: no document may send a reader to `plugins update beacon` as the way to update.
+    for name, text in (("guide", guide), ("plugin README", (ROOT / "hermes-plugin" / "beacon" / "README.md").read_text(encoding="utf-8"))):
+        assert "or update with `hermes -p <profile> plugins update beacon`" not in text, name
+        assert "use `hermes -p <profile> plugins update beacon`" not in text, name
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ class NotificationReplyTest {
 
     @Test fun aFailureThatCannotHaveSentMayBeRetriedAndALateOneMustNotBe() {
         assertEquals("before the hand-over", ReplyState.NotSent, replyOutcomeFor(IOException("boom"), attempted = false))
-        assertEquals(ReplyState.NotSent, replyOutcomeFor(NativeTurnNotSent("The conversation could not be prepared."), attempted = true))
+        assertEquals(ReplyState.NotSent, replyOutcomeFor(NativeTurnNotSent("Couldn't open the chat. Your message is kept."), attempted = true))
         assertEquals("never connected", ReplyState.NotSent, replyOutcomeFor(ConnectException("refused"), attempted = true))
         assertEquals(ReplyState.NotSent, replyOutcomeFor(SocketTimeoutException("connect timed out"), attempted = true))
         assertEquals("a lost answer after the hand-over", ReplyState.Unsure, replyOutcomeFor(IOException("stream closed"), attempted = true))

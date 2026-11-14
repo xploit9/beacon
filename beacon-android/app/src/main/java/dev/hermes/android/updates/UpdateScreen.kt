@@ -73,11 +73,9 @@ import kotlin.math.sin
     val context = LocalContext.current
     val state by updates.state.collectAsStateWithLifecycle()
     val account = client.takeIf { connected }
-    var review by remember { mutableStateOf(false) }
     val now by produceState(System.currentTimeMillis()) { while (true) { delay(30_000); value = System.currentTimeMillis() } }
     LaunchedEffect(Unit) { updates.screenOpened() }
     LaunchedEffect(client, connected, pluginAbsent, state.latest?.pluginVersion) { updates.refreshPlugin(account, pluginAbsent) }
-    LaunchedEffect(state.plugin.status) { if (state.plugin.status == PluginStatus.NeedsReview) review = true }
     fun alertsEnabled() = androidx.core.app.NotificationManagerCompat.from(context).areNotificationsEnabled() &&
         context.getSystemService(android.app.NotificationManager::class.java).getNotificationChannel(UpdateManager.CHANNEL)?.importance != android.app.NotificationManager.IMPORTANCE_NONE
     var alertsAllowed by remember { mutableStateOf(alertsEnabled()) }
@@ -99,14 +97,11 @@ import kotlin.math.sin
             onRetry = { if (state.failure?.retriesCheck == true) updates.checkNow() else updates.startUpdate(account, pluginAbsent) },
             onCancel = updates::cancel,
             onAllow = { context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) },
-            onReview = { review = true },
             alertsBlocked = state.supported && !alertsAllowed,
             onAllowAlerts = {
                 context.startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName))
             })
     }
-    if (review && state.plugin.status == PluginStatus.NeedsReview) PluginReviewDialog(state.plugin.review,
-        onAllow = { review = false; updates.reviewPlugin(account) }, onDismiss = { review = false })
 }
 
 /** The whole screen from state alone, so every state can be shown without a network, a phone account or Hermes. */
@@ -120,7 +115,6 @@ import kotlin.math.sin
     onRetry: () -> Unit,
     onCancel: () -> Unit,
     onAllow: () -> Unit,
-    onReview: () -> Unit,
     modifier: Modifier = Modifier,
     alertsBlocked: Boolean = false,
     onAllowAlerts: () -> Unit = {},
@@ -161,10 +155,10 @@ import kotlin.math.sin
             SettingsSection(uiText("Components"), testTag = "update-components") {
                 if (showApp) SettingsValueRow(uiText("App"), icon = Icons.Rounded.SystemUpdate, value = if (release != null) "$installed → ${release.name}" else installed,
                     status = if (release != null) SettingsStatus.Attention else SettingsStatus.Ok,
-                    statusLabel = uiText(if (release != null) "Ready to update" else "Up to date"), testTag = "update-row-app")
+                    statusLabel = uiText(if (release != null) "Update available" else "Up to date"), testTag = "update-row-app")
                 if (showPlugin) {
                     if (showApp) SettingsDivider()
-                    PluginComponentRow(plugin, showMessage = release != null, onReview = onReview)
+                    PluginComponentRow(plugin, showMessage = release != null)
                 }
             }
         }
@@ -271,16 +265,14 @@ import kotlin.math.sin
     }
 }
 
-/** The Beacon plugin row: versions and a status pill, or the one action it needs ([PluginStatus.NeedsReview]). */
-@Composable private fun PluginComponentRow(plugin: PluginRow, showMessage: Boolean, onReview: () -> Unit) {
+/** The Beacon plugin row: versions and a status pill. */
+@Composable private fun PluginComponentRow(plugin: PluginRow, showMessage: Boolean) {
     val (status, label) = pluginPill(plugin.status)
-    val changing = plugin.status in setOf(PluginStatus.Checking, PluginStatus.Available, PluginStatus.Updating, PluginStatus.NeedsReview, PluginStatus.Busy, PluginStatus.Failed)
+    val changing = plugin.status in setOf(PluginStatus.Checking, PluginStatus.Available, PluginStatus.Updating, PluginStatus.Busy, PluginStatus.Failed)
     val versions = if (changing && plugin.installed.isNotBlank() && plugin.target.isNotBlank()) "${plugin.installed} → ${plugin.target}" else plugin.installed.ifBlank { plugin.target }
     val message = plugin.text.takeIf { showMessage && plugin.status in PluginSentenceStates }
     // The tag sits on the row itself, so its versions, sentence and pill are read (and found) as one node.
-    if (plugin.status == PluginStatus.NeedsReview) SettingsNavRow(uiText("Beacon plugin"), onClick = onReview, icon = Icons.Rounded.Hub, value = versions,
-        status = status, statusLabel = label, testTag = "update-row-plugin")
-    else SettingsValueRow(uiText("Beacon plugin"), icon = Icons.Rounded.Hub, value = message?.let { uiText(it) } ?: versions, status = status, statusLabel = label,
+    SettingsValueRow(uiText("Beacon plugin"), icon = Icons.Rounded.Hub, value = message?.let { uiText(it) } ?: versions, status = status, statusLabel = label,
         valueMaxLines = if (message != null) 2 else 1, testTag = "update-row-plugin")
 }
 
@@ -290,7 +282,6 @@ import kotlin.math.sin
     PluginStatus.UpToDate, PluginStatus.Updated -> SettingsStatus.Ok to uiText(PluginRow(status).text)
     PluginStatus.Available -> SettingsStatus.Attention to uiText(PluginRow(status).text)
     PluginStatus.Updating -> SettingsStatus.Working to uiText(PluginRow(status).text)
-    PluginStatus.NeedsReview -> SettingsStatus.Attention to uiText(PluginRow(status).text)
     PluginStatus.Restart, PluginStatus.DashboardRestart, PluginStatus.DashboardFailed -> SettingsStatus.Attention to uiText("Restart needed")
     PluginStatus.Waiting -> SettingsStatus.Working to uiText("Waiting")
     PluginStatus.Busy -> SettingsStatus.Off to uiText("Hermes is busy")
@@ -320,8 +311,6 @@ private class HeroSpec(
             if (spec.longLine.isNotBlank()) Text(spec.longLine, Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite }.testTag("update-plugin-line"),
                 style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             SettingsStatusPill(spec.status, spec.pill, testTag = spec.pillTag)
-            // A plugin-only action also reads as Available, but the app itself is current then.
-            if (spec.badge && release != null) SettingsBadge(uiText("New"), testTag = "update-badge-new")
             if (spec.callPill) SettingsStatusPill(SettingsStatus.Off, uiText(UpdateFailure.Call.text), testTag = "update-call-busy")
             // With a checklist on screen the running step carries the progress; the hero keeps its sentence.
             if (spec.working && heroBarShown(state)) {
@@ -359,7 +348,7 @@ private class HeroSpec(
     return when {
         !state.supported -> HeroSpec(SettingsStatus.Off, uiText("Preview build"), line = uiText("Installed manually"))
         // Hermes installs and restarts without the phone: nothing here to cancel, and never "up to date" while it runs.
-        plugin.status == PluginStatus.Updating -> HeroSpec(SettingsStatus.Working, uiText("Updating the Beacon plugin…"), working = true)
+        plugin.status == PluginStatus.Updating -> HeroSpec(SettingsStatus.Working, uiText("Updating Beacon on Hermes…"), working = true)
         phase == UpdatePhase.Idle -> {
             val checking = state.phase == UpdatePhase.Checking
             val ago = checkedAgo(state.checkedAt, now, uiText("just now"), uiText("{0} min ago"), uiText("{0} h ago"), uiText("{0} d ago"))
@@ -404,7 +393,6 @@ private class HeroSpec(
         PluginStatus.Waiting -> HeroSpec(SettingsStatus.Working, uiText("Waiting"), longLine = message)
         PluginStatus.DashboardRestart -> HeroSpec(SettingsStatus.Attention, uiText("Restart needed"), longLine = message, secondary = secondary)
         PluginStatus.Newer -> HeroSpec(SettingsStatus.Attention, uiText("Newer than app"), longLine = message)
-        PluginStatus.NeedsReview -> HeroSpec(SettingsStatus.Attention, uiText("Update available"))
         else -> HeroSpec(SettingsStatus.Attention, uiText("Update available"), primary = primary, callPill = callBusy)
     }
 }
@@ -423,22 +411,6 @@ private class HeroSpec(
             Text(uiText(if (expanded) "Show less" else "Show more"))
         }
     }
-}
-
-@Composable private fun PluginReviewDialog(lines: List<String>, onAllow: () -> Unit, onDismiss: () -> Unit) {
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(uiText("Review what's changing")) },
-        text = {
-            Column(Modifier.heightIn(max = 360.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(uiText("This update changes what the Beacon plugin can do on Hermes."))
-                if (lines.isEmpty()) Text(uiText("No change list. Review the update on your PC first."))
-                lines.forEach { Text("• $it", style = MaterialTheme.typography.bodySmall) }
-            }
-        },
-        confirmButton = { TextButton(onClick = onAllow) { Text(uiText("Allow and update")) } },
-        dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } },
-    )
 }
 
 /** "Updated to <version>" with What's new, once, on the first launch after the update. */

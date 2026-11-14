@@ -10,14 +10,14 @@ class CallToolApprovalTest {
             .put("summary","Fixture evidence").put("sources",org.json.JSONArray()).put("observed_at",123),false))
         for(value in listOf(false,"true",1,JSONObject.NULL)) {
             val parsed=CallToolReceipt.from(JSONObject(event.toString()).put("result_present",value))!!
-            assertFalse(parsed.hasResult);assertEquals("Completion not confirmed",parsed.chipLabel())
+            assertFalse(parsed.hasResult);assertEquals("Not confirmed",parsed.chipLabel())
         }
         assertFalse(CallToolReceipt.from(JSONObject(event.toString()).apply { remove("result_present") })!!.hasResult)
         for(status in listOf("running","failed","uncertain","needs_approval","cancelled"))
             assertFalse(CallToolReceipt.from(JSONObject(event.toString()).put("status",status))!!.hasResult)
         for(name in listOf("write_file","hermes_work","mcp__native__hermes_memory","other_lookup")) {
             val parsed=CallToolReceipt.from(JSONObject(event.toString()).put("tool_name",name))!!
-            assertFalse(parsed.hasResult);assertEquals("Completion not confirmed",parsed.chipLabel())
+            assertFalse(parsed.hasResult);assertEquals("Not confirmed",parsed.chipLabel())
         }
     }
 
@@ -185,8 +185,8 @@ class CallToolApprovalTest {
     @Test fun newCallApprovalFailuresUseShortOwnerFacingMessages() {
         assertEquals("The approval changed. Review the request again.", callToolApprovalErrorMessage("Approval proposal mismatch"))
         assertEquals("This call ended. The action was not allowed.", callToolApprovalErrorMessage("Call is closed or unavailable; no allowance was granted"))
-        assertEquals("This call has reached its saved-tool limit. Choose Allow once.", callToolApprovalErrorMessage("Call tool allowance capacity reached"))
-        assertEquals("The app has reached its saved-tool limit. Choose Allow once.", callToolApprovalErrorMessage("Tool allowance capacity reached"))
+        assertEquals("Can't save more. Choose Allow once.", callToolApprovalErrorMessage("Call tool allowance capacity reached"))
+        assertEquals("Can't save more. Choose Allow once.", callToolApprovalErrorMessage("Tool allowance capacity reached"))
         assertEquals("The request changed. Review the current details.", callToolApprovalErrorMessage("Request identity conflicts with its original arguments"))
         assertEquals("This tool changed. Refresh the list and try again.", callToolApprovalErrorMessage("Tool changed or is no longer configured; rediscover it"))
         assertEquals("The call is busy. Try again shortly.", callToolApprovalErrorMessage("Tool execution capacity reached"))

@@ -29,7 +29,7 @@ class NativeSkillsTest {
         attempts = 0; status = 401
         assertEquals(401, (runCatching { skills.read("mail") }.exceptionOrNull() as ApiFailure).status)
         assertEquals(1, attempts)
-        assertTrue(nativeErrorMessage(JSONObject(), 502).contains("Retry"))
+        assertTrue(nativeErrorMessage(JSONObject(), 502).contains("Try again"))
     }
 
     @Test fun nativeRowsPreserveDisabledStateAndRejectUnknownState() {

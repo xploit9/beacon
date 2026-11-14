@@ -64,14 +64,19 @@ class VisualFixesV2bTest {
 
     @Test fun notificationsSaysLastContactNotHeardFromHermes() {
         val page = source("NotificationSettings.kt")
-        assertTrue(page.contains("uiText(\"Last contact\") to agoText(now, heardAt)"))
+        // Root, 13 Nov 2026 (slop list, UX P2-9): "Last contact" read like phone contacts, so the label names Hermes. The bare "Heard from Hermes" stays out.
+        assertTrue(page.contains("uiText(\"Last heard from Hermes\") to agoText(now, heardAt)"))
+        assertFalse(page.contains("uiText(\"Last contact\")"))
         assertFalse(page.contains("uiText(\"Heard from Hermes\")"))
     }
 
     @Test fun keepConnectedBeingOffIsWordedOneWayWhereverItShows() {
-        // The hero, the plugin's Notifications row and the Notifications action all say it the same way: "Keep connected is off", then "Turn on".
+        // The hero and the plugin's Notifications row say it the same way: "Keep connected is off". The switch under the hero is the one control,
+        // so the hero has no second "Turn on" button (slop list G3, 13 Nov 2026).
         assertTrue(source("NotificationSettings.kt").contains("uiText(\"Keep connected is off\")"))
-        assertTrue(source("NotificationSettings.kt").contains("SettingsAction(uiText(\"Turn on\")"))
+        assertFalse(source("NotificationSettings.kt").contains("SettingsAction(uiText(\"Turn on\")"))
+        assertTrue(source("NotificationSettings.kt").contains("DeliveryState.Off -> null"))
+        assertTrue(source("NotificationSettings.kt").contains("testTag = \"keep-connected-toggle\""))
         assertTrue(source("PluginHealth.kt").contains("HealthLine(SettingsStatus.Off, \"Keep connected is off\""))
         assertFalse(source("PluginHealth.kt").contains("Turn on Keep connected"))
         assertTrue("Keep connected is off" in PluginHealthStrings)
@@ -87,8 +92,10 @@ class VisualFixesV2bTest {
 
     @Test fun approvalsSaysWhatManualAndAutoDo() {
         val code = source("NativeApprovalMenu.kt")
-        assertTrue(code.contains("uiText(\"Manual asks every time. Auto lets safe actions through.\")"))
-        assertTrue(code.contains("profile-approvals-caption"))
+        // The labels say it themselves now (Always ask / Ask for risky ones), so the caption that explained Manual and Auto is gone.
+        assertFalse(code.contains("Manual asks every time"))
+        assertFalse(code.contains("profile-approvals-caption"))
+        assertEquals(listOf("Always ask", "Ask for risky ones"), ProfileApprovalChoices.map(::approvalChoiceLabel))
     }
 
     // Item 6: the plugin section shows its internal rows only when one needs attention.

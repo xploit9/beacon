@@ -31,7 +31,7 @@ class SkillsPhoneUiTest {
         // The counts are figures with labels, not a sentence.
         compose.onNode(hasText("Installed") and hasText("2")).assertExists()
         compose.onNode(hasText("Enabled") and hasText("1") and !isSelectable()).assertExists()
-        compose.onNode(hasText("Need setup") and hasText("1")).assertExists()
+        compose.onNode(hasText("Needs setup") and hasText("1")).assertExists()
         compose.onNodeWithTag("skills-filter-needs-setup").performScrollTo().performClick()
         compose.onNodeWithTag("skills-filter-needs-setup").assertIsSelected()
         compose.onNodeWithTag("skill-row-needs-skill").assertExists()

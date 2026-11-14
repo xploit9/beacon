@@ -115,7 +115,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
 }
 
 /** The watch switch: the whole row toggles; under its label, how the watch is doing and when it last looked. */
-@Composable private fun WatchSwitchRow(checked: Boolean, enabled: Boolean, busy: Boolean, onChange: (Boolean) -> Unit, health: ProactiveHealthState?, lastCheck: String?) {
+@Composable private fun WatchSwitchRow(checked: Boolean, enabled: Boolean, busy: Boolean, onChange: (Boolean) -> Unit, health: ProactiveHealthState?, lastCheck: String?, reason: String = "", onRetry: () -> Unit = {}) {
     val active = enabled && !busy
     Row(Modifier.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeightTwoLine).alpha(if (enabled) 1f else .38f)
         .toggleable(checked, enabled = active, role = Role.Switch, onValueChange = onChange).testTag("assistant-proactive-toggle")
@@ -128,6 +128,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 health?.let { ProactiveHealthChip(it) }
                 lastCheck?.let { Text(uiText("Checked {0}").replace("{0}", it), Modifier.testTag("proactive-last-check"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1) }
             }
+            health?.let { ProactiveFailureDetail(it, reason, onRetry) }
         }
         if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
         Switch(checked, onCheckedChange = null, enabled = active)
@@ -159,7 +160,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
         Row(verticalAlignment = Alignment.CenterVertically) {
             Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SettingsBadge(ruleSourceLabel(rule.opt("signal") as? String), Modifier.weight(1f, fill = false), testTag = "proactive-rule-source-$id")
-                FilterChip(night, { onUpdate(json("night" to !night)) }, label = { Text(uiText("At night"), maxLines = 1) }, enabled = enabled,
+                FilterChip(night, { onUpdate(json("night" to !night)) }, label = { Text(uiText("Even at night"), maxLines = 1) }, enabled = enabled,
                     leadingIcon = { Icon(Icons.Rounded.Bedtime, null, Modifier.size(FilterChipDefaults.IconSize)) }, modifier = Modifier.testTag("proactive-rule-night-$id"))
             }
             SettingsIconButton(Icons.Rounded.DeleteOutline, uiText("Delete"), onDelete, Modifier.testTag("proactive-rule-delete-$id"), enabled = enabled, tint = scheme.error)
@@ -184,6 +185,8 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     val pluginStatus = ui.bootstrap.optJSONObject("optional_features")?.optString("plugin").orEmpty()
     val callbacksAvailable = callbacksAvailable(ui.bootstrap)
     val scope = rememberCoroutineScope()
+    // Every time on this screen is written in the phone's own 12/24-hour clock.
+    val is24Hour = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
     var savingProactive by remember(profile) { mutableStateOf(false) }
     var proactiveFetching by remember(profile) { mutableStateOf(false) }
     var proactiveRefresh by remember(profile) { mutableIntStateOf(0) }
@@ -191,6 +194,10 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     var proactiveDelivery by remember(proactiveVersion) { mutableStateOf(proactive?.string("delivery").orEmpty().ifBlank { "notify" }) }
     var proactiveCheckMinutes by remember(proactiveVersion) { mutableIntStateOf(proactive?.optInt("check_minutes", 15) ?: 15) }
     var proactiveQuietStart by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_start").orEmpty().ifBlank { "22:00" }) }
+    // The watch's own model as saved (watch_model/watch_provider); "" (Same as assistant) when none is chosen or it is the assistant's model.
+    val assistantWatchKey = proactiveModelKey(prefs.assistantModel, prefs.assistantProvider)
+    var watchModelChoice by remember(proactiveVersion, prefs.assistantModel, prefs.assistantProvider) { mutableStateOf(proactiveWatchModelChoice(
+        proactiveModelKey(proactive?.string("watch_model").orEmpty(), proactive?.string("watch_provider").orEmpty()), assistantWatchKey)) }
     var proactiveQuietEnd by remember(proactiveVersion) { mutableStateOf(proactive?.string("quiet_end").orEmpty().ifBlank { "07:00" }) }
     var ruleToDelete by remember(profile) { mutableStateOf<Pair<String, String>?>(null) }
     var earlierSheet by remember(profile) { mutableStateOf(false) }
@@ -202,8 +209,8 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     var savingSources by remember(profile) { mutableStateOf(false) }
     var queuedSources by remember(profile) { mutableStateOf<List<String>?>(null) }
     // Words the callbacks below show are translated here, where uiText can run.
-    val loadFailed = uiText("Couldn't load Proactive settings. Try again.")
-    val updateFailed = uiText("Couldn't update Proactive settings. Try again.")
+    val loadFailed = uiText("Couldn't load What needs you. Try again.")
+    val updateFailed = uiText("Couldn't save. Try again.")
     val ruleFailed = uiText("Couldn't update the rule. Try again.")
     val noteFailed = uiText("Couldn't clear earlier ratings. Try again.")
     val earlierFailed = uiText("Couldn't save the rule. Try again.")
@@ -252,24 +259,26 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
         }
     }
     /** A changed choice is saved at once; if the save fails the controls go back to what Hermes has. */
-    fun saveProactiveChoices(delivery: String = proactiveDelivery, checkMinutes: Int = proactiveCheckMinutes, quietStart: String = proactiveQuietStart, quietEnd: String = proactiveQuietEnd) {
+    fun saveProactiveChoices(delivery: String = proactiveDelivery, checkMinutes: Int = proactiveCheckMinutes, quietStart: String = proactiveQuietStart, quietEnd: String = proactiveQuietEnd, modelChoice: String = watchModelChoice) {
         if (savingProactive || !proactiveLoaded) return
-        if (delivery == proactiveDelivery && checkMinutes == proactiveCheckMinutes && quietStart == proactiveQuietStart && quietEnd == proactiveQuietEnd) return
+        if (delivery == proactiveDelivery && checkMinutes == proactiveCheckMinutes && quietStart == proactiveQuietStart && quietEnd == proactiveQuietEnd && modelChoice == watchModelChoice) return
         val wasDelivery = proactiveDelivery
         val wasCheckMinutes = proactiveCheckMinutes
         val wasQuietStart = proactiveQuietStart
         val wasQuietEnd = proactiveQuietEnd
-        proactiveDelivery = delivery; proactiveCheckMinutes = checkMinutes; proactiveQuietStart = quietStart; proactiveQuietEnd = quietEnd
+        val wasModelChoice = watchModelChoice
+        proactiveDelivery = delivery; proactiveCheckMinutes = checkMinutes; proactiveQuietStart = quietStart; proactiveQuietEnd = quietEnd; watchModelChoice = modelChoice
         savingProactive = true
         scope.launch {
             try {
-                val body = proactiveSettingsBody(proactiveEnabled, delivery, checkMinutes, quietStart, quietEnd, prefs)
+                // Every save carries the watch's current model, so changing one choice never resets another.
+                val body = proactiveSettingsBody(proactiveEnabled, delivery, checkMinutes, quietStart, quietEnd, prefs, watchModelKey = modelChoice)
                 val response = saveProactiveSettings(vm, profile, body)
                 if (vm.client?.scope?.origin == ui.origin && vm.client?.scope?.owner == ui.owner && vm.preferences.value.assistantProfile == profile)
                     vm.storeData(proactiveKey, response)
             } catch (error: Throwable) {
                 if (error is CancellationException) throw error
-                proactiveDelivery = wasDelivery; proactiveCheckMinutes = wasCheckMinutes; proactiveQuietStart = wasQuietStart; proactiveQuietEnd = wasQuietEnd
+                proactiveDelivery = wasDelivery; proactiveCheckMinutes = wasCheckMinutes; proactiveQuietStart = wasQuietStart; proactiveQuietEnd = wasQuietEnd; watchModelChoice = wasModelChoice
                 reportProactiveError(error, updateFailed)
             } finally { savingProactive = false }
         }
@@ -365,6 +374,8 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     // "provider\tmodel" keys; blank = the profile's default. The saved pick stays listed even before the list loads.
     val models = data["picker:models"]?.rows("groups").orEmpty().flatMap { group -> group.rows("models").map { group.string("provider_id") + "\t" + it.string("id") to group.string("provider") + " · " + it.string("label", it.string("id")) } }.toMap()
     val selectedModel = if (prefs.assistantModel.isBlank()) "" else prefs.assistantProvider + "\t" + prefs.assistantModel
+    // The watch's model options: the same list as the assistant's, with readable names (the watch row only).
+    val watchModelOptions = proactiveModelLabels(data["picker:models"]?.rows("groups").orEmpty())
     // Check-ups stay bound to the active client, independently of the assistant chat profile.
     val activeScope = vm.client?.scope?.takeIf { it.origin == ui.origin && it.owner == ui.owner && it.profile == ui.profile }
     val checkupKey = activeScope?.let { "checkup-capabilities:${it.key}" }
@@ -383,7 +394,7 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
     val activeProfileLabel = if (profileLoading) loadingProfile else profileDisplayName(ui.profile, profileRows)
     // Owner, 4 Nov 2026: "Check-in calls", and how often they come is a choice.
     val checkupTitle = assistantText("Check-in calls")
-    val checkupExplanation = assistantText("Beacon calls you to check in between 10:00 and 22:00. Do Not Disturb applies.")
+    val checkupExplanation = checkinSentenceInPhoneClock(assistantText("Beacon calls you to check in between 10:00 and 22:00. Do Not Disturb applies."), is24Hour)
     val checkupAction = uiText("Turn on")
     val checkupOffTitle = uiText("Turn off check-in calls?")
     val checkupOffExplanation = assistantText("Beacon stops these calls.")
@@ -453,11 +464,12 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 else {
                     val checking = proactive?.optBoolean("_loading") == true || connected && proactive == null
                     if (!connected) SettingsErrorRow(uiText("Connect to manage alerts"), { vm.connect(ui.origin) }, uiText("Reconnect"))
-                    else if (proactive?.has("_error") == true) SettingsErrorRow(uiText(proactive.string("_message", "Couldn't load Proactive settings. Try again.")),
+                    else if (proactive?.has("_error") == true) SettingsErrorRow(uiText(proactive.string("_message", "Couldn't load What needs you. Try again.")),
                         { proactiveRefresh++ }, uiText("Retry"), Modifier.testTag("proactive-load-error"))
                     WatchSwitchRow(proactiveEnabled, enabled = proactiveLoaded && connected, busy = savingProactive, onChange = ::setProactive,
                         health = when { checking && !proactiveLoaded -> ProactiveHealthState.Checking; proactiveEnabled -> proactiveHealthState(proactive, false); else -> null },
-                        lastCheck = if (proactiveEnabled) proactiveLastCheck(proactive) else null)
+                        lastCheck = if (proactiveEnabled) proactiveLastCheck(proactive, is24Hour = is24Hour) else null,
+                        reason = proactiveFailureReason(proactive), onRetry = { proactiveRefresh++ })
                     if (proactiveLoaded && proactiveEnabled) {
                         SettingsDivider()
                         SettingsChoiceRow(uiText("Delivery"), proactiveDelivery, listOf("notify", "call"), { saveProactiveChoices(delivery = it) }, icon = Icons.Rounded.Notifications,
@@ -465,6 +477,11 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                             enabled = controlsEnabled, anchorTestTag = "proactive-delivery")
                         if (proactiveCallsUnavailable(proactive, proactiveDelivery, callbacksAvailable))
                             SettingsStatusPill(SettingsStatus.Attention, uiText("Calls off on this Hermes"), Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp), testTag = "proactive-calls-off")
+                        SettingsDivider()
+                        // The watch's own model for this profile; the assistant's model is the default, and the list is the profile's models.
+                        SettingsChoiceRow(uiText("Model"), watchModelChoice, voiceOptionsWithSelected(listOf("") + watchModelOptions.keys, watchModelChoice),
+                            { key -> saveProactiveChoices(modelChoice = proactiveWatchModelChoice(key, assistantWatchKey)) }, icon = Icons.Rounded.Memory, style = ChoiceStyle.Menu, enabled = controlsEnabled, anchorTestTag = "proactive-model",
+                            optionLabels = proactiveWatchModelLabels(uiText("Same as assistant"), watchModelOptions, watchModelChoice))
                         SettingsDivider()
                         SettingsChoiceRow(uiText("Check every"), proactiveCheckMinutes.toString(), listOf("5", "15", "30"), { saveProactiveChoices(checkMinutes = it.toInt()) }, icon = Icons.Rounded.Timer,
                             optionLabels = mapOf("5" to "5 min", "15" to "15 min", "30" to "30 min"), enabled = controlsEnabled, anchorTestTag = "proactive-check-minutes")
@@ -517,12 +534,12 @@ internal suspend fun <T> runCatchingCancellable(block: suspend () -> T): Result<
                 val ready = checkupCapabilities?.optBoolean("checkups_ready") == true
                 val known = checkupCapabilitiesKnown(checkupCapabilities)
                 val failed = !ui.connected || activeScope == null || (recordError(checkupCapabilities).isNotBlank() && !(checkupKey in refreshing))
-                if (failed) SettingsErrorRow(uiText("Couldn't load check-up calls"), if (ui.connected && activeScope != null) ({ refreshCheckups() }) else null, uiText("Retry"), retryTestTag = "checkups-retry")
+                if (failed) SettingsErrorRow(uiText("Couldn't load check-in calls"), if (ui.connected && activeScope != null) ({ refreshCheckups() }) else null, uiText("Retry"), retryTestTag = "checkups-retry")
                 if (!known && !failed) SettingsSkeletonRows(1)
                 val cadences = checkinCadences(checkupCapabilities)
                 val cadence = checkupCapabilities?.optString("checkup_cadence")?.takeIf { it in CHECKIN_CADENCES } ?: "random"
                 if (known) SettingsSwitchRow(assistantText("Beacon calls you"), checkupsActive, ::setCheckups, icon = Icons.AutoMirrored.Rounded.PhoneCallback,
-                    summary = uiText(checkinCadenceLabel(cadence)) + ", 10:00–22:00",
+                    summary = uiText(checkinCadenceLabel(cadence)) + ", " + checkinWindowLabel(is24Hour),
                     status = if (!ready && !checkupsActive) SettingsStatus.Attention else null, statusLabel = uiText("Set up on your computer"),
                     enabled = connected && (ready || checkupsActive), testTag = "assistant-checkups-toggle")
                 if (known && checkupsActive && cadences.isNotEmpty()) {
@@ -610,6 +627,9 @@ internal fun ownerNameDraft(raw: String): String = raw.filter { it.isLetter() ||
     }
 }
 
+/** The section reads "Phones"; its id keeps the name the tests know, in every state the section can show. */
+private const val DEVICES_SECTION_TAG = "settings-section:Devices"
+
 /** Settings > Connection > Devices: this phone and every other phone linked to the account, each with its own device id. */
 @Composable
 internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) {
@@ -628,11 +648,11 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     // Words the callbacks below show are translated here, where uiText can run.
     val tooManyPhones = uiText("Too many phones. Remove one below.")
     val couldntAddPhone = uiText("Couldn't add this phone. Try again.")
-    val finishSetup = uiText("Finish setting up the Beacon plugin, then retry.")
+    val finishSetup = uiText("Finish setting up Beacon on Hermes, then retry.")
     // The devices route is missing: a Beacon plugin older than this app.
-    val pluginMissing = uiText("Update the Beacon plugin")
-    val couldntLoad = uiText("Couldn't load devices. Check your connection and try again.")
-    val couldntRemove = uiText("Couldn't remove this device. Try again.")
+    val pluginMissing = uiText("Update Beacon on Hermes")
+    val couldntLoad = uiText("Couldn't load phones. Check your connection.")
+    val couldntRemove = uiText("Couldn't remove this phone. Try again.")
 
     fun linkFailure(failure: Throwable) = if ((failure as? ApiFailure)?.status == 409) tooManyPhones else couldntAddPhone
 
@@ -696,7 +716,7 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     }
 
     val thisDeviceId = source?.let { NativePairing.deviceId(context, it.scope) }
-    val title = uiText("Devices")
+    val title = uiText("Phones")
     val refreshLabel = uiText("Refresh devices")
     // Refresh sits beside the heading; a spinner next to it says a read or a change is running.
     val refreshAction: @Composable RowScope.() -> Unit = {
@@ -705,18 +725,18 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     }
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(SettingsKit.SectionGap)) {
         when {
-            pluginAbsent -> SettingsSection(title) { MissingBeaconPluginState(compact = true) }
-            source == null || !ui.authenticated -> SettingsSection(title) {
+            pluginAbsent -> SettingsSection(title, testTag = DEVICES_SECTION_TAG) { MissingBeaconPluginState(compact = true) }
+            source == null || !ui.authenticated -> SettingsSection(title, testTag = DEVICES_SECTION_TAG) {
                 SettingsErrorRow(uiText("Reconnect to see devices"), { vm.connect(ui.origin) }, uiText("Reconnect"))
             }
-            removed -> SettingsSection(title) {
+            removed -> SettingsSection(title, testTag = DEVICES_SECTION_TAG) {
                 SettingsValueRow(uiText("This phone was removed"), icon = Icons.Rounded.PhoneAndroid, value = uiText("Add it to get calls and alerts"), testTag = "devices-removed")
                 if (error.isNotBlank()) SettingsErrorRow(error, null, "")
                 SettingsDivider()
                 SettingsActionRow(uiText("Add this phone"), ::addThisPhone, icon = Icons.Rounded.Add, enabled = !busy, busy = busy, testTag = "devices-link-this-phone")
             }
-            loading && devices == null -> SettingsSection(title, trailing = refreshAction) { SettingsSkeletonRows(2) }
-            error.isNotBlank() && devices == null -> SettingsSection(title, trailing = refreshAction) {
+            loading && devices == null -> SettingsSection(title, trailing = refreshAction, testTag = DEVICES_SECTION_TAG) { SettingsSkeletonRows(2) }
+            error.isNotBlank() && devices == null -> SettingsSection(title, trailing = refreshAction, testTag = DEVICES_SECTION_TAG) {
                 SettingsErrorRow(error, { refresh++ }, uiText("Retry"), retryTestTag = "settings-devices-retry")
             }
             else -> DevicesList(devices.orEmpty(), thisDeviceId, enabled = !busy, trailing = refreshAction, error = error,
@@ -774,8 +794,8 @@ internal fun DevicesList(
     var showAll by rememberSaveable { mutableStateOf(false) }
     val shown = devicesShown(others, showAll)
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(SettingsKit.SectionGap)) {
-        if (thisPhone != null || onAddThisPhone != null || error.isNotBlank()) SettingsSection(uiText("Devices"), trailing = trailing,
-            footer = if (thisPhone != null && others.isEmpty()) uiText("No other phones") else "") {
+        if (thisPhone != null || onAddThisPhone != null || error.isNotBlank()) SettingsSection(uiText("Phones"), trailing = trailing,
+            footer = if (thisPhone != null && others.isEmpty()) uiText("No other phones") else "", testTag = DEVICES_SECTION_TAG) {
             if (error.isNotBlank()) SettingsErrorRow(error, null, "")
             if (thisPhone != null) DeviceSettingsRow(thisPhone, current = true, enabled = enabled, onRemove = null)
             else if (onAddThisPhone != null) SettingsActionRow(uiText("Add this phone"), onAddThisPhone, icon = Icons.Rounded.Add, value = uiText("Not linked"),

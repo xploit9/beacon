@@ -248,7 +248,8 @@ def _cron_helpers():
 def default_setup():
     quiet_start, quiet_end = DEFAULT_QUIET_HOURS
     return {"delivery": DEFAULT_DELIVERY, "check_minutes": DEFAULT_CHECK_MINUTES,
-            "quiet_start": quiet_start, "quiet_end": quiet_end, "model": "", "provider": ""}
+            "quiet_start": quiet_start, "quiet_end": quiet_end, "model": "", "provider": "",
+            "watch_model": "", "watch_provider": ""}
 
 
 def _valid_time(value):
@@ -256,7 +257,7 @@ def _valid_time(value):
 
 
 def validate_setup(value):
-    allowed = {"enabled", "delivery", "check_minutes", "quiet_start", "quiet_end", "model", "provider"}
+    allowed = {"enabled", "delivery", "check_minutes", "quiet_start", "quiet_end", "model", "provider", "watch_model", "watch_provider"}
     if not isinstance(value, dict) or set(value) - allowed:
         raise ValueError("Unknown Proactive setup field")
     if "enabled" not in value or type(value["enabled"]) is not bool:
@@ -271,11 +272,20 @@ def validate_setup(value):
         raise ValueError("Quiet hours must use 24-hour HH:MM")
     output = {"delivery": delivery, "check_minutes": check_minutes,
               "quiet_start": value["quiet_start"], "quiet_end": value["quiet_end"]}
+    # model is the saved model that nightly upkeep and, until a watch model is chosen, the watch use.
     for name in ("model", "provider"):
         item = value.get(name, "")
         if not isinstance(item, str) or len(item) > 200:
             raise ValueError(f"{name} must be a string up to 200 characters")
         output[name] = item.strip()
+    # The watch's own model and provider are one pair. If either key is in the request, the pair is the request's own (a missing
+    # half is empty); if neither is, configure keeps the saved pair (N4, R3-3).
+    if "watch_model" in value or "watch_provider" in value:
+        for name in ("watch_model", "watch_provider"):
+            item = value.get(name, "")
+            if not isinstance(item, str) or len(item) > 200:
+                raise ValueError(f"{name} must be a string up to 200 characters")
+            output[name] = item.strip()
     return output
 
 
@@ -291,7 +301,8 @@ def _setup(mobile, owner, profile):
         raise RuntimeError("Saved Proactive setup is invalid")
     if not ({"signals", "watch", "schedule", "urgent"} & set(value)):
         try:
-            return validate_setup({"enabled": False, **{key: item for key, item in value.items() if key != "enabled"}})
+            setup = validate_setup({"enabled": False, **{key: item for key, item in value.items() if key != "enabled"}})
+            return {"watch_model": "", "watch_provider": "", **setup}
         except ValueError:
             raise RuntimeError("Saved Proactive setup is invalid") from None
 
@@ -305,13 +316,14 @@ def _setup(mobile, owner, profile):
              "check_minutes": check_minutes,
              "quiet_start": schedule.get("quiet_start", value.get("quiet_start", DEFAULT_QUIET_HOURS[0])),
              "quiet_end": schedule.get("quiet_end", value.get("quiet_end", DEFAULT_QUIET_HOURS[1])),
-             "model": value.get("model", ""), "provider": value.get("provider", "")}
+             "model": value.get("model", ""), "provider": value.get("provider", ""),
+             "watch_model": "", "watch_provider": ""}
     if setup["delivery"] not in ("notify", "call"):
         setup["delivery"] = DEFAULT_DELIVERY
     for key, fallback in (("quiet_start", DEFAULT_QUIET_HOURS[0]), ("quiet_end", DEFAULT_QUIET_HOURS[1])):
         if not _valid_time(setup[key]):
             setup[key] = fallback
-    for key in ("model", "provider"):
+    for key in ("model", "provider", "watch_model", "watch_provider"):
         if not isinstance(setup[key], str) or len(setup[key]) > 200:
             setup[key] = ""
         else:
@@ -816,6 +828,10 @@ def _specs(setup, requests=(), toolsets=None):
     for spec in output:
         spec["model"] = setup.get("model") or None
         spec["provider"] = setup.get("provider") or None
+    # The watch alone takes its own model when one is chosen; nightly memory upkeep always keeps the saved model.
+    if setup.get("watch_model"):
+        watch["model"] = setup["watch_model"]
+        watch["provider"] = setup.get("watch_provider") or None
     return output
 
 
@@ -1048,7 +1064,8 @@ def status(mobile, owner, profile):
             "setup_complete": _setup_complete(mobile, owner, profile),
             "timezone": _profile_timezone(profile), "delivery": setup["delivery"],
             "check_minutes": setup["check_minutes"], "quiet_start": setup["quiet_start"],
-            "quiet_end": setup["quiet_end"], "health": health(mobile, owner, profile, setup),
+            "quiet_end": setup["quiet_end"], "watch_model": setup["watch_model"], "watch_provider": setup["watch_provider"],
+            "health": health(mobile, owner, profile, setup),
             "rules": rules, "learned": learned, "learned_proposal": learned_proposal(learned),
             "jobs": _job_status(mobile, owner, profile, jobs, specs)}
     if _meta_get(mobile, _key(owner, profile, "enable-error")):
@@ -1229,6 +1246,12 @@ def set_enabled(mobile, owner, profile, value):
 def configure(mobile, owner, profile, value):
     setup = validate_setup(value)
     with _SET_ENABLED_LOCK:
+        # A save from a phone that predates the watch model leaves the saved watch model alone (N4).
+        try:
+            saved = _setup(mobile, owner, profile)
+        except RuntimeError:
+            saved = default_setup()  # an unreadable saved setup is replaced by this save, as before
+        setup = {"watch_model": saved["watch_model"], "watch_provider": saved["watch_provider"], **setup}
         if value["enabled"]:
             _enable_locked(mobile, owner, profile, setup, save_setup=True)
         else:

@@ -32,6 +32,19 @@ import org.json.JSONObject
 
 internal fun profileDisplayName(profileId: String, profiles: List<JSONObject>): String =
     profiles.firstOrNull { it.string("name") == profileId }?.string("display_name")?.trim()?.takeIf(String::isNotBlank) ?: profileId
+/** A profile id as words, for a profile Hermes has no name for: "coder" reads "Coder", "my-work_2" reads "My work 2". */
+internal fun readableProfileId(profileId: String): String = profileId.split('-', '_').filter(String::isNotBlank).joinToString(" ").trim().replaceFirstChar(Char::uppercase)
+/**
+ * The name a chat titles itself with for [profileId] (review R29 Should 1): Hermes' display name when it gives one other than the id; else, on the
+ * assistant's own profile ([assistantProfile]) only, the assistant's name; else the id made readable. Never the bare id: Hermes leaves the display name
+ * empty until someone renames the profile, and "default" or "coder" reads like a placeholder. Another profile's chat never claims the assistant's name.
+ */
+internal fun profileTitle(profileId: String, profiles: List<JSONObject>, assistantName: String, assistantProfile: String): String =
+    profiles.firstOrNull { it.string("name") == profileId }?.string("display_name")?.trim()?.takeIf { it.isNotBlank() && it != profileId }
+        ?: assistantName.trim().takeIf { it.isNotBlank() && profileId == assistantProfile }
+        ?: readableProfileId(profileId).ifBlank { assistantName }
+/** The notice after a saved change whose screen copy could not be saved: with no notice of its own, only the plain sentence (review R29 Nice 2). */
+internal fun refreshPageNotice(message: String): String = if (message.isBlank()) "Refresh this page." else "$message. Refresh this page."
 internal fun profileDisplayLabel(profileId: String, profiles: List<JSONObject>, loading: Boolean): String =
     if (loading) "Loading profile…" else profileDisplayName(profileId, profiles)
 
@@ -90,7 +103,7 @@ internal data class BackgroundActivitySummary(
 /** The background line's fixed texts, which reach uiText through [backgroundActivityStatus]. Each count sits inside its own template as {0}. */
 internal val BackgroundActivityStrings = listOf(
     "1 agent", "{0} agents", "1 process", "{0} processes",
-    "More may be active", "Background status unavailable",
+    "Background status unavailable",
 )
 
 /** [text] translates one of [BackgroundActivityStrings] whole. */
@@ -101,7 +114,6 @@ internal fun backgroundActivityStatus(activity: BackgroundActivitySummary, text:
         count(activity.processes, "1 process", "{0} processes"),
     )
     return when {
-        counts.isNotEmpty() && !activity.available -> counts.joinToString(" · ") + " · " + text("More may be active")
         counts.isNotEmpty() -> counts.joinToString(" · ")
         !activity.available -> text("Background status unavailable")
         else -> ""
@@ -148,7 +160,7 @@ internal fun conversationBackgroundActivity(roster: JSONObject?, processes: JSON
     val delegations = roster?.rows("delegations").orEmpty().mapNotNull { row ->
         val id = row.string("delegation_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
         val state = status(row.string("status"))
-        BackgroundActivityItem("delegation:$id:${row.optInt("task_index")}", "Delegation", row.string("goal"), state, elapsed(row, "dispatched_at", "completed_at", state in setOf("Running", "Queued")))
+        BackgroundActivityItem("delegation:$id:${row.optInt("task_index")}", "Handed-off task", row.string("goal"), state, elapsed(row, "dispatched_at", "completed_at", state in setOf("Running", "Queued")))
     }.distinctBy { it.id }
     val jobs = processes?.rows("processes").orEmpty().mapNotNull { row ->
         val id = row.string("session_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
@@ -184,28 +196,65 @@ internal fun conversationActionLabel(action: String, pinned: Boolean, archived: 
     action == "Toolsets" -> "Tools"
     // The id the menu dispatches on stays "Compress context"; the row says what it does for the owner.
     action == "Compress context" -> "Shorten history"
+    // The ids stay; a person reads chat and message.
+    action == "New conversation" -> "New chat"
+    action == "Delete conversation" -> "Delete chat"
+    action == "Undo last turn" -> "Undo last message"
     else -> action
 }
 
 internal fun conversationMenuTitle(label: String): String = label.replaceFirstChar(Char::uppercase)
 
+/** The chat actions that open a confirm form from the chat's menu (ChatScreen `chatAction`). */
+internal val ChatActionFormKeys = listOf("Rename", "Branch", "Undo last turn", "Delete conversation")
+/** A chat action's form title: the label the menu shows for it, never its id ("Delete conversation" reads "Delete chat", as in the menu). */
+internal fun chatActionFormTitle(action: String): String = conversationActionLabel(action, pinned = false, archived = false)
+
 internal fun branchSessionId(response: JSONObject): String =
     response.optJSONObject("session")?.string("session_id")?.takeIf(String::isNotBlank) ?: response.string("session_id").takeIf(String::isNotBlank).orEmpty()
 
 internal fun fileDownloadError(error: Throwable): String = when {
-    error is IllegalArgumentException && error.message?.contains("Download exceeds permitted size") == true -> "This file is larger than the 256 MB download limit."
+    error is IllegalArgumentException && error.message?.contains("This file is too large to download here.") == true -> "This file is larger than the 256 MB download limit."
     error is ApiFailure && error.status == 404 -> "This file is no longer available."
     else -> "Couldn’t download this file. Check your connection and try again."
 }
 
 private val terminalOnlyCommand = Regex("(?:\\bcli|\\bterminal)[ -]only\\b|terminal drift|terminal ui", RegexOption.IGNORE_CASE)
 // shortcut: Hermes exposes no per-client command capability, so this omits explicit terminal-only cues until it does.
-/** The commands the phone offers. Each keeps its name; its description is what a person reads: [slashCommandText]. */
+/**
+ * Hermes built-ins a phone cannot use: they act on the computer's terminal, editor, clipboard, window or local browser. Each is `cli_only` in Hermes' command
+ * registry (hermes_cli/commands.py), except density and mouse, which are its terminal-UI extras (tui_gateway/command_discovery.py); checked at Hermes 2bd378ed.
+ * Only Hermes' own entries are hidden: a quick command, plugin command or skill is marked `own` when the catalog is read and always stays listed,
+ * with its own description, even when it shares one of these names.
+ */
+internal val computerOnlyCommands = setOf("prompt", "worktree", "statusbar", "battery", "timestamps", "verbose", "focus", "indicator", "palette", "quit", "wake", "pet", "hatch",
+    "copy", "paste", "image", "browser", "skin", "density", "mouse")
+/** A command's report shown whole, in a dialog the person closes: [title] is the command as typed ("/context"), [text] Hermes' Markdown. */
+internal data class CommandReport(val title: String, val text: String)
+/** About two lines of a notice: a longer report, or one of several lines, opens whole in the report dialog instead of a notice that closes by itself. */
+internal const val CommandNoticeMaxChars = 120
+internal fun commandReportIsLong(output: String): Boolean = output.trim().let { '\n' in it || it.length > CommandNoticeMaxChars }
+/** A short report as a notice, which draws no Markdown: Hermes' bold, code and heading marks are dropped, the words kept. */
+internal fun commandNoticeText(output: String): String = output.replace(Regex("\\*\\*|__|`"), "").replace(Regex("(?m)^#+\\s+"), "").trim()
+/** A command that ran empties the composer when it still holds that command, as typed or as the list inserts it ("/status "); other words stay. */
+internal fun commandRanClearsDraft(draft: String, command: String): Boolean = draft.isNotBlank() && draft.trim() == command.trim()
+
+/** A typed `/name` that Hermes' catalog lists but the phone leaves out: it is answered on the phone and never sent to the model as a message. */
+internal fun phoneHiddenCommand(draft: String, catalog: List<JSONObject>): Boolean {
+    val name = draft.takeIf { it.startsWith('/') }?.drop(1)?.takeWhile { !it.isWhitespace() }?.takeIf(String::isNotBlank) ?: return false
+    fun JSONObject.named() = string("name").removePrefix("/").trim().equals(name, ignoreCase = true)
+    return catalog.any { it.named() } && mobileSlashCommands(catalog).none { it.named() }
+}
+/**
+ * The commands the phone offers. Each keeps its name; its description is what a person reads: [slashCommandText]. A built-in is left out when it
+ * works only on a computer or Hermes marked it `runs` false (a shared gateway does not run it for a phone); the owner's own commands always stay.
+ */
 internal fun mobileSlashCommands(commands: List<JSONObject>): List<JSONObject> = commands.filterNot { command ->
     val name = command.string("name").removePrefix("/").trim()
-    name.equals("redraw", ignoreCase = true) || terminalOnlyCommand.containsMatchIn("$name ${command.string("description")}")
+    name.equals("redraw", ignoreCase = true) || !command.optBoolean("own") && (name.lowercase() in computerOnlyCommands || !command.optBoolean("runs", true)) ||
+        terminalOnlyCommand.containsMatchIn("$name ${command.string("description")}")
 }.map { command ->
-    val text = slashCommandText(command.string("name"), command.string("description"))
+    val text = slashCommandText(command.string("name"), command.string("description"), own = command.optBoolean("own"))
     if (text == command.string("description")) command else JSONObject(command.toString()).put("description", text)
 }
 
@@ -216,13 +265,13 @@ internal fun mobileSlashCommands(commands: List<JSONObject>): List<JSONObject> =
  */
 private val slashCommandTexts = mapOf(
     "new" to "New chat", "reset" to "New chat", "clear" to "Start fresh", "history" to "Show history", "save" to "Export chat",
-    "retry" to "Try again", "undo" to "Undo last turn", "rewind" to "Return to an earlier prompt", "title" to "Rename chat", "branch" to "Branch chat", "fork" to "Branch chat",
+    "retry" to "Try again", "undo" to "Undo last message", "rewind" to "Return to an earlier prompt", "title" to "Rename chat", "branch" to "Branch chat", "fork" to "Branch chat",
     "compress" to "Shorten history", "stop" to "Stop reply", "status" to "Show status", "model" to "Change model", "usage" to "Show usage",
     "help" to "Show commands", "queue" to "Queue a message", "background" to "Run in background", "bg" to "Run in background", "reasoning" to "Set reasoning level",
     "skills" to "Browse skills", "tools" to "Choose tools",
     "prompt" to "Write a prompt in your editor", "handoff" to "Hand off to a messaging app", "worktree" to "Manage git worktrees",
     "rollback" to "Restore a saved checkpoint", "snapshot" to "Save or restore a snapshot", "export" to "Export a profile", "import" to "Import a profile",
-    "btw" to "Ask a side question", "agents" to "Show active agents", "journey" to "Open the learning timeline", "steer" to "Guide the reply in progress",
+    "btw" to "Ask a side question", "agents" to "Show active agents", "journey" to "Open the learning timeline", "steer" to "Change the reply now",
     "goal" to "Set a standing goal", "heartbeat" to "Repeat a prompt when idle", "refine" to "Save lessons from this chat", "review" to "Get an independent review",
     "loop" to "Repeat a prompt on a schedule", "plan" to "Write a plan without running it", "moa" to "Ask several models at once", "subgoal" to "Refine the current goal",
     "egress" to "Show network proxy status", "context" to "Show context usage", "whoami" to "Show your command access", "profile" to "Show the active profile",
@@ -250,8 +299,8 @@ private val openParenthetical = Regex("""\s*\([^)]*$""")
 private val whitespaceRun = Regex("""\s+""")
 
 /** What a command's row says: a short text for a common command, else Hermes' description without "(usage: ...)" and other parenthetical mechanics. */
-internal fun slashCommandText(name: String, description: String): String {
-    slashCommandTexts[name.removePrefix("/").trim().lowercase()]?.let { return it }
+internal fun slashCommandText(name: String, description: String, own: Boolean = false): String {
+    if (!own) slashCommandTexts[name.removePrefix("/").trim().lowercase()]?.let { return it }
     var text = description
     // Nested or repeated groups come off from the inside out; a cut-off group at the end goes too.
     while (parenthetical.containsMatchIn(text)) text = parenthetical.replace(text, "")
@@ -308,4 +357,4 @@ internal fun conversationMoreMenu(debug: Boolean = BuildConfig.DEBUG): List<Stri
 
 /** The chat menu's and message marker's fixed texts, which reach uiText through variables. */
 internal val ConversationStrings = conversationActionGroups.keys.filter(String::isNotBlank) + conversationActionGroups.values.flatten() + conversationMoreActions + conversationDebugActions +
-    listOf("Unpin", "Unarchive", "Tools", "Shorten history", "Stopped") + SlashCommandStrings
+    listOf("Unpin", "Unarchive", "Tools", "Shorten history", "New chat", "Delete chat", "Undo last message", "Stopped") + SlashCommandStrings

@@ -92,6 +92,21 @@ class ServerPagesGapsUiTest {
         compose.onAllNodesWithText("Running").assertCountEquals(0)
     }
 
+    // UX review P1-10: Hermes' own verdict read "Hermes is healthy" while its log showed a refused write.
+    @Test fun aRecentErrorInHermesLogTurnsTheHealthyVerdictIntoNeedsAttentionAndSaysTheError() {
+        val refused = "FATAL: state.db was replaced underneath the gateway; refusing further writes to this file."
+        show({ "Health" }, { hermes.copy(overall = "degraded", recentError = refused, components = parts(NativeComponent("gateway", "ok", "running"))) }, Calls())
+        compose.onNodeWithText("Some parts of Hermes need attention").assertIsDisplayed()
+        compose.onAllNodesWithText("Hermes is healthy").assertCountEquals(0)
+        compose.onNodeWithTag("server-recent-error-row").assertIsDisplayed().assertTextContains("Hermes reported an error").assertTextContains(refused)
+    }
+
+    @Test fun withNoRecentErrorTheHealthPageHasNoErrorRow() {
+        show({ "Health" }, { hermes.copy(components = parts(NativeComponent("gateway", "ok", "running"))) }, Calls())
+        compose.onNodeWithText("Hermes is healthy").assertIsDisplayed()
+        compose.onNodeWithTag("server-recent-error").assertDoesNotExist()
+    }
+
     @Test fun logChipsNameTheFileAndTheSearchFieldReportsTyping() {
         val calls = Calls()
         var state by mutableStateOf(NativeServerState(logFile = "errors", logs = listOf("one line")))

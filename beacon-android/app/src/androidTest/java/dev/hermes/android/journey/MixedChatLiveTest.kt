@@ -77,11 +77,21 @@ class MixedChatLiveTest {
     // Both rules precede activity launch, including on ordinary non-opted-in instrumentation runs.
     @get:Rule val rules: RuleChain = RuleChain.outerRule(ownerRuntimeOptIn).around(optIn).around(compose)
 
-    @Test(timeout = 480_000) fun completedGrokCallThenImageAndLunaReplyStayOrderedAcrossSync() = runBlocking {
+    // The cap must outlast the longest this test can wait for itself, cleanup included, or JUnit ends the thread in the middle of the cleanup and leaves the dirty scope it exists to prevent (R20 Nice 2).
+    // Bounded waits in code order, seconds: connect 105 (90 + 15), preflight queue 45, new chat 60, call up 45, greeting 45, text reply 45, hang-up 45, reopen 45, call rows 30, local copy 45,
+    // first reply 150, reselect 45 + reconnect 150, terminal proof 150, rows 90, two reopens 45 + 150, recreate 150 (connect 105 + reopen 45) = 1440.
+    // Cleanup, if it all runs: hang-up 45, reopen 45, idle 150, queue 45 = 285. Together 1725; the margin covers calls the test does not bound itself (a stuck HTTP call is up to 75: 15 connect + 60 read).
+    @Test(timeout = 2_000_000) fun completedGrokCallThenImageAndLunaReplyStayOrderedAcrossSync() = runBlocking {
         val h = OwnerJourneyHarness(compose, "mixed-chat-live")
         h.checked {
             qa(); check(scope == verified)
-            check(vm.composer.value.text.isBlank() && vm.attachments.value.isEmpty() && vm.chat.value.queued.isEmpty())
+            // A copy of an earlier attempt's message that Hermes already delivered is retired by the chat's own receipt sweep (about 5 s after the chat opens): that is the signal to wait for.
+            // qa() has already refused any copy that is not delivered, so only delivered ones can still be here.
+            runCatching { await(45_000) { vm.chat.value.queued.isEmpty() } }
+            // One clause per line, so the failure line names the clause.
+            check(vm.composer.value.text.isBlank())
+            check(vm.attachments.value.isEmpty())
+            check(vm.chat.value.queued.isEmpty())
             check(vm.chat.value.liveText.isBlank() && vm.chat.value.liveTools.isEmpty() && !vm.ui.value.botModeEnabled)
             val owner = scope
             val began = System.nanoTime()
@@ -130,7 +140,7 @@ class MixedChatLiveTest {
                 val ownedRows = chat.messages.filter { it.role == "assistant" && it.id !in baselineRows && it.text.isNotBlank() }
                 seenRows.addAll(ownedRows.map { it.id })
                 val submission = local.get()?.submissionId.orEmpty()
-                return chat.liveText.isNotBlank() || ownedRows.isNotEmpty() || chat.raw.rows("_unconfirmed_replies").any {
+                return chat.liveText.isNotBlank() || chat.liveSealed.isNotEmpty() || ownedRows.isNotEmpty() || chat.raw.rows("_unconfirmed_replies").any {
                     it.string("text").isNotBlank() && (submission.isNotBlank() && it.string("submission_id") == submission || it.string("_history_row_id") in seenRows)
                 }
             }
@@ -140,13 +150,15 @@ class MixedChatLiveTest {
                 val retained = chat.raw.rows("_unconfirmed_replies").lastOrNull {
                     it.string("text").isNotBlank() && (it.string("submission_id") == local.get()?.submissionId || it.string("_history_row_id") in seenRows)
                 }
-                val tag = when {
-                    chat.liveText.isNotBlank() -> "live-reply"
-                    row != null -> "message-row:${row.id}"
-                    retained != null -> "unconfirmed-reply:${retained.string("id")}"
+                // What the chat shows as the active reply (ChatScreen "live" item): the words the model said before a tool step as ordinary bubbles, then the live bubble.
+                val tags = chat.liveSealed.indices.map { "live-sealed:$it" } + when {
+                    chat.liveText.isNotBlank() -> listOf("live-reply")
+                    row != null -> listOf("message-row:${row.id}")
+                    retained != null -> listOf("unconfirmed-reply:${retained.string("id")}")
+                    chat.liveSealed.isNotEmpty() -> emptyList()
                     else -> error("owned_reply_not_renderable")
                 }
-                compose.onNodeWithTag(tag).performScrollTo().assertIsDisplayed()
+                tags.forEach { compose.onNodeWithTag(it).performScrollTo().assertIsDisplayed() }
             }
             suspend fun nativeSnapshot(): JSONObject {
                 current(); check(scope == owner)
@@ -190,6 +202,40 @@ class MixedChatLiveTest {
                 } finally {
                     reopening.set(false)
                 }
+            }
+            suspend fun deleteConversation() {
+                val deleted = client.detached()
+                try { check(deleted.post("/api/session/delete", json("session_id" to session, "scope_key" to owner.session(session).key)).string("deleted") == session) }
+                finally { deleted.closeNative() }
+                evidence.put("conversation_deleted", true).put("cleanup_pending", false)
+            }
+            /**
+             * A failed attempt leaves the scope as it found it, so the next attempt starts clean (12 Nov: the first attempt's accepted copy was still in the queue and the rerun's preflight stopped on it).
+             * A turn still running is stopped with the chat's own Stop and waited for until Hermes is idle; the copies of the message are removed the way the owner removes them; the composer and
+             * attachments are emptied; the disposable chat is deleted. Nothing here may hide the failure it follows, so the caller keeps its own error.
+             */
+            suspend fun settleFailedAttempt() {
+                if (submitted) {
+                    if (!ownChat()) runCatching { reopen(false) }
+                    if (ownChat() && vm.chat.value.streamId.isNotBlank()) withContext(Dispatchers.Main.immediate) { vm.cancel() }.join()
+                    val quiet = withTimeoutOrNull(150_000) { while (!runCatching { idle(nativeSnapshot()) }.getOrDefault(false)) delay(1_000); true } == true
+                    evidence.put("failed_attempt_idle", quiet)
+                    // A turn that is still running keeps its chat: it is not deleted under it.
+                    if (!quiet) return
+                    // Delivered copies retire by the chat's own receipt sweep; whatever is still shown is removed.
+                    runCatching { await(45_000) { vm.chat.value.queued.isEmpty() } }
+                    vm.chat.value.queued.map { it.id }.forEach { id ->
+                        withContext(Dispatchers.Main.immediate) { vm.removeUnresolvedLocalMessage(id) }.join()
+                        withContext(Dispatchers.Main.immediate) { vm.removeConfirmedLocalCopy(id) }.join()
+                        withContext(Dispatchers.Main.immediate) { vm.removeQueued(id) }.join()
+                    }
+                }
+                withContext(Dispatchers.Main.immediate) {
+                    vm.composer(androidx.compose.ui.text.input.TextFieldValue())
+                    repeat(vm.attachments.value.size) { vm.removeAttachment(0) }
+                }
+                evidence.put("failed_attempt_queue_left", vm.chat.value.queued.size)
+                deleteConversation()
             }
             try {
                 check(voice.hasKey("grok"))
@@ -246,8 +292,17 @@ class MixedChatLiveTest {
                 evidence.put("call_completed", true).put("call_muted", true).put("qa_workspace_verified", true).put("luna_model_verified", true); save("call_complete")
 
                 // The only local file read is this freshly generated private image, removed immediately after staging.
-                val bitmap = Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888)
+                // A small synthetic picture a vision tool can read (a 2x2 one made Hermes' vision_analyze fail on its crop): three plain shapes on a light ground, drawn here, no real content.
+                val bitmap = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+                android.graphics.Canvas(bitmap).apply {
+                    drawColor(0xFFF2F2F2.toInt())
+                    val paint = android.graphics.Paint()
+                    paint.color = 0xFF1E5AA8.toInt(); drawRect(6f, 6f, 30f, 30f, paint)
+                    paint.color = 0xFFC0392B.toInt(); drawCircle(44f, 22f, 12f, paint)
+                    paint.color = 0xFF2E7D32.toInt(); drawRect(10f, 40f, 54f, 58f, paint)
+                }
                 val png = ByteArrayOutputStream().use { bytes -> check(bitmap.compress(Bitmap.CompressFormat.PNG, 100, bytes)); bytes.toByteArray() }
+                check(png.size > 100) { "synthetic_image_too_small" }
                 bitmap.recycle()
                 image = File.createTempFile("mixed-${runId.take(8)}-", ".png", File(app.cacheDir, "exports").apply { mkdirs() })
                 image!!.writeBytes(png); png.fill(0)
@@ -265,9 +320,9 @@ class MixedChatLiveTest {
                                 "reopening" to reopening.get(), "projection" to chat.projectionReady,
                                 "loading" to vm.ui.value.loading, "restoring" to vm.ui.value.restoringSession,
                                 "messages" to chat.messages.size, "owned_rows" to ownedNow,
-                                "live_len" to chat.liveText.length, "unconfirmed" to unconfirmedNow,
+                                "live_len" to chat.liveText.length, "sealed" to chat.liveSealed.size, "tools" to chat.liveTools.size, "unconfirmed" to unconfirmedNow,
                                 "stream" to chat.streamId.isNotBlank(),
-                                "body" to (chat.liveText.isNotBlank() || ownedNow > 0 || unconfirmedNow > 0)))
+                                "body" to (chat.liveText.isNotBlank() || chat.liveSealed.isNotEmpty() || ownedNow > 0 || unconfirmedNow > 0)))
                         }
                         if (active.get() && !reopening.get() && chat.projectionReady && !vm.ui.value.loading && !vm.ui.value.restoringSession) {
                             if (visibleBody(chat)) sawBody.set(true) else if (sawBody.get()) lostBody.set(true)
@@ -280,7 +335,21 @@ class MixedChatLiveTest {
                 }
                 await(45_000) { local.get() != null }
                 val item = checkNotNull(local.get()); id("submission_id", item.submissionId); id("admission_id", item.admissionId)
-                await(60_000) { delay(750); receipt().string("status") in setOf("started", "terminal") && visibleBody(vm.chat.value) }
+                // The first words of the reply. A slow but healthy turn (the image is analysed first, then tools, one of them 30 s: 68 s in all on 12 Nov) is told from a dead one by the
+                // turn's own progress, not by a fixed budget: the receipt, the Working stream, the live tool rows and the status line. It fails when none of them changes for a minute, when
+                // the turn ends without words, or at the cap. The words stay on screen from the moment they come (the chat keeps them), so this does not depend on catching a moment.
+                var progress = ""; var changedAt = System.nanoTime()
+                await(150_000) {
+                    delay(750)
+                    val value = receipt(); val status = value.string("status"); val chat = vm.chat.value
+                    check(status != "terminal" || value.string("outcome") == "completed") { "mixed_turn_ended_without_reply" }
+                    val signal = listOf(status, chat.streamId.isNotBlank(), chat.status, chat.liveText.length, chat.liveReasoning.length, chat.liveSealed.size,
+                        chat.liveTools.map { it.toString() }.hashCode(), chat.messages.size).joinToString("|")
+                    if (signal != progress) { progress = signal; changedAt = System.nanoTime() }
+                    val words = status in setOf("started", "terminal") && visibleBody(chat)
+                    check(words || (System.nanoTime() - changedAt) / 1_000_000 < 60_000) { "mixed_turn_stalled" }
+                    words
+                }
                 active.set(true); sawBody.set(true)
                 check(vm.chat.value.approval == null && vm.chat.value.clarification == null)
                 val displayedInput = vm.chat.value.queued.singleOrNull { it.id == item.id }?.rowId?.takeIf { id ->
@@ -368,10 +437,9 @@ class MixedChatLiveTest {
                 if (complete && reconciled && creationVerified && ownChat() && runCatching { current() }.isSuccess) {
                     check(idle(nativeSnapshot()))
                     check(client.nativeRequest("/api/plugins/beacon/mobile/calls/$call").opt("closed") == true)
-                    val deleted = client.detached()
-                    try { check(deleted.post("/api/session/delete", json("session_id" to session, "scope_key" to owner.session(session).key)).string("deleted") == session) }
-                    finally { deleted.closeNative() }
-                    evidence.put("conversation_deleted", true).put("cleanup_pending", false)
+                    deleteConversation()
+                } else if (!complete && creationVerified) {
+                    runCatching { settleFailedAttempt() }.onFailure { evidence.put("failed_attempt_cleanup_error", it.javaClass.simpleName) }
                 }
                 if (complete) check(evidence.opt("conversation_deleted") == true)
                 } finally {

@@ -203,9 +203,9 @@ class ChatMigrationUiTest {
 
     @Test fun dispatchedDelegationReadsAsDispatchedNotCompleted() {
         compose.setContent { MaterialTheme { ToolCard(tool("delegate_task", "status" to "completed", "result" to """{"status":"dispatched"}""")) } }
-        compose.onNodeWithTag("tool-card-meta", useUnmergedTree = true).assertTextEquals("Dispatched")
+        compose.onNodeWithTag("tool-card-meta", useUnmergedTree = true).assertTextEquals("Handed off")
         compose.onNodeWithTag("tool-card-toggle").performClick()
-        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Dispatched")
+        compose.onNodeWithTag("tool-card-status", useUnmergedTree = true).assertContentDescriptionEquals("Handed off")
         compose.onAllNodesWithText("Status: Completed").assertCountEquals(0)
     }
 
@@ -272,7 +272,7 @@ class ChatMigrationUiTest {
         compose.onNodeWithTag("chat-activity-strip").performClick()
         compose.onNodeWithTag("chat-activity-sheet").assertIsDisplayed()
         expandModalSheet()
-        compose.onNodeWithText("Read-only status from this conversation").assertIsDisplayed()
+        compose.onNodeWithText("Read-only status from this conversation").assertDoesNotExist()
         compose.onNodeWithText("2 background agents").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("1 background process").performScrollTo().assertIsDisplayed()
         compose.onAllNodesWithText("watch", substring = true).assertCountEquals(0)

@@ -31,7 +31,7 @@ class SettingsSearchTest {
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "chat display"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "SEND"))
         assertTrue(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "sending  display"))
-        assertTrue(settingsSearchMatches("Tools & MCP", "Tool groups and MCP servers", "tools & mcp"))
+        assertTrue(settingsSearchMatches("Tools & MCP", "Tools and MCP servers", "tools & mcp"))
         assertFalse(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "camera"))
         assertFalse(settingsSearchMatches(settingsLabel("Chat"), chatDescription, "sending camera"))
         assertTrue(settingsSearchMatches("Appearance", "Theme and colors", " "))
@@ -124,13 +124,13 @@ class SettingsSearchTest {
             connected = true, profile = "work", sendKey = "ctrl_enter", formatMessages = false, showThinking = true,
             theme = "dark", colorStyle = "graphite",
             installedVersion = "0.4.14", voiceProviderId = "gemini", voiceKeySaved = true, autoFollow = true, animateBackground = false,
-            keepConnectedEnabled = true,
+            keepConnectedEnabled = true, hardwareKeyboard = true,
         )
         assertEquals("Connected · work", summary("Connection", known))
         assertEquals("Connection needs attention · work", summary("Connection", known.copy(connected = false)))
         assertEquals("work", summary("Profiles & model", known))
         // Two facts at most, so a hub row stays on one line.
-        assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", known))
+        assertEquals("Enter adds a line · Thinking shown", summary("Chat", known))
         assertEquals("Dark · Graphite", summary("Appearance", known))
         assertEquals("System · Beacon",summary("Appearance", SettingsSnapshot(theme = "system", colorStyle = "default")))
         assertEquals("0.4.14", summary("App updates", known))
@@ -143,9 +143,9 @@ class SettingsSearchTest {
         assertEquals("Keep connected is on", summary("Notifications & Keep connected", known))
         assertEquals("Keep connected is off", summary("Notifications & Keep connected", known.copy(keepConnectedEnabled = false)))
         assertEquals("Graphite", summary("Appearance", SettingsSnapshot(theme = "sepia", colorStyle = "graphite")))
-        assertEquals("Enter to send", summary("Chat", SettingsSnapshot(sendKey = "enter")))
-        assertEquals("", summary("Chat", SettingsSnapshot(sendKey = "shift_enter")))
-        for ((stored, label) in mapOf("enter" to "Enter to send", "ctrl_enter" to "Ctrl + Enter to send", "ctrl+enter" to "Ctrl + Enter to send", "shift+enter" to "Shift + Enter to send")) assertEquals(label, summary("Chat", SettingsSnapshot(sendKey = stored)))
+        assertEquals("Enter sends", summary("Chat", SettingsSnapshot(sendKey = "enter", hardwareKeyboard = true)))
+        assertEquals("", summary("Chat", SettingsSnapshot(sendKey = "shift_enter", hardwareKeyboard = true)))
+        for ((stored, label) in mapOf("enter" to "Enter sends", "ctrl_enter" to "Enter adds a line", "ctrl+enter" to "Enter adds a line", "shift+enter" to "Enter adds a line")) assertEquals(label, summary("Chat", SettingsSnapshot(sendKey = stored, hardwareKeyboard = true)))
         for (stored in listOf("", "shift_enter", "alt+enter", "Enter ")) assertNull("$stored is not a composer shortcut", settingsSendKeyLabel(stored))
         for (route in settingsSearchRoutes - setOf("Connection", "Profiles", "Profiles & model", "Chat", "Appearance", "App updates", "Voice & calls", "Notifications & Keep connected", "Assistant", "About & licenses")) assertTrue("$route has no observable state to summarize", settingsSummary(route, known).isEmpty())
     }
@@ -163,7 +163,16 @@ class SettingsSearchTest {
         assertEquals(listOf(SettingsSummaryPart("custom-skin", false)), settingsSummary("Appearance", SettingsSnapshot(colorStyle = "custom-skin")))
         for (skin in NativeSkins) assertEquals(skinLabels.getValue(skin), settingsSummary("Appearance", SettingsSnapshot(colorStyle = skin)).single().text)
     }
-    private val base = SettingsSnapshot(connected = true, profile = "work", theme = "dark")
+    private val base = SettingsSnapshot(connected = true, profile = "work", theme = "dark", hardwareKeyboard = true)
+    /** Review R25 Should 3: a soft keyboard's Enter always adds a line (the composer sends only on a key event), so without a keyboard the hub says nothing about Enter. */
+    @Test fun withoutAHardwareKeyboardTheHubSaysNothingAboutEnter() {
+        val touch = base.copy(hardwareKeyboard = false)
+        for (stored in listOf("enter", "ctrl_enter", "shift+enter")) assertEquals(stored, "", summary("Chat", touch.withLoaded(json("send_key" to stored))))
+        assertEquals("Thinking shown", summary("Chat", touch.withLoaded(json("send_key" to "enter", "show_thinking" to true))))
+        assertEquals("Thinking hidden", summary("Settings", touch.withLoaded(json("send_key" to "ctrl_enter", "show_thinking" to false))))
+        assertEquals("Enter sends · Thinking shown", summary("Chat", base.withLoaded(json("send_key" to "enter", "show_thinking" to true))))
+        assertFalse("Unknown is no keyboard", SettingsSnapshot().hardwareKeyboard)
+    }
     @Test fun absentFailedOrLoadingRecordsLeaveEverySummaryUnknown() {
         // Each chat record carries non-default values; absent, failed and loading records still leave it unknown.
         fun chat() = json("send_key" to "ctrl_enter", "render_user_markdown" to false, "show_thinking" to true)
@@ -173,7 +182,7 @@ class SettingsSearchTest {
             chat().put("_loading", true),
         )
         // The same values without the error/loading marker do produce summaries.
-        assertEquals("Ctrl + Enter to send · Thinking shown", summary("Chat", base.withLoaded(chat())))
+        assertEquals("Enter adds a line · Thinking shown", summary("Chat", base.withLoaded(chat())))
         assertEquals("Grok · Add key", summary("Voice & calls", base.copy(voiceProviderId = "grok", voiceKeySaved = false)))
         for (record in records) {
             val state = base.withLoaded(record)
@@ -184,14 +193,14 @@ class SettingsSearchTest {
     }
     @Test fun missingKeysAreNeverDefaulted() {
         val onlySendKey = base.withLoaded(json("send_key" to "ctrl_enter"))
-        assertEquals("Ctrl + Enter to send", summary("Chat", onlySendKey))
+        assertEquals("Enter adds a line", summary("Chat", onlySendKey))
         assertNull(onlySendKey.formatMessages)
         assertNull(onlySendKey.showThinking)
         assertNull(onlySendKey.autoFollow)
         assertNull(onlySendKey.animateBackground)
         assertEquals("A loaded but empty record claims nothing", "", summary("Chat", base.withLoaded(JSONObject())))
-        assertEquals("Enter to send", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to "false", "show_thinking" to JSONObject.NULL, "auto_scroll_follow" to "false", "animate_background" to JSONObject.NULL))))
-        assertEquals("Enter to send · Thinking shown", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to false, "show_thinking" to true, "auto_scroll_follow" to false, "animate_background" to true))))
+        assertEquals("Enter sends", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to "false", "show_thinking" to JSONObject.NULL, "auto_scroll_follow" to "false", "animate_background" to JSONObject.NULL))))
+        assertEquals("Enter sends · Thinking shown", summary("Chat", base.withLoaded(json("send_key" to "enter", "render_user_markdown" to false, "show_thinking" to true, "auto_scroll_follow" to false, "animate_background" to true))))
     }
     @Test fun voiceSummaryNeedsKnownPhoneProviderAndKeyState() {
         assertEquals("Gemini Live · Key saved", summary("Voice & calls", base.copy(voiceProviderId = "gemini", voiceKeySaved = true)))

@@ -40,7 +40,7 @@ import org.junit.Test
 class HermesSettingsUiTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
-    private val work = NativeBot("work", "Work bot", "Route work tasks", "Use the approved work inbox.", "custom", "old", "revision")
+    private val work = NativeBot("work", "Work bot", "Route work tasks", "Use the approved work inbox.", "custom", "old")
     private val profiles = listOf(NativeBotSummary("default", "Default", "Daily help"), NativeBotSummary("work", "Work", ""))
 
     @Test fun profilesAreTappableRowsWithAnActivePillAndNoButtonsPerRow() {

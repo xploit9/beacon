@@ -1,5 +1,6 @@
 """Authenticated call-bound direct Hermes and MCP endpoints."""
 import asyncio
+import contextlib
 import contextvars
 import importlib.util
 import logging
@@ -9,6 +10,16 @@ import threading
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 logger=logging.getLogger(__name__)
+
+# A lookup that is still running after its limit is answered with a 504 and left to finish. Each limit is clearly below what the phone
+# waits for that route (DirectVoice.kt), so the plugin always speaks first and its timeout is logged:
+#   tool search 10 s (phone 15 s; the search itself answers within gateway_tools.DISCOVER_LIST_WAIT),
+#   invoke and approval decision 15 s (phone 20 s),
+#   receipt reads, status and cancel, 5 s (phone 8 s; a receipt is a local read, so a slow one is a stuck one).
+# The call's search, memory and skills reads are dashboard routes (plugin_api.feature) with their own 12 s and 8 s limits against the phone's 15 s.
+LOOKUP_LIMIT=15
+DISCOVER_LIMIT=10
+RECEIPT_LIMIT=5
 
 key='beacon_gateway_tools'
 if key not in sys.modules:
@@ -37,9 +48,10 @@ def build_router(call, body, scoped, mobile, refuse_while_updating=_never_updati
         owner,provider,row,_=await call(request,call_id,writable)
         return (owner,provider,row['profile'],call_id),row['conversation']
 
-    async def bounded(fn,*args,receipt=False):
+    async def bounded(fn,*args,receipt=False,limit=None):
         # Disconnects must not cancel a mutation receipt or replay its execution.
         permits=receipt_admissions if receipt else admissions
+        limit=limit or (RECEIPT_LIMIT if receipt else LOOKUP_LIMIT)
         if not permits.acquire(blocking=False): raise HTTPException(429,'Tool request capacity reached')
         worker=None
         def run():
@@ -53,16 +65,26 @@ def build_router(call, body, scoped, mobile, refuse_while_updating=_never_updati
             permits.release()
             raise
         task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
-        try: return await asyncio.wait_for(asyncio.shield(task),15)
+        try: return await asyncio.wait_for(asyncio.shield(task),limit)
         except asyncio.TimeoutError:
             logger.warning('Beacon call %s timed out; worker_stack=%s',fn.__name__,sys.modules[key].worker_stack(worker))
             raise HTTPException(504,'Tool lookup still settling; inspect the same request identity') from None
 
     @router.get('/mobile/calls/{call_id}/tools')
     async def discover(call_id:str,request:Request,query:str=''):
-        binding,_=await scope(request,call_id,True)
-        await refuse_while_updating()
-        return await bounded(gateway.discover,binding[2],query)
+        make=getattr(sys.modules[key],'StageTimer',None)
+        timer=make() if make else None
+        stage=timer.stage if timer else (lambda name: contextlib.nullcontext())
+        try:
+            with stage('authorise'):
+                binding,_=await scope(request,call_id,True)
+                await refuse_while_updating()
+            return await bounded(gateway.discover,binding[2],query,timer,limit=DISCOVER_LIMIT)
+        finally:
+            if timer:
+                # Stage names and seconds only. A slow request, or one whose lookup is still running, is a warning.
+                slow=timer.elapsed()>=2.0 or bool(timer.running)
+                (logger.warning if slow else logger.info)('Beacon call discover stages: %s',timer.summary())
 
     @router.post('/mobile/calls/{call_id}/tools/invoke')
     async def invoke(call_id:str,request:Request):

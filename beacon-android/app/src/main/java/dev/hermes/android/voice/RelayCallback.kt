@@ -1,5 +1,6 @@
 package dev.hermes.android.voice
 
+import dev.hermes.android.BuildConfig
 import java.util.UUID
 import org.json.JSONObject
 
@@ -57,11 +58,20 @@ data class RelayCallback(
 ) {
     fun remainingRingMillis(now: Long, elapsed: Long): Long {
         if (now < arrivedAt || elapsed < arrivedElapsed) return 0
-        return minOf(expiresAt - now, ringDeadlineElapsed - elapsed, RING_WINDOW_MS).coerceAtLeast(0)
+        return minOf(expiresAt - now, ringDeadlineElapsed - elapsed, ringWindowMs()).coerceAtLeast(0)
     }
 
     companion object {
         const val RING_WINDOW_MS = 20_000L
+        @Volatile private var ringWindowOverride: Long? = null
+        /** How long a call rings from its arrival: [RING_WINDOW_MS] in every build that is not a debug test run. */
+        fun ringWindowMs(): Long = if (BuildConfig.DEBUG) ringWindowOverride ?: RING_WINDOW_MS else RING_WINDOW_MS
+        /** Debug builds only: a test on a loaded emulator may give a call more time between its arrival and the tap. Null restores [RING_WINDOW_MS]. */
+        internal fun ringWindowForTest(millis: Long?) {
+            check(BuildConfig.DEBUG) { "The ring window can only be widened in a debug build" }
+            require(millis == null || millis >= RING_WINDOW_MS) { "A test may only widen the ring window" }
+            ringWindowOverride = millis
+        }
         const val MAX_CLOCK_SKEW_MS = 5_000L
         private val UUID_PATTERN = Regex("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
         private val EVENT_ID_PATTERN = Regex("[0-9a-fA-F]{32}")
@@ -94,12 +104,13 @@ data class RelayCallback(
             }
             val created = millis("created_at") ?: return null
             val expires = millis("expires_at") ?: return null
-            if (now < 0 || elapsed < 0 || elapsed > Long.MAX_VALUE - RING_WINDOW_MS || created < 0 ||
-                created > Long.MAX_VALUE - RING_WINDOW_MS || created - now > MAX_CLOCK_SKEW_MS ||
-                expires != created + RING_WINDOW_MS || expires <= now || string("status") != "ringing") return null
+            val window = ringWindowMs()
+            if (now < 0 || elapsed < 0 || elapsed > Long.MAX_VALUE - window || created < 0 ||
+                created > Long.MAX_VALUE - window || created - now > MAX_CLOCK_SKEW_MS ||
+                expires != created + window || expires <= now || string("status") != "ringing") return null
             return RelayCallback(id, binding, string("title")?.take(120)?.ifBlank { "Hermes" } ?: "Hermes",
                 string("reason")?.take(1000).orEmpty(), expires, now, elapsed,
-                elapsed + (expires - now).coerceAtMost(RING_WINDOW_MS))
+                elapsed + (expires - now).coerceAtMost(window))
         }
     }
 }

@@ -59,10 +59,10 @@ internal class NativeSpeechRenderer(
                 val rendered = (result as? Rendered.Audio)?.bytes
                 if (rendered == null) {
                     val message = when (result) {
-                        Rendered.TransportFailure -> "The speech connection dropped. You can continue in the attached conversation."
-                        Rendered.ProviderBusy -> "The speech provider is busy. You can continue in the attached conversation."
-                        Rendered.ProviderRejected -> "The speech session could not start. You can continue in the attached conversation."
-                        else -> "Voice could not safely read the reply. Open the attached conversation."
+                        Rendered.TransportFailure -> "Voice dropped. The reply is in the chat."
+                        Rendered.ProviderBusy -> "Voice is busy. The reply is in the chat."
+                        Rendered.ProviderRejected -> "Voice didn't start. The reply is in the chat."
+                        else -> "Couldn't read this aloud. Open the chat."
                     }
                     event(JSONObject().put("type", "warning").put("message", message))
                     break
@@ -94,7 +94,7 @@ internal class NativeSpeechRenderer(
                         if (!valid(line.generation)) { presentedAll = false; break }
                         if (!presented) {
                             synchronized(fence) { if (valid(line.generation)) {
-                                event(JSONObject().put("type", "warning").put("message", "Voice playback could not be confirmed. Open the attached conversation."))
+                                event(JSONObject().put("type", "warning").put("message", "Couldn't play the reply. Open the chat."))
                                 interrupt()
                             } }
                             presentedAll = false; break
@@ -115,7 +115,7 @@ internal class NativeSpeechRenderer(
     /** Reads Hermes' verified [text] aloud; the call's greeting is the live model's own, never rendered here. */
     fun say(text: String): Boolean {
         if (text.isBlank() || !owned()) return false
-        val bounded = if (text.length > 12000) text.take(12000) + " The rest is in the attached conversation." else text
+        val bounded = if (text.length > 12000) text.take(12000) + " The rest is in the chat." else text
         return lines.trySend(Line(generation.get(), bounded)).isSuccess
     }
     private fun prefetch(token: Long, text: String): Boolean {

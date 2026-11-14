@@ -383,7 +383,7 @@ internal fun keepConnectedCallData(event: JSONObject, now: Long): Map<String, St
     "conversation_ref" to event.optString("conversation_ref"),
     "kind" to "incoming_call",
     // Whole seconds round down so the local card cannot outlive the Relay action receipt.
-    "expires_at" to minOf(event.getLong("expires_at"), (now + RelayCallback.RING_WINDOW_MS) / 1_000L).toString(),
+    "expires_at" to minOf(event.getLong("expires_at"), (now + RelayCallback.ringWindowMs()) / 1_000L).toString(),
 )
 
 internal fun keepConnectedLoopNeedsRestart(
@@ -425,16 +425,17 @@ internal fun prepareKeepConnectedCall(
         is Long -> value
         else -> return null
     }
+    val window = RelayCallback.ringWindowMs()
     if (event.optString("kind") != "incoming_call" || event.optString("state") != "pending" ||
         event.optString("callback_id") != eventId || owner != scope.owner || profile != scope.profile ||
         event.optString("conversation_id") != session || session.isBlank() || session.length > 512 ||
         !validOpaque(source) || !validOpaque(eventId) || !validOpaque(event.optString("conversation_ref")) ||
-        seconds <= 0 || now < 0 || now > Long.MAX_VALUE - RelayCallback.RING_WINDOW_MS
+        seconds <= 0 || now < 0 || now > Long.MAX_VALUE - window
     ) return null
     val serverExpiry = runCatching { Math.multiplyExact(seconds, 1_000L) }.getOrNull() ?: return null
-    val expires = minOf(serverExpiry, now + RelayCallback.RING_WINDOW_MS)
+    val expires = minOf(serverExpiry, now + window)
     if (!enabled || expires <= now) return null
-    val created = expires - RelayCallback.RING_WINDOW_MS
+    val created = expires - window
     if (created < 0) return null
 
     val connectionId = if (scope.nativeProvider.isEmpty()) "${scope.origin}\u0000${scope.owner}\u0000${scope.profile}".digest() else scope.copy(session = "").key
@@ -781,7 +782,7 @@ class KeepConnectedService : Service() {
         }
     }
 
-    private fun postSignInNotification() = postSignInNotification(this, "Sign in again", "Your Hermes session expired. Sign in to keep receiving calls.", "Sign in again")
+    private fun postSignInNotification() = postSignInNotification(this, "Sign in again", "Your Hermes sign-in expired. Sign in to keep getting calls.", "Sign in again")
 
     private fun ensureChannel() = ensureChannel(this)
 
@@ -1084,7 +1085,7 @@ internal fun keepConnectedReasonText(reason: String): String {
         reason == "Hermes did not answer in time" -> "Hermes didn't answer. Retrying…"
         reason == "Could not reach Hermes" -> "Can't reach Hermes. Retrying…"
         status == 403 || status == 409 -> "Hermes refused the connection. Retrying…"
-        status == 404 -> "Check the Beacon plugin on Hermes."
+        status == 404 -> "Check Beacon on Hermes."
         else -> "Hermes had a problem. Retrying…"
     }
 }

@@ -52,7 +52,8 @@ def space_member(members, profile):
     return any(m['profile'] == profile for m in members)
 
 
-def build_router(identity, body, native):
+def build_router(identity, body, native, principal_for):
+    """principal_for(request, owner, provider) is the plugin's one check of the verified login: None for a grant or a loopback."""
     router = APIRouter(prefix='/mobile/bot-mode')
 
     async def rpc(owner, provider, profile, method, **params):
@@ -301,6 +302,18 @@ def build_router(identity, body, native):
             raise HTTPException(400, 'Choose a bot')
         owner, provider, _, _ = identity(request)
         _, _, bot, _ = identity(request, value['bot'])
+        principal = principal_for(request, owner, provider) or None
+        def verified(stored):
+            return native.verify(owner, provider, bot, stored, principal=principal) if principal else native.verify(owner, provider, bot, stored)
+        def owned(stored):
+            """The host stamps a chat made through any login with its owner subject; Beacon's own record of it names this login.
+            A chat left empty by an open that stopped before that record is given it here; one with history, or another's, is not."""
+            try:
+                return verified(stored)
+            except LookupError:
+                if not (principal and native.adopt_unused(owner, provider, bot, stored, principal)):
+                    raise
+                return verified(stored)
         # Native exact-title registry is the authority; no saved chat-pointer mirror.
         def canonical():
             def lookup():
@@ -308,7 +321,7 @@ def build_router(identity, body, native):
                 match = next((r for r in rows if (r.get('root_title') or r.get('title')) == CANONICAL_TITLE), None)
                 if match:
                     stored = match.get('resolved_id') or match['id']
-                    native.verify(owner, provider, bot, stored)
+                    owned(stored)
                     return stored
             roster = native.rpc(owner, provider, 'profiles.list', {'profile': bot, 'include_sessions': False}).get('profiles', [])
             row = next((r for r in roster if r.get('name') == bot), None)
@@ -323,24 +336,29 @@ def build_router(identity, body, native):
             existing = lookup()
             if existing:
                 return existing
-            created = native.rpc(owner, provider, 'session.create', {'profile': bot, 'title': CANONICAL_TITLE, 'hidden': True, 'follow_profile_config': True, 'source': 'android', 'close_on_disconnect': False})
+            def title(runtime):
+                native.rpc(owner, provider, 'session.title', {'profile': bot, 'session_id': runtime, 'title': CANONICAL_TITLE}, *((principal,) if principal else ()))
             try:
-                native.rpc(owner, provider, 'session.title', {'profile': bot, 'session_id': created['session_id'], 'title': CANONICAL_TITLE})
+                if principal:
+                    # Made with the login, so Beacon's record of it is written with the chat.
+                    return native.create(owner, provider, bot, principal, CANONICAL_TITLE, {'hidden': True, 'follow_profile_config': True}, title)
+                created = native.rpc(owner, provider, 'session.create', {'profile': bot, 'title': CANONICAL_TITLE, 'hidden': True, 'follow_profile_config': True, 'source': 'android', 'close_on_disconnect': False})
+                title(created['session_id'])
+                owned(created['stored_session_id'])
+                return created['stored_session_id']
             except LookupError:
                 # A desktop/peer may have claimed the title during creation. Adopt only an owned winner.
                 winner = lookup()
                 if winner:
                     return winner
                 raise
-            native.verify(owner, provider, bot, created['stored_session_id'])
-            return created['stored_session_id']
         try:
             async with CHAT_LOCK:
                 stored = await asyncio.to_thread(canonical)
         except LookupError:
-            raise HTTPException(409, 'Bot Chat is unavailable or belongs to another owner') from None
+            raise HTTPException(409, "This Bot Chat can't be opened right now.") from None
         except (RuntimeError, OSError):
-            raise HTTPException(503, 'Native Bot Chat is unavailable') from None
+            raise HTTPException(503, "Bot Chat isn't available right now.") from None
         return {'profile': bot, 'stored_session_id': stored, 'title': CANONICAL_TITLE}
 
     return router

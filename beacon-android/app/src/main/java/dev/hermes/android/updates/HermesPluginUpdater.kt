@@ -1,5 +1,6 @@
 package dev.hermes.android.updates
 
+import dev.hermes.android.BuildConfig
 import dev.hermes.android.core.PLUGIN_VERSION_PATTERN
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.BeaconClient
@@ -9,7 +10,15 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
 
-internal class HermesPluginUpdater(private val client: BeaconClient, private val clock: () -> Long = System::currentTimeMillis) : PluginEndpoint {
+/**
+ * [commitFor] names the commit of the release being installed (the update's own release, so a newer one published meanwhile is not taken);
+ * the update is Hermes' installer pinned to it, never `git pull`, so every install runs exactly the published release.
+ */
+internal class HermesPluginUpdater(
+    private val client: BeaconClient,
+    private val commitFor: suspend () -> String = { GitHubReleases(userAgent = "Beacon-Android/${BuildConfig.VERSION_NAME}").latestCommit().commit },
+    private val clock: () -> Long = System::currentTimeMillis,
+) : PluginEndpoint {
     /** How the dashboard restart's polling waits between asks; tests shorten it. */
     internal var pause: suspend (Long) -> Unit = { delay(it) }
 
@@ -22,11 +31,8 @@ internal class HermesPluginUpdater(private val client: BeaconClient, private val
         return versions
     }
 
-    override suspend fun update(acceptCapabilities: Boolean): JSONObject {
-        val body = JSONObject()
-        if (acceptCapabilities) body.put("accept_capabilities", true)
-        return client.nativeRequest("/api/dashboard/agent-plugins/beacon/update", "POST", body)
-    }
+    // A tree Hermes will not take even when forced (a dangerous scan verdict) comes back as HTTP 400, which the caller reads as a failed update.
+    override suspend fun update(): JSONObject = client.nativeRequest("/api/dashboard/agent-plugins/install", "POST", pluginInstallBody(commitFor()))
 
     /** Waits for the restart [pid] to finish and the gateway to serve again (45 s at most). */
     private suspend fun awaitRestart(pid: Int): RestartResult = withTimeoutOrNull(45_000) {

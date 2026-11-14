@@ -9,6 +9,17 @@ import org.json.JSONObject
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
+/** Shown when the model Hermes has is no longer the one a model draft was made from: the draft is kept, the new base is shown, nothing is saved. */
+internal const val MODEL_CHANGED_ELSEWHERE = "The model changed elsewhere. Review it and save again."
+/** Shown when the model was written but reading it back failed: the typed pair is shown as saved, not as an error. */
+internal const val MODEL_SAVED_UNCONFIRMED = "Default model saved for new chats. Not confirmed yet."
+/**
+ * The model a Save compares Hermes' current one with. Normally the pair the bot was opened with. After a save that could not be read back, Hermes may hold the pair in another form,
+ * so for that same bot and pair what Hermes holds now is the base (the owner's own change, not another's). Any other bot or pair keeps its own base.
+ */
+internal fun modelSaveBase(unconfirmed: Triple<String, String, String>?, bot: NativeBot, now: Pair<String, String>): Pair<String, String> =
+    if (unconfirmed == Triple(bot.profile, bot.provider, bot.model)) now else bot.provider to bot.model
+
 /** Profile editors outlive their page; late responses never replace another account's draft. */
 class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: SavedStateHandle, private val draftChanged: () -> Unit = {}, private val screens: ScreenCache? = null,
     private val globalClient: (() -> BeaconClient?)? = null, private val authorizeProfile: suspend (BeaconClient, String) -> Unit = { _, _ -> },
@@ -64,7 +75,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         val bot = _bots.value
         bot.selected?.takeIf { bot.editing && (bot.draftProvider != it.provider || bot.draftModel != it.model) }?.let { base ->
             result.put("bot", json("profile" to base.profile, "title" to base.title, "description" to base.description, "soul" to base.soul, "draftProvider" to bot.draftProvider, "draftModel" to bot.draftModel,
-                "baseProvider" to base.provider, "baseModel" to base.model, "revision" to base.revision))
+                "baseProvider" to base.provider, "baseModel" to base.model))
         }
         require(result.toString().toByteArray(Charsets.UTF_8).size <= 1_048_576) { "Settings draft is too large to recover" }
         return result
@@ -92,11 +103,11 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val limit = (row.get("limit") as? Int)?.also { require(it in 1..256_000) } ?: error("Invalid note limit")
                 val base = NativeMemoryDocument(target, text(row, "base"), revision(row), flag(row, "enabled"), limit)
                 val draft = text(row, "draft").also { require(it != base.content) }
-                NativeMemoryState(scopeKey, text(row, "provider", 160), flag(row, "providerReady"), listOf(base), editing = target, draft = draft, message = "Recovered draft. Refresh notes after saving or cancelling to reload all documents.")
+                NativeMemoryState(scopeKey, text(row, "provider", 160), flag(row, "providerReady"), listOf(base), editing = target, draft = draft, message = "Unsaved changes restored.")
             } else null
             val bot = if (value.has("bot")) value.getJSONObject("bot").let { row ->
                 val profile = text(row, "profile", 160).also { require(it.isNotBlank() && it.none(Char::isISOControl)) }
-                val base = NativeBot(profile, text(row, "title", 1000), text(row, "description", 16_000), text(row, "soul"), text(row, "baseProvider", 1000), text(row, "baseModel", 1000), revision(row))
+                val base = NativeBot(profile, text(row, "title", 1000), text(row, "description", 16_000), text(row, "soul"), text(row, "baseProvider", 1000), text(row, "baseModel", 1000))
                 val provider = text(row, "draftProvider"); val model = text(row, "draftModel")
                 require(provider != base.provider || model != base.model)
                 NativeBotsState(profiles = listOf(NativeBotSummary(profile, base.title, base.description)), selected = base, editing = true, draftProvider = provider, draftModel = model)
@@ -105,8 +116,34 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }.getOrNull() ?: return
         restored.first?.let { if (!_skills.value.editing && !_skills.value.saving) { skillJob?.cancel(); _skills.value = it } }
         restored.second?.let { if (_memory.value.editing.isBlank() && !_memory.value.saving) { memoryJob?.cancel(); _memory.value = it } }
-        restored.third?.let { if (!_bots.value.editing && !_bots.value.saving) { botJob?.cancel(); _bots.value = it } }
+        restored.third?.let { if (!_bots.value.editing && !_bots.value.saving) { botJob?.cancel(); _bots.value = it; it.selected?.let(::reviewRestoredModel) } }
         draftChanged()
+    }
+
+    /** The profile's model now, from its row in Hermes' profile list (GET /api/profiles has no probe; GET /api/model/info can take 5 s). */
+    private suspend fun storedModel(c: BeaconClient, profile: String): Pair<String, String> {
+        val row = c.nativeGet("/api/profiles").rows("profiles").firstOrNull { it.string("name") == profile } ?: throw ApiFailure(404, "Bot not found")
+        return row.string("provider") to row.string("model")
+    }
+    /** The open editor of [bot] when Hermes has another model than the one the draft was made from: Hermes' model is the base now, the draft stays, and it says so. */
+    private fun withModelChangedElsewhere(state: NativeBotsState, bot: NativeBot, now: Pair<String, String>): NativeBotsState =
+        state.takeIf { it.selected == bot }?.copy(selected = bot.copy(provider = now.first, model = now.second), saving = false, error = MODEL_CHANGED_ELSEWHERE) ?: state
+    /** A model draft that came back after a restart rests on the model of that day: if Hermes has another one now, show it before the owner saves. A failed read says nothing; Save reads again. */
+    private fun reviewRestoredModel(bot: NativeBot) {
+        val active = client() ?: return
+        val revision = bindingRevision
+        botJob = jobs.launch {
+            val c = active.detached()
+            try {
+                authorizeProfile(active, bot.profile)
+                if (!current(active, revision)) return@launch
+                c.bindProfile(bot.profile)
+                val now = storedModel(c, bot.profile)
+                if (now != bot.provider to bot.model && current(active, revision)) { _bots.update { withModelChangedElsewhere(it, bot, now) }; draftChanged() }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { }
+            finally { c.closeNative() }
+        }
     }
 
     fun bind(force: Boolean = false) {
@@ -289,7 +326,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                     return@launch
                 }
                 val result = when (page) {
-                    "Health" -> parseServerStatus(c.nativeGet("/api/status", q), _server.value)
+                    "Health" -> parseServerStatus(c.nativeGet("/api/status", q), _server.value, recentHermesError(c, q))
                     "Logs" -> _server.value.copy(logs = c.nativeGet("/api/logs", q + mapOf("file" to _server.value.logFile, "search" to _server.value.logSearch, "lines" to "100")).optJSONArray("lines")?.strings().orEmpty())
                     "Session checkpoints" -> parseCheckpoints(c.nativeGet("/api/ops/checkpoints", q), _server.value)
                     else -> error("Unknown server page")
@@ -300,6 +337,10 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
             finally { c.closeNative() }
         }
     }
+    /** What Hermes' error log says just now (see [recentServerError]). Hermes' own health verdict is kept when the logs cannot be read: this only adds a warning. */
+    private suspend fun recentHermesError(c: BeaconClient, q: Map<String, String>): String = try {
+        readRecentServerError { query -> c.nativeGet("/api/logs", q + query).optJSONArray("lines")?.strings().orEmpty() }
+    } catch (e: CancellationException) { throw e } catch (e: Exception) { "" }
     fun logFile(value: String) { _server.update { it.copy(logFile = value) }; loadServer("Logs") }
     fun logSearch(value: String) { _server.update { it.copy(logSearch = value) } }
     fun clearReviewedUpdate() {
@@ -308,7 +349,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         updateJob?.cancel(); ++updateObservationRevision
         val host = updateKey(c)
         saved["server-update:$host:at"] = ""; saved["server-update:$host:id"] = ""
-        _server.update { it.copy(requestedAt = "", requestedActionId = "", applying = false, updateStatusFresh = false, update = null, notice = "Previous update result remains unconfirmed. Checking the current server version.") }
+        _server.update { it.copy(requestedAt = "", requestedActionId = "", applying = false, updateStatusFresh = false, update = null, notice = "Checking the Hermes version…") }
         loadServer("Server updates", force = true)
     }
     fun applyServerUpdate() {
@@ -330,7 +371,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         val revision = ++updateObservationRevision
         val host = updateKey(active)
         fun observing() = global() === active && updateObservationRevision == revision
-        fun lost() { if (observing()) _server.update { it.copy(applying = false, updateStatusFresh = false, notice = "Waiting for Hermes to reconnect. Refresh to check the update receipt.") } }
+        fun lost() { if (observing()) _server.update { it.copy(applying = false, updateStatusFresh = false, notice = "Waiting for Hermes to restart. Refresh to see if it finished.") } }
         _server.update { if (apply) it.copy(applying = true, updateStatusFresh = false, action = null, receipt = null, error = "")
             else it.copy(applying = false, updateStatusFresh = false) }
         updateJob = jobs.launch {
@@ -338,19 +379,19 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
             try {
                 val settled = withTimeoutOrNull(900_000L) {
                     if (apply) {
-                        val prior = _server.value
-                        val before = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to prior.requestedAt, "action_id" to prior.requestedActionId))
+                        val before = c.nativeUpdateStatus()
                         if (!observing()) return@withTimeoutOrNull true
-                        if (before.optBoolean("host_busy") || before.optJSONObject("action")?.optBoolean("running") == true) {
+                        if (before.optBoolean("host_busy")) {
                             _server.update { it.withUpdateStatus(before) }
                         } else {
-                            val baseline = before.getString("server_now")
+                            // This phone's own marker that it asked: the update is told apart by the action id Hermes answers with, not by a clock.
+                            val baseline = java.time.Instant.now().toString()
                             saved["server-update:$host:at"] = baseline
                             saved["server-update:$host:id"] = ""
                             _server.update { it.copy(requestedAt = baseline, requestedActionId = "") }
                             if (!observing()) return@withTimeoutOrNull true
-                            val response = c.nativeGet("/api/plugins/beacon/admin/update", method = "POST", data = JSONObject())
-                            if (!response.optBoolean("accepted")) {
+                            val response = c.nativeGet("/api/hermes/update", method = "POST", data = JSONObject())
+                            if (!response.optBoolean("ok") || response.optBoolean("already_running")) {
                                 saved["server-update:$host:at"] = ""; saved["server-update:$host:id"] = ""
                                 if (!observing()) return@withTimeoutOrNull true
                                 _server.update { it.copy(applying = false, updateStatusFresh = false, requestedAt = "", requestedActionId = "",
@@ -359,11 +400,9 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                             } else {
                                 val id = response.string("action_id")
                                 require(id.isNotBlank()) { "Update action identity is missing" }
-                                val requestedAt = response.getString("requested_at")
                                 saved["server-update:$host:id"] = id
-                                saved["server-update:$host:at"] = requestedAt
                                 if (!observing()) return@withTimeoutOrNull true
-                                _server.update { it.copy(requestedActionId = id, requestedAt = requestedAt) }
+                                _server.update { it.copy(requestedActionId = id) }
                             }
                         }
                     }
@@ -372,7 +411,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                         if (!observing()) return@withTimeoutOrNull true
                         try {
                             val state = _server.value
-                            val result = c.nativeGet("/api/plugins/beacon/admin/update/status", mapOf("requested_at" to state.requestedAt, "action_id" to state.requestedActionId))
+                            val result = c.nativeUpdateStatus()
                             if (!observing()) return@withTimeoutOrNull true
                             _server.update { it.withUpdateStatus(result) }
                             failures = 0
@@ -416,19 +455,23 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
         return botJob
     }
+    /** A bot from Hermes' own routes: its row in the profile list and its instructions. */
+    private suspend fun nativeBot(c: BeaconClient, profile: String): NativeBot {
+        val row = c.nativeGet("/api/profiles").rows("profiles").firstOrNull { it.string("name") == profile } ?: throw ApiFailure(404, "Bot not found")
+        return NativeBot.fromNative(row, c.nativeGet("/api/profiles/$profile/soul").string("content"))
+    }
     fun openBot(profile: String): Job? {
         val active = client() ?: return null
         val revision = bindingRevision
         if (_bots.value.saving || _bots.value.profiles.none { it.profile == profile }) return null
-        botJob?.cancel(); _bots.update { it.copy(loading = true, selected = null, editing = false, error = "", notice = "") }; _botModels.value = emptyList()
+        botJob?.cancel(); _bots.update { it.copy(loading = true, selected = null, editing = false, error = "", notice = "", unconfirmedModel = null) }; _botModels.value = emptyList()
         botJob = jobs.launch {
             val c = active.detached()
             try {
                 authorizeProfile(active, profile)
                 if (!current(active, revision)) return@launch
                 c.bindProfile(profile)
-                val bot = NativeBot.parse(c.nativeGet("/api/plugins/beacon/admin/bot"))
-                require(bot.profile == profile) { "Bot response belongs to another profile" }
+                val bot = nativeBot(c, profile)
                 if (current(active, revision)) _bots.update { it.copy(selected = bot) }
                 val options = c.nativeGet("/api/model/options", mapOf("profile" to profile, "include_unconfigured" to "false"))
                 val choices = options.rows("providers").flatMap { row -> row.optJSONArray("models")?.strings().orEmpty().map { row.string("slug") to it } }.distinct()
@@ -444,7 +487,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         _bots.update { state -> state.selected?.takeIf { it.profile == profile }?.let { bot ->
             state.copy(selected = bot.copy(description = description ?: bot.description, soul = soul ?: bot.soul)) } ?: state }
     }
-    fun closeBot() { if (!_bots.value.saving) { botJob?.cancel(); _bots.update { it.copy(selected = null, editing = false, loading = false) }; draftChanged() } }
+    fun closeBot() { if (!_bots.value.saving) { botJob?.cancel(); _bots.update { it.copy(selected = null, editing = false, loading = false, unconfirmedModel = null) }; draftChanged() } }
     fun editBot(editing: Boolean) { if (!_bots.value.saving && (!editing || !_bots.value.loading && _bots.value.selected != null)) { _bots.update { it.copy(editing = editing, draftProvider = it.selected?.provider.orEmpty(), draftModel = it.selected?.model.orEmpty(), error = "") }; draftChanged() } }
     fun botDraft(provider: String, model: String) { _bots.update { it.copy(draftProvider = provider, draftModel = model) }; draftChanged() }
     fun saveBot() {
@@ -459,11 +502,28 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 authorizeProfile(active, bot.profile)
                 if (!current(active, revision)) return@launch
                 c.bindProfile(bot.profile)
-                val response = c.nativeGet("/api/plugins/beacon/admin/bot", method = "PUT", data = bot.saveModel(state.draftProvider, state.draftModel))
-                require(response.optBoolean("ok")) { "Bot save was not confirmed" }
-                val confirmed = NativeBot.parse(response.getJSONObject("bot"))
-                require(confirmed.profile == bot.profile) { "Saved bot belongs to another profile" }
-                if (current(active, revision)) { _bots.update { it.copy(selected = confirmed, saving = false, editing = false, notice = "Default model saved for new chats.") }; draftChanged() }
+                // Hermes' PUT is last writer wins, so the phone looks first: a draft made from a model that changed since (on the computer, or before a restart) is not saved over it.
+                val now = storedModel(c, bot.profile)
+                // The base is a pair this phone wrote and could not read back: Hermes may have stored it normalised, so what it holds now is the base (the owner's own change, not another's).
+                val base = modelSaveBase(state.unconfirmedModel, bot, now)
+                if (now != base) {
+                    if (current(active, revision)) { _bots.update { withModelChangedElsewhere(it, bot, now) }; draftChanged() }
+                    return@launch
+                }
+                // Hermes' own PUT /api/profiles/{name}/model. Its answer echoes the strings it was sent, but what it stores went through its own normalisation (alias, vendor
+                // prefix, dot or dash form), so the stored pair is read back the way the check before the write reads it and that is what is shown: the next Save then
+                // compares against what Hermes holds and meets no false "changed elsewhere". A blank stored model is not a confirmed save.
+                val response = c.nativeGet("/api/profiles/${bot.profile}/model", method = "PUT", data = bot.saveModel(state.draftProvider, state.draftModel))
+                require(response.optBoolean("ok") && response.string("model").isNotBlank()) { "Bot save was not confirmed" }
+                // The write worked. If only the read-back fails (a network blip) that is no error: the typed pair is shown as saved, said honestly as not confirmed yet.
+                val stored = try { storedModel(c, bot.profile) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+                require(stored == null || stored.second.isNotBlank()) { "Bot save was not confirmed" }
+                val confirmed = if (stored != null) bot.copy(provider = stored.first, model = stored.second) else bot.copy(provider = state.draftProvider, model = state.draftModel)
+                if (current(active, revision)) {
+                    _bots.update { it.copy(selected = confirmed, saving = false, editing = false, unconfirmedModel = if (stored == null) Triple(confirmed.profile, confirmed.provider, confirmed.model) else null,
+                        notice = if (stored == null) MODEL_SAVED_UNCONFIRMED else "Default model saved for new chats.") }
+                    draftChanged()
+                }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (current(active, revision)) { _bots.update { it.copy(saving = false, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }

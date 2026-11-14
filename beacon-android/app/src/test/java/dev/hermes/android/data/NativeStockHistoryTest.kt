@@ -187,7 +187,7 @@ class NativeStockHistoryTest {
         for (i in 0 until 3) assertFalse(result.getJSONArray("sessions").getJSONObject(i).getBoolean("archived"))
         assertEquals("active title 1", result.getJSONArray("sessions").getJSONObject(1).getString("title"))
         assertEquals(200, result.getInt("limit"))
-        assertEquals("Newest 200 conversation titles and identities", result.getString("search_scope"))
+        assertEquals("Conversation titles and message text", result.getString("search_scope"))
         assertTrue(stock.pluginHistory().isEmpty())
         assertTrue(stock.listPages().all { it.url.queryParameter("archived") in setOf(null, "exclude") })
         assertTrue("Cron runs are excluded from active recents", stock.listPages().all { it.url.queryParameter("exclude_sources") == "cron" })
@@ -197,8 +197,118 @@ class NativeStockHistoryTest {
         assertTrue(probe.opened.isEmpty())
     }
 
+    private fun contentHit(id: String, title: String? = null, source: String = "android", archived: Boolean = false, profile: String = "work") =
+        json("session_id" to id, "id" to id, "title" to title, "source" to source, "profile" to profile, "message_count" to 4, "archived" to archived, "preview" to "first words")
+
+    @Test fun searchFindsAChatByItsMessageTextNotOnlyItsTitle() = runBlocking<Unit> {
+        val stock = Stock()
+        stock.override = { request -> if (request.url.encodedPath == "/api/sessions/search") 200 to json("results" to JSONArray()
+            .put(contentHit("text-hit")).put(contentHit("active-0", "active title 0")).put(contentHit("cron-hit", source = "cron"))
+            .put(contentHit("old-hit", archived = true)).put(contentHit("other-profile", profile = "other"))).toString() else null }
+        val probe = SocketProbe()
+        val result = list(client(stock, probe), query = "Venice")
+        assertEquals("a word inside a message finds its chat once; cron, archived and other profiles stay out", listOf("active-0", "text-hit").sorted(), ids(result).sorted())
+        val search = stock.requests.single { it.url.encodedPath == "/api/sessions/search" }
+        assertEquals("work", search.url.queryParameter("profile"))
+        assertEquals("Venice", search.url.queryParameter("q"))
+        assertTrue(probe.opened.isEmpty())
+    }
+
+    /** Hermes stores a photo's own note in front of the caption and its search reads that note too; the phone shows the caption only. */
+    private val photoNote = "[The user sent an image~ Here's what I can see: A red rectangle and a small square on a white page]\n" +
+        "[If you need a closer look, use vision_analyze with image_url: /tmp/synthetic/upload_1.png ~]\n\n"
+    private fun userHit(id: String, snippet: String) = contentHit(id).put("role", "user").put("snippet", snippet)
+    private fun Stock.photoChats(vararg captions: Pair<String, String>) {
+        override = { request ->
+            val path = request.url.encodedPath
+            val hit = captions.firstOrNull { path == "/api/sessions/${it.first}/messages" }
+            when {
+                path == "/api/sessions/search" -> 200 to json("results" to JSONArray().apply { captions.forEach { (id, _) ->
+                    put(userHit(id, if (request.url.queryParameter("q") == "rectangle") "...a red >>>rectangle<<< and a small square on a white page..." else "...a small >>>square<<< on a white page...")) } }).toString()
+                hit != null -> 200 to json("session_id" to hit.first, "profile" to "work", "messages" to JSONArray().put(json("id" to 41L, "role" to "user", "content" to photoNote + hit.second)),
+                    "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 1)).toString()
+                else -> null
+            }
+        }
+    }
+
+    @Test fun searchMatchesOnlyWhatTheOwnerCanSeeNotHermesPhotoNote() = runBlocking<Unit> {
+        val stock = Stock().apply { photoChats("photo-a" to "What color is it", "photo-b" to "A holiday picture") }
+        assertEquals("a word only in the stored photo note finds nothing", emptyList<String>(), ids(list(client(stock), query = "rectangle")))
+    }
+
+    @Test fun searchStillFindsAPhotoByItsCaption() = runBlocking<Unit> {
+        val stock = Stock().apply { photoChats("photo-a" to "What color is the square", "photo-b" to "A holiday picture") }
+        // photo-a: the caption holds "square"; photo-b: only the note does (and its snippet is inside the note).
+        assertEquals(listOf("photo-a"), ids(list(client(stock), query = "square")))
+    }
+
+    /** Live on the demo (9 Nov): the stored row of a photo turn ends with "[Image attached at: <path>]" and a "[screenshot]" line; neither is anything the owner typed. */
+    @Test fun searchIgnoresTheImageLinesHermesStoresAfterTheCaption() = runBlocking<Unit> {
+        val stored = "What color is the square in this image\n\n[Image attached at: /home/example/cache/native-inputs/ab/upload_a.png]\n[screenshot]"
+        val stock = Stock().apply { override = { request ->
+            val path = request.url.encodedPath
+            when {
+                path == "/api/sessions/search" -> 200 to json("results" to JSONArray().put(userHit("photo-a", "...>>>${request.url.queryParameter("q")}<<<..."))).toString()
+                path == "/api/sessions/photo-a/messages" -> 200 to json("session_id" to "photo-a", "profile" to "work", "messages" to JSONArray().put(json("id" to 41L, "role" to "user", "content" to stored)),
+                    "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 1)).toString()
+                else -> null
+            }
+        } }
+        assertEquals("a word only in the stored image lines finds nothing", emptyList<String>(), ids(list(client(stock), query = "screenshot")))
+        assertEquals(emptyList<String>(), ids(list(client(stock), query = "native-inputs")))
+        assertEquals("a word of the caption still finds the chat", listOf("photo-a"), ids(list(client(stock), query = "square")))
+    }
+
+    /** R9 Should 2: Hermes strips `?` before it searches, so `invoice?` matches "Where is the invoice"; the owner's own words must not be dropped for the mark. */
+    @Test fun searchWithAQuestionMarkStillFindsTheOwnersOwnMessage() = runBlocking<Unit> {
+        val stock = Stock().apply { override = { request ->
+            val path = request.url.encodedPath
+            when {
+                path == "/api/sessions/search" -> 200 to json("results" to JSONArray().put(userHit("own-a", "...where is the >>>invoice<<<..."))).toString()
+                path == "/api/sessions/own-a/messages" -> 200 to json("session_id" to "own-a", "profile" to "work", "messages" to JSONArray().put(json("id" to 7L, "role" to "user", "content" to "Where is the invoice")),
+                    "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 1)).toString()
+                else -> null
+            }
+        } }
+        assertEquals(listOf("own-a"), ids(list(client(stock), query = "invoice?")))
+        assertEquals("a relaxed two-word query keeps the chat when one word is visible", listOf("own-a"), ids(list(client(stock), query = "invoice receipt")))
+    }
+
+    /** R9 Nice 7: a chat the title search already lists is not read again for message text. */
+    @Test fun aChatTheTitleSearchAlreadyFoundIsNotReadForItsMessages() = runBlocking<Unit> {
+        val stock = Stock().apply { override = { request ->
+            val path = request.url.encodedPath
+            when (path) {
+                "/api/sessions/search" -> 200 to json("results" to JSONArray()
+                    .put(userHit("active-0", "...an >>>active<<< word...")).put(userHit("text-hit", "...an >>>active<<< word..."))).toString()
+                "/api/sessions/text-hit/messages" -> 200 to json("session_id" to "text-hit", "profile" to "work", "messages" to JSONArray().put(json("id" to 9L, "role" to "user", "content" to "an active word")),
+                    "pagination" to json("limit" to 500, "offset" to 0, "order" to "latest", "returned" to 1)).toString()
+                else -> null
+            }
+        } }
+        val result = list(client(stock), query = "active")
+        assertTrue("active-0 is listed by its title and text-hit by its text", ids(result).containsAll(listOf("active-0", "text-hit")))
+        val reads = stock.requests.filter { it.url.encodedPath.endsWith("/messages") }.map { it.url.encodedPath }
+        assertFalse("A chat already listed by title is not read again: $reads", "/api/sessions/active-0/messages" in reads)
+        assertTrue("The other hit is still checked: $reads", "/api/sessions/text-hit/messages" in reads)
+    }
+
+    @Test fun aFailedCheckOfAPhotoHitLeavesItOutInsteadOfShowingAHiddenMatch() = runBlocking<Unit> {
+        val stock = Stock().apply { photoChats("photo-a" to "What color is it") }
+        val search = stock.override
+        stock.override = { request -> if (request.url.encodedPath == "/api/sessions/photo-a/messages") 500 to json("detail" to "fixture").toString() else search(request) }
+        assertEquals(emptyList<String>(), ids(list(client(stock), query = "rectangle")))
+    }
+
+    @Test fun aFailedMessageSearchKeepsTheTitleMatches() = runBlocking<Unit> {
+        val stock = Stock()
+        stock.override = { request -> if (request.url.encodedPath == "/api/sessions/search") 500 to json("detail" to "Search failed").toString() else null }
+        assertEquals(listOf("active-1"), ids(list(client(stock), query = "active title 1")))
+    }
+
     @Test fun emptySessionsAreFilteredAndConfirmedShellOverlaySurvivesRefresh() = runBlocking<Unit> {
-        val stock = Stock().apply { active = Stock.rows("active", 2) + json("id" to "old-empty", "title" to "Untitled conversation", "message_count" to 0) }
+        val stock = Stock().apply { active = Stock.rows("active", 2) + json("id" to "old-empty", "title" to "Untitled chat", "message_count" to 0) }
         val result = list(client(stock))
         assertEquals(listOf("active-0", "active-1"), ids(result))
         val confirmedShell = json("session_id" to "phone-created", "title" to "New conversation", "message_count" to 0, "profile" to "work")
@@ -210,10 +320,79 @@ class NativeStockHistoryTest {
     @Test fun anEmptyThreadIsListedLikeAChannelButAnEmptyChatIsNot() = runBlocking<Unit> {
         val stock = Stock().apply { active = Stock.rows("active", 2) +
             json("id" to "news-thread", "title" to "News", "source" to "android_thread", "message_count" to 0) +
-            json("id" to "old-empty", "title" to "Untitled conversation", "message_count" to 0) }
+            json("id" to "old-empty", "title" to "Untitled chat", "message_count" to 0) }
         val result = list(client(stock))
         assertEquals("An empty thread waits for its first post in the list", setOf("active-0", "active-1", "news-thread"), ids(result).toSet())
         assertTrue(stock.threadReads().single().let { it.url.queryParameter("min_messages") == "0" && it.url.queryParameter("sources") == "android_thread,phone" })
+    }
+
+    // A Hermes with session authority stores a thread as an ordinary chat (it refuses the thread source), so Hermes' thread-source filter cannot return it.
+    private fun Stock.withoutThreadSources(extra: (Request) -> Pair<Int, String>? = { null }) {
+        override = { r -> if (r.url.encodedPath == "/api/sessions" && r.url.queryParameter("sources") != null) 200 to json("sessions" to JSONArray()).toString() else extra(r) }
+    }
+    private suspend fun threadLane(c: BeaconClient) = c.get("/api/sessions", mapOf("profile" to "work", "include_archived" to "0", "view" to "threads"))
+    private fun source(result: JSONObject, index: Int) = result.getJSONArray("sessions").getJSONObject(index).optString("source")
+
+    @Test fun aChatMarkedAsAThreadIsInTheThreadLaneAndListedAsAThread() = runBlocking<Unit> {
+        ThreadMarks.reset()
+        val stock = Stock().apply { withoutThreadSources() }
+        val c = client(stock)
+        try {
+            ThreadMarks.add(c.scope, "active-1")
+            val lane = threadLane(c)
+            assertEquals(listOf("active-1"), ids(lane))
+            assertEquals("android_thread", source(lane, 0))
+            assertEquals("The main list shows it as a thread too", "android_thread", source(list(c), 1))
+            assertEquals("The others stay ordinary chats", "", source(list(c), 0))
+        } finally { ThreadMarks.reset() }
+    }
+
+    @Test fun aMarkedThreadWithNoMessagesYetJoinsTheMainListButAnEmptyChatDoesNot() = runBlocking<Unit> {
+        ThreadMarks.reset()
+        val stock = Stock().apply {
+            active = Stock.rows("active", 2) + json("id" to "fresh-thread", "title" to "Fresh", "message_count" to 0) + json("id" to "old-empty", "title" to "Empty", "message_count" to 0)
+            withoutThreadSources { r -> if (r.url.encodedPath == "/api/sessions/fresh-thread")
+                200 to json("id" to "fresh-thread", "session_id" to "fresh-thread", "profile" to "work", "title" to "Fresh", "message_count" to 0, "last_active" to 5).toString() else null }
+        }
+        val c = client(stock)
+        try {
+            ThreadMarks.add(c.scope, "fresh-thread")
+            assertEquals(setOf("active-0", "active-1", "fresh-thread"), ids(list(c)).toSet())
+        } finally { ThreadMarks.reset() }
+    }
+
+    @Test fun aMarkWhoseChatHermesDroppedIsForgottenAndReadsAsNothing() = runBlocking<Unit> {
+        ThreadMarks.reset()
+        val stock = Stock().apply { withoutThreadSources() }
+        val c = client(stock)
+        try {
+            ThreadMarks.add(c.scope, "deleted-thread")
+            assertEquals(emptyList<String>(), ids(threadLane(c)))
+            assertTrue(ThreadMarks.ids(c.scope).isEmpty())
+        } finally { ThreadMarks.reset() }
+    }
+
+    @Test fun aThreadAnotherPhoneMarkedShowsHereThroughThePlugin() = runBlocking<Unit> {
+        ThreadMarks.reset()
+        val stock = Stock().apply {
+            withoutThreadSources { r -> if (r.url.encodedPath == "/api/plugins/beacon/mobile/threads") 200 to json("threads" to JSONArray().put(json("id" to "active-2", "title" to "News"))).toString() else null }
+        }
+        val c = client(stock)
+        try {
+            assertEquals(listOf("active-2"), ids(threadLane(c)))
+            assertEquals("android_thread", source(threadLane(c), 0))
+            assertEquals(setOf("active-2"), ThreadMarks.ids(c.scope))
+        } finally { ThreadMarks.reset() }
+    }
+
+    @Test fun aPluginWithoutTheThreadListLeavesThisPhonesMarksWorking() = runBlocking<Unit> {
+        ThreadMarks.reset()
+        val stock = Stock().apply { withoutThreadSources(); pluginStatus = 404 }
+        val c = client(stock)
+        try {
+            ThreadMarks.add(c.scope, "active-0")
+            assertEquals(listOf("active-0"), ids(threadLane(c)))
+        } finally { ThreadMarks.reset() }
     }
 
     @Test fun anOldPinStaysListedWhenAnEmptyThreadReordersTheWindow() = runBlocking<Unit> {

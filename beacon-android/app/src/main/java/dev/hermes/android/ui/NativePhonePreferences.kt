@@ -10,6 +10,7 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
@@ -23,6 +24,8 @@ import kotlinx.coroutines.delay
     val profile = target.ifBlank { ui.profile }
     val profileName = profileDisplayName(profile, data["navigation-profiles"]?.rows("profiles").orEmpty())
     val editor = vm.phoneSettings
+    val roster by vm.botMode.state.collectAsStateWithLifecycle()
+    val choosing by vm.settingsProfileSelecting.collectAsStateWithLifecycle()
     val skills by editor.skills.collectAsStateWithLifecycle()
     val memory by editor.memory.collectAsStateWithLifecycle()
     var discard by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -43,7 +46,12 @@ import kotlinx.coroutines.delay
         if (page == "Skills") editor.loadSkills(force = false) else editor.loadMemory(force = false)
     }
     Column(Modifier.fillMaxSize()) {
-        Header(uiText(settingsLabel(page)), subtitle = if (profileName.isBlank()) "" else "${uiText("Profile")} · $profileName", back = if (page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
+        // In Bot Mode the page belongs to a bot: its avatar and name, as Bot Mode shows bots, not the word Profile. While another bot is being
+        // chosen the page names nobody, so it never shows one bot's name over another's notes.
+        val botMode = ui.botModeEnabled && profile.isNotBlank() && !choosing
+        val botTitle = if (botMode) roster.bots.firstOrNull { it.profile == profile }?.let { botName(it, data["navigation-profiles"]?.rows("profiles").orEmpty()) } ?: profileName else profileName
+        Header(uiText(settingsLabel(page)), subtitle = if (ui.botModeEnabled) (if (botMode) botTitle else "") else if (profileName.isBlank()) "" else "${uiText("Profile")} · $profileName", back = if (page == "Skills" && skills.selected == null) null else back, menu = LocalOpenNavigationMenu.current) {
+            if (botMode) ChatAvatar(botTitle, profile, Modifier.testTag("bot-page-avatar"), size = 32.dp)
             if (page == "Memory") SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh memory"), { editor.loadMemory() }, enabled = profileClient != null && !memory.loading && !memory.saving && memory.editing.isBlank())
             else SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh skills"), { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = profileClient != null && !skills.loading && !skills.saving && !skills.editing)
         }
@@ -77,7 +85,7 @@ import kotlinx.coroutines.delay
     Column(Modifier.fillMaxSize()) {
         // The checkpoints page is named for what it holds: the earlier versions of changed files.
         val backups = serverCheckpointPage(page)
-        Header(if (backups) uiText("File backups") else uiText(settingsLabel(page)), if (backups) uiText("Earlier versions of changed files") else "", back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
+        Header(if (backups) uiText("File backups") else uiText(settingsLabel(page)), "", back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
             SettingsIconButton(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"), { vm.phoneSettings.loadServer(page) }, enabled = !state.loading)
         })
         NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page, force = true) },
@@ -88,7 +96,7 @@ import kotlinx.coroutines.delay
         text = { Text(uiText("Hermes may reconnect while updating.")) },
         confirmButton = { TextButton(onClick = { confirm = false; if (!vm.app.calls.state.value.active) vm.phoneSettings.applyServerUpdate() else vm.notice(callBlocksUpdate) }) { Text(uiText("Apply update")) } },
         dismissButton = { TextButton(onClick = { confirm = false }) { Text(uiText("Cancel")) } })
-    if (reviewUnknown) AlertDialog(onDismissRequest = { reviewUnknown = false }, title = { Text(uiText("Check the server before retrying")) },
+    if (reviewUnknown) AlertDialog(onDismissRequest = { reviewUnknown = false }, title = { Text(uiText("Check Hermes before retrying")) },
         text = { Text(uiText("The update's result is unknown. Check the installed version.")) },
         confirmButton = { TextButton(onClick = { reviewUnknown = false; vm.phoneSettings.clearReviewedUpdate() }) { Text(uiText("Check current version")) } },
         dismissButton = { TextButton(onClick = { reviewUnknown = false }) { Text(uiText("Keep waiting")) } })

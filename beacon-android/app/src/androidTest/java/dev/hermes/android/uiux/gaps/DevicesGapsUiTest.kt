@@ -63,8 +63,8 @@ class DevicesGapsUiTest {
     }
 
     @Test fun aFailureShowsAboveTheRowsWithoutRetryAndTheRowsStay() {
-        compose.showPage { DevicesList(listOf(phone("a"), phone("b")), "a", error = "Couldn't remove this device. Try again.") {} }
-        compose.onNodeWithText("Couldn't remove this device. Try again.").assertIsDisplayed()
+        compose.showPage { DevicesList(listOf(phone("a"), phone("b")), "a", error = "Couldn't remove this phone. Try again.") {} }
+        compose.onNodeWithText("Couldn't remove this phone. Try again.").assertIsDisplayed()
         compose.onNodeWithText("Retry").assertDoesNotExist()
         compose.onNodeWithTag("settings-device-a").assertIsDisplayed()
         compose.onNodeWithTag("settings-device-b").assertIsDisplayed()

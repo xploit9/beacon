@@ -1,5 +1,7 @@
 package dev.hermes.android.updates
 
+import dev.hermes.android.BuildConfig
+import dev.hermes.android.core.Release
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.NativeAuthExpiredException
@@ -15,15 +17,17 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 
 /**
- * The official unpinned GitHub source, the same string the README installer uses; unpinned keeps the in-app plugin update working.
- * A constant on purpose: it is never taken from Hermes, a link or the user.
+ * The official GitHub source, the same string the README installer uses. Every install, update and repair from the app pins it to the commit
+ * of the latest release ([pluginInstallBody]). A constant on purpose: it is never taken from Hermes, a link or the user.
  */
 internal const val BEACON_PLUGIN_SOURCE = "xploit9/beacon/hermes-plugin/beacon"
 
 internal enum class PluginInstallStage { Idle, Installing, Checking, NeedsRestart, Restarting, Done, Failed }
 
 /** Why a step stopped. [NotYet]: Beacon did not answer in time. [GatewayDown]: Hermes did not come back after the restart in time. */
-internal enum class PluginInstallFailure { SignIn, Denied, Offline, Unsupported, Busy, Error, NotYet, GatewayDown }
+/** [NoRelease]: the latest Beacon release, or the commit its tag names, could not be read from GitHub, so nothing was installed. [GitHubBusy]: GitHub's rate limit. */
+/** [Blocked]: Hermes' own security scan refused the plugin; a forced install never overrides that. */
+internal enum class PluginInstallFailure { SignIn, Denied, Offline, Unsupported, Busy, Error, NotYet, GatewayDown, NoRelease, GitHubBusy, Blocked }
 
 /**
  * [busy]: Hermes is working on a reply or task right now. [failure] with [PluginInstallStage.NeedsRestart]: the restart did not start,
@@ -57,13 +61,41 @@ internal interface PluginInstallEndpoint {
     suspend fun restartGateway()
 }
 
-/** Hermes' own installer takes the owner's tap as the consent for what it adds, so the body carries only the fixed source and `enable`. */
-internal fun pluginInstallBody(): JSONObject =
-    JSONObject().put("identifier", BEACON_PLUGIN_SOURCE).put("enable", true).put("force", false)
+/**
+ * The one install the app asks Hermes for: the fixed source, replaced if it is already there (`force`), turned on, and pinned to the commit of
+ * the latest release (`ref`, a full 40-hex SHA). Hermes' own installer takes the owner's tap as the consent for what it adds; the policy lets
+ * exactly this shape through and nothing broader ([dev.hermes.android.data.NativeOperationPolicy.installBodyAllowed]).
+ */
+internal fun pluginInstallBody(commit: String): JSONObject {
+    require(COMMIT_SHA.matches(commit)) { "Invalid release commit" }
+    return JSONObject().put("identifier", BEACON_PLUGIN_SOURCE).put("enable", true).put("force", true).put("ref", commit)
+}
 
-internal class HermesPluginInstaller(private val client: BeaconClient) : PluginInstallEndpoint {
+/** What a repair needs beyond an install: what Hermes lists, what Beacon says about itself, and the published release. */
+internal interface RepairEndpoint : PluginInstallEndpoint {
+    suspend fun published(): PublishedCommit
+    /** Hermes' own row for Beacon (`GET /api/dashboard/plugins/hub`), or null when it lists none. */
+    suspend fun hub(): HubPlugin?
+    /** Beacon's own version route, or null when Beacon does not answer. */
+    suspend fun versions(): PluginVersions?
+}
+
+internal class HermesPluginInstaller(
+    private val client: BeaconClient,
+    private val releases: GitHubReleases = GitHubReleases(userAgent = "Beacon-Android/${BuildConfig.VERSION_NAME}"),
+    /** The release the last update check found, commit included: when there is one the tap asks GitHub for nothing. */
+    private val known: () -> Release? = { null },
+) : RepairEndpoint {
+    private var resolved: PublishedCommit? = null
+    /** The latest release, read once per install so a repair shows and installs the same one. */
+    override suspend fun published(): PublishedCommit = resolved ?: (known()?.takeIf { COMMIT_SHA.matches(it.commit) }?.let { PublishedCommit(it.pluginVersion, it.commit) }
+        ?: releases.latestCommit()).also { resolved = it }
     override suspend fun install(): JSONObject =
-        client.nativeRequest("/api/dashboard/agent-plugins/install", "POST", pluginInstallBody())
+        client.nativeRequest("/api/dashboard/agent-plugins/install", "POST", pluginInstallBody(published().commit))
+    override suspend fun hub(): HubPlugin? = hubPluginOf(client.nativeRequest("/api/dashboard/plugins/hub"))
+    override suspend fun versions(): PluginVersions? = try { HermesPluginUpdater(client).version() }
+        catch (error: CancellationException) { throw error }
+        catch (error: ApiFailure) { if (error.status == 404 || error.status == 502 || error.status == 503) null else throw error }
     override suspend fun enable(): JSONObject = client.nativeRequest("/api/dashboard/agent-plugins/beacon/enable", "POST", JSONObject())
     // "unauthorized" is the plugin answering before this phone is linked, which signing in does next.
     override suspend fun present(): Boolean = client.probeOptionalFeatures().optString("plugin") in setOf("available", "unauthorized")
@@ -71,8 +103,18 @@ internal class HermesPluginInstaller(private val client: BeaconClient) : PluginI
     override suspend fun restartGateway() { client.nativeRequest("/api/gateway/restart", "POST", JSONObject()) }
 }
 
+/** A reply lost after the request left (a timeout, a dropped connection) may still have installed Beacon: the caller looks before it calls that a failure. */
+internal fun lostReply(error: Exception): Boolean =
+    error is java.io.IOException && error !is ApiFailure && error !is NativeAuthExpiredException && error !is UpdateException && !requestNeverSent(error)
+
+/** Hermes answered 400 with its scan block ("Security scan blocked plugin install: ..."): a forced install never overrides a dangerous verdict. */
+internal fun scanBlocked(error: Exception): Boolean =
+    error is ApiFailure && error.status == 400 && error.message.trimStart().startsWith("Security scan blocked", ignoreCase = true)
+
 internal fun installFailure(error: Exception): PluginInstallFailure = when {
     error is NativeAuthExpiredException -> PluginInstallFailure.SignIn
+    error is UpdateException -> if (error.kind == UpdateException.Kind.Busy) PluginInstallFailure.GitHubBusy else PluginInstallFailure.NoRelease
+    scanBlocked(error) -> PluginInstallFailure.Blocked
     error is ApiFailure -> when (error.status) {
         401 -> PluginInstallFailure.SignIn
         403 -> PluginInstallFailure.Denied
@@ -92,10 +134,10 @@ private const val RESTART_PAUSE_MS = 2000L
 
 private fun failed(failure: PluginInstallFailure) = PluginInstallUi(PluginInstallStage.Failed, failure)
 
-private suspend fun <T> attempt(block: suspend () -> T): T? = try { block() } catch (error: CancellationException) { throw error } catch (_: Exception) { null }
+internal suspend fun <T> attempt(block: suspend () -> T): T? = try { block() } catch (error: CancellationException) { throw error } catch (_: Exception) { null }
 
 /** Asks until Beacon answers, a few times and no longer: Hermes mounts a new plugin's routes on the first request that reaches them. */
-private suspend fun beaconAnswers(endpoint: PluginInstallEndpoint, pause: suspend (Long) -> Unit): Boolean {
+internal suspend fun beaconAnswers(endpoint: PluginInstallEndpoint, pause: suspend (Long) -> Unit): Boolean {
     for (tries in 0 until PRESENCE_TRIES) {
         if (tries > 0) pause(PRESENCE_PAUSE_MS)
         if (attempt { endpoint.present() } == true) return true
@@ -121,12 +163,8 @@ internal suspend fun runPluginInstall(endpoint: PluginInstallEndpoint, pause: su
     catch (error: Exception) {
         // A reply lost after the request left may still have installed Beacon: look before calling it a failure. The gateway
         // state is unknown then, so it is read as if Hermes had asked for the restart.
-        val lostReply = error is java.io.IOException && error !is ApiFailure && error !is NativeAuthExpiredException && !requestNeverSent(error)
-        if (lostReply) return afterInstall(endpoint, true, pause)
-        // Hermes refuses a Beacon that is already on its disk (installed but off, or placed by the installer): turn that one on.
-        if (error is ApiFailure && error.status == 400) return try {
-            if (endpoint.enable().optBoolean("ok", true)) afterInstall(endpoint, true, pause) else failed(PluginInstallFailure.Error)
-        } catch (again: CancellationException) { throw again } catch (again: Exception) { failed(installFailure(again)) }
+        if (lostReply(error)) return afterInstall(endpoint, true, pause)
+        // The install replaces a Beacon that is already there and turns it on, so a refusal is Hermes' answer, not "already installed".
         return failed(installFailure(error))
     }
     if (!response.optBoolean("ok")) return failed(PluginInstallFailure.Error)
@@ -135,11 +173,11 @@ internal suspend fun runPluginInstall(endpoint: PluginInstallEndpoint, pause: su
     return afterInstall(endpoint, flagged, pause)
 }
 
-/** "Try again" after [PluginInstallFailure.NotYet]: only asks again, because installing twice would be refused as already there. */
+/** "Try again" after [PluginInstallFailure.NotYet]: only asks again; the install already went through. */
 internal suspend fun runPluginCheck(endpoint: PluginInstallEndpoint, restartPending: Boolean = false, pause: suspend (Long) -> Unit = { delay(it) }): PluginInstallUi =
     afterInstall(endpoint, restartPending, pause)
 
-private suspend fun gatewayServing(endpoint: PluginInstallEndpoint, settle: Boolean, pause: suspend (Long) -> Unit): PluginInstallUi {
+internal suspend fun gatewayServing(endpoint: PluginInstallEndpoint, settle: Boolean, pause: suspend (Long) -> Unit): PluginInstallUi {
     if (settle) pause(RESTART_SETTLE_MS) // the old gateway may still report itself running
     for (tries in 0 until RESTART_TRIES) {
         if (tries > 0) pause(RESTART_PAUSE_MS)
@@ -178,7 +216,10 @@ internal class PluginInstallController(
     private val client: () -> BeaconClient?,
     private val finished: () -> Unit,
     private val showUpdates: () -> Unit,
-    private val endpointFor: (BeaconClient) -> PluginInstallEndpoint = { HermesPluginInstaller(it) },
+    /** Tests give a scripted Hermes; the app uses the real one. */
+    private val endpointFor: ((BeaconClient) -> PluginInstallEndpoint)? = null,
+    /** The release the last update check found, for the commit to pin: the tap then asks GitHub for nothing. */
+    private val known: () -> Release? = { null },
 ) {
     private val mutable = MutableStateFlow(PluginInstallUi())
     val state: StateFlow<PluginInstallUi> = mutable.asStateFlow()
@@ -211,15 +252,19 @@ internal class PluginInstallController(
             PluginInstallStep.Gateway, PluginInstallStep.Restart -> PluginInstallStage.Restarting
         })
         job = scope.launch {
+            // Repair and the app update post the same install: one plugin change at a time, and the one that waits says so.
+            if (!PluginChange.begin()) { detached.closeNative(); mutable.value = failed(PluginInstallFailure.Busy); return@launch }
             val result = try {
-                val endpoint = endpointFor(detached)
-                when (step) {
-                    PluginInstallStep.Install -> runPluginInstall(endpoint)
-                    PluginInstallStep.Check -> runPluginCheck(endpoint, before.restartPending)
-                    PluginInstallStep.Gateway -> runGatewayCheck(endpoint)
-                    PluginInstallStep.Restart -> runPluginRestart(endpoint, before)
-                }
-            } finally { detached.closeNative() }
+                try {
+                    val endpoint = endpointFor?.invoke(detached) ?: HermesPluginInstaller(detached, known = known)
+                    when (step) {
+                        PluginInstallStep.Install -> runPluginInstall(endpoint)
+                        PluginInstallStep.Check -> runPluginCheck(endpoint, before.restartPending)
+                        PluginInstallStep.Gateway -> runGatewayCheck(endpoint)
+                        PluginInstallStep.Restart -> runPluginRestart(endpoint, before)
+                    }
+                } finally { detached.closeNative() }
+            } finally { PluginChange.finish() }
             mutable.value = result
             if (result.stage == PluginInstallStage.Done) finished()
         }

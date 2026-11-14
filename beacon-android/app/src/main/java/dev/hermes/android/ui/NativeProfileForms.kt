@@ -113,7 +113,7 @@ private val noCapitals = KeyboardOptions(capitalization = KeyboardCapitalization
                     }
                     Text(uiText("Instructions"), Modifier.weight(1f).padding(start = 4.dp), style = MaterialTheme.typography.titleLarge)
                     TextButton(onClick = { onSave(draft) }, enabled = !admin.busy && changed, modifier = Modifier.heightIn(min = 48.dp).testTag("profile-instructions-save")) {
-                        Text(uiText(if (admin.busy) "Saving..." else "Save"))
+                        Text(uiText(if (admin.busy) "Saving…" else "Save"))
                     }
                 }
                 if (admin.error.isNotBlank()) Text(uiText(admin.error), Modifier.padding(horizontal = 16.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.error)

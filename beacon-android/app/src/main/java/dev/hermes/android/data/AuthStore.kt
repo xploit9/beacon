@@ -113,6 +113,27 @@ internal fun AuthContext.sameCookieAuthority(expected: AuthContext): Boolean =
         scope().sameAccount(expected.scope()) && backend == expected.backend &&
         bearer?.copy(profile = expected.profile) == expected.bearer && loopbackSession == expected.loopbackSession
 
+/**
+ * The stored record is still the sign-in [held] belongs to: the same origin, owner and issuer (a saved sign-in that has no issuer yet may be given it) and the
+ * same kind of credential. A logout, another owner or issuer, or a different kind of sign-in on the origin is not.
+ */
+internal fun AuthContext.keepsSignInOf(held: AuthContext): Boolean =
+    owner.isNotBlank() && backend == held.backend && origin == held.origin && owner == held.owner &&
+        (held.nativeProvider.isBlank() || nativeProvider == held.nativeProvider) &&
+        (held.bearer == null || bearer != null) && (held.loopbackSession == null || loopbackSession?.verified == true)
+
+/**
+ * After the credential epoch moved, whether the stored sign-in [this] is still the one [held] was made with: the same account, profile and backend, and the same
+ * credential, or for a loopback sign-in a renewal of its session (another token, the same origin and owner, still verified). Nothing here writes: the held context is
+ * never saved over the stored one, so a renewed session is never replaced by the older token an action started with.
+ */
+internal fun AuthContext.continuesSignInOf(held: AuthContext): Boolean =
+    scope().sameAccount(held.scope()) && profile == held.profile && backend == held.backend &&
+        (held.bearer?.let { it == bearer } == true ||
+            held.loopbackSession?.takeIf { it.verified }?.let { session -> loopbackSession?.let { it.verified && it.origin == session.origin && it.owner == session.owner } == true } == true ||
+            held.bearer == null && held.loopbackSession == null && held.nativeProvider.isNotBlank() &&
+            this == held && canReconnectNative(held.origin))
+
 internal fun AuthContext.compareAndSetCookies(expected: AuthContext, replacement: List<String>): AuthContext? {
     if (!sameCookieAuthority(expected) || cookies != expected.cookies) return null
     return copy(cookies = replacement)
@@ -188,7 +209,6 @@ internal fun persistAuthContextIfUnchanged(
 class AuthStore(context: Context, private val cipher: AppCipher) {
     private val prefs = context.getSharedPreferences("auth-private", Context.MODE_PRIVATE)
     internal val authorityEpoch = CredentialEpoch()
-    @Volatile internal var incidentSink: ((BeaconClient, String, String, Throwable) -> Unit)? = null
     // Allows a regression to hold the actual disk write after the caller's authority check.
     @Volatile internal var ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO
     @Synchronized fun read(origin: String): AuthContext {
@@ -251,6 +271,11 @@ class AuthStore(context: Context, private val cipher: AppCipher) {
         JSONObject(String(cipher.decrypt(Base64.decode(raw, Base64.NO_WRAP), origin), Charsets.UTF_8))
             .optString("incident_admission").takeIf { it == java.util.UUID.fromString(it).toString() }
     }.getOrNull()
+    /**
+     * A random token that names one saved sign-in (kept as `incident_admission` in the sealed record; the name is from the removed incident log
+     * and stays so saved accounts keep it). It changes with every new sign-in, so work started under an old one is refused: device removal and
+     * secure replies check it ([deviceRemovalAuthority], [withIncidentAdmission]).
+     */
     @Synchronized internal fun incidentAdmission(scope: Scope): String? {
         val version = authorityEpoch.readVersion() ?: return null
         val current = read(scope.origin)

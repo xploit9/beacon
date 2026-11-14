@@ -176,7 +176,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
     !plugin.actionable -> ""
     plugin.status in setOf(PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed) -> "Restart Hermes"
     plugin.status == PluginStatus.DashboardFailed -> "Restart dashboard"
-    else -> "Update the Beacon plugin"
+    else -> "Update Beacon on Hermes"
 }
 
 /** Reads the same local state as the focused pages, so a summary never claims more than the page it opens will show. */
@@ -227,6 +227,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
     val verdict = connectionVerdict(ui.connected, ui.loading || ui.restoringSession, ui.authenticated, ui.origin.isNotBlank())
     val snapshot = SettingsSnapshot(
         connected = ui.connected, connecting = verdict == ConnectionVerdict.Checking, profile = if (profileLoading) "" else profileDisplayName(ui.profile, profileRows),
+        hardwareKeyboard = androidx.compose.ui.platform.LocalConfiguration.current.keyboard == android.content.res.Configuration.KEYBOARD_QWERTY,
         theme = prefs.theme, colorStyle = prefs.skin,
         installedVersion = BuildConfig.VERSION_NAME, updateName = update.release?.name.orEmpty(), updateReady = update.phase == UpdatePhase.NeedsPermission || update.phase == UpdatePhase.Installing,
         voiceProviderId = phoneVoice?.first.orEmpty(), voiceKeySaved = phoneVoice?.second,
@@ -262,7 +263,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
                 Box(Modifier.weight(1f).fillMaxHeight(), contentAlignment = Alignment.TopCenter) {
                     Box(Modifier.widthIn(max = 640.dp).fillMaxWidth().fillMaxHeight().testTag("settings-wide-detail")) {
                         if (page.isBlank()) Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                            EmptyState(uiText("Choose a setting"), uiText("Pick one from the list to see it here."), Icons.Rounded.Tune, centered = true)
+                            EmptyState(uiText("Choose a setting"), "", Icons.Rounded.Tune, centered = true)
                         } else MoreSettingsRoute(vm, ui, page, pluginStatus)
                     }
                 }
@@ -302,7 +303,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
     }
     val restoringProfile by vm.settingsProfileRestoring.collectAsStateWithLifecycle()
     val restoreError by vm.settingsProfileRestoreError.collectAsStateWithLifecycle()
-    if (restoringProfile && page in setOf("Skills", "Memory", "Profiles")) {
+    if (restoringProfile && page in setOf("Skills", "Memory", "Vault", "Profiles")) {
         SettingsStatePage(vm, page, refreshing = restoreError.isBlank()) {
             item {
                 SettingsSection(uiText("Profile settings"), testTag = "settings-restoring") {
@@ -360,20 +361,25 @@ private fun choiceTags(label: String, options: List<String>) = options.associate
         SettingsList(refreshing = record?.optBoolean("_loading") == true, testTag = "chat-preferences") {
             if (failed) item { SettingsSection(testTag = "chat-preferences-error") { SettingsErrorRow(uiText("Couldn't load chat settings"), null, "") } }
             item {
+                val hardwareKeyboard = androidx.compose.ui.platform.LocalConfiguration.current.keyboard == android.content.res.Configuration.KEYBOARD_QWERTY
                 SettingsSection(uiText("When you send"), testTag = "settings-section:Sending") {
                     // The stored values stay steer and queue, and the option tags keep the old English label, so saved choices and tests still find them.
                     SettingsChoiceRow(
                         assistantText("If you send while Beacon replies"), busyOverride ?: preferences.busySendAction, busyOptions, { vm.setBusySendAction(it) },
-                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Change the reply", "queue" to "Send after"),
+                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Send now", "queue" to "Queue"),
                         optionIcons = mapOf("steer" to Icons.AutoMirrored.Rounded.CallSplit, "queue" to Icons.AutoMirrored.Rounded.PlaylistAdd),
                         optionTestTags = choiceTags("While Beacon is replying", busyOptions), enabled = preferences.busySendLoaded, style = ChoiceStyle.Segmented, fitSegments = true,
                     )
-                    SettingsDivider()
-                    SettingsChoiceRow(
-                        uiText("Send shortcut"), settings.string("send_key", "enter"), keyOptions, { vm.nativePreferences(json("send_key" to it)) },
-                        icon = Icons.Rounded.Keyboard, optionLabels = mapOf("enter" to "Enter", "ctrl_enter" to "Ctrl + Enter"),
-                        optionTestTags = choiceTags("Send shortcut", keyOptions), enabled = !failed, style = ChoiceStyle.Segmented, fitSegments = true,
-                    )
+                    // A soft keyboard's Enter always adds a line (the composer sends only on a key event), so the row needs a keyboard.
+                    if (hardwareKeyboard) {
+                        SettingsDivider()
+                        SettingsChoiceRow(
+                            uiText("Enter key"), settings.string("send_key", "enter"), keyOptions, { vm.nativePreferences(json("send_key" to it)) },
+                            icon = Icons.Rounded.Keyboard, optionLabels = mapOf("enter" to "Sends", "ctrl_enter" to "New line"),
+                            optionTestTags = choiceTags("Send shortcut", keyOptions), enabled = !failed, style = ChoiceStyle.Segmented, fitSegments = true,
+                            hint = if (settings.string("send_key", "enter") != "enter") uiText("Ctrl + Enter sends") else "",
+                        )
+                    }
                 }
             }
             item {
@@ -409,7 +415,7 @@ private fun choiceTags(label: String, options: List<String>) = options.associate
 }
 @Composable private fun StructuredReadValue(value: Any, depth: Int = 0) {
     when {
-        depth > 8 -> Text(uiText("More details are available on your computer."), style = MaterialTheme.typography.bodySmall)
+        depth > 8 -> Text("…", style = MaterialTheme.typography.bodySmall)
         value is JSONObject -> {
             var expanded by remember(value) { mutableStateOf(depth <= 1) }
             Column {
@@ -452,7 +458,7 @@ internal fun settingsHost(address: String): String {
     var origin by rememberSaveable(ui.origin) { mutableStateOf(ui.origin) }
     var editing by rememberSaveable(ui.origin) { mutableStateOf(false) }
     val signOutTitle = uiText("Sign out of Beacon")
-    val signOutExplanation = uiText("Remove the saved Hermes sign-in from this phone. Your encrypted drafts stay here.")
+    val signOutExplanation = uiText("Your drafts stay on this phone.")
     val signOutLabel = uiText("Sign out")
     val host = settingsHost(ui.origin)
     val verdict = connectionVerdict(ui.connected, ui.loading || ui.restoringSession, ui.authenticated, ui.origin.isNotBlank())

@@ -41,6 +41,13 @@ class LiveCallInterfaceTest {
         shell("wm size reset")
         shell("wm density reset")
         shell("settings put system font_scale 1.0")
+        // The privacy journey puts the screen to sleep and wakes it again; under load that wake did not take effect (fl6-t6-load-1: asleep after it, and every later class failed with "No compose hierarchies found").
+        // However a test ends, the next one needs the display on, as KeepConnectedUiTest.leaveTheDisplayOn guarantees after its idle checks.
+        val context = androidx.test.core.app.ApplicationProvider.getApplicationContext<android.content.Context>()
+        val power = context.getSystemService(android.os.PowerManager::class.java)
+        val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+        val deadline = System.currentTimeMillis() + 15_000
+        while ((!power.isInteractive || keyguard.isKeyguardLocked) && System.currentTimeMillis() < deadline) { shell("input keyevent KEYCODE_WAKEUP"); shell("wm dismiss-keyguard"); Thread.sleep(500) }
     }
     private fun capture(name: String) {
         val dir=File(rule.activity.getExternalFilesDir(null),"ui-evidence").apply{mkdirs()}
@@ -87,6 +94,10 @@ class LiveCallInterfaceTest {
         shell("settings put system font_scale 1.0");shell("wm size 1080x2200");shell("wm density 440")
         device.waitForIdle();Thread.sleep(800)
         rule.onNodeWithTag("beacon-minimize-call").assertDoesNotExist();device.executeShellCommand("input keyevent 3");Thread.sleep(900)
+        // Home hands the call to its bubble once Android has stopped the activity; on a loaded emulator that took 7 s (fl6-base-1: paused 16:42:47.6, stopped 16:42:54.7),
+        // and the fixed 900 ms above then found no compose hierarchy at all. Wait for the bubble itself; the check below is the same one.
+        val bubbleBy = System.currentTimeMillis() + 30_000
+        while (System.currentTimeMillis() < bubbleBy && !runCatching { rule.onAllNodesWithTag("beacon-call-bubble").fetchSemanticsNodes().isNotEmpty() }.getOrDefault(false)) Thread.sleep(100)
         rule.onNodeWithTag("beacon-call-bubble").assertExists();capture("bubble-right")
         rule.runOnUiThread {
             val overlay=checkNotNull(LiveCallShowcaseActivity::class.java.getDeclaredField("overlay").apply{isAccessible=true}.get(null))

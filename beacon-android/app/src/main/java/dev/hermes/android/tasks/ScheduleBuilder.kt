@@ -5,6 +5,7 @@ package dev.hermes.android.tasks
 import dev.hermes.android.core.json
 import dev.hermes.android.core.string
 import dev.hermes.android.ui.nativeClockPattern
+import dev.hermes.android.ui.nativeDateTimePattern
 import dev.hermes.android.ui.nativeDayPattern
 import org.json.JSONObject
 import java.time.DayOfWeek
@@ -145,6 +146,9 @@ internal fun scheduleFieldVisible(key: String, mode: String): Boolean = modeFiel
 internal class ScheduleFormat(
     val is24Hour: Boolean = true, val locale: Locale = Locale.getDefault(), val text: (String) -> String = { it },
     val dayPattern: String = nativeDayPattern(locale, withYear = false, withWeekday = false),
+    /** The day and the clock as the locale joins them. A caller that fixes its own [dayPattern] (tests) gets that day, a comma and the clock. */
+    val dateTimePattern: String = if (dayPattern == nativeDayPattern(locale, withYear = false, withWeekday = false)) nativeDateTimePattern(locale, is24Hour, withYear = false, withWeekday = false)
+        else "$dayPattern, ${nativeClockPattern(locale, is24Hour)}",
 ) {
     private val clockPattern = nativeClockPattern(locale, is24Hour)
     private fun format(pattern: String, hour: Int, minute: Int, date: LocalDate = LocalDate.of(2000, 1, 1)) =
@@ -155,7 +159,7 @@ internal class ScheduleFormat(
     fun hour(hour: Int) = format(if (is24Hour) "HH" else "h a", hour, 0)
     /** A day with its weekday and year, for the date choice. */
     fun fullDay(date: LocalDate) = format(nativeDayPattern(locale, withYear = true, withWeekday = true), 0, 0, date)
-    fun dayAndClock(at: LocalDateTime) = format("$dayPattern, $clockPattern", at.hour, at.minute, at.toLocalDate())
+    fun dayAndClock(at: LocalDateTime) = format(dateTimePattern, at.hour, at.minute, at.toLocalDate())
     fun fill(template: String, vararg values: Pair<String, Any>) = values.fold(text(template)) { acc, (key, value) -> acc.replace("{$key}", value.toString()) }
     /** [day] in cron numbering (0 = Sunday), as the locale writes it. */
     fun weekday(day: Int, style: TextStyle) = DayOfWeek.of(if (day == 0) 7 else day).getDisplayName(style, locale)
@@ -169,8 +173,8 @@ internal val ScheduleBuilderStrings = listOf(
     "Weekdays", "Weekends", "minutes", "hours", "days",
     "Enter when this should run.", "Enter how often this should run.", "Choose at least one day.", "Choose a time in the future.",
     "Choose a start hour before the end hour.", "Choose a gap of 1 to 12 hours.", "Choose an end hour of 23 or earlier, or turn off Include the end hour.",
-    "Refresh and reopen this form before saving. The time zone changed or can't be confirmed.", "Choose one interval, such as every 2h.",
-    "Ran", "Callback", "Completed schedules",
+    "The time zone changed. Reopen this form to save.", "Choose one interval, such as every 2h.",
+    "Ran", "Call back", "Completed schedules",
     "Looks through your connected sources and lets you know when something needs you.", "Tidies up what Beacon remembers about you.", "Runs in the background for Beacon.",
 )
 

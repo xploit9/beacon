@@ -12,7 +12,7 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class NativeSessionPinTest {
-    private class Fixture(var pluginStatus: Int = 200, var pluginError: String = "Not Found") {
+    private class Fixture(var patchStatus: Int = 200) {
         val requests = mutableListOf<Pair<Request, JSONObject>>()
         val bootstrapRequests = mutableListOf<Request>()
         private val wire = NativeOperationsTest.Fixture(canonical = false)
@@ -31,14 +31,13 @@ class NativeSessionPinTest {
                         .body(payload.toString().toResponseBody("application/json".toMediaType())).build()
                 }
                 requests += request to body
-                val plugin = request.url.encodedPath == "/api/plugins/beacon/sessions/pin"
+                val patch = request.method == "PATCH"
                 val payload = when {
-                    plugin && pluginStatus == 200 -> json("session_id" to body.string("session_id"), "pinned" to body.getBoolean("pinned"))
-                    plugin -> json("detail" to pluginError)
                     request.url.encodedPath.endsWith("/mutation-snapshot") -> json("exists" to true, "runtime_revision" to 4, "runtime_generation" to 2)
+                    patch && patchStatus != 200 -> json("detail" to "Session changed in Hermes")
                     else -> json("session_id" to "chat-a", "pinned" to body.getBoolean("pinned"))
                 }
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (plugin) pluginStatus else 200).message("Fixture")
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (patch) patchStatus else 200).message("Fixture")
                     .body(payload.toString().toResponseBody("application/json".toMediaType())).build()
             }
         }
@@ -51,57 +50,45 @@ class NativeSessionPinTest {
         fun close() { client.closeNative(); wire.client.closeNative() }
     }
 
-    @Test fun pinUsesThePluginWithExplicitProfileAndNoMaintenancePatch() = runBlocking {
+    @Test fun pinUsesHermesRevisionCheckedPatchAndNeverAsksThePlugin() = runBlocking {
         val fixture = Fixture()
         try {
             val result = fixture.client.call("/api/session/pin", method = "POST", data = json("session_id" to "chat-a", "pinned" to true))
             assertTrue(result.getBoolean("pinned"))
-            val (request, body) = fixture.requests.single()
-            assertEquals("/api/plugins/beacon/sessions/pin", request.url.encodedPath)
-            assertEquals("POST", request.method)
-            assertEquals("work", request.url.queryParameter("beacon_profile"))
-            assertEquals("work", body.string("profile"))
-            assertEquals("chat-a", body.string("session_id"))
-            fixture.assertBootstrap()
-        } finally { fixture.close() }
-    }
-
-    @Test fun missingPluginRouteKeepsTheRevisionCheckedStockPatch() = runBlocking {
-        val fixture = Fixture(pluginStatus = 404)
-        try {
-            fixture.client.call("/api/session/pin", method = "POST", data = json("session_id" to "chat-a", "pinned" to true))
-            assertEquals(listOf("POST", "GET", "PATCH"), fixture.requests.map { it.first.method })
+            assertEquals(listOf("GET", "PATCH"), fixture.requests.map { it.first.method })
+            assertTrue(fixture.requests.none { it.first.url.encodedPath.startsWith("/api/plugins/beacon/") })
+            assertEquals("/api/sessions/chat-a/mutation-snapshot", fixture.requests.first().first.url.encodedPath)
+            assertEquals("/api/sessions/chat-a", fixture.requests.last().first.url.encodedPath)
             val patch = fixture.requests.last().second
             assertEquals(4, patch.getInt("expected_revision"))
             assertEquals(2, patch.getInt("expected_generation"))
             assertTrue(patch.string("request_id").isNotBlank())
             assertEquals("work", patch.string("profile"))
+            assertTrue(patch.getBoolean("pinned"))
             fixture.assertBootstrap()
         } finally { fixture.close() }
     }
 
-    @Test fun ownerOrSessionDenialNeverFallsThroughToPatch() = runBlocking {
-        for ((status, detail) in listOf(403 to "Owner not authorized", 404 to "Conversation not found.")) {
-            val fixture = Fixture(status, detail)
+    @Test fun unpinSendsTheSamePatchWithFalse() = runBlocking {
+        val fixture = Fixture()
+        try {
+            val result = fixture.client.call("/api/session/pin", method = "POST", data = json("session_id" to "chat-a", "pinned" to false))
+            assertFalse(result.getBoolean("pinned"))
+            assertFalse(fixture.requests.last().second.getBoolean("pinned"))
+            fixture.assertBootstrap()
+        } finally { fixture.close() }
+    }
+
+    @Test fun aRefusedPatchFailsOnceWithoutAnotherRoute() = runBlocking {
+        for (status in listOf(403, 404, 409)) {
+            val fixture = Fixture(status)
             try {
-                assertTrue(runCatching { fixture.client.call("/api/session/pin", method = "POST", data = json("session_id" to "chat-a", "pinned" to true)) }.isFailure)
-                assertEquals(1, fixture.requests.size)
+                val failure = runCatching { fixture.client.call("/api/session/pin", method = "POST", data = json("session_id" to "chat-a", "pinned" to true)) }.exceptionOrNull()
+                assertTrue(failure is ApiFailure && failure.status == status)
+                assertEquals(listOf("GET", "PATCH"), fixture.requests.map { it.first.method })
                 fixture.assertBootstrap()
             } finally { fixture.close() }
         }
-    }
-
-    @Test fun plugin401UsesTheRevisionCheckedNativePinWithoutChangingCredentials() = runBlocking {
-        val fixture = Fixture(pluginStatus = 401, pluginError = "Pairing expired")
-        try {
-            val result = fixture.client.call("/api/session/pin", method = "POST", data = json("session_id" to "chat-a", "pinned" to true))
-            assertTrue(result.getBoolean("pinned"))
-            assertEquals(listOf("POST", "GET", "PATCH"), fixture.requests.map { it.first.method })
-            assertEquals(4, fixture.requests.last().second.getInt("expected_revision"))
-            assertEquals(2, fixture.requests.last().second.getInt("expected_generation"))
-            assertEquals("owner", fixture.client.auth.owner)
-            fixture.assertBootstrap()
-        } finally { fixture.close() }
     }
 
     @Test fun conversationMutationFailuresCannotExposeServerPaths() {

@@ -39,10 +39,11 @@ class BotModeDrawerTest {
     }
 
     @Test fun theStatusIsTypingFirstThenTheSpacesTheBotIsInThenNothing() {
-        assertEquals("Typing…", botStatus(true, 3, "Typing…", "Spaces: {0}"))
-        assertEquals("Spaces: 2", botStatus(false, 2, "Typing…", "Spaces: {0}"))
+        assertEquals("Typing…", botStatus(true, 3, "Typing…", "In {0} spaces"))
+        assertEquals("In 2 spaces", botStatus(false, 2, "Typing…", "In {0} spaces", "In 1 space"))
+        assertEquals("In 1 space", botStatus(false, 1, "Typing…", "In {0} spaces", "In 1 space"))
         // No spaces: nothing is invented.
-        assertEquals("", botStatus(false, 0, "Typing…", "Spaces: {0}"))
+        assertEquals("", botStatus(false, 0, "Typing…", "In {0} spaces"))
     }
 
     @Test fun suggestedRolesAreForASmallTeamAndSkipWhatAlreadyExists() {

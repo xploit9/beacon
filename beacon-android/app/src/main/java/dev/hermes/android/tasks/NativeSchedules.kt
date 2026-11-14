@@ -3,18 +3,22 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.ui.nativeClockPattern
-import dev.hermes.android.ui.nativeDayPattern
+import dev.hermes.android.ui.nativeDateTimePattern
+import dev.hermes.android.ui.platformBestPattern
 import kotlinx.coroutines.CancellationException
 import org.json.JSONArray
 import org.json.JSONObject
 /** Schedules showed 24-hour time before the phone's setting counted, so that stays the default; callers pass the phone's own. */
-internal fun scheduleTime(value: String, timezone: String, empty: String, is24Hour: Boolean = true, locale: java.util.Locale = java.util.Locale.getDefault()): String {
+internal fun scheduleTime(
+    value: String, timezone: String, empty: String, is24Hour: Boolean = true, locale: java.util.Locale = java.util.Locale.getDefault(),
+    best: (java.util.Locale, String) -> String? = ::platformBestPattern,
+): String {
     if (value.isBlank()) return empty
     return runCatching {
         val time = java.time.OffsetDateTime.parse(value)
         // Without the plugin there is no Hermes zone; Hermes wrote the time with its own offset, so that wall clock is right.
         val zone = java.util.TimeZone.getTimeZone(runCatching { java.time.ZoneId.of(timezone) }.getOrElse { time.offset })
-        val pattern = nativeDayPattern(locale, withYear = true, withWeekday = false) + ", " + nativeClockPattern(locale, is24Hour)
+        val pattern = nativeDateTimePattern(locale, is24Hour, withYear = true, withWeekday = false, best)
         java.text.SimpleDateFormat(pattern, locale).also { it.timeZone = zone }.format(java.util.Date.from(time.toInstant()))
     }.getOrDefault("Time unavailable")
 }
@@ -28,6 +32,7 @@ internal class ScheduleWhenWords(val due: String = "Due now", val minutes: Strin
 internal fun scheduleNextRun(
     value: String, empty: String, words: ScheduleWhenWords = ScheduleWhenWords(), now: java.time.Instant = java.time.Instant.now(),
     zone: java.time.ZoneId = java.time.ZoneId.systemDefault(), is24Hour: Boolean = true, locale: java.util.Locale = java.util.Locale.getDefault(),
+    best: (java.util.Locale, String) -> String? = ::platformBestPattern,
 ): String {
     if (value.isBlank()) return empty
     return runCatching {
@@ -42,8 +47,8 @@ internal fun scheduleNextRun(
         when {
             days == 0L -> words.today.replace("{0}", clock)
             days == 1L -> words.tomorrow.replace("{0}", clock)
-            days in 2L..6L -> format("EEE ${nativeClockPattern(locale, is24Hour)}")
-            else -> format(nativeDayPattern(locale, withYear = day.year != now.atZone(zone).year, withWeekday = false) + ", " + nativeClockPattern(locale, is24Hour))
+            days in 2L..6L -> format(best(locale, "EEE" + (if (is24Hour) "Hm" else "hm"))?.takeIf { it.isNotBlank() } ?: "EEE ${nativeClockPattern(locale, is24Hour)}")
+            else -> format(nativeDateTimePattern(locale, is24Hour, withYear = day.year != now.atZone(zone).year, withWeekday = false, best))
         }
     }.getOrDefault("Time unavailable")
 }
@@ -102,7 +107,7 @@ internal fun scheduleState(job: JSONObject): String = when {
     scheduleRunFailed(job) || job.string("state") == "error" -> "Failed"
     scheduleGatewayNeedsAttention(job) -> "Waiting"
     job.string("next_run_at").isNotBlank() -> "Waiting"
-    else -> "Execution unconfirmed"
+    else -> "Not confirmed"
 }
 /** Why the last result could not be delivered (for example a thread that was deleted), as Hermes recorded it; blank otherwise. */
 internal fun scheduleDeliveryError(job: JSONObject): String = if (job.string("last_status") == "delivery_failed") job.string("last_delivery_error").take(200) else ""
@@ -122,7 +127,11 @@ private val proactiveMarker = Regex("^\\s*<!--\\s*BEACON_PROACTIVE_JOB:([A-Za-z0
 internal fun proactiveKind(job: JSONObject): String? = proactiveMarker.find(job.string("prompt"))?.groupValues?.get(1)
 /** Jobs the plugin keeps in shape: only their name is the owner's to change. */
 internal fun scheduleNameOnly(job: JSONObject): Boolean = job.string("script").endsWith("beacon-checkups.py") || proactiveKind(job) != null
-internal fun scheduleTitle(job: JSONObject, untitled: String, callback: String): String = if (scheduleIsCallback(job)) callback else job.string("name").ifBlank { untitled }
+/** The names the plugin gives its two managed jobs; the card says them in the app's own words (the stored name is unchanged, and a name the owner chose is shown as it is). */
+private val managedJobTitles = mapOf("Beacon: what needs you" to "What needs you", "Beacon proactive: Nightly memory upkeep" to "Memory tidy-up")
+internal val ManagedJobTitleStrings = managedJobTitles.values.toList()
+internal fun scheduleTitle(job: JSONObject, untitled: String, callback: String, text: (String) -> String = { it }): String =
+    if (scheduleIsCallback(job)) callback else job.string("name").let { name -> managedJobTitles[name]?.takeIf { proactiveKind(job) != null }?.let(text) ?: name }.ifBlank { untitled }
 /** Why a callback was scheduled, when the plugin says; blank otherwise. */
 internal fun callbackReason(capabilities: JSONObject?, jobId: String): String = capabilities?.optJSONObject("callbacks")?.optJSONObject(jobId)?.string("reason").orEmpty().trim()
 /** The plain-words line for each Beacon-managed job kind; scheduleBody's `text` translates it. */
@@ -185,7 +194,7 @@ internal class NativeSchedules(private val c: BeaconClient) {
             if (ScheduleMode.of(d.string("_schedule_mode")) == ScheduleMode.Fixed && schedule != d.optJSONObject("_original")?.string("schedule").orEmpty()) {
                 val expected = d.string("_timezone")
                 val actual = c.nativeGet("/api/plugins/beacon/mobile/tasks/capabilities").string("timezone")
-                require(expected.isNotBlank() && expected == actual) { "Refresh and reopen this form before saving. The time zone changed or can't be confirmed." }
+                require(expected.isNotBlank() && expected == actual) { "The time zone changed. Reopen this form to save." }
             }
             d.put("schedule", schedule)
             require(!schedule.contains(Regex("(?i)every.*(?:to|random)"))) { "Choose one interval, such as every 2h." }

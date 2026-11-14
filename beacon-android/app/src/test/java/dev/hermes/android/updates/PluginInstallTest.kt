@@ -49,13 +49,55 @@ class PluginInstallTest {
     private fun failed(failure: PluginInstallFailure) = PluginInstallUi(PluginInstallStage.Failed, failure)
     private val done = PluginInstallUi(PluginInstallStage.Done)
 
-    @Test fun theRequestCarriesOnlyTheFixedSourceEnabledAndNotForced() {
-        val body = pluginInstallBody()
+    private val commit = "0123456789abcdef0123456789abcdef01234567"
+
+    @Test fun theRequestIsTheFixedSourceReplacedEnabledAndPinnedToTheReleaseCommit() {
+        val body = pluginInstallBody(commit)
         assertEquals("xploit9/beacon/hermes-plugin/beacon", body.getString("identifier"))
         assertTrue(body.getBoolean("enable"))
-        assertFalse(body.getBoolean("force"))
-        // Unpinned (no ref) so the in-app update keeps following the latest release, and never a catalog name.
-        assertEquals(setOf("identifier", "enable", "force"), body.keys().asSequence().toSet())
+        assertTrue(body.getBoolean("force"))
+        assertEquals(commit, body.getString("ref"))
+        // Exactly these four keys: never a catalog name, never a branch.
+        assertEquals(setOf("identifier", "enable", "force", "ref"), body.keys().asSequence().toSet())
+    }
+
+    @Test fun onlyAFullLowercaseCommitCanBePinned() {
+        for (bad in listOf("", "main", "v1.1.33", commit.uppercase(), commit.take(39), commit + "0", " $commit", commit + "\u000a"))
+            try { pluginInstallBody(bad); fail("Accepted '$bad'") } catch (_: IllegalArgumentException) { }
+    }
+
+    @Test fun theInstallRouteTakesThatOneBodyAndNothingBroader() {
+        val install = "/api/dashboard/agent-plugins/install"
+        assertTrue(NativeOperationPolicy.installBodyAllowed(install, pluginInstallBody(commit)))
+        val exact = { pluginInstallBody(commit) }
+        val refused = listOf<JSONObject?>(
+            null, JSONObject(), exact().put("accept_capabilities", true), exact().put("force", false), exact().put("enable", false), exact().put("ref", commit.uppercase()),
+            exact().put("ref", "main"), exact().put("ref", 1), exact().put("identifier", "someone-else/beacon/hermes-plugin/beacon"), exact().put("identifier", "xploit9/beacon"),
+            exact().apply { remove("ref") }, exact().apply { remove("force") }, exact().put("catalog_name", "beacon"),
+        )
+        refused.forEachIndexed { index, body -> assertFalse("body $index: $body", NativeOperationPolicy.installBodyAllowed(install, body)) }
+        // Every other route has no body rule of its own.
+        assertTrue(NativeOperationPolicy.installBodyAllowed("/api/gateway/restart", JSONObject()))
+        assertTrue(NativeOperationPolicy.installBodyAllowed("/api/dashboard/agent-plugins/beacon/enable", null))
+    }
+
+    @Test fun theHubIsReadOnlyAndNothingAroundItIsOpen() {
+        assertTrue(NativeOperationPolicy.direct("/api/dashboard/plugins/hub", "GET"))
+        for (method in listOf("POST", "PUT", "PATCH", "DELETE", "get")) assertFalse(method, NativeOperationPolicy.direct("/api/dashboard/plugins/hub", method))
+        for (other in listOf("/api/dashboard/plugins", "/api/dashboard/plugins/rescan", "/api/dashboard/plugins/catalog", "/api/dashboard/plugins/hub/", "/api/dashboard/plugins/hub/x",
+                "/api/dashboard/plugins/auto-update", "/api/dashboard/agent-plugins/update-all", "/api/dashboard/agent-plugins/activate"))
+            assertFalse("GET $other", NativeOperationPolicy.direct(other, "GET"))
+    }
+
+    @Test fun aReleaseThatCannotBeFoundInstallsNothingAndIsNotMistakenForALostReply() {
+        for (kind in UpdateException.Kind.entries) {
+            val endpoint = Fake(failure = UpdateException(kind, "GitHub"))
+            // GitHub's rate limit has its own words; every other way the release cannot be found is "no release".
+            assertEquals(failed(if (kind == UpdateException.Kind.Busy) PluginInstallFailure.GitHubBusy else PluginInstallFailure.NoRelease), install(endpoint))
+            assertEquals(1, endpoint.installs)
+            assertEquals("Beacon is never looked for when no request left", 0, endpoint.asked)
+            assertEquals(0, endpoint.enables)
+        }
     }
 
     @Test fun theSourceIsTheOneTheReadmeInstallerUses() {
@@ -110,17 +152,12 @@ class PluginInstallTest {
         assertEquals(PluginInstallUi(PluginInstallStage.NeedsRestart), install(Fake(answer = { missing })))
     }
 
-    @Test fun aBeaconAlreadyOnHermesIsTurnedOnInsteadOfInstalledTwice() {
-        // Hermes refuses a second install of a Beacon already on its disk (installed but off, or placed by the installer).
-        val exists = Fake(failure = ApiFailure(400, "Plugin 'beacon' already exists."), gateways = listOf(GatewayStatus(running = false, busy = false)))
-        assertEquals(done, install(exists))
-        assertEquals(1, exists.installs)
-        assertEquals(1, exists.enables)
-        // Turned on while its gateway runs: whether that gateway has it is unknown, so the restart is offered.
-        assertEquals(PluginInstallUi(PluginInstallStage.NeedsRestart), install(Fake(failure = ApiFailure(400, "exists"))))
-        // An enable Hermes refuses says why, and nothing is looked for.
-        val refused = Fake(failure = ApiFailure(400, "exists"), enableFailure = ApiFailure(403, "no"))
-        assertEquals(failed(PluginInstallFailure.Denied), install(refused))
+    @Test fun aBeaconAlreadyOnHermesIsReplacedByTheInstallItselfAndARefusalIsHermesAnswer() {
+        // The install replaces and turns on a Beacon that is already there, so a 400 is a refusal, never "turn it on instead".
+        val refused = Fake(failure = ApiFailure(400, "Plugin was not published"), gateways = listOf(GatewayStatus(running = false, busy = false)))
+        assertEquals(failed(PluginInstallFailure.Error), install(refused))
+        assertEquals(1, refused.installs)
+        assertEquals(0, refused.enables)
         assertEquals(0, refused.asked)
         // An answer that is not ok is an install failure.
         assertEquals(failed(PluginInstallFailure.Error), install(Fake(answer = { JSONObject().put("ok", false) })))
@@ -301,8 +338,8 @@ class PluginInstallTest {
     }
 
     @OptIn(ExperimentalCoroutinesApi::class)
-    @Test fun slowPresenceAfterLostReplyOrEnableStillOffersRestart() = runTest {
-        for (failure in listOf(SocketTimeoutException("Read timed out"), ApiFailure(400, "exists"))) {
+    @Test fun slowPresenceAfterALostReplyStillOffersRestart() = runTest {
+        for (failure in listOf(SocketTimeoutException("Read timed out"))) {
             val endpoint = Fake(failure = failure, presence = List(8) { false } + true)
             var finished = 0
             val controller = PluginInstallController(this, ::signedIn, { finished++ }, {}, { endpoint })
@@ -312,7 +349,7 @@ class PluginInstallTest {
             assertEquals(PluginInstallUi(PluginInstallStage.NeedsRestart), controller.state.value)
             assertEquals(0, finished)
             assertEquals(1, endpoint.installs)
-            assertEquals(if (failure is ApiFailure) 1 else 0, endpoint.enables)
+            assertEquals(0, endpoint.enables)
             assertEquals(0, endpoint.restarts)
         }
     }
@@ -339,6 +376,51 @@ class PluginInstallTest {
         hold.complete(Unit)
         assertEquals(PluginInstallUi(), controller.state.value)
         assertEquals(0, finished)
+    }
+
+    @Test fun anAccountChangeMidInstallGivesTheSharedSlotBackForTheNextChange() {
+        val hold = kotlinx.coroutines.CompletableDeferred<Unit>()
+        val controller = PluginInstallController(kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined), ::signedIn, {}, {}, { Fake(hold = hold) })
+        controller.install()
+        assertTrue("an install holds the one plugin change", PluginChange.active)
+        controller.reset()
+        assertFalse("walking away does not lock the plugin for the repair and the update", PluginChange.active)
+        hold.complete(Unit)
+        assertFalse(PluginChange.active)
+    }
+
+    @Test fun anInstallThatCannotStartBecauseAnotherChangeRunsSaysBusyAndTouchesNothing() {
+        val endpoint = Fake()
+        val controller = PluginInstallController(kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Unconfined), ::signedIn, {}, {}, { endpoint })
+        assertTrue(PluginChange.begin())
+        try {
+            controller.install()
+            assertEquals(failed(PluginInstallFailure.Busy), controller.state.value)
+            assertEquals(0, endpoint.installs + endpoint.enables + endpoint.restarts + endpoint.asked)
+        } finally { PluginChange.finish() }
+        // Once the other change is over, "Try again" goes through.
+        controller.retry()
+        assertEquals(done, controller.state.value)
+        assertFalse(PluginChange.active)
+    }
+
+    @Test fun aLostReplyIsOneRuleForTheInstallTheRepairAndTheUpdate() {
+        for (lost in listOf(SocketTimeoutException("Read timed out"), java.net.SocketException("Connection reset"), IOException("unexpected end of stream"), java.io.EOFException()))
+            assertTrue(lost.toString(), lostReply(lost))
+        // The request never left, the phone said no, or Hermes answered: nothing may have been installed, so none of these is "lost".
+        for (settled in listOf<Exception>(ConnectException("refused"), UnknownHostException("no host"), SocketTimeoutException("connect timed out"), ApiFailure(500, "boom"),
+                NativeAuthExpiredException(), UpdateException(UpdateException.Kind.Network, "offline"), IllegalStateException("x")))
+            assertFalse(settled.toString(), lostReply(settled))
+    }
+
+    @Test fun aScanBlockAndGitHubBeingBusyEachHaveTheirOwnFailure() {
+        val blocked = ApiFailure(400, "Security scan blocked plugin install: dangerous verdict (2 findings).")
+        assertTrue(scanBlocked(blocked)); assertTrue(scanBlocked(ApiFailure(400, "  security scan blocked plugin install")))
+        assertFalse(scanBlocked(ApiFailure(400, "Install failed."))); assertFalse(scanBlocked(ApiFailure(403, "Security scan blocked"))); assertFalse(scanBlocked(IOException("Security scan blocked")))
+        assertEquals(failed(PluginInstallFailure.Blocked), install(Fake(failure = blocked)))
+        assertEquals(failed(PluginInstallFailure.Error), install(Fake(failure = ApiFailure(400, "Install failed."))))
+        assertEquals(failed(PluginInstallFailure.GitHubBusy), install(Fake(failure = UpdateException(UpdateException.Kind.Busy, "GitHub answered 429"))))
+        assertEquals(failed(PluginInstallFailure.NoRelease), install(Fake(failure = UpdateException(UpdateException.Kind.Network, "offline"))))
     }
 
     @Test fun notNowAtTheOfferOrAfterALateGatewayReadsBeaconAgainOnce() {

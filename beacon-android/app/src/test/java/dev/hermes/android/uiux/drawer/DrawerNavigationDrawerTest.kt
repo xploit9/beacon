@@ -66,7 +66,6 @@ class DrawerNavigationDrawerTest {
         assertTrue(drawerUpdateReady(AppUpdateUi(phase = UpdatePhase.NeedsPermission, release = release)))
         // A plugin that can update counts when the app is current; one that failed or is busy does not read as "ready".
         assertTrue(drawerUpdateReady(AppUpdateUi(phase = UpdatePhase.Available, plugin = PluginRow(PluginStatus.Available))))
-        assertTrue(drawerUpdateReady(AppUpdateUi(phase = UpdatePhase.Available, plugin = PluginRow(PluginStatus.NeedsReview))))
         assertTrue(drawerUpdateReady(AppUpdateUi(phase = UpdatePhase.Available, plugin = PluginRow(PluginStatus.Restart))))
         assertFalse(drawerUpdateReady(AppUpdateUi(phase = UpdatePhase.Available, plugin = PluginRow(PluginStatus.Failed))))
         assertFalse(drawerUpdateReady(AppUpdateUi(phase = UpdatePhase.Available, plugin = PluginRow(PluginStatus.Busy))))

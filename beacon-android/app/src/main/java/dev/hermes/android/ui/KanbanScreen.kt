@@ -204,13 +204,13 @@ internal fun kanbanMissingSavedTask(record: JSONObject?, error: Throwable): Bool
         if (error.isNotBlank()) Glass(Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) { SettingsErrorRow(uiText(error), { if (!loading && !busy) scope.launch { refresh() } }, uiText("Retry"), retryTestTag = "kanban-retry") }
         // Cards already shown: a thin bar while the board refreshes or a move is saved; the skeleton is for the first read only.
         if (busy || loading && cards.isNotEmpty()) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
-        if (!loading && board.isBlank() && error.isBlank()) EmptyState(uiText("No boards yet"), uiText("Create a Kanban board in your Hermes dashboard, then refresh it here."), Icons.Rounded.ViewKanban)
+        if (!loading && board.isBlank() && error.isBlank()) EmptyState(uiText("No boards yet"), uiText("Create a board in the Hermes dashboard."), Icons.Rounded.ViewKanban)
         val shownStatuses = boardStatuses.keys.filter { it != "archived" || cards.any { card -> card.status == "archived" } }
         val visibleColumn = selectedColumn.takeIf { it in shownStatuses } ?: cards.firstOrNull { it.status in shownStatuses }?.status ?: "todo"
         val emptyBoard = !loading && board.isNotBlank() && cards.isEmpty() && error.isBlank()
         if (loading && cards.isEmpty() && error.isBlank()) Glass(Modifier.padding(16.dp).testTag("kanban-skeleton")) { SettingsSkeletonRows(3) }
         else if (emptyBoard) Box(Modifier.weight(1f).fillMaxWidth().testTag("kanban-empty"), contentAlignment = Alignment.Center) {
-            EmptyState(uiText("No tasks yet"), uiText("Add one to get started."), Icons.Rounded.ViewKanban, action = uiText("Add task"), onAction = { edit(null) }, centered = true)
+            EmptyState(uiText("No tasks yet"), "", Icons.Rounded.ViewKanban, action = uiText("Add task"), onAction = { edit(null) }, centered = true)
         }
         else if (board.isNotBlank()) BoxWithConstraints(Modifier.weight(1f)) {
             val expanded = maxWidth >= 720.dp * LocalDensity.current.fontScale.coerceAtLeast(1f)
@@ -273,12 +273,12 @@ internal fun kanbanMissingSavedTask(record: JSONObject?, error: Throwable): Bool
             text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(card.title, style = MaterialTheme.typography.titleMedium)
                 when (destination) {
-                    "delete" -> Text(uiText("This removes the task from the board."))
+                    "delete" -> {}
                     "ready" -> Text(uiText("An assigned bot may start this task."))
                     "done" -> Text(uiText("Add a short result before marking this task done."))
                 }
                 if (destination == "done") OutlinedTextField(completionResult, { completionResult = it }, label = { Text(uiText("Result")) }, minLines = 2, maxLines = 3, modifier = Modifier.fillMaxWidth().testTag("kanban-completion-result"), enabled = !busy)
-                if (destination != "delete" && card.status == "running") Text(uiText("A worker is on this task. This change overrides its claim."), color = MaterialTheme.colorScheme.error)
+                if (destination != "delete" && card.status == "running") Text(uiText("A bot is working on this task. Change it anyway?"), color = MaterialTheme.colorScheme.error)
                 if (error.isNotBlank()) Text(uiText(error), color = MaterialTheme.colorScheme.error)
             } },
             confirmButton = {
@@ -343,7 +343,7 @@ internal fun kanbanMissingSavedTask(record: JSONObject?, error: Throwable): Bool
                 TextButton(enabled = editable, onClick = { persist(""); editing = false; error = ""; conflict = null }, modifier = Modifier.testTag("kanban-discard")) { Text(uiText("Discard")) }
                 TextButton(enabled = editable, onClick = ::cancelEdit) { Text(uiText("Keep draft")) }
             } })
-            conflict?.let { latest -> AlertDialog(onDismissRequest = { conflict = null }, title = { Text(uiText("Task changed on the dashboard")) }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(latest.title); Text(latest.body); Text(uiText("Bot: {0}").replace("{0}", kanbanProfileLabel(latest.assignee, profileRows, profileLoading))); Text(uiText("Review this version, then keep your edits or use the latest details.")) } }, confirmButton = { TextButton(onClick = { persist(record.copy().put("base", latest.json()).toString()); conflict = null; error = "" }) { Text(uiText("Keep my edits")) } }, dismissButton = { TextButton(onClick = { persist(record.copy().put("title", latest.title).put("body", latest.body).put("assignee", latest.assignee).put("base", latest.json()).toString()); conflict = null; error = "" }) { Text(uiText("Use latest")) } }) }
+            conflict?.let { latest -> AlertDialog(onDismissRequest = { conflict = null }, title = { Text(uiText("Task changed on the dashboard")) }, text = { Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(latest.title); Text(latest.body); Text(uiText("Bot: {0}").replace("{0}", kanbanProfileLabel(latest.assignee, profileRows, profileLoading))) } }, confirmButton = { TextButton(onClick = { persist(record.copy().put("base", latest.json()).toString()); conflict = null; error = "" }) { Text(uiText("Keep my edits")) } }, dismissButton = { TextButton(onClick = { persist(record.copy().put("title", latest.title).put("body", latest.body).put("assignee", latest.assignee).put("base", latest.json()).toString()); conflict = null; error = "" }) { Text(uiText("Use latest")) } }) }
         }
     }
 }

@@ -126,7 +126,7 @@ class NativeProfileAdmin(
             }
             when (profileDeleteOutcome(result)) {
                 ProfileDelete.Done -> "Profile deleted"
-                ProfileDelete.DonePending -> "Profile deleted. Hermes still has to finish cleaning up on your computer."
+                ProfileDelete.DonePending -> "Profile deleted. Hermes is still cleaning up."
                 null -> null
             }
         }

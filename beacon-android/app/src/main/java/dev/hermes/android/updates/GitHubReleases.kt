@@ -29,10 +29,13 @@ import java.security.MessageDigest
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/** [kind] separates "GitHub or the connection failed" from "what GitHub served is not an acceptable update". */
+/** [kind] separates "GitHub or the connection failed" from "what GitHub served is not an acceptable update"; [Busy] is GitHub's rate limit (403 or 429). */
 internal class UpdateException(val kind: Kind, message: String, cause: Throwable? = null) : IOException(message, cause) {
-    enum class Kind { Network, Verification }
+    enum class Kind { Network, Verification, Busy }
 }
+
+/** The plugin version of the latest release and the commit its tag names. */
+internal data class PublishedCommit(val version: String, val commit: String)
 
 internal sealed interface LatestRelease {
     data object NotModified : LatestRelease
@@ -44,6 +47,10 @@ private const val API_LIMIT = 256 * 1024
 private const val METADATA_LIMIT = 16 * 1024
 private const val NOTES_LIMIT = 8 * 1024
 private const val MAX_REDIRECTS = 5
+private const val COMMIT_LIMIT = 128
+private val TAG_NAME = Regex("v?[0-9][A-Za-z0-9._-]{0,62}")
+/** A full commit id, as Hermes' installer takes it for `ref`: 40 lowercase hex digits and nothing else. */
+internal val COMMIT_SHA = Regex("[0-9a-f]{40}")
 private val METADATA_NAME = Regex("Beacon-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\\.json")
 private val VERSION_NAME = Regex("[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 private val STORED_SHA = Regex("[a-f0-9]{64}")
@@ -66,6 +73,8 @@ internal class GitHubReleases(
     private fun permitted(url: HttpUrl, hosts: Set<String>) = (url.isHttps || !secureOnly) && url.host in hosts && url.username.isEmpty() && url.password.isEmpty()
     private fun verification(message: String) = UpdateException(UpdateException.Kind.Verification, message)
     private fun network(message: String, cause: Throwable? = null) = UpdateException(UpdateException.Kind.Network, message, cause)
+    /** GitHub's own "not now" for an unauthenticated address (403, or 429 for its secondary limit) is not "no release" or "no connection". */
+    private fun refused(code: Int) = if (code == 403 || code == 429) UpdateException(UpdateException.Kind.Busy, "GitHub answered $code") else network("GitHub answered $code")
 
     /** [etag] is the one stored from the last answer; GitHub replies 304 while nothing was published since. */
     suspend fun latest(etag: String?): LatestRelease {
@@ -79,8 +88,45 @@ internal class GitHubReleases(
             304 -> LatestRelease.NotModified
             404 -> LatestRelease.Found(null, null)
             200 -> LatestRelease.Found(try { release(JSONObject(String(body, Charsets.UTF_8))) } catch (error: JSONException) { throw verification("GitHub answered with an unreadable release") }, answerEtag)
-            else -> throw network("GitHub answered $code")
+            else -> throw refused(code)
         }
+    }
+
+    /**
+     * The commit the latest release was built from, for the plugin install that pins it: latest release, its tag, the commit that tag names
+     * (asked as a bare SHA). Fails closed: no release, a draft or prerelease, a tag that is not a plugin version, or an answer that is not
+     * exactly 40 lowercase hex digits is an [UpdateException] and nothing is installed. [expectedVersion] ties the commit to the release an
+     * update is for, so a release published meanwhile is never installed under the old one's name.
+     */
+    suspend fun latestCommit(expectedVersion: String? = null): PublishedCommit {
+        val api = "$apiBase/repos/$repo/releases/latest".toHttpUrl()
+        val latest = Request.Builder().url(api).header("Accept", "application/vnd.github+json").header("X-GitHub-Api-Version", "2022-11-28").header("User-Agent", userAgent).build()
+        val body = fetch(latest, setOf(api.host)) { response ->
+            when (response.code) {
+                200 -> response.bounded(API_LIMIT)
+                404 -> throw verification("GitHub has no Beacon release")
+                else -> throw refused(response.code)
+            }
+        }
+        val json = try { JSONObject(String(body, Charsets.UTF_8)) } catch (error: JSONException) { throw verification("GitHub answered with an unreadable release") }
+        val tag = json.string("tag_name")
+        val version = tag.removePrefix("v")
+        if (json.optBoolean("draft") || json.optBoolean("prerelease") || !TAG_NAME.matches(tag) || !PLUGIN_VERSION_PATTERN.matches(version))
+            throw verification("The latest release has no usable tag")
+        if (expectedVersion != null && version != expectedVersion) throw verification("The latest release is not the one being installed")
+        return PublishedCommit(version, commitOf(tag))
+    }
+
+    /** The commit [tag] names, asked as a bare SHA and accepted only as exactly 40 lowercase hex digits. */
+    private suspend fun commitOf(tag: String): String {
+        val commits = "$apiBase/repos/$repo/commits".toHttpUrl().newBuilder().addPathSegment(tag).build()
+        val ask = Request.Builder().url(commits).header("Accept", "application/vnd.github.sha").header("X-GitHub-Api-Version", "2022-11-28").header("User-Agent", userAgent).build()
+        val sha = fetch(ask, setOf(commits.host)) { response ->
+            if (response.code != 200) throw if (response.code == 404 || response.code == 422) verification("The release tag names no commit") else refused(response.code)
+            String(response.bounded(COMMIT_LIMIT), Charsets.UTF_8).trim()
+        }
+        if (!COMMIT_SHA.matches(sha)) throw verification("GitHub answered with something that is not a commit")
+        return sha
     }
 
     /**
@@ -89,6 +135,7 @@ internal class GitHubReleases(
      */
     suspend fun relayed(json: JSONObject): Release? = release(json)
 
+    /** The release this document describes, with the commit its tag names: found here, once, so an Update or Repair tap needs no GitHub call of its own. */
     private suspend fun release(json: JSONObject): Release? {
         if (json.optBoolean("draft") || json.optBoolean("prerelease")) return null
         val assets = json.optJSONArray("assets")?.let { rows -> (0 until rows.length()).mapNotNull { rows.optJSONObject(it) } }.orEmpty()
@@ -105,8 +152,12 @@ internal class GitHubReleases(
         }
         val metadata = try { JSONObject(String(metadataBytes, Charsets.UTF_8)) } catch (error: JSONException) { throw verification("The release metadata is unreadable") }
         checkMetadata(metadata, versionName, apk.optLong("size"))
+        // One release is one version: its tag has to name that version, or the commit it names is not the plugin this release ships.
+        val tag = json.string("tag_name")
+        if (!TAG_NAME.matches(tag) || tag.removePrefix("v") != versionName) throw verification("The release tag does not match its version")
+        val commit = commitOf(tag)
         val notes = json.string("body").replace("\r\n", "\n").take(NOTES_LIMIT).trim()
-        return Release.from(metadata, assetUrl(apk).toString(), notes, json.string("published_at"))
+        return Release.from(metadata, assetUrl(apk).toString(), notes, json.string("published_at"), commit)
     }
 
     private fun assetUrl(asset: JSONObject): HttpUrl =

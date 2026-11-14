@@ -1,8 +1,0 @@
-**
-!Dockerfile
-!pytest_harness.py
-!pytest.ini
-!gradle-init.gradle
-!gradle_harness.py
-!licenses/
-!licenses/android-sdk-license

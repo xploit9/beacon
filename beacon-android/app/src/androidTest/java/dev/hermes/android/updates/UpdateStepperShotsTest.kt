@@ -132,7 +132,7 @@ class UpdateStepperShotsTest {
                 LocalLayoutDirection provides if (look.rtl) LayoutDirection.Rtl else LayoutDirection.Ltr) {
                 dev.hermes.android.ui.NativeLocalization(look.language) { BeaconTheme(dark = look.dark) { Surface(Modifier.fillMaxSize()) {
                     Box(Modifier.systemBarsPadding().widthIn(max = 411.dp)) {
-                        AppUpdateContent(ui.value, installed.value, false, now, onCheck = {}, onUpdate = {}, onRetry = {}, onCancel = {}, onAllow = {}, onReview = {})
+                        AppUpdateContent(ui.value, installed.value, false, now, onCheck = {}, onUpdate = {}, onRetry = {}, onCancel = {}, onAllow = {})
                     }
                 } } }
             }

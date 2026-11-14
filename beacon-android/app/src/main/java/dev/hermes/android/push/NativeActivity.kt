@@ -19,6 +19,19 @@ internal fun nativeActivityTimeout(kind:String,expires:Long,now:Long):Long {
     if(expires<=now/1000) return 0
     return ((expires-now/1000).coerceAtMost(if(kind=="working") 14400L else 300L)*1000-now%1000).coerceAtLeast(1)
 }
+/** The plugin's fixed notification words, said the way the app says them and in the phone's language; any other title is the request's own text. */
+internal fun activityTitleWords(context: Context, title: String): String = when (title) {
+    "Beacon needs approval" -> serviceText(context, "Approval needed")
+    "Beacon asks" -> serviceText(context, "Question for you")
+    else -> title
+}
+/** An approval's buttons carry the plugin's fixed English labels; a question's buttons are its own choices and stay as written. */
+internal fun activityLabelWords(context: Context, kind: String, label: String): String = if (kind != "approval") label else when (label) {
+    "Allow session" -> serviceText(context, "Allow for this chat")
+    "Allow once", "Deny", "Always allow" -> serviceText(context, label)
+    else -> label
+}
+internal val ActivityNotificationStrings = listOf("Approval needed", "Question for you", "Allow for this chat", "Allow once", "Deny", "Always allow")
 internal fun nativeVisibleActions(route: JSONObject, kind: String): List<JSONObject> {
     val actions = route.rows("actions")
     if(!completeNativePreview(route)) return if(kind=="approval") actions.filter { it.string("value")=="deny" }.take(1) else emptyList()
@@ -56,7 +69,7 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
     val fallback = notificationFallback(kind)
     val preview = route?.optJSONObject("preview")
-    val content = (preview?.string("title")?.let { boundedNotificationText(it, 120) }?.takeIf { it.isNotBlank() } ?: fallback.first) to
+    val content = (preview?.string("title")?.let { boundedNotificationText(activityTitleWords(context, it), 120) }?.takeIf { it.isNotBlank() } ?: fallback.first) to
         (preview?.string("body")?.let { boundedNotificationText(it, 640,preserveWhitespace=true) }?.takeIf { it.isNotBlank() } ?: fallback.second)
     val public = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("Beacon activity").setContentText("Open Beacon to review.").build()
     val delete = Intent(context, NativeActivityReceiver::class.java).setAction("dismiss").setData(android.net.Uri.parse("hermes://dismiss/$tag"))
@@ -81,7 +94,7 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
         if (Build.VERSION.SDK_INT >= 31) button.setAuthenticationRequired(true)
         builder.addAction(button.build())
     }
-    route?.let { nativeVisibleActions(it, kind) }?.forEach { action(it.string("value"), boundedNotificationText(it.string("label"), 80)) }
+    route?.let { nativeVisibleActions(it, kind) }?.forEach { action(it.string("value"), boundedNotificationText(activityLabelWords(context, kind, it.string("label")), 80)) }
     if (route!=null&&!completeNativePreview(route)&&kind in setOf("approval","clarify")) {
         val review=Notification.Action.Builder(null,"Review",PendingIntent.getActivity(context,0,tap,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         if(Build.VERSION.SDK_INT>=31) review.setAuthenticationRequired(true)
@@ -119,8 +132,8 @@ class NativeActivityReceiver : BroadcastReceiver() {
             val open=posted.contentIntent ?: return
             val review=Notification.Action.Builder(null,"Open Beacon",open)
             if(android.os.Build.VERSION.SDK_INT>=31) review.setAuthenticationRequired(true)
-            val message="Android couldn’t queue your response. Open Beacon to review and respond."
-            try { manager.notify(tag,3,Notification.Builder.recoverBuilder(context,posted).setContentTitle("Response not sent").setContentText(message)
+            val message="Couldn't send your answer. Open Beacon to answer."
+            try { manager.notify(tag,3,Notification.Builder.recoverBuilder(context,posted).setContentTitle("Answer not sent").setContentText(message)
                 .setStyle(Notification.BigTextStyle().bigText(message)).setActions(review.build()).setOnlyAlertOnce(true).build()) } catch(_:SecurityException) { }
         }
     }

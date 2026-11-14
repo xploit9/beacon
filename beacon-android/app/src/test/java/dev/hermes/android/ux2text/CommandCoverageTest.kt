@@ -2,7 +2,9 @@ package dev.hermes.android.ux2text
 
 import dev.hermes.android.core.json
 import dev.hermes.android.core.string
+import dev.hermes.android.data.ownCommandEntries
 import dev.hermes.android.ui.SlashCommandStrings
+import dev.hermes.android.ui.computerOnlyCommands
 import dev.hermes.android.ui.isBuiltInCommand
 import dev.hermes.android.ui.mobileSlashCommands
 import dev.hermes.android.ui.nativeAliases
@@ -50,7 +52,9 @@ class CommandCoverageTest {
     @Test fun theTwoCommandsTheReviewerNamedHaveTheirExactWords() {
         assertEquals("Write a prompt in your editor", slashCommandText("prompt", "Compose your next prompt in \$EDITOR (markdown), then send it"))
         assertEquals("Hand off to a messaging app", slashCommandText("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)"))
-        assertEquals("/prompt", mobileSlashCommands(listOf(json("name" to "/prompt", "description" to "Compose your next prompt in \$EDITOR"))).single().string("name"))
+        // It opens an editor on the computer, so the phone leaves it out of the list (it keeps its short text for the check above).
+        assertTrue(mobileSlashCommands(listOf(json("name" to "/prompt", "description" to "Compose your next prompt in \$EDITOR"))).isEmpty())
+        assertEquals("/handoff", mobileSlashCommands(listOf(json("name" to "/handoff", "description" to "Hand off this session to a messaging platform"))).single().string("name"))
     }
 
     @Test fun messagingOnlyCommandsAreNotListedSoTheyHaveNoText() {
@@ -97,6 +101,50 @@ class CommandCoverageTest {
             assertFalse("de \"$text\"", formal.containsMatchIn(translated("de", text)))
             assertTrue("ar \"$text\"", arabicLetters.containsMatchIn(translated("ar", text)))
         }
+    }
+
+    // ---- Slop list, Root 5 (13 Nov 2026): Hermes built-ins that only work on the computer are not listed on a phone
+
+    @Test fun computerOnlyBuiltInsAreNotListedOnAPhone() {
+        assertEquals(setOf("prompt", "worktree", "statusbar", "battery", "timestamps", "verbose", "focus", "indicator", "palette", "quit", "wake", "pet", "hatch",
+            "copy", "paste", "image", "browser", "skin", "density", "mouse"), computerOnlyCommands)
+        val listed = mobileSlashCommands(offered.map { json("name" to it, "description" to "Hermes' own description") }).map { it.string("name") }
+        assertEquals(offered.filterNot { it in computerOnlyCommands }, listed)
+        // The names come as Hermes sends them, with a slash and in any case.
+        assertTrue(mobileSlashCommands(listOf(json("name" to "/Copy", "description" to "Copy the last assistant response to clipboard"))).isEmpty())
+        // footer and voice work from any client (not cli_only in Hermes), so they stay.
+        for (kept in listOf("footer", "voice")) assertEquals(kept, mobileSlashCommands(listOf(json("name" to kept, "description" to "Toggle it"))).single().string("name"))
+    }
+
+    @Test fun theOwnersOwnCommandIsNeverHiddenEvenWithAHiddenName() {
+        // Hermes lists a quick command under "User commands", a plugin command under "Plugin commands" and a skill in `skills`.
+        val catalog = JSONObject("""{"pairs":[["/copy","Copy the last assistant response to clipboard"],["/copy","Copy the standup note to the team channel (usage: /copy)"],["/focus","Plugin focus timer"],["/image","Make a picture"],["/standup","Post the daily standup note"]],
+            "categories":[{"name":"Info","pairs":[["/copy","Copy the last assistant response to clipboard"]]},{"name":"User commands","pairs":[["/copy","Copy the standup note to the team channel (usage: /copy)"],["/standup","Post the daily standup note"]]},{"name":"Plugin commands","pairs":[["/focus","Plugin focus timer"]]}],
+            "skills":{"/image":{"usage":0}}}""")
+        val own = ownCommandEntries(catalog)
+        assertEquals(setOf("/copy" to "Copy the standup note to the team channel (usage: /copy)", "/standup" to "Post the daily standup note", "/focus" to "Plugin focus timer", "/image" to "Make a picture"), own)
+        val pairs = catalog.getJSONArray("pairs")
+        val rows = (0 until pairs.length()).map { i -> pairs.getJSONArray(i).let { pair -> json("name" to pair.getString(0).removePrefix("/"), "description" to pair.getString(1)).apply { if (pair.getString(0) to pair.getString(1) in own) put("own", true) } } }
+        val listed = mobileSlashCommands(rows)
+        // Hermes' own /copy is gone; the owner's /copy, the plugin's /focus and the skill /image stay, each with its own words.
+        assertEquals(listOf("copy", "focus", "image", "standup"), listed.map { it.string("name") })
+        assertEquals("Copy the standup note to the team channel", listed[0].string("description"))
+        assertEquals("Plugin focus timer", listed[1].string("description"))
+        assertEquals("Make a picture", listed[2].string("description"))
+        // A catalog saved before this marker existed has no `own`: nothing crashes, and Hermes' own rows are still the only ones judged by name.
+        assertTrue(ownCommandEntries(JSONObject()).isEmpty())
+    }
+
+    @Test fun theHideListMatchesHermesRegistryWhereTheHermesSourceIsInstalled() {
+        val source = File(System.getenv("LOCALAPPDATA").orEmpty(), "hermes/hermes-agent/hermes_cli/commands.py")
+        assumeTrue("Hermes is not installed here", source.isFile)
+        val registry = source.readText(Charsets.UTF_8).substringAfter("COMMAND_REGISTRY: list[CommandDef]").split("CommandDef(").drop(1)
+        fun entry(name: String) = registry.firstOrNull { Regex("""^\s*"$name"""").containsMatchIn(it) }
+        // density and mouse are terminal-UI extras (tui_gateway/command_discovery.py), not registry commands.
+        for (name in computerOnlyCommands - setOf("density", "mouse")) assertTrue("$name is cli_only in Hermes", entry(name)?.contains("cli_only=True") == true)
+        for (name in listOf("footer", "voice")) assertTrue("$name is not cli_only, so it stays listed", entry(name)?.contains("cli_only=True") == false)
+        val extras = File(source.parentFile.parentFile, "tui_gateway/command_discovery.py").readText(Charsets.UTF_8)
+        for (name in listOf("density", "mouse")) assertTrue(name, "(\"/$name\"" in extras)
     }
 
     @Test fun aNewHermesBuiltInIsCaughtWhereTheHermesSourceIsInstalled() {

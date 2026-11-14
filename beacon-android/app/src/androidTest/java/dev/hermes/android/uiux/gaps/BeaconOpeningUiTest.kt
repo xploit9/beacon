@@ -44,10 +44,10 @@ class BeaconOpeningUiTest {
         show(vm, opening = true)
         compose.onNodeWithTag("chat-skeleton").assertIsDisplayed()
         compose.onNodeWithText("Your chats and drafts are saved.").assertDoesNotExist()
-        compose.onNodeWithText("Opening Beacon’s conversation").assertDoesNotExist()
+        compose.onNodeWithText("Opening Beacon…").assertDoesNotExist()
         compose.onNodeWithTag("message-input").assertIsDisplayed().assertIsNotEnabled()
         compose.onNodeWithText("Message Beacon").assertExists()
-        compose.onNodeWithText("Branch this conversation to reply").assertDoesNotExist()
+        compose.onNodeWithText("Branch this chat to reply").assertDoesNotExist()
         compose.onNodeWithTag("composer-attach").assertIsNotEnabled()
         compose.onNodeWithTag("composer-dictate").assertIsNotEnabled()
         compose.onNodeWithTag("composer-model-effort").assertIsNotEnabled()
@@ -56,17 +56,17 @@ class BeaconOpeningUiTest {
     @Test fun anErrorKeepsItsOwnPageWithRetryAndNoComposer() = withClientlessVm(compose) { vm ->
         show(vm, opening = false, error = "Synthetic failure")
         compose.onNodeWithTag("chat-skeleton").assertDoesNotExist()
-        compose.onNodeWithText("Beacon’s conversation is unavailable").assertIsDisplayed()
+        compose.onNodeWithText("Can't open Beacon").assertIsDisplayed()
         compose.onNodeWithText("Synthetic failure").assertIsDisplayed()
-        compose.onNodeWithText("Retry Beacon").assertIsDisplayed()
+        compose.onNodeWithText("Retry").assertIsDisplayed()
         compose.onNodeWithTag("message-input").assertDoesNotExist()
     }
 
     @Test fun anOpenThatIsNotRunningKeepsItsRetryPageWithoutTheSavedLine() = withClientlessVm(compose) { vm ->
         show(vm, opening = false)
         compose.onNodeWithTag("chat-skeleton").assertDoesNotExist()
-        compose.onNodeWithText("Opening Beacon’s conversation").assertIsDisplayed()
+        compose.onNodeWithText("Opening Beacon…").assertIsDisplayed()
         compose.onNodeWithText("Your chats and drafts are saved.").assertDoesNotExist()
-        compose.onNodeWithText("Retry Beacon").assertIsDisplayed()
+        compose.onNodeWithText("Retry").assertIsDisplayed()
     }
 }

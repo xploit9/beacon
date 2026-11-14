@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Forum
+import androidx.compose.material.icons.rounded.ChatBubbleOutline
 import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -43,6 +44,22 @@ import org.json.JSONObject
  */
 internal val LocalBotModeDialog = compositionLocalOf<MutableState<String>?> { null }
 
+/** Until Hermes (or the list saved on this phone) has answered, "no bots" and "no shared spaces" are not known: a skeleton stands in. A failed first read shows its error, not a skeleton. */
+internal fun botModeAwaitingList(state: NativeBotModeState): Boolean = !state.loaded && state.error.isBlank() && state.bots.isEmpty() && state.spaces.isEmpty()
+/** An empty state may be shown only after a list has answered and no read is running over it. */
+internal fun botModeEmptyKnown(state: NativeBotModeState): Boolean = state.loaded && !state.loading
+
+internal enum class BotModeBack { Home, LeaveMode, None }
+/** System Back: out of a bot or space to Bot Mode's home, out of the home to normal chats; nothing while the mode is switching. */
+internal fun botModeBack(state: NativeBotModeState, switching: Boolean): BotModeBack = when {
+    state.activeBot != null || state.openingBot != null || state.selectedSpace.isNotBlank() -> BotModeBack.Home
+    switching -> BotModeBack.None
+    else -> BotModeBack.LeaveMode
+}
+
+/** Where the cold-start list is read from before the app is connected: the screen cache entry [NativeBotModeController] saves. */
+internal const val BOT_MODE_ROSTER_KEY = "bot-mode:roster"
+
 @Composable fun NativeBotModeSidebar(vm: BeaconViewModel, modifier: Modifier = Modifier, beforeRoster: @Composable () -> Unit = {}) {
     val state by vm.botMode.state.collectAsState()
     val ui by vm.ui.collectAsState()
@@ -53,34 +70,36 @@ internal val LocalBotModeDialog = compositionLocalOf<MutableState<String>?> { nu
     val you = uiText("You")
     LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(vm.botMode) { vm.botMode.refresh(silent = true) }
+    val cachedRoster = data[BOT_MODE_ROSTER_KEY]
+    LaunchedEffect(cachedRoster, ui.connected, state.loaded) { if (!ui.connected && !state.loaded) vm.botMode.showCached(cachedRoster, ui.origin, ui.owner, ui.profile) }
     BotModeDialogs(vm, dialog)
     val statusOf = rememberBotStatus(state)
     val starters = suggestedRolesOffered(suggestedRoleCatalog(), state.bots.map { it.profile } + profileRows.map { it.string("name") }, state.bots.size)
     CompositionLocalProvider(LocalBotModeDialog provides dialog) {
         LazyColumn(modifier.background(MaterialTheme.colorScheme.surfaceContainer).testTag("bot-mode-sidebar"), contentPadding = PaddingValues(bottom = 16.dp)) {
             item("destinations") { beforeRoster() }
-            if (state.loading && state.bots.isEmpty() && state.spaces.isEmpty()) item { Glass(Modifier.padding(12.dp)) { SettingsSkeletonRows(2) } }
+            if (botModeAwaitingList(state) || state.loading && state.bots.isEmpty() && state.spaces.isEmpty()) item { Glass(Modifier.padding(12.dp)) { SettingsSkeletonRows(2) } }
             if (state.error.isNotBlank() && !(ui.tab == "More" && ui.morePage == "Bots")) item {
-                Glass(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) { SettingsErrorRow(uiText(state.error), { vm.showBotMode() }, uiText("Review Bot Mode"), retryTestTag = "bot-mode-review") }
+                Glass(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) { SettingsErrorRow(uiText(state.error), { vm.showBotMode() }, uiText("Open Bot Mode"), retryTestTag = "bot-mode-review") }
             }
             item {
                 RosterHeader(uiText("Bots"), end = {
                     IconButton(onClick = { vm.botMode.refresh() }, enabled = !state.loading, modifier = Modifier.testTag("bot-mode-refresh")) { Icon(Icons.Rounded.Refresh, uiText("Refresh Bot Mode")) }
                 })
             }
-            if (state.bots.isEmpty() && !state.loading) item { EmptyState(uiText("No bots available"), uiText("Refresh to check again."), ProfilesIcon, action = uiText("Refresh"), onAction = { vm.botMode.refresh() }) }
+            if (state.bots.isEmpty() && botModeEmptyKnown(state)) item { EmptyState(uiText("No bots yet"), "", ProfilesIcon, action = uiText("Refresh"), onAction = { vm.botMode.refresh() }) }
             items(state.bots, key = { "bot:${it.profile}" }) { bot ->
                 TeammateRow(botName(bot, profileRows), bot.profile, botRole(bot, profileRows), state.activeBot?.profile == bot.profile,
                     botActions(vm, bot, vm.canDeleteProfile(bot.profile), dialog), "bot-row-${bot.profile}",
                     status = statusOf(bot.profile)) { vm.openBot(bot) }
             }
             // Not before the first read, and not blinking out while a refresh runs over bots already shown.
-            if (starters.isNotEmpty() && (state.bots.isNotEmpty() || !state.loading)) item("suggested-roles") { SuggestedRolesRow(starters) { dialog.value = "newBot:$it" } }
+            if (starters.isNotEmpty() && (state.bots.isNotEmpty() || botModeEmptyKnown(state))) item("suggested-roles") { SuggestedRolesRow(starters) { dialog.value = "newBot:$it" } }
             item { RosterHeader(uiText("Shared spaces")) }
             items(state.spaces, key = { "space:${it.id}" }) { space ->
                 GroupRow(vm, space, profileRows, state, you, is24Hour, dialog, "bot-space-${space.id}", isOpen = state.activeBot == null && state.selectedSpace == space.id)
             }
-            if (state.spaces.isEmpty() && !state.loading) item { Text(uiText("No shared spaces yet"), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
+            if (state.spaces.isEmpty() && botModeEmptyKnown(state)) item { Text(uiText("No shared spaces yet"), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall) }
             if (state.moreSpaces) item { Text(uiText("Recent spaces"), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
     }
@@ -89,7 +108,7 @@ internal val LocalBotModeDialog = compositionLocalOf<MutableState<String>?> { nu
 @Composable private fun GroupRow(vm: BeaconViewModel, space: BotModeSpace, profileRows: List<JSONObject>, state: NativeBotModeState, you: String, is24Hour: Boolean, dialog: MutableState<String>, tag: String, isOpen: Boolean) {
     val name = { profile: String -> profileDisplayName(profile, profileRows) }
     val botCount = uiText("{0} bots")
-    SpaceListRow(space.name, space.members.map { name(it) to it }, spacePreview(space, name, you, botCount), chatListTime(space.updatedAt * 1000, is24Hour = is24Hour), isOpen,
+    SpaceListRow(space.name, space.members.map { name(it) to it }, spacePreview(space, name, you, botCount), chatListTime(space.updatedAt * 1000, locale = uiLocale(), is24Hour = is24Hour), isOpen,
         spaceActions(vm, space, state.canRename, state.canDelete, dialog), tag) { vm.openBotSpace(space.id) }
 }
 
@@ -103,9 +122,12 @@ internal val LocalBotModeDialog = compositionLocalOf<MutableState<String>?> { nu
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = owner.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
     LaunchedEffect(owner.origin, owner.owner, owner.connected) { if (owner.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
-    BackHandler(state.activeBot != null || state.openingBot != null || state.selectedSpace.isNotBlank()) { vm.showBotMode() }
+    val back = botModeBack(state, owner.botModeSwitching)
+    BackHandler(!owner.showSessions) { when (back) { BotModeBack.Home -> vm.showBotMode(); BotModeBack.LeaveMode -> vm.toggleBotMode(); BotModeBack.None -> Unit } }
+    val cachedRoster = data[BOT_MODE_ROSTER_KEY]
+    LaunchedEffect(cachedRoster, owner.connected, state.loaded) { if (!owner.connected && !state.loaded) controller.showCached(cachedRoster, owner.origin, owner.owner, owner.profile) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle
-    LaunchedEffect(controller, lifecycle, state.selectedSpace, state.activeBot) {
+    LaunchedEffect(controller, lifecycle, state.selectedSpace, state.activeBot, owner.connected) {
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             controller.refresh(silent = true)
             while (state.selectedSpace.isNotBlank() && state.activeBot == null) { delay(botModePollMillis(controller.state.value.working)); controller.refresh(silent = true) }
@@ -142,9 +164,15 @@ internal val LocalBotModeDialog = compositionLocalOf<MutableState<String>?> { nu
                 DropdownMenuItem({ Text(uiText("Edit shared space")) }, onClick = { menu = false; dialog.value = "renameSpace:${state.selectedSpace}" })
                 DropdownMenuItem({ Text(uiText("Create another space")) }, onClick = { menu = false; controller.home(); openNewChat() }, enabled = !state.loading)
                 HorizontalDivider()
-                DropdownMenuItem({ Text(uiText(if (state.canDelete) "Delete shared space" else "Deletion unavailable"), color = MaterialTheme.colorScheme.error) }, onClick = { menu = false; dialog.value = "deleteSpace:${state.selectedSpace}" }, enabled = !state.loading && state.canDelete)
+                DropdownMenuItem({ Text(uiText(if (state.canDelete) "Delete shared space" else "Can't delete"), color = MaterialTheme.colorScheme.error) }, onClick = { menu = false; dialog.value = "deleteSpace:${state.selectedSpace}" }, enabled = !state.loading && state.canDelete)
             }
-        } else IconButton(onClick = { controller.refresh() }, enabled = !state.loading, modifier = Modifier.size(48.dp).testTag("bot-mode-home-refresh")) { Icon(Icons.Rounded.Refresh, uiText("Refresh Bot Mode")) }
+        } else {
+            // The way back to normal chats, in plain sight: the drawer's Bots tile is the same switch, but nothing there says so.
+            TextButton(onClick = { vm.toggleBotMode() }, enabled = !owner.botModeSwitching, modifier = Modifier.heightIn(min = 48.dp).testTag("bot-mode-leave")) {
+                Icon(Icons.Rounded.ChatBubbleOutline, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(uiText("Chats"))
+            }
+            IconButton(onClick = { controller.refresh() }, enabled = !state.loading, modifier = Modifier.size(48.dp).testTag("bot-mode-home-refresh")) { Icon(Icons.Rounded.Refresh, uiText("Refresh Bot Mode")) }
+        }
     }
     Column(Modifier.fillMaxSize().imePadding().testTag(if (shared) "bot-mode-shared" else "bot-mode-home")) {
         if (shared) SharedSpaceHeader(spaceName, state, profileRows, LocalOpenNavigationMenu.current, headerActions)
@@ -175,6 +203,7 @@ private val HomeTwoColumnsFrom = 720.dp
 ) {
     val controller = vm.botMode
     val is24Hour = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
+    val locale = uiLocale()
     val you = uiText("You")
     val statusOf = rememberBotStatus(state)
     val starters = suggestedRolesOffered(suggestedRoleCatalog(), state.bots.map { it.profile } + profileRows.map { it.string("name") }, state.bots.size)
@@ -187,9 +216,9 @@ private val HomeTwoColumnsFrom = 720.dp
     // Read once per fresh list, as the Schedules screen does, so a run's relative time is as old as the data under it.
     val now = remember(crons) { java.time.Instant.now() }
     val team: LazyListScope.() -> Unit = {
-        if (state.loading && state.bots.isEmpty()) item("loading") { Glass(Modifier.padding(horizontal = SettingsPagePadding, vertical = 8.dp)) { SettingsSkeletonRows(3) } }
         item("bots") { RosterHeader(uiText("Bots")) }
-        if (state.bots.isEmpty() && !state.loading) item("no-bots") { EmptyState(uiText("No bots available"), uiText("Refresh to check again."), ProfilesIcon, action = uiText("Refresh"), onAction = { controller.refresh() }) }
+        if (botModeAwaitingList(state) || state.loading && state.bots.isEmpty()) item("loading") { Glass(Modifier.padding(horizontal = SettingsPagePadding, vertical = 8.dp)) { SettingsSkeletonRows(3) } }
+        if (state.bots.isEmpty() && botModeEmptyKnown(state)) item("no-bots") { EmptyState(uiText("No bots yet"), "", ProfilesIcon, action = uiText("Refresh"), onAction = { controller.refresh() }) }
         items(state.bots, key = { "teammate:${it.profile}" }) { member ->
             val name = botName(member, profileRows)
             TeammateRow(name, member.profile, botRole(member, profileRows), false, botActions(vm, member, vm.canDeleteProfile(member.profile), dialog), "teammate-row:${member.profile}",
@@ -197,7 +226,7 @@ private val HomeTwoColumnsFrom = 720.dp
         }
         // Not before the first read, and not blinking out while a refresh runs over bots already shown.
         // The same compact chips as the drawer's, so the team does not push Up next and the shared spaces off the screen.
-        if (starters.isNotEmpty() && (state.bots.isNotEmpty() || !state.loading)) item("suggested-roles") { SuggestedRolesRow(starters) { dialog.value = "newBot:$it" } }
+        if (starters.isNotEmpty() && (state.bots.isNotEmpty() || botModeEmptyKnown(state))) item("suggested-roles") { SuggestedRolesRow(starters) { dialog.value = "newBot:$it" } }
     }
     val activity: LazyListScope.() -> Unit = {
         if (upNext.isNotEmpty()) item("up-next") {
@@ -206,12 +235,13 @@ private val HomeTwoColumnsFrom = 720.dp
                 upNext.forEach { run ->
                     val bot = state.bots.firstOrNull { it.profile == run.profile }
                     UpNextRow(run.title, bot?.let { botName(it, profileRows) } ?: profileDisplayName(run.profile, profileRows), run.profile,
-                        scheduleNextRun(run.nextRunAt, "", whenWords, now, phoneZone, is24Hour), "up-next:${run.id}") { vm.navigate("Cron") }
+                        scheduleNextRun(run.nextRunAt, "", whenWords, now, phoneZone, is24Hour, locale), "up-next:${run.id}") { vm.navigate("Cron") }
                 }
             }
         }
         item("spaces") { RosterHeader(uiText("Shared spaces")) }
-        if (state.spaces.isEmpty() && !state.loading) item("no-spaces") { EmptyState(uiText("No shared spaces yet"), uiText("Give a team of bots a task in one shared conversation."), Icons.Rounded.Forum) }
+        if (botModeAwaitingList(state)) item("spaces-loading") { Glass(Modifier.padding(horizontal = SettingsPagePadding, vertical = 8.dp)) { SettingsSkeletonRows(1) } }
+        if (state.spaces.isEmpty() && botModeEmptyKnown(state)) item("no-spaces") { EmptyState(uiText("No shared spaces yet"), uiText("Give a team of bots one task in a shared chat."), Icons.Rounded.Forum) }
         items(state.spaces, key = { "overview-space:${it.id}" }) { space ->
             GroupRow(vm, space, profileRows, state, you, is24Hour, dialog, "space-row:${space.id}", isOpen = false)
         }
@@ -280,7 +310,7 @@ private val HomeTwoColumnsFrom = 720.dp
     // The space left the list: it is deleted.
     LaunchedEffect(space == null) { if (space == null) onDismiss() }
     AlertDialog(onDismissRequest = { if (!state.loading) onDismiss() }, title = { Text(uiText("Delete shared space?")) },
-        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(space?.name.orEmpty(), style = MaterialTheme.typography.titleMedium); Text(uiText("Delete removes the space from your list and stops its bots. Hermes may keep its history for a while. Your Bot Chats stay.")); if (state.error.isNotBlank()) Text(uiText(state.error), color = MaterialTheme.colorScheme.error) } },
+        text = { Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Text(space?.name.orEmpty(), style = MaterialTheme.typography.titleMedium); Text(uiText("Its bots stop. Your Bot Chats stay.")); if (state.error.isNotBlank()) Text(uiText(state.error), color = MaterialTheme.colorScheme.error) } },
         confirmButton = { TextButton({ onDelete() }, enabled = !state.loading && state.canDelete) { Text(uiText(if (state.loading) "Deleting…" else "Delete space"), color = MaterialTheme.colorScheme.error) } },
         dismissButton = { TextButton({ onDismiss() }, enabled = !state.loading) { Text(uiText("Cancel")) } })
 }

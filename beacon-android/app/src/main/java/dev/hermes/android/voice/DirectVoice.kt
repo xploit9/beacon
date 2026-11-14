@@ -23,6 +23,63 @@ internal data class DirectCallEnd(val notSent:Int=0,val submissionUnknown:Int=0)
 internal suspend fun <T:Any> callLookup(block:suspend ()->T):T =
     withTimeoutOrNull(15000) { block() } ?: throw java.net.SocketTimeoutException("Lookup timed out. Try again.")
 
+/** The tool search waits this long for its first answer; the plugin answers well before (its own deadline is about 5 s). */
+internal const val DISCOVER_ATTEMPT_MS = 15000L
+/** How long a tool search pauses before its one retry, so a catalogue the plugin is still building can finish. */
+internal const val DISCOVER_RETRY_DELAY_MS = 2000L
+/** The retry waits less: the plugin has been building since the first try. */
+internal const val DISCOVER_RETRY_ATTEMPT_MS = 8000L
+
+/** What the model hears when the tool list cannot be read. The hand-off tool does not depend on it, so the model is told to call it. */
+internal const val HANDOFF_AFTER_FAILED_LOOKUP = "The tool list could not be read just now and nothing ran. Call hermes_work now, in this same turn, with the owner's original request " +
+    "(mode background if it is long): it runs the request with every tool in the same chat. Do not tell the owner you are handing it to Hermes unless you call hermes_work, " +
+    "and do not claim it was submitted until its receipt confirms admission."
+/** The tool list is still being built; nothing is wrong. The model asks again, or hands a long request to Hermes at once. */
+internal const val DISCOVER_STILL_STARTING = "The tools are still starting up; nothing is wrong and nothing ran. Try discover_tools once more. " +
+    "If it is still starting, call hermes_work with the owner's request instead. If the request is long or needs several steps, call hermes_work now."
+/** A call is told "still starting" once; the second one in a row is a failure, so a tool list that never finishes ends in a hand-off, not in asking for ever. */
+internal const val DISCOVER_STARTING_ANSWERS = 2
+
+/** The plugin answered but its tool list is still being built. */
+internal fun discoverStarting(result:JSONObject):Boolean = result.optString("status")=="starting"
+/**
+ * Counts the rounds of "still starting" one call has been given in a row. [began] and [returned] are the clock readings (any steady
+ * clock) of the search that got the answer. A search that began before the last counted answer had returned was asked in the same
+ * turn as it, not as a second try after it: it is told "still starting" too but does not count as another round.
+ */
+internal class StartingAnswers {
+    private var inARow=0
+    private var lastReturned=Long.MIN_VALUE
+    /** Whether [answer] is one "still starting" too many for this call. Any other answer starts the count again. */
+    @Synchronized fun tooMany(answer:JSONObject,began:Long,returned:Long):Boolean {
+        if(!discoverStarting(answer)) { inARow=0;lastReturned=Long.MIN_VALUE;return false }
+        if(began<lastReturned) return false
+        inARow++;lastReturned=returned
+        return inARow>=DISCOVER_STARTING_ANSWERS
+    }
+}
+/** A lookup worth asking again: its own timeout, or the plugin's deadline (a gateway timeout) while it builds the list. */
+internal fun discoverRetryable(error:Throwable):Boolean = error is java.net.SocketTimeoutException || error is ApiFailure&&error.status in setOf(502,504)
+
+/**
+ * One tool search that survives a catalogue still being built (owner trial, 7 Nov 2026: the first search after a quiet hour timed out and
+ * the call said "Discover tools failed"). A timeout, a gateway timeout or a "still starting" answer is tried once more after a short pause;
+ * anything else, and a second failure, is reported as it is. If the retry fails but the first answer said "still starting", that is what is reported.
+ */
+internal suspend fun discoverWithRetry(attempt:suspend (timeoutMs:Long)->JSONObject,pause:suspend (Long)->Unit={ delay(it) }):JSONObject {
+    var starting:JSONObject?=null
+    try {
+        val answer=attempt(DISCOVER_ATTEMPT_MS)
+        if(!discoverStarting(answer)) return answer
+        starting=answer
+    } catch(error:CancellationException) { throw error }
+    catch(error:Exception) { if(!discoverRetryable(error)) throw error }
+    pause(DISCOVER_RETRY_DELAY_MS)
+    return try { attempt(DISCOVER_RETRY_ATTEMPT_MS) }
+    catch(error:CancellationException) { throw error }
+    catch(error:Exception) { starting ?: throw error }
+}
+
 /** UI receipts confirm a bounded read without copying its private contents. */
 internal fun directLookupReceipt(requestId:String,name:String,retained:JSONObject):JSONObject {
     val returned=if(name=="discover_tools") retained.optJSONArray("tools")!=null else retained.opt("summary") is String
@@ -153,6 +210,7 @@ internal fun callToolHint(name:String,result:JSONObject):String {
     return when {
         name in setOf("hermes_work","hermes_follow") && status in setOf("failed","denied","expired","cancelled") -> "The exact operation did not complete successfully. Explain its verified status; do not offer a success callback or repeat the operation."
         name in setOf("hermes_work","hermes_follow") && status in setOf("submission_unconfirmed","uncertain") -> "The exact outcome is unconfirmed. Inspect this same receipt; never repeat the operation or claim completion or a successful callback."
+        name=="discover_tools" && discoverStarting(result) -> DISCOVER_STILL_STARTING
         name=="hermes_callback" && result.optBoolean("subscribed") -> "Tell the owner you will call back when the selected work is ready."
         name=="hermes_callback" && result.opt("subscribed")==false -> "The callback was withdrawn. The existing work continues; do not offer another callback unless the owner asks."
         name=="hermes_callback" && status=="not_sent" -> "There is no Hermes work from this call to call back about yet. Hand the task to hermes_work with callback true; to call the owner back after a while or at a time, use schedule_callback."
@@ -303,7 +361,6 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     /** [at] is a phase that happened earlier on the tap clock; [warm] marks work done before the tap; [failed] names the stage a failed call did not finish. */
     private fun diagnostic(stage:String,error:Throwable?=null,closeCode:Int?=null,at:Long?=null,warm:Boolean?=null,failed:String?=null) {
         if(stopped) return
-        if(error!=null&&stage=="provider_error") client.reportIncident("voice","connect",error)
         event(JSONObject().put("type","media_diagnostic").put("stage",stage)
             .put("elapsed_ms",at?:elapsedMs()).put("provider",provider).put("attempt",reconnects.failures).apply {
                 warm?.let { put("warm",it) }
@@ -535,11 +592,11 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             try { client.nativeEvents { frame ->
                 if(stopped) return@nativeEvents
                 if(frame.has("id")&&frame.optString("method") in setOf("approval","clarify"))
-                    event(JSONObject().put("type","warning").put("message","${dev.hermes.android.data.currentAssistantName} needs your approval or answer. Open the attached conversation."))
+                    event(JSONObject().put("type","warning").put("message","${dev.hermes.android.data.currentAssistantName} needs your answer. Open the chat."))
                 if(frame.has("id")&&frame.optString("method") in setOf("vault.save_login","vault.code","vault.unlock_prompt","secret"))
-                    event(JSONObject().put("type","warning").put("message","Secure input is needed. Open the conversation to continue."))
+                    event(JSONObject().put("type","warning").put("message","Open the chat to answer."))
             } } catch(e:CancellationException) { throw e } catch(e:Exception) {
-                if(!stopped) event(JSONObject().put("type","warning").put("message","Connection to Hermes interrupted. Check the attached conversation for task status."))
+                if(!stopped) event(JSONObject().put("type","warning").put("message","Lost Hermes. Check the chat."))
             }
         }
     }
@@ -965,14 +1022,22 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
             .optString("job_id").takeIf(String::isNotBlank)
     } catch(error:CancellationException) { throw error } catch(_:Exception) { null }
     private suspend fun gateway():NativeToolGateway { val id=admittedCall();return gatewayFor.getOrPut(id) { NativeToolGateway(client,id) } }
-    private suspend fun discoverTools(query:String):JSONObject =
-        withTimeoutOrNull(15000) { gatewayRequests.withPermit { gateway().discover(query) } }
-            ?: throw java.net.SocketTimeoutException("Tool discovery timed out")
+    private val startingAnswers=StartingAnswers()
+    private suspend fun discoverTools(query:String):JSONObject {
+        val began=System.nanoTime()
+        val answer=discoverWithRetry({ timeoutMs ->
+            withTimeoutOrNull(timeoutMs) { gatewayRequests.withPermit { gateway().discover(query) } }
+                ?: throw java.net.SocketTimeoutException("Tool discovery timed out")
+        })
+        // Still starting for the second time in a row: report it as a failure, which hands the request to hermes_work.
+        if(startingAnswers.tooMany(answer,began,System.nanoTime())) throw java.net.SocketTimeoutException("Tool list still starting")
+        return answer
+    }
     private class ToolNameLookupFailed(cause:Throwable):Exception(cause)
     private suspend fun resolveToolName(name:String):String? {
         try {
             val found=discoverTools(name)
-            require(found.optString("status") !in setOf("unavailable","failed","error")) { "Tool discovery unavailable" }
+            require(found.optString("status") !in setOf("unavailable","failed","error","starting")) { "Tool discovery unavailable" }
             return GeminiWire.pickToolId(found.getJSONArray("tools"),name)
         } catch(error:CancellationException) { throw error }
         catch(error:Exception) {
@@ -1282,14 +1347,13 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         } catch(error:CancellationException) { throw error }
         catch(e:Exception) {
             val stage=synchronized(toolReceipts) { toolReceipts[id]?.optString("status") }
-            client.reportIncident("tools",if(lookup) "discover_tools" else "invoke_tool",e)
             when {
                 e is ToolNameLookupFailed -> JSONObject().put("status","not_sent").put("request_id",requestId).put("fallback_tool","hermes_work")
-                    .put("message","Tool discovery failed or timed out; no tool was run. Use hermes_work once for the user's original request in this same conversation, with its normal approvals. Do not claim it was submitted until its receipt confirms admission.")
+                    .put("message",HANDOFF_AFTER_FAILED_LOOKUP)
                 // The plugin answers this at once while Hermes updates (admin_api.UPDATING), before anything runs.
                 e is ApiFailure&&e.status==503&&e.message=="Hermes is updating" -> JSONObject().put("status","not_sent").put("error_code","hermes_updating").put("message","Hermes is updating, so nothing ran. Tell the user to try again in a few minutes.")
                 name=="discover_tools" -> JSONObject().put("status","unavailable").put("error_code",errorCode(e)).put("fallback_tool","hermes_work")
-                    .put("message","Tool discovery is unavailable; no tool was run. Use hermes_work once for the user's original request in this same conversation, with its normal approvals. Do not claim it was submitted until its receipt confirms admission.")
+                    .put("message",HANDOFF_AFTER_FAILED_LOOKUP)
                 name in setOf("hermes_search","hermes_memory","hermes_skills","hermes_context","tool_status","get_visual_state") -> JSONObject().put("status","unavailable").put("error_code",errorCode(e)).put("message",(if(errorCode(e)=="timeout") "This lookup timed out." else "This lookup failed.")+" No current result was verified; report the failure without inventing facts or claiming the service is disconnected.")
                 name=="hermes_work"&&stage in setOf("creating_native_session","waiting_for_idle","submitting","staging_native") -> JSONObject().put("status","not_sent").put("request_id",requestId).put("message","The request was not submitted because native admission failed or the call ended.")
                 stage=="submitting" -> JSONObject().put("status","not_sent").put("request_id",requestId).put("message","Native request validation failed; no mutation was attempted.")

@@ -90,7 +90,7 @@ class HistoryRetentionUiTest {
         }
         compose.onNodeWithTag("settings-skeleton").assertIsDisplayed()
         compose.onNodeWithTag("history-retention-choice").assertDoesNotExist()
-        compose.runOnIdle { error = "Couldn’t load history retention from Hermes." }
+        compose.runOnIdle { error = "Couldn't load history settings." }
         compose.onNodeWithTag("history-retention-error").assertIsDisplayed()
         compose.onNodeWithTag("history-retention-retry").performClick()
         assertEquals(1, retried)

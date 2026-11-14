@@ -3,6 +3,8 @@ import asyncio
 import base64
 import json
 import math
+import re
+import sys
 import time
 
 from fastapi import APIRouter, HTTPException, Request
@@ -168,5 +170,23 @@ def build_router(identity, mobile, principal_for, verify):
         before = _read_cursor(request.query_params.get('before'), mobile)
         result = await asyncio.to_thread(_page, mobile, owner, provider, profile, int(raw_limit), before, principal, verify)
         return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+    @router.post('/mobile/sessions/{stored_id}/thread')
+    async def mark_thread(stored_id: str, request: Request):
+        # Not call history: this module already carries the verified-login principal and the owner check this route needs, and the frozen
+        # dashboard router cannot take a new route. A chat made on a Hermes with session authority cannot carry the thread source, so
+        # the app marks it here (idempotent). Only a chat the caller can see is ever marked; the mark goes when Hermes drops the chat.
+        owner, provider, profile, _ = identity(request)
+        if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', stored_id):
+            raise HTTPException(400, 'Choose an existing conversation')
+        principal = principal_for(request, owner, provider)
+        try:
+            await asyncio.to_thread(verify, owner, provider, profile, stored_id, principal)
+            await asyncio.to_thread(sys.modules['beacon_native'].mark_thread, owner, profile, stored_id)
+        except LookupError:
+            raise HTTPException(404, 'Conversation is not available to this account') from None
+        except (RuntimeError, OSError):
+            raise HTTPException(503, 'Native conversation store is unavailable; try again later') from None
+        return JSONResponse({'thread': True, 'stored_session_id': stored_id, 'profile': profile}, headers={'Cache-Control': 'no-store'})
 
     return router

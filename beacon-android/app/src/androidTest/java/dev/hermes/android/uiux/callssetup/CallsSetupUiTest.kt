@@ -81,13 +81,13 @@ class CallsSetupUiTest {
     @Test fun incomingSheetHasNoReasonLineWithoutAReasonAndLocksBothButtonsWhileBusy() {
         compose.setContent {
             NativeLocalization("en") { BeaconTheme(dark = true) {
-                IncomingCallContent("", 1f, "", "Please wait", false, {}, {})
+                IncomingCallContent("", 1f, "", "Connecting…", false, {}, {})
             } }
         }
         compose.onAllNodesWithTag("beacon-incoming-reason").assertCountEquals(0)
         compose.onNodeWithTag("beacon-incoming-answer").assertIsNotEnabled()
         compose.onNodeWithTag("beacon-incoming-decline").assertIsNotEnabled()
-        compose.onNodeWithText("Please wait").assertIsDisplayed()
+        compose.onNodeWithText("Connecting…").assertIsDisplayed()
     }
 
     // ---- Live call dock ----

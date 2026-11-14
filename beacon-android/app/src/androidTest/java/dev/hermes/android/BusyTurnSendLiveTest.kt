@@ -64,10 +64,10 @@ class BusyTurnSendLiveTest {
         val knownStates = setOf("queued", "sending", "accepted", "unknown", "sent", "settled")
         fun errorCategory(text: String): String = when (text) {
             "" -> "none"
-            "Stop the current reply before deleting this conversation.", "This chat is busy with a reply. Try again when it finishes." -> "busy_reply"
+            "Stop the reply before deleting this chat.", "This chat is busy with a reply. Try again when it finishes." -> "busy_reply"
             "Conversation close was not confirmed." -> "close_unconfirmed"
             "Deletion was not confirmed. Refresh before trying again." -> "delete_unconfirmed"
-            "Refresh this conversation to confirm whether a reply is still running." -> "idle_unconfirmed"
+            "Refresh this chat to see if the reply is still running." -> "idle_unconfirmed"
             "Can't reach Hermes. Check your connection, then try again." -> "connection"
             "Sign-in expired. Sign in again.", "Sign in with Hermes again, then try again." -> "authentication"
             "Hermes couldn't do that. Try again." -> "operation_unclassified"

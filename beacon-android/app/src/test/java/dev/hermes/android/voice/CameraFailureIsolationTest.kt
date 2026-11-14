@@ -13,13 +13,13 @@ class CameraFailureIsolationTest {
         assertEquals(voice.startedAt,failed.startedAt);assertEquals(voice.transcript,failed.transcript)
         assertFalse(failed.cameraSharing);assertTrue(failed.cameraStopPending)
         assertFalse(failed.cameraCanFlip);assertFalse(failed.cameraBusy)
-        assertTrue(failed.error.contains("could not be confirmed"));assertFalse(failed.error.contains("sharing is off"))
+        assertTrue(failed.error.contains("Camera may still be on"));assertFalse(failed.error.contains("Camera unavailable"))
     }
     @Test fun confirmedCleanupOnlyDisablesVideoAndClearsUnconfirmedState() {
         val voice=CallState(active=true,state="connected",callId="owned",cameraSharing=true,cameraStopPending=true)
         val stopped=voice.afterCameraFailure(true)
         assertTrue(stopped.active);assertEquals(voice.callId,stopped.callId);assertEquals(voice.state,stopped.state)
         assertFalse(stopped.cameraSharing);assertFalse(stopped.cameraStopPending)
-        assertTrue(stopped.error.contains("sharing is off"))
+        assertTrue(stopped.error.contains("Camera unavailable"));assertFalse(stopped.error.contains("may still be on"))
     }
 }

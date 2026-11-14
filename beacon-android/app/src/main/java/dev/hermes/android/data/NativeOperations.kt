@@ -7,8 +7,33 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import dev.hermes.android.core.*
+import dev.hermes.android.ui.splitAttachedMedia
 import org.json.JSONArray
 import org.json.JSONObject
+
+/** The characters Hermes turns into spaces before it searches (hermes_state_search._FTS5_SPECIAL_CHARS, outside a quoted phrase). */
+private const val HERMES_SEARCH_SPECIAL = "+{}():\"^@/#&|~[]<>,;!?\$=\\'"
+
+/**
+ * Whether [text] holds a word of a search [query] as Hermes' own message search reads one: a quoted phrase is one term (held apart, so its punctuation stays), every other
+ * word loses the characters Hermes strips (`invoice?` is `invoice`), a trailing `*` is a prefix, and a term after NOT is not asked for. Hermes also retries a query nothing
+ * matched with ANY of its terms (hermes_state_search._or_relaxed_query), so one term in the visible text is enough: a hit whose words are only in Hermes' own note has none.
+ * Used only to check that a hit lies in words the owner can see.
+ */
+internal fun visibleSearchMatch(text: String, query: String): Boolean {
+    var negated = false
+    val terms = mutableListOf<String>()
+    for (token in Regex("\"[^\"]*\"|\\S+").findAll(query.trim()).map { it.value }) {
+        when {
+            token == "AND" || token == "OR" -> Unit
+            token == "NOT" -> negated = true
+            negated -> negated = false
+            token.length > 1 && token.startsWith('"') && token.endsWith('"') -> token.trim('"').trim().takeIf(String::isNotEmpty)?.let(terms::add)
+            else -> token.map { if (it in HERMES_SEARCH_SPECIAL) ' ' else it }.joinToString("").split(' ').forEach { part -> part.trimEnd('*').takeIf(String::isNotEmpty)?.let(terms::add) }
+        }
+    }
+    return terms.isEmpty() || terms.any { text.contains(it, ignoreCase = true) }
+}
 
 /** "high" for an assistant chat whose profile default is slower than that, else null (keep the default). */
 internal fun assistantEffortCap(current: String): String? = if (current in setOf("xhigh", "max", "ultra")) "high" else null
@@ -17,13 +42,14 @@ internal fun assistantEffortCap(current: String): String? = if (current in setOf
 internal fun pinMutationIdentity(snapshot: JSONObject, requestId: String): JSONObject {
     val revision = snapshot.opt("runtime_revision"); val generation = snapshot.opt("runtime_generation")
     require(snapshot.opt("exists") == true && revision is Number && revision.toLong() >= 0 && generation is Number && generation.toLong() >= 0) {
-        "This conversation changed. Refresh and try again."
+        "This chat changed. Refresh and try again."
     }
     return JSONObject().put("request_id", requestId).put("expected_revision", revision.toLong()).put("expected_generation", generation.toLong())
 }
 
-/** Projects existing Compose contracts onto native operations; never proxies the WebUI. */
-private class NativeTurnEnded : Exception()
+// Projects existing Compose contracts onto native operations; never proxies the WebUI.
+/** The normal end of a followed turn: it unwinds the event callback and is not a failure of the connection. */
+internal class NativeTurnEnded : Exception()
 internal class NativeModelConfirmation(message: String) : IllegalStateException(message)
 private data class CanonicalModelGuard(val version: Long, val model: String, val provider: String, val token: String)
 private val canonicalModelGuards = linkedMapOf<String, CanonicalModelGuard>()
@@ -135,6 +161,26 @@ internal fun nativeSettledTurn(receipt: JSONObject, submission: String): JSONObj
     return turn.copy().put("submission_id", submission)
 }
 
+/**
+ * A steered turn: Hermes never calls it `complete` (it holds more than one user row), but its `persisted_turn` still lists every committed user row
+ * in order (the prompt, then each steer) and names the final reply. That is enough to show the reply once and to pair each steer bubble with its row.
+ * Anything short of a fully listed, committed, distinct set of rows is not proof.
+ */
+internal fun nativeSteeredTurn(turn: JSONObject, submission: String): JSONObject? {
+    if (submission.isBlank() || turn.has("submission_id") && turn.string("submission_id") != submission) return null
+    fun ids(key: String): List<Long>? {
+        val array = turn.optJSONArray(key) ?: return null
+        return (0 until array.length()).map { nativeReplayNumber(array.opt(it))?.takeIf { id -> id > 0 } ?: return null }
+    }
+    val user = nativeReplayNumber(turn.opt("user_row_id"))?.takeIf { it > 0 } ?: return null
+    val final = nativeReplayNumber(turn.opt("final_assistant_row_id"))?.takeIf { it > 0 } ?: return null
+    val users = ids("user_row_ids") ?: return null
+    val rows = ids("row_ids") ?: return null
+    if (users.size < 2 || users.first() != user || users.distinct().size != users.size || rows.distinct().size != rows.size ||
+        !rows.containsAll(users) || final !in rows || final in users) return null
+    return turn.copy().put("submission_id", submission)
+}
+
 internal fun storedSessionSettings(snapshot: JSONObject): JSONObject {
     val raw = snapshot.opt("model_config")
     val config = (raw as? JSONObject) ?: (raw as? String)?.takeIf(String::isNotBlank)?.let { runCatching { JSONObject(it) }.getOrNull() } ?: JSONObject()
@@ -148,6 +194,20 @@ internal fun storedSessionSettings(snapshot: JSONObject): JSONObject {
         }
     }
 }
+/**
+ * True when a chat's saved row holds a setting Hermes keeps per chat and a new chat does not start with: "Never ask" (`yolo_mode`, hermes_state_sessions.set_session_yolo, restored on
+ * resume) or a Fast mode (`service_tier` other than normal, written to the row by tui_gateway/agent_factory._persist_live_session_runtime after config.set fast; both keys are in
+ * tui_gateway/methods_config_set._SESSION_SCOPED_KEYS). A config that cannot be read is not a fresh chat.
+ */
+internal fun chatKeepsApprovalOrSpeed(session: JSONObject): Boolean {
+    val raw = session.opt("model_config")
+    val config = when {
+        raw is JSONObject -> raw
+        raw is String && raw.isNotBlank() -> try { JSONObject(raw) } catch (_: org.json.JSONException) { return true }
+        else -> return false
+    }
+    return config.optBoolean("yolo_mode") || config.string("service_tier").trim().lowercase() !in setOf("", "normal", "default", "standard", "off", "none")
+}
 private val storedSessionId = Regex("[A-Za-z0-9_.:-]{1,256}")
 // Stock dashboard bounds: /api/sessions pages reject limit > 100; Beacon keeps its 200-row drawer window.
 private const val SESSION_PAGE_LIMIT = 100
@@ -159,11 +219,26 @@ private const val HISTORY_WINDOW = 500
 private const val MAX_COMPRESSION_CHAIN = 512
 private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
+/**
+ * The create parameters for a new conversation, from the request body. Every other key of the body stays on the phone (the profile rides in the envelope, a `worktree`
+ * flag or a previous chat means nothing to Hermes). `request_id` is the create's retry identity: Hermes derives the session from it and returns the session an earlier
+ * create with the same id made (gateway/session_local.py:333-340), as its own desktop client relies on (apps/desktop/src/api/canonical-protocol.ts, prepareCreate).
+ */
+internal fun nativeCreateParams(d: JSONObject): JSONObject {
+    val params = JSONObject()
+    for (key in setOf("title", "model")) if (d.has(key) && !d.isNull(key)) params.put(key, d.opt(key))
+    d.string("model_provider").takeIf { it.isNotBlank() }?.let { params.put("provider", it) }
+    d.string("workspace").takeIf { it.isNotBlank() }?.let { params.put("cwd", it) }
+    d.string("request_id").takeIf { it.isNotBlank() && it.length <= 256 }?.let { params.put("request_id", it) }
+    if (d.optBoolean("thread")) params.put("source", BEACON_THREAD_SOURCE)
+    return params
+}
+
 /** One lazy resume of [id]: the runtime Hermes holds for it (the stream id) and that runtime's turn status; null when the answer is not about this conversation. */
 internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<String, String?>? {
     if (!id.matches(storedSessionId)) return null
     // A resumed socket may bind a different runtime id than the stale ChatState stream id.
-    // Lazy: a stored conversation resumes as usual; one Hermes no longer holds answers 4007 (unknown) instead of a new ownerless row.
+    // Lazy: a stored conversation resumes as usual; one Hermes no longer holds answers 4007 (legacy) or 4001 not_found (canonical) instead of a new ownerless row.
     val binding = nativeSession(id, lazy = true)
     if (binding.scope != scope || binding.storedSessionId != id) return null
     val lease = nativeTurnLease(id, binding.runtimeSessionId)
@@ -184,6 +259,11 @@ internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<Strin
 }
 
 internal suspend fun BeaconClient.recoveredNativeSessionStatus(id: String): String? = recoveredNativeSession(id)?.second
+
+private const val THREAD_MARK_READ_MS = 60_000L
+private const val MARKED_THREAD_FETCH_LIMIT = 40
+/** When each account last asked the plugin which chats are threads (only a throttle; the answer joins [ThreadMarks]). */
+internal val threadMarkReads = HashMap<String, Long>()
 
 internal class NativeOperations(private val c: BeaconClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
@@ -225,7 +305,7 @@ internal class NativeOperations(private val c: BeaconClient) {
             if (info.has("profile_name") && !info.isNull("profile_name")) require(info.opt("profile_name") == c.scope.profile) { "Conversation profile changed." }
         }
         if (messages) {
-            val rows = snapshot.optJSONArray("messages") ?: error("Refresh the conversation before changing its history.")
+            val rows = snapshot.optJSONArray("messages") ?: error("Refresh the chat first.")
             require(snapshot.opt("messages_omitted") != true && nativeReplayNumber(snapshot.opt("message_count")) == rows.length().toLong() &&
                 snapshot.rows("messages").size == rows.length()) { "Conversation history could not be confirmed." }
         }
@@ -251,8 +331,11 @@ internal class NativeOperations(private val c: BeaconClient) {
         }
         return result
     }
+    /** What Hermes holds now: the first open prompt (null = none) and the ones behind it, oldest first. */
+    private fun pendingPrompts(prompts: List<JSONObject>): JSONObject =
+        json("pending" to prompts.firstOrNull(), "waiting" to JSONArray().apply { prompts.drop(1).forEach { put(it) } })
     private fun canonicalPrompts(snapshot: JSONObject, kind: String): List<JSONObject> {
-        val array = snapshot.optJSONArray("prompts") ?: error("Refresh this conversation before answering a request.")
+        val array = snapshot.optJSONArray("prompts") ?: error("Refresh this chat first.")
         val rows = snapshot.rows("prompts")
         val generation = nativeReplayNumber(snapshot.opt("execution_generation"))?.takeIf { it >= 0 }
         require(rows.size == array.length() && generation != null) { "Request status could not be confirmed." }
@@ -271,12 +354,24 @@ internal class NativeOperations(private val c: BeaconClient) {
         suspend fun binding(): NativeSessionBinding { require(sid().isNotBlank()) { "Choose a native conversation first" }; return c.nativeSession(sid()) }
         when (path) {
             "/api/mobile/bootstrap" -> return c.bootstrap()
-            "/api/commands", "/api/commands/catalog" -> { val result = c.nativeRpc("commands.catalog"); val pairs = result.optJSONArray("pairs") ?: JSONArray(); val commands = JSONArray(); for (i in 0 until pairs.length()) { val pair = pairs.optJSONArray(i) ?: continue; commands.put(json("name" to pair.optString(0).removePrefix("/"), "description" to pair.optString(1))) }; return json("commands" to commands, "available" to true, "warning" to result.string("warning")) }
+            "/api/commands", "/api/commands/catalog" -> {
+                val result = c.nativeRpc("commands.catalog"); val pairs = result.optJSONArray("pairs") ?: JSONArray(); val own = ownCommandEntries(result); val commands = JSONArray()
+                // A shared gateway runs only some built-ins for a phone ([sharedGatewayRuns]); with its readiness unknown the list stays whole, as before.
+                val shared = try { c.nativeSessionAuthority() } catch (e: CancellationException) { throw e } catch (e: Exception) { false }
+                for (i in 0 until pairs.length()) {
+                    val pair = pairs.optJSONArray(i) ?: continue
+                    val name = pair.optString(0).removePrefix("/")
+                    commands.put(json("name" to name, "description" to pair.optString(1)).apply {
+                        if (pair.optString(0) to pair.optString(1) in own) put("own", true) else if (shared && !sharedGatewayRuns(name)) put("runs", false)
+                    })
+                }
+                return json("commands" to commands, "available" to true, "warning" to result.string("warning"))
+            }
             "/api/commands/exec" -> {
                 val name = d.getString("name").removePrefix("/").lowercase()
                 val argument = d.string("argument").trim()
                 require(!chatCommandChangesProfile(name, argument)) { "Change this for all chats in Settings." }
-                require(name != "yolo") { "Use Approvals beside the composer to skip approvals." }
+                require(name != "yolo") { "Use Approvals next to the message box." }
                 if (name == "model") {
                     val (model, provider) = chatModelChoice(argument)
                     return dispatch("/api/session/update", emptyMap(), "POST", json("session_id" to sid(), "model" to model, "model_provider" to provider,
@@ -293,7 +388,13 @@ internal class NativeOperations(private val c: BeaconClient) {
                     require(result.string("value").isNotBlank()) { "The chat setting was not confirmed." }
                     return result.put("type", "local").put("output", "Updated for this chat")
                 }
-                return c.nativeRpc("command.dispatch", json("session_id" to binding().runtimeSessionId, "name" to name, "arg" to argument))
+                // Hermes' own clients run a typed command with slash.exec (apps/desktop .../use-prompt-actions/slash.ts:521, acp_adapter/gateway_commands.py:89), which a
+                // shared gateway answers exactly as command.dispatch (gateway/session_controls.py:441-447). Without one, slash.exec would run a command Hermes' clients
+                // run themselves (/new, /branch, /bg …, desktop slash.ts:649-1217) in a separate slash worker, not this chat (tui_gateway/methods_tools.py:1070-1098).
+                val session = binding().runtimeSessionId
+                val shared = try { c.nativeSessionAuthority() } catch (e: CancellationException) { throw e } catch (e: Exception) { false }
+                return if (shared) c.nativeRpc("slash.exec", json("session_id" to session, "command" to listOf(name, argument).filter(String::isNotBlank).joinToString(" ")))
+                else c.nativeRpc("command.dispatch", json("session_id" to session, "name" to name, "arg" to argument))
             }
             // What Hermes starts a new chat with in this profile, for the composer of a chat with no messages yet.
             "/api/profile/defaults" -> {
@@ -322,25 +423,26 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/sessions", "/api/sessions/search" -> return sessionIndex(archived = q["include_archived"] == "1", query = q["q"].orEmpty(), threads = q["view"] == "threads", hidden = q["hidden_sources"].orEmpty(), order = q["order"].orEmpty())
             "/api/session/new", "/api/beacon/open" -> {
-                val params = JSONObject()
-                for (key in setOf("title", "model")) if (d.has(key) && !d.isNull(key)) params.put(key, d.opt(key))
-                d.string("model_provider").takeIf { it.isNotBlank() }?.let { params.put("provider", it) }
-                d.string("workspace").takeIf { it.isNotBlank() }?.let { params.put("cwd", it) }
-                if (d.optBoolean("thread")) params.put("source", BEACON_THREAD_SOURCE)
+                val params = nativeCreateParams(d)
+                // A Hermes with session authority stores a chat only under its own surfaces (the thread source is refused), so a thread there is made as a
+                // titled chat and marked as a thread on this phone and in the plugin; anywhere else it keeps its source as before.
+                val markThread = params.string("source") == BEACON_THREAD_SOURCE && c.nativeSessionAuthority()
+                if (markThread) params.remove("source")
                 val b = c.nativeCreate(params)
                 require(b.storedSessionId.isNotBlank()) { "Native session has no durable identity yet; submit the first prompt before saving selection" }
+                if (markThread) markAsThread(b.storedSessionId)
                 val cappedEffort = if (path == "/api/beacon/open") capAssistantEffort(b.runtimeSessionId) else null
                 return sessionProjection(c.nativeSessionSnapshot().put("messages", JSONArray()).put("acknowledged_shell", true), b).put("profile", c.auth.profile).apply {
                     // The composer shows the effort this chat really got.
                     cappedEffort?.let { put("reasoning_effort", it) }
                     // Hermes holds a create title until the first turn; show it (and the thread lane) from the start.
                     if (string("title").isBlank() && params.string("title").isNotBlank()) put("title", params.string("title"))
-                    if (params.string("source") == BEACON_THREAD_SOURCE) put("source", BEACON_THREAD_SOURCE)
+                    if (markThread || params.string("source") == BEACON_THREAD_SOURCE) put("source", BEACON_THREAD_SOURCE)
                 }
             }
             "/api/session" -> {
                 require(sid().matches(storedSessionId)) { "Choose a native conversation first" }
-                return passiveHistory(sid())
+                return passiveHistory(sid()).also { if (sid() in ThreadMarks.ids(c.scope)) it.put("source", BEACON_THREAD_SOURCE) }
             }
             "/api/chat/start", "/api/chat/steer" -> {
                 require(path != "/api/chat/steer" || d.rows("attachments").isEmpty()) { "Guide accepts text only" }
@@ -351,7 +453,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                         ?: throw NativeTurnNotSent("The running conversation is no longer available") else b?.runtimeSessionId)
                 } catch (e: Throwable) {
                     if (e is CancellationException || e is NativeTurnNotSent) throw e
-                    throw NativeTurnNotSent("The conversation could not be prepared. The message is retained.", e)
+                    throw NativeTurnNotSent("Couldn't open the chat. Your message is kept.", e)
                 }
                 val bound = lease.binding
                 if (bound.scope != c.scope || bound.storedSessionId != sid()) throw NativeTurnNotSent("Conversation identity changed")
@@ -366,7 +468,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                     val model = info.string("model")
                     val provider = info.string("provider")
                     if (model != d.string("model") || d.string("model_provider").isNotBlank() && provider != d.string("model_provider"))
-                        throw NativeTurnNotSent("The queued message's model changed. Select its saved model before sending it.")
+                        throw NativeTurnNotSent("The model changed. Pick this message's model to send it.")
                 }
                 for (attachment in d.rows("attachments")) {
                     require(attachment.string("scope_key") == c.scope.session(bound.storedSessionId).key) { "Attachment belongs to another conversation" }
@@ -374,7 +476,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                     val mime = attachment.string("mime")
                     val receipt = if (lease.authority) {
                         if (mime !in setOf("image/png", "image/jpeg", "image/gif", "image/webp"))
-                            throw NativeTurnNotSent("This server cannot send the queued attachment type. The message is kept on this phone.")
+                            throw NativeTurnNotSent("This Hermes can't take this attachment. The message stays on this phone.")
                         val staged = c.nativeTurnRpc(lease, "image.attach_bytes", json("session_id" to bound.runtimeSessionId,
                             "content_base64" to data, "filename" to attachment.string("name")))
                         require(staged.optBoolean("attached") && staged.string("path").isNotBlank() && staged.string("mime") == mime) { "Native image staging was not confirmed" }
@@ -420,10 +522,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                     if (!promptAttempted || error is NativeTurnNotSent || requestNeverSent(error)) kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
                         for (queuedPath in queuedPaths.distinct()) runCatching { c.nativeTurnRpc(lease, "image.detach", json("session_id" to bound.runtimeSessionId, "path" to queuedPath)) }
                     }
-                    if (!promptAttempted && error !is CancellationException && error !is NativeTurnNotSent) throw NativeTurnNotSent("The message was not sent. Its draft is retained.", error)
+                    if (!promptAttempted && error !is CancellationException && error !is NativeTurnNotSent) throw NativeTurnNotSent("Not sent. Your draft is kept.", error)
                     if (steer && error is ApiFailure && ((!lease.authority && error.status == 4010) ||
                             (lease.authority && error.detail in setOf("unsupported_control", "execution_not_ready", "stale_generation"))))
-                        throw NativeTurnNotSent("Guidance was not accepted. The message is retained.", error)
+                        throw NativeTurnNotSent("Couldn't change the reply. Your message is kept.", error)
                     throw error
                 }
             }
@@ -440,21 +542,21 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val ref = result.optJSONObject("ref")
                 val profile = snapshot.optJSONObject("info")?.string("profile_id").orEmpty()
                 require(ref?.string("session_id") == b.storedSessionId && (profile.isBlank() || ref?.string("profile_id") == profile) &&
-                    nativeReplayNumber(result.opt("execution_generation")) == generation) { "Stop was not confirmed. Refresh before trying again." }
+                    nativeReplayNumber(result.opt("execution_generation")) == generation) { "Couldn't confirm the stop. Refresh and try again." }
                 return result
             }
             "/api/approval/pending" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
-                if (lease.authority) return json("pending" to canonicalPrompts(canonicalSnapshot(lease), "approval").firstOrNull()?.let { it.copy().put("approval_id", it.getString("prompt_id")) })
+                if (lease.authority) return pendingPrompts(canonicalPrompts(canonicalSnapshot(lease), "approval").map { it.copy().put("approval_id", it.getString("prompt_id")) })
                 val result = c.nativeRpc("approval.pending", json("session_id" to b.runtimeSessionId))
-                return json("pending" to result.rows("approvals").firstOrNull()?.let { it.copy().put("approval_id", it.string("request_id")) })
+                return pendingPrompts(result.rows("approvals").map { it.copy().put("approval_id", it.string("request_id")) })
             }
             "/api/clarify/pending" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
-                if (lease.authority) return json("pending" to canonicalPrompts(canonicalSnapshot(lease), "clarify").firstOrNull()?.let { it.copy().put("clarify_id", it.getString("prompt_id")) })
+                if (lease.authority) return pendingPrompts(canonicalPrompts(canonicalSnapshot(lease), "clarify").map { it.copy().put("clarify_id", it.getString("prompt_id")) })
                 val result = c.nativeRpc("session.resume", json("session_id" to b.storedSessionId, "omit_messages" to true, "close_on_disconnect" to false))
                 val requests = result.rows("open_requests")
-                return json("pending" to requests.firstOrNull { it.string("method").contains("clarify") }?.let { (it.optJSONObject("params") ?: it).copy().put("clarify_id", it.string("id")) })
+                return pendingPrompts(requests.filter { it.string("method").contains("clarify") }.map { (it.optJSONObject("params") ?: it).copy().put("clarify_id", it.string("id")) })
             }
             "/api/approval/mode" -> {
                 require(method in setOf("GET", "POST")) { "Unsupported approval setting operation" }
@@ -470,10 +572,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                 }
                 val yoloWrite = method == "POST"
                 if (method == "POST") {
-                    require(d.keys().asSequence().all { it in setOf("session_id", "yolo", "scope_key") } && d.opt("yolo") is Boolean) { "Choose Ask first or YOLO for this chat." }
+                    require(d.keys().asSequence().all { it in setOf("session_id", "yolo", "scope_key") } && d.opt("yolo") is Boolean) { "Choose Always ask or Don't ask for this chat." }
                     require(d.string("scope_key") == c.scope.session(sid()).key) { "Reopen Approvals in the original account and profile" }
                     val target = binding()
-                    require(d.string("scope_key") == c.scope.session(target.storedSessionId).key) { "Refresh the resolved conversation before changing approvals" }
+                    require(d.string("scope_key") == c.scope.session(target.storedSessionId).key) { "Refresh the chat first." }
                     if (d.getBoolean("yolo")) {
                         val profileMode = c.nativeRpc("config.get", json("key" to "approvals.mode")).string("value")
                         require(profileMode in nativeApprovalModes) { "Approvals are unavailable. Refresh and try again." }
@@ -533,8 +635,15 @@ internal class NativeOperations(private val c: BeaconClient) {
                         return result
                     }
                 }
-                return if (path == "/api/approval/respond") c.nativeAnswerServerRequest("approval", d.getString("approval_id"), target.runtimeSessionId, d)
-                else c.nativeAnswerServerRequest("clarify", d.getString("clarify_id"), target.runtimeSessionId, d)
+                return try {
+                    if (path == "/api/approval/respond") c.nativeAnswerServerRequest("approval", d.getString("approval_id"), target.runtimeSessionId, d)
+                    else c.nativeAnswerServerRequest("clarify", d.getString("clarify_id"), target.runtimeSessionId, d)
+                } catch (e: NativeRequestEnded) {
+                    // Hermes' own snapshot no longer holds the prompt and this route sends no server request for it: Hermes ended it (its own wait ran out, or it settled
+                    // while the phone was away). Nothing is sent; the card closes and says so, instead of a lost connection. A gateway without session authority keeps its error.
+                    if (!lease.authority) throw e
+                    json("status" to "ended", "prompt_id" to id)
+                }
             }
             "/api/session/branch" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
@@ -587,18 +696,14 @@ internal class NativeOperations(private val c: BeaconClient) {
                     require(result.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
                     return result
                 }
-                try {
-                    return c.nativeRequest("/api/plugins/beacon/sessions/pin", "POST", json("session_id" to sid(), "pinned" to d.getBoolean("pinned"), "profile" to c.auth.profile)).also {
-                        require(it.string("session_id") == sid() && it.opt("pinned") == d.getBoolean("pinned")) { "Pin change was not confirmed. Try again." }
-                    }
-                } catch (error: ApiFailure) {
-                    // Missing or unpaired plugins use native authority; explicit owner/session refusals stay final.
-                    if (!(error.plugin && error.status == 401 || error.status in setOf(405, 501) || error.status == 404 && error.detail.equals("Not Found", true))) throw error
-                }
-                // Hermes accepts a sidebar change only with its revision precondition and a fresh request id, as its own web client sends.
+                // Hermes' own PATCH reaches a running gateway itself (web_server_sessions._mutate_session_request); it accepts a sidebar change only with
+                // its revision precondition and a fresh request id, as its own web client sends.
                 val snapshot = c.nativeGet("/api/sessions/${sid()}/mutation-snapshot", mapOf("profile" to c.auth.profile))
                 val identity = pinMutationIdentity(snapshot, java.util.UUID.randomUUID().toString())
-                return c.nativeRequest("/api/sessions/${sid()}", "PATCH", identity.put("pinned", d.getBoolean("pinned")).put("profile", c.auth.profile))
+                val pinned = d.getBoolean("pinned")
+                return c.nativeRequest("/api/sessions/${sid()}", "PATCH", identity.put("pinned", pinned).put("profile", c.auth.profile)).also {
+                    require(it.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
+                }
             }
             "/api/session/rename" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
@@ -632,7 +737,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
                 if (lease.authority) {
                     val snapshot = canonicalSnapshot(lease)
-                    require(snapshot.opt("running") == false && snapshot.opt("pending") is JSONArray && snapshot.rows("pending").isEmpty()) { "Stop the current reply before deleting this conversation." }
+                    require(snapshot.opt("running") == false && snapshot.opt("pending") is JSONArray && snapshot.rows("pending").isEmpty()) { "Stop the reply before deleting this chat." }
                     val result = canonicalMutation(lease, snapshot, "delete", JSONObject())
                     require(result.optJSONArray("deleted_ids")?.strings()?.contains(b.storedSessionId) == true) { "Deletion was not confirmed. Refresh before trying again." }
                     return result.put("deleted", b.storedSessionId)
@@ -640,13 +745,13 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val fresh = c.nativeRpc("session.resume", json("session_id" to sid(), "omit_messages" to true, "close_on_disconnect" to false))
                 val target = nativeSessionBinding(c.scope, fresh)
                 require(target.storedSessionId == sid()) { "Conversation identity changed. Reopen before deleting." }
-                require(fresh.opt("running") is Boolean) { "Refresh this conversation to confirm whether a reply is still running." }
-                require(fresh.opt("running") == false && fresh.opt("inflight") in listOf(null, JSONObject.NULL) && fresh.opt("queued") in listOf(null, JSONObject.NULL)) { "Stop the current reply before deleting this conversation." }
+                require(fresh.opt("running") is Boolean) { "Refresh this chat to see if the reply is still running." }
+                require(fresh.opt("running") == false && fresh.opt("inflight") in listOf(null, JSONObject.NULL) && fresh.opt("queued") in listOf(null, JSONObject.NULL)) { "Stop the reply before deleting this chat." }
                 val closed = c.nativeRpc("session.close", json("session_id" to target.runtimeSessionId))
                 require(closed.opt("closed") == true) { "Conversation close was not confirmed." }
                 val deleted = try { c.nativeRpc("session.delete", json("session_id" to target.storedSessionId)) }
                 catch (error: ApiFailure) {
-                    if (error.status != 4007 || error.message != "session not found") throw error
+                    if (!nativeSessionNotFound(error)) throw error
                     json("deleted" to target.storedSessionId)
                 }
                 return deleted.also {
@@ -674,7 +779,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val payload = JSONObject().apply { d.string("focus_topic").takeIf(String::isNotBlank)?.let { put("focus", it) } }
                 val result = canonicalMutation(lease, canonicalSnapshot(lease), "compress", payload)
                 if (result.string("status") == "noop") return result.put("status", "aborted")
-                require(result.string("status").isBlank() && result.string("target_session_id").matches(storedSessionId) && nativeReplayNumber(result.opt("message_count"))?.let { it >= 0 } == true) { "Compression was not confirmed. Refresh before trying again." }
+                require(result.string("status").isBlank() && result.string("target_session_id").matches(storedSessionId) && nativeReplayNumber(result.opt("message_count"))?.let { it >= 0 } == true) { "Couldn't confirm the summary. Refresh and try again." }
                 return result.put("status", "compressed")
             }
             "/api/session/usage" -> {
@@ -806,7 +911,7 @@ internal class NativeOperations(private val c: BeaconClient) {
 
     /** Resolve an uncertain send by native identity only; absence never authorizes another submission. */
     private suspend fun submissionReceipt(stored: String, input: String, knownAdmission: String, completedProof: Boolean): JSONObject {
-        require(stored.matches(storedSessionId) && input.matches(storedSessionId)) { "Choose a saved send receipt" }
+        require(stored.matches(storedSessionId) && input.matches(storedSessionId)) { "Choose a message to check." }
         val b = c.nativeSession(stored)
         require(b.scope == c.scope && b.storedSessionId == stored) { "The admission belongs to another conversation" }
         val lease = c.nativeTurnLease(stored, b.runtimeSessionId)
@@ -872,7 +977,7 @@ internal class NativeOperations(private val c: BeaconClient) {
             require(opt("text") is String) { "Reopen this file before editing it." }
             put("content", if (optBoolean("binary")) "" else opt("text"))
             if (optBoolean("binary") || '\uFFFD' in string("text")) put("edit_blocked_reason", "This file can't be edited here.")
-            else if (optBoolean("truncated")) put("edit_blocked_reason", "File preview is truncated; download the complete file before editing")
+            else if (optBoolean("truncated")) put("edit_blocked_reason", "Only part of this file is shown. Download it to edit.")
         }
 
     private suspend fun readTextFile(path: String): JSONObject = try {
@@ -885,18 +990,18 @@ internal class NativeOperations(private val c: BeaconClient) {
     private suspend fun saveTextFile(fields: JSONObject): JSONObject {
         require(fields.opt("content") is String && fields.opt("expected_content") is String) { "Reopen this file before saving; its disk revision is required." }
         val text = fields.string("content")
-        require(text.toByteArray(Charsets.UTF_8).size.toLong() + text.count { it == '\n' } <= 512 * 1024 && '\u0000' !in text) { "The phone editor supports text files up to 512 KiB without binary characters. Your draft is kept." }
+        require(text.toByteArray(Charsets.UTF_8).size.toLong() + text.count { it == '\n' } <= 512 * 1024 && '\u0000' !in text) { "This file can't be edited on the phone. Your draft is kept." }
         try { return c.nativeRequest("/api/plugins/beacon/mobile/files/text", "POST", fields) }
         catch (error: ApiFailure) { if (error.status != 404 && !(error.plugin && error.status == 401)) throw error }
         val path = fields.getString("path")
         val latest = nativeTextFile(path)
         require('\uFFFD' !in latest.string("text") && '\uFFFD' !in fields.getString("expected_content")) { "This file can't be edited here." }
-        require(!latest.optBoolean("truncated") && !latest.optBoolean("binary") && latest.string("text") == fields.getString("expected_content")) { "This file changed on the computer. Reopen it before saving; your edits are retained." }
+        require(!latest.optBoolean("truncated") && !latest.optBoolean("binary") && latest.string("text") == fields.getString("expected_content")) { "This file changed on the computer. Reopen it to save; your edits are kept." }
         // Stock Hermes chooses platform newlines; preserving disk formatting requires the optional plugin.
         // shortcut: stock write-text has no compare-and-write, so two devices saving in the same instant are last-writer-wins; use the plugin's revision-locked save if native Hermes adds a precondition.
         val result = c.nativeGet("/api/fs/write-text", mapOf("profile" to c.auth.profile), "POST", json("path" to path, "content" to text.replace("\r\n", "\n")))
         val actual = nativeTextFile(path)
-        require(!actual.optBoolean("truncated") && !actual.optBoolean("binary") && '\uFFFD' !in actual.string("text")) { "Saved file preview is unavailable; reopen or download it before editing again." }
+        require(!actual.optBoolean("truncated") && !actual.optBoolean("binary") && '\uFFFD' !in actual.string("text")) { "Reopen or download this file to edit it again." }
         return result.put("content", actual.string("text")).put("byteSize", actual.optLong("byteSize")).put("path", actual.string("path", path))
     }
 
@@ -967,6 +1072,17 @@ internal class NativeOperations(private val c: BeaconClient) {
                 if (rows.putIfAbsent(id, row) == null) mergedThreads += id
             }
         }
+        // A chat marked as a thread (made where Hermes cannot store the thread source) reads as one; the lane and the empty ones are read by id.
+        if (!archived) {
+            val marked = threadMarkIds()
+            if (marked.isNotEmpty()) {
+                rows.forEach { (id, row) -> if (id in marked) row.put("source", BEACON_THREAD_SOURCE) }
+                markedThreadRows(marked.filter { it !in rows }.takeLast(MARKED_THREAD_FETCH_LIMIT)).forEach { (id, row) ->
+                    // A thread with messages is already in the main list's window; the lane lists every marked thread.
+                    if (threads || row.optInt("message_count") == 0) { if (rows.putIfAbsent(id, row) == null) mergedThreads += id }
+                }
+            }
+        }
         // REST has no include_hidden option. Gateway session.list is read-only and does not resume an agent.
         if (archived) {
             rows.entries.removeAll { !nativeSessionFlag(it.value, "archived") }
@@ -993,8 +1109,87 @@ internal class NativeOperations(private val c: BeaconClient) {
         val window = if (archived || mergedThreads.any(rows::containsKey)) rows.entries.sortedByDescending { (_, row) -> row.optDouble(if (order == "created") "started_at" else "last_active", row.optDouble("started_at", 0.0)) } else rows.entries.toList()
         // Hermes back-fills every pin onto a page, so a pinned chat stays past the window after a re-sort too.
         val listed = window.filterIndexed { index, entry -> index < SESSION_INDEX_WINDOW || nativeSessionFlag(entry.value, "pinned") }.filter { (id, row) -> query.isBlank() || row.string("title").contains(query, true) || id.contains(query, true) }
-        return json("sessions" to JSONArray(listed.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden")) }),
-            "search_scope" to "Newest 200 conversation titles and identities", "limit" to SESSION_INDEX_WINDOW)
+            .map { (id, row) -> id to row }
+        // Words inside the messages find a chat too: Hermes' own search answers for the chats a title cannot.
+        val found = listed.map { it.first }.toSet()
+        val shown = listed + (if (query.isBlank() || archived) emptyList() else sessionContentHits(query, threads, hiddenSources, found))
+        return json("sessions" to JSONArray(shown.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden")) }),
+            "search_scope" to "Conversation titles and message text", "limit" to SESSION_INDEX_WINDOW)
+    }
+
+    /** Remember a chat as a thread on this phone and in the plugin (for the owner's other phones and scheduled posts); without the plugin route this phone still lists it. */
+    private suspend fun markAsThread(id: String) {
+        ThreadMarks.add(c.scope, id)
+        try { c.nativeRequest("/api/plugins/beacon/mobile/sessions/$id/thread", "POST", JSONObject()) }
+        catch (e: CancellationException) { throw e } catch (_: Exception) { /* an older plugin: the mark on this phone is enough to list it */ }
+    }
+
+    /** The chats known to be threads: this phone's marks plus the plugin's, read at most once a minute and only as a best effort. */
+    private suspend fun threadMarkIds(): Set<String> {
+        val now = System.currentTimeMillis()
+        val account = c.scope.copy(session = "").key
+        val due = synchronized(threadMarkReads) { (now - (threadMarkReads[account] ?: 0L) >= THREAD_MARK_READ_MS).also { if (it) threadMarkReads[account] = now } }
+        if (due) try {
+            // Optional, like the voice archive: any failure, including the plugin's own 401, only leaves this phone's marks.
+            val listed = kotlinx.coroutines.withTimeoutOrNull(OPTIONAL_VOICE_HISTORY_TIMEOUT_MS) {
+                c.detached().nativeGet("/api/plugins/beacon/mobile/threads", mapOf("profile" to c.auth.profile), persistAuth = false)
+            }
+            if (listed == null) synchronized(threadMarkReads) { threadMarkReads.remove(account) }
+            else ThreadMarks.add(c.scope, *listed.rows("threads").map { it.string("id") }.filter { it.matches(storedSessionId) }.toTypedArray())
+        } catch (e: CancellationException) { throw e }
+        catch (_: Exception) { synchronized(threadMarkReads) { threadMarkReads.remove(account) } }  // an older plugin or a busy one: ask again with the next list
+        return ThreadMarks.ids(c.scope)
+    }
+
+    /** The marked threads the index did not return (the thread source filter cannot match them), read by id; a chat Hermes no longer has loses its mark. */
+    private suspend fun markedThreadRows(ids: List<String>): List<Pair<String, JSONObject>> = coroutineScope {
+        val permits = Semaphore(6)
+        ids.map { id -> async { permits.withPermit {
+            try {
+                val row = c.nativeGet("/api/sessions/$id", mapOf("profile" to c.auth.profile))
+                if (row.string("id", row.string("session_id")) == id && ownedByProfile(row) && !nativeSessionFlag(row, "hidden") && !nativeSessionFlag(row, "archived"))
+                    id to row.copy().put("session_id", id).put("source", BEACON_THREAD_SOURCE) else null
+            } catch (e: Exception) {
+                if (e is CancellationException || e is NativeAuthExpiredException || e is LoopbackSessionRefreshFailed || e is CachedIdentityMismatch || e is ApiFailure && e.status == 401) throw e
+                if (e is ApiFailure && e.status == 404) ThreadMarks.remove(c.scope, id)
+                null
+            }
+        } } }.awaitAll().filterNotNull()
+    }
+
+    /** The chats whose message text matches [query], from Hermes' own search (the stock dashboard route); a search that fails only leaves the title matches. */
+    private suspend fun sessionContentHits(query: String, threads: Boolean, hidden: List<String>, alreadyListed: Set<String>): List<Pair<String, JSONObject>> {
+        val scope = if (threads) mapOf("sources" to THREAD_SOURCES.joinToString(",")) else mapOf("exclude_sources" to (listOf("cron") + hidden).distinct().joinToString(","))
+        val page = try { c.nativeGet("/api/sessions/search", mapOf("profile" to c.auth.profile, "q" to query.trim().take(200), "limit" to "30") + scope) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (e is NativeAuthExpiredException || e is LoopbackSessionRefreshFailed || e is CachedIdentityMismatch || e is ApiFailure && e.status == 401) throw e
+                return emptyList()
+            }
+        val hits = page.rows("results").mapNotNull { row ->
+            val id = row.string("session_id", row.string("id"))
+            // A chat the title search already lists is not read again for its message text.
+            if (id in alreadyListed || !id.matches(storedSessionId) || !ownedByProfile(row) || nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden") || row.string("source").lowercase() == "cron") null else id to row
+        }
+        // Hermes searches the stored text, which includes the notes it writes into a user row (a photo's description and file path). Only words the owner can see count.
+        return coroutineScope {
+            val permits = Semaphore(4)
+            hits.map { hit -> async { permits.withPermit { hit.takeIf { visibleContentHit(it.first, it.second, query) } } } }.awaitAll().filterNotNull()
+        }
+    }
+
+    /** True when the words of [query] are in what the owner sees of the chat. Only a stored user row can hold Hermes' own note, so every other hit stands; a user-row hit is read against the chat's newest rows, cleaned as the chat cleans them. A check that cannot be made leaves the hit out. */
+    private suspend fun visibleContentHit(id: String, hit: JSONObject, query: String): Boolean {
+        if (hit.string("role") != "user") return true
+        val page = try { c.nativeGet("/api/sessions/$id/messages", mapOf("profile" to c.auth.profile, "order" to "latest", "limit" to "$HISTORY_WINDOW", "offset" to "0", "inline_images" to "false")) }
+            catch (e: CancellationException) { throw e }
+            catch (e: Exception) {
+                if (e is NativeAuthExpiredException || e is LoopbackSessionRefreshFailed || e is CachedIdentityMismatch || e is ApiFailure && e.status == 401) throw e
+                return false
+            }
+        return (page.opt("messages") as? JSONArray)?.objects().orEmpty().any { row ->
+            row.string("role") == "user" && visibleSearchMatch(splitAttachedMedia(messageContentText("user", historyRowContent(row))).text, query)
+        }
     }
 
     /**
@@ -1072,7 +1267,7 @@ internal class NativeOperations(private val c: BeaconClient) {
         require(resolved.matches(storedSessionId)) { "Invalid historical conversation identity" }
         if (resolved != requested) requireDescendant(requested, resolved, scoped)
         val row = page.rows("messages").single()
-        require(row.optLong("id", row.optLong("row_id")) == rowId && row.string("role") == "user") { "Historical image message changed. Reopen it before previewing." }
+        require(row.optLong("id", row.optLong("row_id")) == rowId && row.string("role") == "user") { "This image changed. Reopen it to see it." }
         val content = row.opt("content")
         val parts = (content as? JSONArray)?.objects() ?: listOfNotNull(content as? JSONObject)
         val part = parts.filter { it.string("type") in setOf("image_url", "input_image", "image") }.getOrNull(imageIndex) ?: error("Historical image is unavailable")
@@ -1116,6 +1311,10 @@ internal class NativeOperations(private val c: BeaconClient) {
             val params = raw.optJSONObject("params") ?: JSONObject()
             if (params.string("type") == "gateway.ready") return@nativeEvents
             val payload = (params.optJSONObject("payload") ?: params).copy().put("session_id", b.storedSessionId)
+            val promptId = if (params.has("payload")) payload.string("prompt_id") else ""
+            // Hermes stamps each frame of the turn it runs with that turn's admission (session_events.publish, stamped at the claim in session_authority._stamp_claim).
+            // The payload's own admission_id is not that stamp, so the stamp is kept under its own key.
+            params.string("admission_id").takeIf(String::isNotBlank)?.let { payload.put("turn_admission_id", it) }
             val type = if (raw.optString("method") == "reconciliation.required") { params.optJSONObject("history")?.let { payload.put("session", sessionProjection(it, b)) }; if (path == "/api/session/stream") "session_updated" else "state_saved" } else when (params.string("type", raw.string("method"))) {
                 "message.delta" -> "token"
                 "reasoning.delta", "reasoning.available", "thinking.delta" -> "reasoning"
@@ -1129,6 +1328,10 @@ internal class NativeOperations(private val c: BeaconClient) {
                 "approval" -> "approval"
                 "clarify" -> "clarify"
                 "request.cancel" -> "request_cancel"
+                // The canonical authority asks and withdraws its questions as events carrying the prompt (gateway/session_pending_controls.py), not as requests.
+                "approval.request" -> if (promptId.isBlank()) "native_event" else "approval"
+                "clarify.request" -> if (promptId.isBlank()) "native_event" else "clarify"
+                "approval.settled", "clarify.settled" -> if (promptId.isBlank()) "native_event" else "request_cancel"
                 "status.update" -> {
                     payload.string("text").takeIf(String::isNotBlank)?.let { payload.put("message", it) }
                     "warning"
@@ -1137,6 +1340,11 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             if (raw.has("id")) {
                 payload.put("id", raw.opt("id")).put("approval_id", params.string("request_id", raw.string("id"))).put("clarify_id", raw.opt("id"))
+            }
+            // A canonical prompt is known by its id: the card is answered and withdrawn by it.
+            if (promptId.isNotBlank() && type in setOf("approval", "clarify", "request_cancel")) {
+                payload.put("id", promptId)
+                if (type == "approval") payload.put("approval_id", promptId) else if (type == "clarify") payload.put("clarify_id", promptId)
             }
             payload.put("stream_id", b.runtimeSessionId)
             val epoch = params.string("replay_epoch")

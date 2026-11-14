@@ -170,7 +170,7 @@ class RestartHonestyTest {
     @Test fun theHubCanReadWhetherAPluginActionIsPending() {
         assertFalse(AppUpdateUi().pluginPending)
         assertFalse(AppUpdateUi(plugin = PluginRow(PluginStatus.UpToDate, "1.1.3", "1.1.3")).pluginPending)
-        listOf(PluginStatus.Available, PluginStatus.NeedsReview, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed,
+        listOf(PluginStatus.Available, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed,
             PluginStatus.DashboardRestart, PluginStatus.Newer, PluginStatus.Failed, PluginStatus.Busy).forEach {
             assertTrue(it.name, AppUpdateUi(plugin = PluginRow(it, "1.1.1", "1.1.3")).pluginPending)
         }

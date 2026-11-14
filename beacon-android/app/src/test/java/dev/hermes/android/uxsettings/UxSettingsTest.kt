@@ -144,7 +144,7 @@ class UxSettingsTest {
 
     @Test fun theSectionUsesTheOwnersWordsAndOneTermForTheServerPart() {
         val code = source("PluginHealth.kt")
-        for (label in listOf("Beacon plugin", "Health", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "The Beacon plugin isn't installed"))
+        for (label in listOf("Beacon plugin", "Health", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "Beacon isn't installed on this Hermes"))
             assertTrue(label, code.contains("uiText(\"$label\")"))
         // Rows in the owner's order: Health, Version, dashboard, gateway, Calls, Notifications, Check now.
         val order = listOf("plugin-health-status", "plugin-health-version", "plugin-health-dashboard", "plugin-health-gateway", "plugin-health-calls", "plugin-health-notifications", "plugin-health-check")
@@ -197,14 +197,16 @@ class UxSettingsTest {
         val page = source("MoreScreen.kt")
         assertTrue(page.contains("SettingsSection(uiText(\"When you send\"), testTag = \"settings-section:Sending\")"))
         assertTrue(page.contains("assistantText(\"If you send while Beacon replies\")"))
-        assertTrue(page.contains("optionLabels = mapOf(\"steer\" to \"Change the reply\", \"queue\" to \"Send after\")"))
+        assertTrue(page.contains("optionLabels = mapOf(\"steer\" to \"Send now\", \"queue\" to \"Queue\")"))
+        assertFalse("the internal word is not a label", page.contains("to \"Steer\""))
         // What is stored does not change, and the option tags keep the label saved layouts and tests know.
         assertTrue(page.contains("val busyOptions = listOf(\"steer\", \"queue\")"))
         assertTrue(page.contains("choiceTags(\"While Beacon is replying\", busyOptions)"))
         // The progress word "Sending" is not the section title any more.
         assertFalse(page.contains("SettingsSection(uiText(\"Sending\"))"))
-        assertTrue("Change the reply" in SettingsStrings && "Send after" in SettingsStrings)
-        assertFalse("Steer" in SettingsStrings || "Queue" in SettingsStrings)
+        // One vocabulary everywhere: Send now and Queue, as in the composer and the queue box.
+        assertTrue("Send now" in SettingsStrings && "Queue" in SettingsStrings)
+        assertFalse("Steer" in SettingsStrings || "Change the reply" in SettingsStrings || "Send after" in SettingsStrings)
     }
 
     @Test fun theOldWordsStillFindChatInSearch() {
@@ -238,8 +240,8 @@ class UxSettingsTest {
     // Translations
 
     private val newWords = listOf(
-        "Beacon plugin", "Hermes dashboard", "Hermes gateway", "The Beacon plugin isn't installed", "When you send", "If you send while Beacon replies",
-        "Change the reply", "Send after", "Turn it on to get calls and alerts while Beacon is closed.",
+        "Beacon plugin", "Hermes dashboard", "Hermes gateway", "Beacon isn't installed on this Hermes", "When you send", "If you send while Beacon replies",
+        "Send now", "Queue", "Turn it on to get calls and alerts while Beacon is closed.",
         "Notification delivery keep connected", "while replying steer queue change the reply send after",
     )
 
@@ -273,7 +275,7 @@ class UxSettingsTest {
     }
 
     @Test fun healthWordsAndSearchWordsAreInTheCheckedLists() {
-        assertTrue(PluginHealthStrings.containsAll(listOf("Beacon plugin", "Hermes dashboard", "Hermes gateway", "Working", "Hermes is busy", "The Beacon plugin isn't installed")))
+        assertTrue(PluginHealthStrings.containsAll(listOf("Beacon plugin", "Hermes dashboard", "Hermes gateway", "Working", "Hermes is busy", "Beacon isn't installed on this Hermes")))
         val keywords = SettingsStrings.filter { it.startsWith("Notification delivery") || it.startsWith("while replying") }
         assertEquals(listOf("while replying steer queue change the reply send after", "Notification delivery keep connected").sorted(), keywords.sorted())
     }

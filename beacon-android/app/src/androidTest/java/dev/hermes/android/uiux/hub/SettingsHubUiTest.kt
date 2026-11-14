@@ -126,7 +126,8 @@ class SettingsHubUiTest {
         compose.onNodeWithText("No matching settings").assertIsDisplayed()
     }
 
-    private fun withPage(route: String, check: () -> Unit) {
+    /** [keyboard] is what Android reports (Configuration.keyboard): QWERTY with a hardware keyboard attached, NOKEYS on a touch-only phone. */
+    private fun withPage(route: String, keyboard: Int = android.content.res.Configuration.KEYBOARD_QWERTY, check: () -> Unit) {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val prior = runBlocking { app.preferences.data.first() }
         val store = ViewModelStore()
@@ -134,7 +135,10 @@ class SettingsHubUiTest {
             runBlocking { app.preferences.edit { it[stringPreferencesKey("origin")] = "" } }
             val vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
             compose.setContent {
-                BeaconTheme(dark = true) { Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { MoreScreen(vm) } }
+                val configuration = android.content.res.Configuration(androidx.compose.ui.platform.LocalConfiguration.current).apply { this.keyboard = keyboard }
+                androidx.compose.runtime.CompositionLocalProvider(androidx.compose.ui.platform.LocalConfiguration provides configuration) {
+                    BeaconTheme(dark = true) { Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { MoreScreen(vm) } }
+                }
             }
             compose.waitUntil(5_000) { vm.ui.value.origin.isBlank() && !vm.ui.value.restoringSession }
             compose.runOnIdle { vm.tab("More"); vm.more(route) }
@@ -159,6 +163,23 @@ class SettingsHubUiTest {
         compose.onNodeWithTag("choice-option:While Beacon is replying:steer").assertIsSelected()
         for (tag in listOf("chat-pref-format", "chat-pref-thinking", "chat-pref-follow", "chat-pref-animation")) reach("chat-preferences", tag).assert(role(Role.Switch))
         compose.onNodeWithText("Follow new replies").assertExists()
+    }
+
+    /** Review R25 Should 3: a soft keyboard's Enter always adds a line, so a touch-only phone shows nothing about the Enter key. */
+    @Test fun aTouchOnlyPhoneShowsNothingAboutTheEnterKey() = withPage("Settings", keyboard = android.content.res.Configuration.KEYBOARD_NOKEYS) {
+        compose.onNodeWithTag("settings-section:Sending").assertExists()
+        compose.onNodeWithTag("choice-option:While Beacon is replying:steer").assertIsDisplayed()
+        for (option in listOf("enter", "ctrl_enter")) compose.onNodeWithTag("choice-option:Send shortcut:$option").assertDoesNotExist()
+        compose.onNodeWithText("Enter key").assertDoesNotExist()
+        compose.onNodeWithText("Ctrl + Enter sends").assertDoesNotExist()
+    }
+
+    @Test fun theHubNamesTheEnterKeyOnlyWithAHardwareKeyboard() {
+        val state = showHub(signedIn.copy(sendKey = "enter", showThinking = true))
+        row("settings-row:Settings").assertTextContains("Thinking shown")
+        compose.onAllNodesWithText("Enter sends", substring = true).assertCountEquals(0)
+        compose.runOnIdle { state.value = signedIn.copy(sendKey = "enter", showThinking = true, hardwareKeyboard = true) }
+        row("settings-row:Settings").assertTextContains("Enter sends · Thinking shown")
     }
 
     @Test fun appearancePageShowsThreeThemeSegmentsAndEverySwatch() = withPage("Appearance") {

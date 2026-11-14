@@ -118,6 +118,8 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                             SettingsNavRow(uiText("Skills"), { onSettings(bot.profile, "Skills") }, icon = SkillsIcon, minHeight = SettingsKit.RowMinHeight, testTag = "profile-skills")
                             SettingsDivider()
                             SettingsNavRow(uiText("Memory"), { onSettings(bot.profile, "Memory") }, icon = MemoryIcon, minHeight = SettingsKit.RowMinHeight, testTag = "profile-memory")
+                            SettingsDivider()
+                            SettingsNavRow(uiText("Vault"), { onSettings(bot.profile, "Vault") }, icon = Icons.Rounded.Lock, minHeight = SettingsKit.RowMinHeight, testTag = "profile-vault")
                         }
                     }
                 }
@@ -170,7 +172,7 @@ internal fun profileInstructionsPreview(soul: String): String =
     SettingsDivider()
     SettingsActionRow(uiText(if (custom) "Hide model ID" else "Use a model ID"), onToggleCustom, icon = Icons.Rounded.Edit, enabled = !state.saving, testTag = "profile-model-custom")
     if (custom) Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        OutlinedTextField(state.draftProvider, { onModelDraft(it, state.draftModel) }, Modifier.fillMaxWidth(), label = { Text(uiText("Configured provider ID")) }, singleLine = true, enabled = !state.saving)
+        OutlinedTextField(state.draftProvider, { onModelDraft(it, state.draftModel) }, Modifier.fillMaxWidth(), label = { Text(uiText("Provider ID")) }, singleLine = true, enabled = !state.saving)
         OutlinedTextField(state.draftModel, { onModelDraft(state.draftProvider, it) }, Modifier.fillMaxWidth(), label = { Text(uiText("Model ID")) }, singleLine = true, enabled = !state.saving)
     }
     FlowRow(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {

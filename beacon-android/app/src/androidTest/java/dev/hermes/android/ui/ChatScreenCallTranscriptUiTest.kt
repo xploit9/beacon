@@ -130,8 +130,8 @@ class ChatScreenCallTranscriptUiTest {
             val secondTop = compose.onNodeWithTag("call-transcript-card:call-two").fetchSemanticsNode().boundsInRoot.top
             assertTrue("Call cards stay in first-event order", firstTop < secondTop)
 
-            compose.onNodeWithContentDescription("Search this conversation").performClick()
-            compose.onNode(hasSetTextAction() and hasText("Find in conversation")).performTextInput("orchid")
+            compose.onNodeWithContentDescription("Search in chat").performClick()
+            compose.onNode(hasSetTextAction() and hasText("Find in chat")).performTextInput("orchid")
             compose.onNodeWithTag("call-transcript-card:call-one").assertIsDisplayed()
             compose.onNodeWithTag("search-count").assertTextEquals("1 of 1")
             // Release review 1.1.2: a search shows its matching line even when the card is collapsed.

@@ -18,9 +18,14 @@ import dev.hermes.android.core.string
 import dev.hermes.android.ui.MoreScreen
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.SidebarNavigation
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -53,6 +58,7 @@ class SettingsProfileIsolationUiTest {
         }
         try {
             compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java] }
+            diagnosticVm = vm; diagnosticFixture = fixture
             compose.runOnIdle {
                 field(vm, "originGeneration", 100)
                 field(vm, "client", fixture.client)
@@ -79,7 +85,20 @@ class SettingsProfileIsolationUiTest {
         }
     }
 
-    private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    private var diagnosticVm: BeaconViewModel? = null
+    private var diagnosticFixture: NativeExperienceFixture? = null
+    private fun await(condition: () -> Boolean) = AwaitDiagnostics.await(compose, { waitState() }, condition)
+    /** What a timed-out wait reports: the sign-in the app holds, the settings profile it is restoring, the memory draft and the last calls Hermes (the fixture) received. */
+    private fun waitState(): String {
+        val vm = diagnosticVm ?: return "no case running"
+        val calls = diagnosticFixture?.requests?.toList().orEmpty().takeLast(10).joinToString { "${it.string("method")} ${it.string("path")}".trim() }
+        // Who the settings editor is attached to (a client the reconnect dropped leaves it detached) and which of the restore's checks failed.
+        fun peek(name: String) = BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm)
+        val attached = "settingsOwner===client=${peek("settingsOwner") === vm.client} settingsClient=${peek("settingsClient")?.let(System::identityHashCode)} epoch=${peek("settingsEpoch")}/generation=${peek("originGeneration")} " +
+            "authenticated=${vm.ui.value.authenticated} selecting=${vm.settingsProfileSelecting.value} restoreError='${vm.settingsProfileRestoreError.value}' restoreJobActive=${(peek("settingsRestoreJob") as? kotlinx.coroutines.Job)?.isActive}"
+        return "client=${System.identityHashCode(vm.client)} connected=${vm.ui.value.connected} restoring=${vm.settingsProfileRestoring.value} settingsProfile='${vm.settingsProfile.value}' $attached " +
+            "memory draft='${vm.phoneSettings.memory.value.draft.take(40)}' scope=${vm.phoneSettings.memory.value.scope} loading=${vm.phoneSettings.memory.value.loading}; notice='${vm.ui.value.notice}' error='${vm.ui.value.error}'; last calls: $calls"
+    }
     private fun scrollTo(matcher: SemanticsMatcher) {
         val list = compose.onAllNodes(hasScrollToNodeAction()).fetchSemanticsNodes().maxBy { it.boundsInRoot.right }
         compose.onNode(SemanticsMatcher("Settings detail list") { it.id == list.id }).performScrollToNode(matcher)
@@ -164,7 +183,8 @@ class SettingsProfileIsolationUiTest {
         assertEquals("manual", vm.data.value["picker:approvals"]?.string("profile_mode"))
         assertEquals(assistantProfile, vm.preferences.value.assistantProfile)
         assertEquals("default", runBlocking { app.auth.read(fixture.scope.origin).profile })
-        for (path in listOf("/api/plugins/beacon/admin/bot", "/api/plugins/beacon/mobile/skills/content", "/api/plugins/beacon/memory/documents")) {
+        assertEquals(setOf("coder", "academic"), fixture.requests.filter { it.string("method") == "PUT" && Regex("/api/profiles/[a-z0-9][a-z0-9_-]*/model").matches(it.string("path")) }.map { it.string("profile") }.toSet())
+        for (path in listOf("/api/plugins/beacon/mobile/skills/content", "/api/plugins/beacon/memory/documents")) {
             assertEquals(setOf("coder", "academic"), fixture.requests.filter { it.string("method") == "PUT" && it.string("path") == path }.map { it.string("profile") }.toSet())
         }
         assertEquals(setOf("coder", "academic"), fixture.requests.filter { it.string("method") == "config.set" && it.optJSONObject("params")?.string("key") == "approvals.mode" }.map { it.getJSONObject("params").string("profile") }.toSet())
@@ -308,5 +328,88 @@ class SettingsProfileIsolationUiTest {
         assertEquals("default", vm.ui.value.profile)
         assertEquals(fixture.scope.copy(profile = "coder").key, vm.phoneSettings.memory.value.scope)
         assertEquals("coder notes", vm.phoneSettings.memory.value.documents.first { it.target == "memory" }.content)
+    }
+
+    /**
+     * The page asks to restore the moment a reconnect marks it restoring, while the old sign-in still reads connected; a cache that is busy keeps the reconnect in that
+     * gap, so the restore can start against the client the reconnect is about to drop. The draft must survive and the page must leave its restoring state.
+     */
+    @Test fun reconnectKeepsTheInspectedProfileDraftWhileTheCacheIsBusy() = withFixture { vm, fixture, _, _ ->
+        await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
+        scrollTo(hasTestTag("profile-open:coder")); compose.onNodeWithTag("profile-open:coder").performClick()
+        await { vm.phoneSettings.bots.value.selected?.profile == "coder" && !vm.phoneSettings.bots.value.loading }
+        scrollTo(hasTestTag("profile-memory")); compose.onNodeWithTag("profile-memory").performClick()
+        await { vm.phoneSettings.memory.value.documents.any { it.content == "coder notes" } && !vm.phoneSettings.memory.value.loading }
+        val saved = BeaconViewModel::class.java.getDeclaredField("saved").apply { isAccessible = true }.get(vm) as SavedStateHandle
+        val originalClient = vm.client
+        val cacheLock = app.cache.javaClass.getDeclaredField("lock").apply { isAccessible = true }.get(app.cache) as Mutex
+        // The cache is busy from the moment the reconnect marks the page restoring (taken in the setter's own call, before the reconnect's first cache write), for a while.
+        val busy = CoroutineScope(Dispatchers.Unconfined).launch {
+            vm.settingsProfileRestoring.first { it }
+            cacheLock.lock()
+            try { delay(1_500) } finally { cacheLock.unlock() }
+        }
+        try {
+            compose.runOnIdle {
+                saved["session:${fixture.scope.key}"] = "chat-a"
+                vm.phoneSettings.editMemory("memory"); vm.phoneSettings.memoryDraft("draft across reconnect")
+                vm.connect(fixture.scope.origin)
+            }
+            await { vm.client != null && vm.client !== originalClient && vm.ui.value.connected && !vm.settingsProfileRestoring.value && vm.settingsProfile.value == "coder" && vm.phoneSettings.memory.value.draft == "draft across reconnect" }
+            assertEquals("default", vm.ui.value.profile)
+            assertEquals(fixture.scope.copy(profile = "coder").key, vm.phoneSettings.memory.value.scope)
+            assertEquals("coder notes", vm.phoneSettings.memory.value.documents.first { it.target == "memory" }.content)
+        } finally { busy.cancel() }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun botRoster(vm: BeaconViewModel) = dev.hermes.android.data.NativeBotModeController::class.java.getDeclaredField("mutable").apply { isAccessible = true }
+        .get(vm.botMode) as MutableStateFlow<dev.hermes.android.data.NativeBotModeState>
+
+    @Test fun theBotModeMemoryTileOpensTheOpenBotsMemoryAndNamesItWithItsAvatar() = withFixture { vm, fixture, navigation, _ ->
+        await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
+        val coder = dev.hermes.android.data.BotModeBot("coder", "Coder", "Reviews code")
+        compose.runOnIdle {
+            flow<AppState>(vm, "_ui").let { ui -> ui.value = ui.value.copy(botModeEnabled = true, tab = "More", morePage = "Bots") }
+            botRoster(vm).value = dev.hermes.android.data.NativeBotModeState(bots = listOf(dev.hermes.android.data.BotModeBot("default", "Default", ""), coder), activeBot = coder, loaded = true)
+            navigation.value = true
+        }
+        compose.onNodeWithTag("navigation-memory").assertIsDisplayed().performClick()
+        // The fixture draws either the drawer or the Memory page, so the page loads only once the drawer is gone: first the switch to the bot, then the page.
+        await { vm.ui.value.morePage == "Memory" && vm.settingsProfile.value == "coder" && !vm.settingsProfileSelecting.value }
+        compose.runOnIdle { navigation.value = false }
+        await { vm.phoneSettings.memory.value.documents.isNotEmpty() && !vm.phoneSettings.memory.value.loading }
+        // The page is the open bot's memory, not the chats' profile, and it says whose it is: avatar and name, never the word Profile.
+        assertEquals("coder notes", vm.phoneSettings.memory.value.documents.first { it.target == "memory" }.content)
+        assertEquals("default", vm.ui.value.profile)
+        compose.onNodeWithTag("bot-page-avatar").assertIsDisplayed()
+        compose.onAllNodesWithText("Coder").fetchSemanticsNodes().let { assertTrue("The bot's name is in the page header", it.isNotEmpty()) }
+        compose.onAllNodesWithText("Profile · ", substring = true).assertCountEquals(0)
+        assertTrue("Memory was read for the bot", fixture.requests.filter { it.string("path") == "/api/plugins/beacon/memory/documents" }.any { it.string("profile") == "coder" })
+        // A picture of the page for the review, only in the explicit synthetic probe run.
+        if (androidx.test.platform.app.InstrumentationRegistry.getArguments().getString("native_ui_probe") == "1") {
+            val automation = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation
+            automation.waitForIdle(400, 4000)
+            val bitmap = requireNotNull(automation.takeScreenshot())
+            val dir = java.io.File(requireNotNull(app.getExternalFilesDir(null)), "botmode-shots").apply { mkdirs() }
+            java.io.File(dir, "memory-page-bot-coder.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+        }
+    }
+
+    @Test fun theBotModeMemoryTileOpensTheMainBotsMemoryWhenNoBotChatIsOpen() = withFixture { vm, _, navigation, _ ->
+        await { vm.phoneSettings.bots.value.profiles.size == 3 && !vm.phoneSettings.bots.value.loading }
+        compose.runOnIdle {
+            flow<AppState>(vm, "_ui").let { ui -> ui.value = ui.value.copy(botModeEnabled = true, tab = "More", morePage = "Bots") }
+            botRoster(vm).value = dev.hermes.android.data.NativeBotModeState(bots = listOf(dev.hermes.android.data.BotModeBot("default", "Default", "")), loaded = true)
+            navigation.value = true
+        }
+        compose.onNodeWithTag("navigation-memory").assertIsDisplayed().performClick()
+        await { vm.ui.value.morePage == "Memory" && vm.settingsProfile.value == "default" && !vm.settingsProfileSelecting.value }
+        compose.runOnIdle { navigation.value = false }
+        await { vm.phoneSettings.memory.value.documents.isNotEmpty() && !vm.phoneSettings.memory.value.loading }
+        compose.onNodeWithTag("bot-page-avatar").assertIsDisplayed()
+        compose.onAllNodesWithText("Profile · ", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("Default").fetchSemanticsNodes().let { assertTrue("The main bot's name is in the page header", it.isNotEmpty()) }
     }
 }

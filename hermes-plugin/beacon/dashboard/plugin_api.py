@@ -29,7 +29,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api','checkups','self_heal','healing_api','healing_runtime','vault_runtime','vault_attestation','vault_api','voice_continuation','canonical_transport')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api','checkups','voice_continuation','canonical_transport')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -47,14 +47,11 @@ phone_tools=sys.modules['beacon_phone_tools']
 # The version this dashboard process imported; /mobile/plugin/version reports it as `running`.
 _read_plugin_version=mobile.read_plugin_version
 _RUNNING_PLUGIN_VERSION=_read_plugin_version(ROOT/'plugin.yaml')
-vault_attestation=sys.modules['beacon_vault_attestation']
 @asynccontextmanager
 async def lifespan(app):
     await start_watcher()
-    healing.start()
     try: yield
     finally:
-        healing.close()
         await stop_watcher()
 router=APIRouter(lifespan=lifespan)
 router.include_router(sys.modules['beacon_voice_continuation'].build_owner_router(mobile,native))
@@ -141,10 +138,6 @@ def identity(request,profile=None,owner_only=False,allow_loopback=False):
 async def identity_async(request,*args,**kwargs):
     """identity() reads the config and SQLite (and may write); a handler runs it off the event loop so a slow disk never stalls other requests."""
     return await asyncio.to_thread(identity,request,*args,**kwargs)
-
-vault_attestation.configure_dashboard(sys.modules['beacon_vault_runtime'],mobile,_RUNNING_PLUGIN_VERSION,
-    [('dashboard/plugin_api.py',identity_async),('vault_api.py',sys.modules['beacon_vault_api'].build_router),
-     ('vault_runtime.py',sys.modules['beacon_vault_runtime'].capabilities)])
 
 def connect_info_url():
     try: return mobile.dashboard_connect_info()
@@ -253,12 +246,9 @@ def skill_scope(profile,fn):
 
 router.include_router(sys.modules['beacon_memory_api'].build_router(identity,body,voice_context.scoped))
 router.include_router(sys.modules['beacon_skills_api'].build_router(identity,body,skill_scope),prefix='/mobile')
-router.include_router(sys.modules['beacon_admin_api'].build_router(identity,body))
+router.include_router(sys.modules['beacon_admin_api'].build_router(identity))
 router.include_router(sys.modules['beacon_files_api'].build_router(identity,body,native))
-router.include_router(sys.modules['beacon_bot_mode_api'].build_router(identity,body,native))
-router.include_router(sys.modules['beacon_vault_api'].build_router(identity_async,body,voice_context.scoped,mobile))
-healing = sys.modules['beacon_healing_runtime'].Runtime(mobile,voice_context.scoped,_RUNNING_PLUGIN_VERSION)
-router.include_router(sys.modules['beacon_healing_api'].build_router(identity_async,body,healing.healer))
+router.include_router(sys.modules['beacon_bot_mode_api'].build_router(identity,body,native,lambda request,owner,provider:voice_principal(request,owner,provider)))  # voice_principal is defined further down; looked up per request
 def safely(fn,*args):
     try: return fn(*args)
     except (KeyError,OSError,TypeError,RuntimeError) as error:
@@ -277,24 +267,37 @@ def reject_unowned_conversation(owner,provider,profile,stored,principal=None):
         return
     if row is not None and not native.owns_row(owner,provider,profile,stored,row,principal,db):
         raise HTTPException(404,_NOT_OWNED_CONVERSATION) from None
+# A call authorisation slower than this is logged with the seconds each step took (step names only, nothing about the call).
+SLOW_AUTHORISE_SECONDS=1.0
 async def call(request,call_id,writable=False):
     def authorize():
-        # First authorize owner, then select the call's recorded profile rather than trust input.
-        owner,provider,profile,cfg=identity(request,owner_only=True)
-        with mobile.connect() as conn:
-            row=safely(mobile.owned,conn,call_id,owner,None,writable)
-            principal=voice_principal(request,owner,provider)
-            saved=row.get('principal') or ''
-            if saved and saved!=principal: raise HTTPException(403,'Call principal mismatch')
-            if not row['closed']:
-                conn.execute('UPDATE calls SET seen=? WHERE id=? AND owner=? AND profile=? AND closed=0',(time.time(),call_id,owner,row['profile']))
-        selected=request.query_params.get('beacon_profile') or request.query_params.get('profile')
-        if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
-        _,_,_,cfg=identity(request,row['profile'])
-        reject_unowned_conversation(owner,provider,row['profile'],row['conversation'],saved or None)
-        if saved: safely(native.verify,owner,provider,row['profile'],row['conversation'],None,True,saved)
-        else: safely(native.verify,owner,provider,row['profile'],row['conversation'])
-        return owner,provider,row,cfg
+        spent={};mark=[time.monotonic()]
+        def took(step):
+            now=time.monotonic();spent[step]=round(now-mark[0],2);mark[0]=now
+        try:
+            # First authorize owner, then select the call's recorded profile rather than trust input.
+            owner,provider,profile,cfg=identity(request,owner_only=True);took('identity')
+            with mobile.connect() as conn:
+                row=safely(mobile.owned,conn,call_id,owner,None,writable)
+                principal=voice_principal(request,owner,provider)
+                saved=row.get('principal') or ''
+                if saved and saved!=principal: raise HTTPException(403,'Call principal mismatch')
+                if not row['closed']:
+                    conn.execute('UPDATE calls SET seen=? WHERE id=? AND owner=? AND profile=? AND closed=0',(time.time(),call_id,owner,row['profile']))
+            took('call_row')
+            selected=request.query_params.get('beacon_profile') or request.query_params.get('profile')
+            if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
+            _,_,_,cfg=identity(request,row['profile']);took('profile')
+            reject_unowned_conversation(owner,provider,row['profile'],row['conversation'],saved or None);took('ownership')
+            if saved: safely(native.verify,owner,provider,row['profile'],row['conversation'],None,True,saved)
+            else: safely(native.verify,owner,provider,row['profile'],row['conversation'])
+            took('verify')
+            return owner,provider,row,cfg
+        finally:
+            rest=time.monotonic()-mark[0]
+            if sum(spent.values())+rest>=SLOW_AUTHORISE_SECONDS:
+                if rest>0.05: spent['unfinished_step']=round(rest,2)  # a step that raised, or that is the one still running
+                logging.getLogger(__name__).warning('Beacon call authorisation was slow: %s',' '.join(f'{k}={v}s' for k,v in spent.items()))
     return await asyncio.to_thread(authorize)
 admin=sys.modules['beacon_admin_api']
 async def refuse_while_updating():
@@ -1324,7 +1327,9 @@ def _warm_profile(owner,profile):
     finally:
         _jobs_warming.discard(key)
 _tools_next={}
-TOOLS_REFRESH_SECONDS=300
+# The call tool list is rebuilt in the background this often (a complete list is current for gateway_tools.CATALOG_REFRESH and is
+# still served, while the next one builds, until CATALOG_STALE_TTL), so a call finds it warm, a dashboard restart included.
+TOOLS_REFRESH_SECONDS=180
 _release_next=0.0
 async def start_watcher():
     global _watch_task
@@ -1336,6 +1341,14 @@ async def start_watcher():
                 if cfg.get('owner_id') and cfg.get('owner_provider'):
                     profiles=cfg.get('profiles')
                     if profiles is None: profiles=_native_profile_names()
+                    # First of everything this pass does, for every profile: the watch below can be slow on a large state database, and
+                    # a call must not wait for it to find its tools. Each build runs on its own thread; this returns at once.
+                    for profile in profiles:
+                        profile_key=(cfg['owner_id'],profile)
+                        if time.monotonic()>=_tools_next.get(profile_key,0):
+                            _tools_next[profile_key]=time.monotonic()+TOOLS_REFRESH_SECONDS
+                            try: voice_context.prefetch_tools(profile)
+                            except Exception: pass
                     for profile in profiles:
                         profile_key=(cfg['owner_id'],profile)
                         if (profile_key not in _jobs_warming and time.monotonic()>=_jobs_retry_after.get(profile_key,0)
@@ -1351,10 +1364,6 @@ async def start_watcher():
                         except Exception: pass
                         try: await asyncio.to_thread(flush_held_posts,cfg['owner_id'],cfg['owner_provider'],profile)
                         except Exception: pass
-                        # The call tool list is scanned once after a start and kept fresh, so no call ever waits for a scan.
-                        if time.monotonic()>=_tools_next.get(profile_key,0):
-                            _tools_next[profile_key]=time.monotonic()+TOOLS_REFRESH_SECONDS
-                            voice_context.prefetch_tools(profile)
                     # A new Beacon release reaches the owner's phones within minutes, even when a phone's own GitHub check is late or refused.
                     if profiles and time.monotonic()>=_release_next:
                         _release_next=time.monotonic()+mobile.RELEASE_CHECK_SECONDS
@@ -1377,7 +1386,9 @@ def check_hermes():
     except Exception as exc:
         logging.getLogger(__name__).info('Beacon could not compare itself with this Hermes: %s',type(exc).__name__)
         return
-    if gone: logging.getLogger(__name__).warning('Beacon uses Hermes names this Hermes lacks; update Beacon: %s','; '.join(gone[:20]))
+    if gone:
+        logging.getLogger(__name__).warning('Beacon uses Hermes names this Hermes lacks; update Beacon: %s','; '.join(gone[:20]))
+        for sentence in compat.stopped(gone): logging.getLogger(__name__).warning(sentence)
     else: logging.getLogger(__name__).info('Beacon matches this Hermes')
 async def stop_watcher():
     global _watch_task
@@ -1520,13 +1531,6 @@ async def current_voice_profile(call_id:str,request:Request):
     owner,provider,row,query=await query_body(request,call_id,'profile-context')
     args=(owner,provider,row['profile'],row['conversation'],call_id)+((row['principal'],) if row.get('principal') else ())
     return await feature(voice_context.profile_context,*args,timeout=8)
-@router.post('/mobile/projects')
-async def create_mobile_project(request:Request):
-    value=await body(request,16384)
-    owner,provider,profile,cfg=await identity_async(request)
-    if set(value)-{'request_id','name','description'}:
-        raise HTTPException(400,'Unexpected project fields')
-    return await feature(native.create_project,owner,provider,profile,value.get('request_id'),value.get('name'),value.get('description',''),timeout=8)
 @router.post('/mobile/sessions/{stored_id}/reserve')
 async def reserve_chat(stored_id:str,request:Request):
     value=await body(request,1024)
@@ -1545,32 +1549,6 @@ async def list_mobile_sessions(request:Request):
     args=(owner,provider,profile,hidden)+((principal,) if principal else ())
     result=await feature(native.conversation_list,*args,timeout=8)
     return JSONResponse(result,headers={'Cache-Control':'no-store'})
-@router.post('/sessions/pin')
-async def pin_session(request:Request):
-    value=await body(request,4096)
-    owner,provider,profile,_=await identity_async(request,value.get('profile'))
-    if set(value)!={'session_id','pinned','profile'} or type(value.get('pinned')) is not bool:
-        raise HTTPException(400,'Choose a conversation and pin state')
-    session_id=value.get('session_id')
-    principal=voice_principal(request,owner,provider)
-    if not isinstance(session_id,str) or not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}',session_id):
-        raise HTTPException(400,'Choose an existing conversation')
-    def update():
-        # Use the gateway's registry writer, as session.set_hidden does; REST maintenance conflicts with a running gateway.
-        from tui_gateway import server
-        with server._profile_db({'profile':profile},writer=True) as db:
-            if db is None: raise HTTPException(503,'Conversation is unavailable. Try again.')
-            key=db.resolve_session_id(session_id)
-            row=db.get_session(key) if key else None
-            if not native.owns_row(owner,provider,profile,key,row,principal):
-                raise HTTPException(404,'Conversation not found.')
-            if not db.set_session_pinned(key,value['pinned']):
-                raise HTTPException(404,'Conversation not found.')
-            return {'session_id':key,'pinned':value['pinned']}
-    try: return await asyncio.to_thread(update)
-    except HTTPException: raise
-    except Exception: raise HTTPException(503,'Conversation is unavailable. Try again.') from None
-
 @router.get('/mobile/sessions/{stored_id}')
 async def read_mobile_session(stored_id:str,request:Request):
     owner,provider,profile,cfg=await identity_async(request)
@@ -1647,14 +1625,15 @@ async def proactive_enabled(request:Request):
     if toggle:
         if type(value['enabled']) is not bool: raise HTTPException(400,'enabled must be a boolean')
     else:
-        allowed={'enabled','delivery','check_minutes','quiet_start','quiet_end','model','provider'}
+        allowed={'enabled','delivery','check_minutes','quiet_start','quiet_end','model','provider','watch_model','watch_provider'}
         if set(value)-allowed or type(value.get('enabled')) is not bool:
             raise HTTPException(400,'Invalid Proactive setup fields')
     owner,provider,profile,cfg=await identity_async(request)
     if not toggle:
         try: proactive.validate_setup(value)
         except ValueError as exc: raise HTTPException(400,str(exc)) from None
-    if value.get('enabled') is True:
+    # The owned-conversation check is for turning the watch on; a full save of a watch that is already on only changes its choices. (A save racing a disable from another phone can pass this once; narrow, accepted.)
+    if value.get('enabled') is True and (toggle or not await feature(proactive.enabled,mobile,owner,profile,timeout=8)):
         stored=cfg.get('scheduled_callback_conversation_id')
         if not isinstance(stored,str) or not stored.strip():
             raise HTTPException(409,'Choose an owned assistant conversation before enabling Proactive')

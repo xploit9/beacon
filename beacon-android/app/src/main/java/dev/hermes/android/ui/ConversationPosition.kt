@@ -41,7 +41,7 @@ internal fun isDetachedDispatch(name: String, result: String?): Boolean {
  *
  * Terminal evidence and errors win over a stale `running`/`generating` status, because the same-id completion is
  * merged into the start event without clearing it. Without terminal evidence, `running`/`generating` only shows
- * while the turn is [streaming]; a stored call is NoResult, never running and never success.
+ * while the turn is [streaming] (a live call, or a stored call of the turn running now: [runningTurnMessageIds]); a call of a turn that is over is NoResult, never running and never success.
  */
 internal fun toolOutcome(name: String, status: String, isError: Boolean, result: String?, explicitCompletion: Boolean, streaming: Boolean): ToolOutcome {
     val state = status.trim().lowercase()
@@ -54,11 +54,20 @@ internal fun toolOutcome(name: String, status: String, isError: Boolean, result:
     }
 }
 
+/**
+ * The saved messages that belong to the turn running now: from the last message that begins a turn to the end (a "[System: ...]" note and a steer the person typed continue a turn, they do not begin
+ * another), and only while [turnRunning], the signal Stop shows. A stored tool call of such a message that has no result reads Running, as its live twin does. An earlier turn's call, and every call
+ * once the turn has ended, keeps "No result recorded". Like core.runningTurnMessages, with no message that begins a turn the whole chat is the turn.
+ */
+internal fun runningTurnMessageIds(messages: List<dev.hermes.android.Message>, turnRunning: Boolean): Set<String> =
+    if (!turnRunning) emptySet()
+    else messages.drop(messages.indexOfLast { it.role == "user" && it.displayKind != "steer" && !dev.hermes.android.core.isSteeringText(it.text) }.coerceAtLeast(0)).map { it.id }.toSet()
+
 internal fun toolOutcomeLabel(outcome: ToolOutcome): String = when (outcome) {
     ToolOutcome.Preparing -> "Preparing"
     ToolOutcome.Running -> "Running"
     ToolOutcome.Completed -> "Completed"
-    ToolOutcome.Dispatched -> "Dispatched"
+    ToolOutcome.Dispatched -> "Handed off"
     ToolOutcome.Failed -> "Failed"
     ToolOutcome.NoResult -> "No result recorded"
 }
@@ -78,6 +87,21 @@ internal fun nativeClockPattern(locale: java.util.Locale, is24Hour: Boolean): St
 internal fun nativeDayPattern(locale: java.util.Locale, withYear: Boolean, withWeekday: Boolean): String =
     android.text.format.DateFormat.getBestDateTimePattern(locale, (if (withWeekday) "EEE" else "") + (if (withYear) "y" else "") + "MMMd")?.takeIf { it.isNotBlank() }
         ?: (if (withWeekday) "EEE, " else "") + "MMM d" + (if (withYear) ", yyyy" else "")
+
+/** The platform's own best pattern for [skeleton] in [locale]; null where it has none (JVM tests). */
+internal fun platformBestPattern(locale: java.util.Locale, skeleton: String): String? = android.text.format.DateFormat.getBestDateTimePattern(locale, skeleton)
+
+/**
+ * A date and its time as one pattern in the locale's own order and joiner. The day and the clock are asked for as one skeleton, so the platform
+ * picks the separator ("12 نوفمبر 2026، 12:01 م", "Nov 12, 2026, 12:01 PM"); joining the two patterns with a fixed ", " left an English comma in Arabic.
+ * [best] is the platform lookup; today's English pattern stands where it has none (JVM tests).
+ */
+internal fun nativeDateTimePattern(
+    locale: java.util.Locale, is24Hour: Boolean, withYear: Boolean, withWeekday: Boolean,
+    best: (java.util.Locale, String) -> String? = ::platformBestPattern,
+): String =
+    best(locale, (if (withWeekday) "EEE" else "") + (if (withYear) "y" else "") + "MMMd" + (if (is24Hour) "Hm" else "hm"))?.takeIf { it.isNotBlank() }
+        ?: ((if (withWeekday) "EEE, " else "") + "MMM d" + (if (withYear) ", yyyy" else "") + ", " + (if (is24Hour) "HH:mm" else "h:mm a"))
 
 /** Like Relay's message and tool timestamps, in the phone's clock; null when no time was recorded. */
 internal fun messageTimeLabel(epoch: Long, zone: java.util.TimeZone = java.util.TimeZone.getDefault(), locale: java.util.Locale = java.util.Locale.getDefault(), is24Hour: Boolean = false): String? {

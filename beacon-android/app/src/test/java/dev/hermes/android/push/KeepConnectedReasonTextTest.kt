@@ -20,7 +20,7 @@ class KeepConnectedReasonTextTest {
         assertEquals("Can't reach Hermes. Retrying…", say(IOException()))
         assertEquals("Hermes refused the connection. Retrying…", say(ApiFailure(403, "")))
         assertEquals("Hermes refused the connection. Retrying…", say(ApiFailure(409, "")))
-        assertEquals("Check the Beacon plugin on Hermes.", say(ApiFailure(404, "")))
+        assertEquals("Check Beacon on Hermes.", say(ApiFailure(404, "")))
         listOf(500, 503, 418).forEach { assertEquals("Hermes had a problem. Retrying…", say(ApiFailure(it, ""))) }
         assertEquals("Hermes had a problem. Retrying…", say(KeepConnectedPageException()))
         assertEquals("Hermes had a problem. Retrying…", say(IllegalStateException()))

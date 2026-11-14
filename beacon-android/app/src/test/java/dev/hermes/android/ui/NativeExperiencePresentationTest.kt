@@ -96,7 +96,7 @@ class NativeExperiencePresentationTest {
         assertFalse(BackgroundActivitySummary().active)
         assertEquals("", backgroundActivityStatus(BackgroundActivitySummary()))
         assertEquals("Background status unavailable", backgroundActivityStatus(BackgroundActivitySummary(available = false)))
-        assertEquals("1 process · More may be active", backgroundActivityStatus(BackgroundActivitySummary(processes = 1, available = false)))
+        assertEquals("1 process", backgroundActivityStatus(BackgroundActivitySummary(processes = 1, available = false)))
     }
     @Test fun activeSubagentCountUsesTheCanonicalConversationRoster() {
         val session = json("subagents" to JSONArray()
@@ -167,7 +167,7 @@ class NativeExperiencePresentationTest {
         assertTrue(updatedHistoryRows(listOf(row), "chat-a", "/api/session/delete", json(), json("deleted" to "chat-a"), false, "").isEmpty())
     }
     @Test fun downloadErrorsAreShortAndDoNotExposeServerDetails() {
-        assertEquals("This file is larger than the 256 MB download limit.", fileDownloadError(IllegalArgumentException("Download exceeds permitted size")))
+        assertEquals("This file is larger than the 256 MB download limit.", fileDownloadError(IllegalArgumentException("This file is too large to download here.")))
         assertEquals("This file is no longer available.", fileDownloadError(dev.hermes.android.data.ApiFailure(404, "private path", plugin = false)))
         assertEquals("Couldn’t download this file. Check your connection and try again.", fileDownloadError(IllegalStateException("private path")))
     }

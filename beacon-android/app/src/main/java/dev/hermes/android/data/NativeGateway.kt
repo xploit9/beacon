@@ -4,8 +4,6 @@ import dev.hermes.android.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.sync.withLock
 import okhttp3.*
 import org.json.JSONObject
@@ -20,7 +18,6 @@ internal const val BEACON_THREAD_SOURCE = "android_thread"
 internal val THREAD_SOURCES = listOf(BEACON_THREAD_SOURCE, "phone")
 private val WINDOW_SERVER_REQUESTS = setOf("preview.act", "preview.read", "terminal.read", "window.read", "tour")
 private val SECURE_SERVER_REQUESTS = setOf("vault.save_login", "vault.code", "vault.unlock_prompt", "secret")
-private const val SECURE_PROMPT_LIMIT_MS = 100_000L // A local limit; the server's cancellation remains authoritative.
 
 private data class ParsedNativeRequestId(val key: String, val text: String)
 private data class NativeRequestIdentity(val idKey: String, val method: String, val sessionId: String)
@@ -87,7 +84,10 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     companion object {
         // Weak, so a gateway leaves with its client; answers are only routed between gateways of one account and profile.
         private val gateways: MutableSet<NativeGateway> = java.util.Collections.newSetFromMap(java.util.WeakHashMap())
-        private val secureProbes = Semaphore(4)
+        /** When a secure question was first seen, so a replay after the app returns keeps Hermes' original deadline. */
+        private val secureFirstSeen = ConcurrentHashMap<String, Long>()
+        /** Told when a secret question arrives and no screen is collecting events (the app is away); the app posts a notice. */
+        @Volatile internal var secureAwaiting: ((Scope, String) -> Unit)? = null
 
         /** Live, already-entitled prompts for the open conversation; values are never retained here. */
         internal fun pendingSecureRequests(scope: Scope, authorityVersion: Long? = null): List<JSONObject> {
@@ -95,6 +95,13 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             // Idle weak-registry entries must not hide a live entitled socket; output stays bounded below.
             val peers = synchronized(gateways) { gateways.filter { it.client.scope == scope.copy(session = "") && it.client.nativeAuthorityVersion() == authorityVersion } }
             return peers.asSequence().flatMap { it.secureRequests(scope).asSequence() }.take(8).toList()
+        }
+
+        /** Whether a live, entitled connection is attached to this conversation: an empty list from it means Hermes has no question open, with none it means nothing is known. */
+        internal fun secureLinkLive(scope: Scope, authorityVersion: Long? = null): Boolean {
+            if (scope.session.isBlank() || authorityVersion == null) return false
+            val peers = synchronized(gateways) { gateways.filter { it.client.scope == scope.copy(session = "") && it.client.nativeAuthorityVersion() == authorityVersion } }
+            return peers.any { it.secureLinkLive(scope) }
         }
     }
     private val connectLock = Mutex()
@@ -111,6 +118,12 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         NativePairing.deviceHeader(CANONICAL_TICKET_PATH, mine.identity.scope) == mine.device
     private fun secureCurrent(mine: Connection): Boolean = connectionIdentityCurrent(mine) && mine.authorityVersion != null &&
         mine.authorityVersion == client.nativeAuthorityVersion() && mine.secureAdmission != null && mine.secureAdmission == client.nativeSecureAdmission()
+
+    private fun secureLinkLive(scope: Scope): Boolean {
+        val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted && secureCurrent(it) } ?: return false
+        val active = synchronized(cursorLock) { cursor } ?: return false
+        return active.connection === mine && active.binding.scope == scope.copy(session = "") && active.binding.storedSessionId == scope.session
+    }
 
     private fun secureRequests(scope: Scope): List<JSONObject> {
         val mine = connection?.takeIf { it.failure == null && it.ready.isCompleted && secureCurrent(it) } ?: return emptyList()
@@ -225,7 +238,11 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                     }
                     if (!frame.has("method") && id.isNotBlank()) mine.pending.remove(id)?.complete(frame)
                     else if (method == "approval" || method == "clarify" || method in SECURE_SERVER_REQUESTS) {
-                        if (method in SECURE_SERVER_REQUESTS) frame.put("_secure_received_ms", System.nanoTime() / 1_000_000)
+                        if (method in SECURE_SERVER_REQUESTS) {
+                            frame.put("_secure_received_ms", System.nanoTime() / 1_000_000)
+                            // Nothing is collecting events (the app is away): the question waits in the queue, and the person is told.
+                            if (frame.has("id") && !consuming.get()) runCatching { secureAwaiting?.invoke(client.scope, method) }
+                        }
                         // A prompt can precede the session.resume acknowledgement that installs its owner binding.
                         // Without an id it is a notification: JSON-RPC never answers one, and it cannot be answered.
                         if (frame.has("id") && !mine.frames.trySend(frame).isSuccess) {
@@ -317,7 +334,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 } else if (authority) {
                     canonicalCreate = true
                     val source = wireParams.string("source")
-                    if (source in THREAD_SOURCES) throw IOException("Native authority cannot create this thread type")
+                    if (source in THREAD_SOURCES) throw NativeThreadUnsupported()
                     if (source == "android") wireParams.remove("source")
                     if (wireParams.has("close_on_disconnect")) {
                         if (wireParams.opt("close_on_disconnect") != false) throw IOException("Native authority cannot apply this disconnect policy")
@@ -325,6 +342,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                     }
                 } else if (normalizeLegacyCreateSource) {
                     wireParams.put("source", if (wireParams.string("source") == BEACON_THREAD_SOURCE) BEACON_THREAD_SOURCE else "android")
+                    // The legacy contract refuses an unknown key as version skew; its create has no retry identity (apps/desktop/src/api/client.ts, LEGACY_STRIP).
+                    wireParams.remove("request_id")
                 }
             }
             currentCoroutineContext().ensureActive()
@@ -466,7 +485,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         // A chat action answers from its own detached client, but the request stays owned by the stream connection that received it.
         val peers = synchronized(gateways) { gateways.filter { it !== this && it.client.scope == client.scope } }
         val (owner, mine, open) = (listOf(this) + peers).firstNotNullOfOrNull { it.openServerRequest(method, requestId, sessionId, payload.optString("secure_connection")) }
-            ?: throw IOException("Native server request is no longer active")
+            ?: throw NativeRequestEnded()
         val result = when (method) {
             "approval" -> {
                 val choice = payload.string("choice")
@@ -535,22 +554,21 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         }
     }
 
-    private suspend fun securePromptsAvailable(mine: Connection): Boolean {
-        val scope = client.scope
-        val origin = runCatching { java.net.URI(scope.origin) }.getOrNull() ?: return false
+    /**
+     * Hermes sends these questions only to a viewer that said it can answer them (client.capabilities server_requests), so no plugin has to
+     * vouch for them. The phone still refuses to take a secret over plain http, except to this device.
+     */
+    private fun securePromptsAvailable(mine: Connection): Boolean {
+        val origin = runCatching { java.net.URI(client.scope.origin) }.getOrNull() ?: return false
         val host = origin.host ?: return false
-        if (origin.userInfo != null || !(origin.scheme == "https" || origin.scheme == "http" &&
-                (host.equals("localhost", true) || host in setOf("127.0.0.1", "::1", "[::1]")))) return false
-        return try {
-            withTimeoutOrNull(4000) {
-                secureProbes.withPermit {
-                    if (connection !== mine || mine.failure != null || client.scope != scope || !secureCurrent(mine)) false
-                    else client.nativeRequest("/api/plugins/beacon/mobile/vault/capabilities")
-                        .optJSONObject("capabilities")?.opt("secure_prompts") == true &&
-                        connection === mine && mine.failure == null && client.scope == scope && secureCurrent(mine)
-                }
-            } ?: false
-        } catch (error: CancellationException) { throw error } catch (_: Exception) { false }
+        return origin.userInfo == null && (origin.scheme == "https" || origin.scheme == "http" &&
+            (host.equals("localhost", true) || host in setOf("127.0.0.1", "::1", "[::1]"))) && connection === mine && mine.failure == null && secureCurrent(mine)
+    }
+
+    /** The first time this question was seen, so a replay keeps Hermes' deadline instead of starting a new window. */
+    private fun secureReceivedMs(sessionId: String, method: String, idKey: String, received: Long): Long {
+        if (secureFirstSeen.size > 256) secureFirstSeen.entries.removeIf { received - it.value > 600_000 }
+        return secureFirstSeen.getOrPut("${client.scope.key}\u0000$sessionId\u0000$method\u0000$idKey") { received }
     }
 
     /** Only the fields needed for the protected form leave the socket reader. */
@@ -652,7 +670,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         }
         val identity = NativeRequestIdentity(idParts.key, method, sessionId)
         val now = System.nanoTime() / 1_000_000
-        var expiresAt = if (secure) frame.optLong("_secure_received_ms", now) + SECURE_PROMPT_LIMIT_MS else Long.MAX_VALUE
+        val window = securePromptWindowMs(method)
+        var expiresAt = if (secure) secureReceivedMs(sessionId, method, idParts.key, frame.optLong("_secure_received_ms", now)) + window else Long.MAX_VALUE
         if (secure && params.has("expires_at_ms")) {
             val raw = params.opt("expires_at_ms")
             if (raw !is Number || !raw.toDouble().isFinite() || raw.toDouble() != raw.toLong().toDouble() || raw.toLong() <= 0) {
@@ -661,7 +680,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 return null
             }
             val remaining = raw.toLong() - System.currentTimeMillis()
-            expiresAt = minOf(expiresAt, now + remaining.coerceIn(0, SECURE_PROMPT_LIMIT_MS))
+            expiresAt = minOf(expiresAt, now + remaining.coerceIn(0, window))
         }
         if (secure && expiresAt <= now) {
             synchronized(mine.requestLock) { rememberRetiredRequestLocked(mine, identity) }
@@ -941,7 +960,12 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         } finally {
             consuming.set(false)
             mine?.let { current -> synchronized(current.requestLock) {
-                current.serverRequests.values.filter { it.method in SECURE_SERVER_REQUESTS }.toList().forEach { retireServerRequestLocked(current, it) }
+                // The screen stopped listening (app left, chat closed). Hermes still waits for its own timeout, so the question is released,
+                // not retired: a replay when the app returns brings it back, and until then it cannot be answered.
+                current.serverRequests.values.filter { it.method in SECURE_SERVER_REQUESTS }.toList().forEach { request ->
+                    if (current.serverRequests[request.idKey] === request) current.serverRequests.remove(request.idKey)
+                    current.secureIds.remove(request.idKey)
+                }
             } }
             if (mine?.failure != null) mine.frames.cancel()
         }

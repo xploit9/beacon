@@ -34,13 +34,13 @@ internal data class LicensedWork(val name: String, val license: String, val noti
 internal val openSourceWorks = listOf(
     LicensedWork("Beacon", "GPL-3.0-only", "Beacon Android · GPL-3.0-only. Complete corresponding source: https://github.com/xploit9/beacon."), // verbatim
     LicensedWork("Mermaid 11.17.2", "MIT", "Mermaid 11.17.2 · MIT. Source: https://github.com/mermaid-js/mermaid. Bundled offline diagram grammar and renderer."), // verbatim
-    LicensedWork("KaTeX 0.18.2", "MIT", "KaTeX 0.18.2 · MIT. Source: https://github.com/KaTeX/KaTeX. Bundled offline math in Mermaid diagrams."), // verbatim
-    LicensedWork("jsoup 1.23.2", "MIT", "jsoup 1.23.2 · MIT. Source: https://jsoup.org. Parses offline HTML before isolated previews."), // verbatim
-    LicensedWork("core-js 3.50.0", "MIT", "core-js 3.50.0 · MIT. Source: https://github.com/zloirock/core-js. Selected compatibility functions for the isolated diagram renderer."), // verbatim
+    LicensedWork("KaTeX 0.18.2", "MIT", "KaTeX 0.18.2 · MIT. Source: https://github.com/KaTeX/KaTeX. Math in diagrams."), // verbatim
+    LicensedWork("jsoup 1.23.2", "MIT", "jsoup 1.23.2 · MIT. Source: https://jsoup.org. Shows HTML."), // verbatim
+    LicensedWork("core-js 3.50.0", "MIT", "core-js 3.50.0 · MIT. Source: https://github.com/zloirock/core-js. Diagram support."), // verbatim
     LicensedWork("hermes-mobile-app reference", "MIT", "Reference design: omarqaterge/hermes-mobile-app · MIT. Source: https://github.com/omarqaterge/hermes-mobile-app, revision 2d5c5881764c218c4393567f8698db670fb9ad7e. Profile selector, navigation and rich content ideas are implemented in native Compose."), // verbatim
-    LicensedWork("Hermes Relay", "MIT", "Hermes Relay · MIT. Adapted code includes chat presentation, NativeAuth, NativeOperations, OpenAiWire, RelayCallback, RelayCallbackPolicy and sphere rendering. SettingsSearch follows Relay’s search pattern. See the source headers and retained Hermes Relay MIT notice."), // verbatim
+    LicensedWork("Hermes Relay", "MIT", "Hermes Relay · MIT. Parts of chat, sign-in, voice, search and the sphere are adapted from it. See the source headers and the Hermes Relay MIT notice."), // verbatim
     LicensedWork("JLaTeXMath Android 0.2.0", "GPL-2.0-or-later", "Copyright 2017 Dimitry Ivanov and upstream contributors. GPL-2.0-or-later with the independent module linking exception. Full license texts are in the document list below.\nSource: https://github.com/noties/jlatexmath-android\nPinned commit: cc2a83dcf695028b5588f91a90734d94eb5bd02b"), // verbatim
-    LicensedWork("AndroidSVG 1.4", "Apache-2.0", "AndroidSVG 1.4 · Apache-2.0. Copyright 2013 Paul LeBeau, Cave Rock Software Ltd. Source: https://github.com/BigBadaboom/androidsvg. Bounded static previews do not load external assets or entities."), // verbatim
+    LicensedWork("AndroidSVG 1.4", "Apache-2.0", "AndroidSVG 1.4 · Apache-2.0. Copyright 2013 Paul LeBeau, Cave Rock Software Ltd. Source: https://github.com/BigBadaboom/androidsvg. Shows SVG images."), // verbatim
 )
 
 @Composable fun LicenseScreen(vm: BeaconViewModel) {

@@ -113,7 +113,7 @@ def test_api_followup_receipt_controls_survive_expensive_timeouts_and_cancellati
     original_wait = asyncio.wait_for
 
     async def short_wait(task, timeout):
-        return await original_wait(task, .03 if timeout == 15 else timeout)
+        return await original_wait(task, .03 if timeout in (15, 10, 5) else timeout)
     monkeypatch.setattr(asyncio, 'wait_for', short_wait)
 
     async def exercise():

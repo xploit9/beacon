@@ -37,7 +37,7 @@ class NativeSchedulesTest {
     }
 
     @Test fun statusNeverInfersRunningFromPersistence() {
-        assertEquals("Execution unconfirmed",scheduleState(JSONObject()))
+        assertEquals("Not confirmed",scheduleState(JSONObject()))
         assertEquals("Completed",scheduleState(JSONObject().put("enabled",false).put("state","completed")))
         assertEquals("Waiting",scheduleState(JSONObject().put("scheduler_heartbeat_age_s",200).put("next_run_at","tomorrow")))
         assertEquals("Failed",scheduleState(JSONObject().put("last_status","error")))
@@ -146,10 +146,10 @@ class NativeSchedulesTest {
         assertTrue("by script alone, in a folder", scheduleIsCallback(json("script" to "C:\\Users\\x\\scripts\\beacon-callback-$hash.py")))
         assertFalse(scheduleIsCallback(json("name" to "Beacon callback notes", "script" to "daily-notes.py")))
         assertFalse(scheduleIsCallback(json("name" to "Morning summary")))
-        assertEquals("Callback", scheduleTitle(callback, "Untitled schedule", "Callback"))
-        assertEquals("Morning summary", scheduleTitle(json("name" to "Morning summary"), "Untitled schedule", "Callback"))
-        assertEquals("Untitled schedule", scheduleTitle(JSONObject(), "Untitled schedule", "Callback"))
-        val shown = listOf(scheduleTitle(callback, "Untitled schedule", "Callback"), scheduleBody(callback, ""), describeSchedule(callback.getJSONObject("schedule"), scheduleDisplay(callback), "Asia/Dubai", ScheduleFormat(true, java.util.Locale.US, { it }, "d MMM")))
+        assertEquals("Call back", scheduleTitle(callback, "Untitled schedule", "Call back"))
+        assertEquals("Morning summary", scheduleTitle(json("name" to "Morning summary"), "Untitled schedule", "Call back"))
+        assertEquals("Untitled schedule", scheduleTitle(JSONObject(), "Untitled schedule", "Call back"))
+        val shown = listOf(scheduleTitle(callback, "Untitled schedule", "Call back"), scheduleBody(callback, ""), describeSchedule(callback.getJSONObject("schedule"), scheduleDisplay(callback), "Asia/Dubai", ScheduleFormat(true, java.util.Locale.US, { it }, "d MMM")))
         shown.forEach { assertFalse(it, it.contains(hash.take(8))) }
         assertEquals("Once · 28 Oct, 19:01", shown[2])
     }

@@ -147,7 +147,8 @@ class BotModeHomeUiTest {
             // The screen reads the roster once when it opens (and, with no Hermes behind it, clears it); the roster is set after that.
             compose.waitForIdle()
             compose.runOnIdle {
-                roster(vm).value = state
+                // An injected list stands for one Hermes answered, as the controller marks it.
+                roster(vm).value = state.copy(loaded = true)
                 if (crons != null) data(vm).value = data(vm).value + ("crons" to crons)
             }
             compose.waitForIdle()
@@ -227,11 +228,11 @@ class BotModeHomeUiTest {
     }
 
     @Test fun botRowsShowTheirRoleARealStatusAndAQuickGroupAction() = withHome { vm ->
-        compose.onNodeWithTag("teammate-row:coder").assertTextContains("Coder").assertTextContains("Reviews code").assertTextContains("Spaces: 1")
-        compose.onNodeWithTag("teammate-row:default").assertTextContains("Your main assistant").assertTextContains("Spaces: 1")
+        compose.onNodeWithTag("teammate-row:coder").assertTextContains("Coder").assertTextContains("Reviews code").assertTextContains("In 1 space")
+        compose.onNodeWithTag("teammate-row:default").assertTextContains("Your main assistant").assertTextContains("In 1 space")
         // The recent-spaces list is cut: a count would be too low, so none is shown.
         compose.runOnIdle { roster(vm).value = roster(vm).value.copy(moreSpaces = true) }
-        compose.onAllNodesWithText("Spaces: 1", substring = true).assertCountEquals(0)
+        compose.onAllNodesWithText("In 1 space", substring = true).assertCountEquals(0)
         compose.runOnIdle { roster(vm).value = roster(vm).value.copy(moreSpaces = false) }
         compose.onNodeWithTag("teammate-space:coder").assertIsDisplayed().assertIsEnabled().assertWidthIsAtLeast(48.dp).assertHeightIsAtLeast(48.dp)
             .assertContentDescriptionContains("Start a group with Coder")
@@ -277,7 +278,7 @@ class BotModeHomeUiTest {
     @Test fun withoutAnyBotYetTheScreenStillOffersWhereToStart() = withHome(NativeBotModeState(), crons = null) { _ ->
         // Nothing read and nothing loading: the buttons stay, the empty state says so, and the suggested roles give the screen a start.
         compose.onNodeWithTag("bot-mode-new-bot").assertIsDisplayed().assertIsEnabled()
-        compose.onNodeWithText("No bots available").assertIsDisplayed()
+        compose.onNodeWithText("No bots yet").assertIsDisplayed()
         compose.onNodeWithTag("bot-mode-home-list").performScrollToNode(hasTestTag("bot-mode-suggested-roles"))
         compose.onNodeWithTag("bot-mode-suggested-role:researcher").assertIsDisplayed()
     }

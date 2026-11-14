@@ -13,6 +13,7 @@ import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.AndroidUiDispatcher
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
@@ -23,6 +24,8 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.nativeApprovalModes
 import dev.hermes.android.data.appErrorText
 import kotlinx.coroutines.CancellationException
+import kotlin.coroutines.ContinuationInterceptor
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 
@@ -44,6 +47,13 @@ internal fun chatApprovalSelection(record: JSONObject?, profileKey: String?, ses
     }
 }
 
+/**
+ * The shield names a mode only once this chat's own record has been read. Until then it is a plain shield with no mode word, never the profile's mode
+ * (a chat that skips approvals would then read as asking), and never the word "Unknown": a chat that cannot be read says so in the menu, where it can be retried.
+ */
+internal fun shieldDescription(selection: String, approvals: String, mode: String): String =
+    if (selection == "unknown") approvals else "$approvals: $mode"
+
 /** While a read or save is in flight the shield keeps a known state on screen (the one just asked for, else the last read) instead of "Unknown". */
 internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: String?): String = if (inFlight) asked ?: settled else settled
 
@@ -56,7 +66,7 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     val pending by vm.conversationPending.collectAsStateWithLifecycle()
     val capturedClient = vm.client
     val capturedScope = vm.authenticatedScope()?.takeIf { it.origin == ui.origin && it.owner == ui.owner && it.profile == ui.profile && it.session == chat.sessionId }
-    val scope = rememberCoroutineScope()
+    val scope = rememberCoroutineScope { MainUiDispatcher }
     var open by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     var confirmYolo by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     var saving by remember(capturedClient, capturedScope) { mutableStateOf(false) }
@@ -97,12 +107,12 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     }
     Box {
         IconButton(onClick = { open = true; vm.loadChatApprovals() }, enabled = enabled && capturedClient != null && capturedScope != null && !busy, modifier = Modifier.testTag("composer-approvals")) {
-            ApprovalShield(selection, uiText("Approvals") + ": " + uiText(approvalChoiceLabel(selection)))
+            ApprovalShield(selection, shieldDescription(selection, uiText("Approvals"), uiText(approvalChoiceLabel(selection))))
         }
         DropdownMenu(open, { open = false }, modifier = Modifier.heightIn(max = 360.dp).testTag("approvals-menu")) {
             DropdownMenuItem({ Text(uiText("Approvals in this chat")) }, {}, enabled = false)
             if (loading || busy) DropdownMenuItem({ Text(uiText(if (busy) "Saving…" else "Checking…")) }, {}, enabled = false)
-            if (record == null && !loading) DropdownMenuItem({ Text(uiText("Approvals are unknown. Tap to retry.")) }, { vm.loadChatApprovals() })
+            if (record == null && !loading) DropdownMenuItem({ Text(uiText("Couldn't load approvals")) }, { vm.loadChatApprovals() })
             if (profileMode == "off") DropdownMenuItem({ Text(uiText("Approvals are off")) }, {}, enabled = false)
             val choicesEnabled = enabled && !loading && !busy && profileMode in nativeApprovalModes && profileMode != "off"
             // Hermes keeps only YOLO per chat; Manual or Auto is the profile's mode and is changed in Profiles.
@@ -111,7 +121,6 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
                 DropdownMenuItem(
                     text = { Column {
                         Text(uiText(approvalChoiceLabel(if (choice == "ask") profileMode else "yolo")))
-                        Text(uiText(if (choice == "yolo") "Never ask before actions" else if (profileMode == "smart") "Ask only for risky actions" else "Ask before actions"), style = MaterialTheme.typography.bodySmall)
                     } },
                     leadingIcon = { ApprovalShield(if (choice == "ask") profileMode else "yolo", null) },
                     trailingIcon = { if (isSelected) Icon(Icons.Rounded.Check, uiText("Selected")) },
@@ -140,7 +149,7 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     val selecting by vm.settingsProfileSelecting.collectAsStateWithLifecycle()
     val active = vm.settingsProfileClient()
     val version = vm.settingsProfileVersion()
-    val scope = rememberCoroutineScope()
+    val scope = rememberCoroutineScope { MainUiDispatcher }
     var saving by remember(active, version) { mutableStateOf(false) }
     var loading by remember(active, version) { mutableStateOf(false) }
     var failed by remember(active, version) { mutableStateOf(false) }
@@ -202,28 +211,32 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
                 if (failed) { SettingsErrorRow(uiText("Couldn't load approvals"), { refresh() }, uiText("Retry"), retryTestTag = "profile-approvals-retry"); SettingsDivider() }
                 // "Off" is not a segment, so neither shows selected; choosing Manual or Auto turns approvals back on.
                 if (profileApprovalsOff(mode)) Row(Modifier.fillMaxWidth().padding(start = 16.dp, top = 12.dp, end = 16.dp)) { SettingsStatusPill(SettingsStatus.Error, uiText("Approvals off"), testTag = "profile-approvals-off") }
-                SettingsChoiceRow(uiText("Approvals for all chats"), mode, ProfileApprovalChoices, ::save, icon = Icons.Rounded.FrontHand,
+                SettingsChoiceRow(uiText("Hermes commands"), mode, ProfileApprovalChoices, ::save, icon = Icons.Rounded.FrontHand,
                     optionLabels = ProfileApprovalChoices.associateWith(::approvalChoiceLabel),
                     optionIcons = mapOf("manual" to Icons.Rounded.FrontHand, "smart" to Icons.Rounded.AutoMode),
                     optionTestTags = ProfileApprovalChoices.associateWith { "profile-approval-$it" },
-                    enabled = active != null && !loading && !busy && !failed, style = ChoiceStyle.Segmented)
-                // One line on what each does: Manual asks every time; Auto lets what Hermes judges safe through and still asks for the rest.
-                Text(uiText("Manual asks every time. Auto lets safe actions through."), Modifier.padding(start = 16.dp, end = 16.dp, bottom = 12.dp).testTag("profile-approvals-caption"),
-                    style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    enabled = active != null && !loading && !busy && !failed, style = ChoiceStyle.Segmented, fitSegments = true)
             }
         }
     }
 }
+
+/**
+ * The dispatcher the app's own windows run composition effects on: the window Recomposer is built on AndroidUiDispatcher.CurrentThread, which is
+ * AndroidUiDispatcher.Main on the main thread (compose-ui WindowRecomposer.android.kt, AndroidUiDispatcher.android.kt). Naming it changes nothing in the
+ * app. Under the v1 Compose test rule, whose UnconfinedTestDispatcher resumes a coroutine on the thread that woke it, it keeps the state these scopes
+ * write after a network call on the main thread. Only the dispatcher is taken: the effect context keeps its own frame clock.
+ */
+internal val MainUiDispatcher: CoroutineContext get() = AndroidUiDispatcher.Main[ContinuationInterceptor]!!
 
 /** The two modes the Settings choice offers; a stored "off" stays recoverable by picking either. */
 internal val ProfileApprovalChoices = listOf("manual", "smart")
 internal fun profileApprovalsOff(mode: String): Boolean = mode == "off"
 
 internal fun approvalChoiceLabel(choice: String): String = when (choice) {
-    "manual" -> "Manual"
-    "smart" -> "Auto"
-    "off" -> "Off"
-    "yolo" -> "Skip approvals"
+    "manual" -> "Always ask"
+    "smart" -> "Ask for risky ones"
+    "off", "yolo" -> "Don't ask"
     else -> "Unknown"
 }
 

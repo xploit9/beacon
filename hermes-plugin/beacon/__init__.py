@@ -13,7 +13,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools','email_drafts','vault_attestation','voice_context','gateway_tools','voice_continuation')
+_MODULE_NAMES=('mobile','native','observers','proactive','phone_delivery','live_context','phone_tools','email_drafts','voice_context','gateway_tools','voice_continuation')
 # Only purge the siblings loaded here; dashboard-only modules may still serve live routes.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -26,7 +26,6 @@ for name in _MODULE_NAMES:
 mobile=sys.modules['beacon_mobile'];native=sys.modules['beacon_native'];observers=sys.modules['beacon_observers']
 proactive=sys.modules['beacon_proactive'];phone_delivery=sys.modules['beacon_phone_delivery']
 live_context=sys.modules['beacon_live_context'];phone_tools=sys.modules['beacon_phone_tools'];email_drafts=sys.modules['beacon_email_drafts']
-vault_attestation=sys.modules['beacon_vault_attestation']
 
 def _cron_fallback_allowed(cfg,row):
     if row.get('source')!='cron' or cfg.get('scheduled_callbacks_enabled') is not True: return False
@@ -719,11 +718,9 @@ def _restart_stale_dashboard():
     except Exception: pass
 
 def register(ctx):
-    global _ctx,_vault_coordinator
+    global _ctx
     _ctx=ctx
     sys.modules['beacon_voice_continuation'].register(ctx,mobile,native)
-    _vault_coordinator=vault_attestation.acquire_gateway(mobile,register)
-    vault_coordinator=_vault_coordinator
     gateway_process=_is_gateway_process()
     ctx.register_tool(name='beacon_call_user',toolset='beacon',description='Ring the owner through Beacon Android using the current saved native conversation. An invitation is pending, not proof of answering. Use only for owner-requested callbacks.',
         schema={'name':'beacon_call_user','description':'Ring an authorized native callback invitation','parameters':{'type':'object','properties':{'reason':{'type':'string','maxLength':240,'description':'Brief owner-requested reason for the call; do not claim unverified work is finished'}},'additionalProperties':False}},handler=call_user)
@@ -771,22 +768,13 @@ def register(ctx):
     ctx.register_hook('on_session_end',native_completion)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
-    ctx.register_hook('pre_tool_call',vault_coordinator.guard)
-    # Cleanup runs before the guard is removed because native registrations unwind in reverse order.
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
-    if callable(getattr(ctx,'on_unload',None)):
-        ctx.on_unload(lambda coordinator=vault_coordinator,owner=vault_attestation: owner.release_gateway(coordinator))
     phone_delivery.register(ctx)
     phone_tools.register(ctx)
     email_drafts.register(ctx)
-    def start_vault(coordinator=vault_coordinator,gateway=gateway_process,owner_mobile=mobile,root=ROOT):
-        if gateway:
-            if not coordinator.version: coordinator.version=owner_mobile.read_plugin_version(root/'plugin.yaml')
-            coordinator.start()
-    _after_load(start_vault,_record_gateway_plugin_version,_restart_stale_dashboard)
+    _after_load(_record_gateway_plugin_version,_restart_stale_dashboard)
 
 _after_load_thread=None
-_vault_coordinator=None
 
 def _after_load(*steps):
     # Hermes gives a plugin 10 s to import and register, then loads Hermes without it: these steps read the database and the

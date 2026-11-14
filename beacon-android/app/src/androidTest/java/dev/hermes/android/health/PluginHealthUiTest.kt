@@ -29,10 +29,15 @@ import dev.hermes.android.ui.HealthTarget
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.PluginHealth
 import dev.hermes.android.ui.PluginHealthRows
+import dev.hermes.android.ui.PluginRepairContent
 import dev.hermes.android.ui.SettingsSection
 import dev.hermes.android.ui.SettingsStatus
 import dev.hermes.android.ui.pluginHealthOf
 import dev.hermes.android.ui.uiText
+import dev.hermes.android.updates.RepairFinding
+import dev.hermes.android.updates.RepairProblem
+import dev.hermes.android.updates.RepairStage
+import dev.hermes.android.updates.RepairUi
 import dev.hermes.android.uiux.gaps.showPage
 import org.json.JSONArray
 import org.json.JSONObject
@@ -207,6 +212,109 @@ class PluginHealthUiTest {
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(gatewayBusy = true)), null, false) {} } }
         compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
         compose.onNodeWithTag("plugin-health-status").assertTextContains("Healthy")
+    }
+
+    // ---- Repair Beacon
+
+    private fun repairPage(state: RepairUi, finding: RepairFinding? = null, onRepair: () -> Unit = {}) =
+        compose.showPage { SettingsSection("Beacon plugin") { PluginRepairContent(state, onRepair, finding) } }
+
+    @Test fun repairAsksFirstAndRunsOnlyWhenTheOwnerConfirms() {
+        var runs = 0
+        repairPage(RepairUi()) { runs++ }
+        compose.onNodeWithTag("plugin-repair").assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("Repair Beacon").assertIsDisplayed()
+        compose.onNodeWithTag("plugin-repair-confirm").assertDoesNotExist()
+        compose.onNodeWithTag("plugin-repair").performClick()
+        // The sheet says only what will happen, in one short line.
+        compose.onNodeWithText("Reinstalls the latest Beacon. The Hermes dashboard restarts briefly.").assertIsDisplayed()
+        compose.onNodeWithTag("plugin-repair-cancel").performClick()
+        compose.runOnIdle { assertEquals(0, runs) }
+        compose.onNodeWithTag("plugin-repair-confirm").assertDoesNotExist()
+        compose.onNodeWithTag("plugin-repair").performClick()
+        compose.onNodeWithTag("plugin-repair-confirm").assertHeightIsAtLeast(48.dp).performClick()
+        compose.runOnIdle { assertEquals(1, runs) }
+        compose.onNodeWithTag("plugin-repair-confirm").assertDoesNotExist()
+    }
+
+    @Test fun repairNamesWhatHermesSaysIsWrongBesideTheRow() {
+        var finding by mutableStateOf<RepairFinding?>(null)
+        compose.showPage { SettingsSection("Beacon plugin") { PluginRepairContent(RepairUi(), {}, finding) } }
+        compose.onNodeWithText("Beacon is on Hermes but isn't running.").assertDoesNotExist()
+        for ((found, line) in listOf(RepairFinding.NotRunning to "Beacon is on Hermes but isn't running.", RepairFinding.TurnedOff to "Beacon is turned off on Hermes.",
+                RepairFinding.NotInstalled to "Beacon isn't installed on this Hermes")) {
+            finding = found
+            compose.waitForIdle()
+            compose.onNodeWithText(line).assertIsDisplayed()
+        }
+        finding = RepairFinding.Healthy
+        compose.waitForIdle()
+        compose.onNodeWithText("Beacon isn't installed on this Hermes").assertDoesNotExist()
+    }
+
+    @Test fun whileItWorksTheRowSaysWhatItDoesAndCannotBeTappedTwice() {
+        var runs = 0
+        var state by mutableStateOf(RepairUi(RepairStage.Checking))
+        compose.showPage { SettingsSection("Beacon plugin") { PluginRepairContent(state, { runs++ }) } }
+        for ((stage, label) in listOf(RepairStage.Checking to "Checking…", RepairStage.Repairing to "Repairing Beacon…", RepairStage.Waiting to "Reconnecting…")) {
+            state = RepairUi(stage)
+            compose.waitForIdle()
+            compose.onNodeWithTag("plugin-repair").assertTextContains(label).performClick()
+            compose.onNodeWithTag("plugin-repair-confirm").assertDoesNotExist()
+        }
+        compose.runOnIdle { assertEquals(0, runs) }
+    }
+
+    @Test fun aFailureSaysWhyInOneLineAndRetryAsksAgainBeforeRunning() {
+        var runs = 0
+        repairPage(RepairUi(RepairStage.Failed, RepairProblem.Busy, RepairFinding.StillOld)) { runs++ }
+        compose.onNodeWithText("Hermes is busy. Try again later.").assertIsDisplayed()
+        compose.onNodeWithTag("plugin-repair-retry").assertHeightIsAtLeast(48.dp).performClick()
+        compose.onNodeWithTag("plugin-repair-confirm").assertIsDisplayed()
+        compose.runOnIdle { assertEquals(0, runs) }
+        compose.onNodeWithTag("plugin-repair-confirm").performClick()
+        compose.runOnIdle { assertEquals(1, runs) }
+    }
+
+    @Test fun everyReasonItCanStopForIsShownInItsOwnWords() {
+        var state by mutableStateOf(RepairUi(RepairStage.Failed, RepairProblem.SignIn))
+        compose.showPage { SettingsSection("Beacon plugin") { PluginRepairContent(state, {}) } }
+        for (problem in RepairProblem.entries) {
+            state = RepairUi(RepairStage.Failed, problem)
+            compose.waitForIdle()
+            compose.onNodeWithText(problem.text).assertIsDisplayed()
+        }
+    }
+
+    @Test fun aFinishedRepairSaysSo() {
+        repairPage(RepairUi(RepairStage.Done, finding = RepairFinding.NotRunning))
+        compose.onNodeWithTag("plugin-repair-done").assertTextContains("Beacon is repaired.")
+        compose.onNodeWithTag("plugin-repair").assertDoesNotExist()
+    }
+
+    @Test fun aBeaconNewerThanTheLatestReleaseIsLeftAloneAndTheRowSaysSoNotRepaired() {
+        repairPage(RepairUi(RepairStage.Done, finding = RepairFinding.Newer))
+        compose.onNodeWithTag("plugin-repair-done").assertTextContains("Beacon is newer than the latest release.")
+        compose.onAllNodesWithText("Beacon is repaired.").assertCountEquals(0)
+        compose.onNodeWithTag("plugin-repair").assertDoesNotExist()
+    }
+
+    @Test fun repairInArabicLargeTextKeepsItsTargetsAndTranslatesTheSheet() {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl, LocalDensity provides Density(density.density, fontScale = 1.6f)) {
+                NativeLocalization("ar") {
+                    dev.hermes.android.BeaconTheme(dark = false) { SettingsSection("Beacon plugin") { PluginRepairContent(RepairUi(), {}, RepairFinding.NotRunning) } }
+                }
+            }
+        }
+        compose.waitUntil(5_000) { compose.onAllNodesWithText("إصلاح Beacon").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("plugin-repair").assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("Beacon موجود على Hermes لكنه لا يعمل.").assertExists()
+        compose.onNodeWithTag("plugin-repair").performClick()
+        compose.onNodeWithText("يعيد تثبيت أحدث إصدار من Beacon. تتم إعادة تشغيل لوحة تحكم Hermes لوقت قصير.").assertExists()
+        compose.onNodeWithTag("plugin-repair-confirm").assertHeightIsAtLeast(48.dp)
+        compose.onNodeWithText("إلغاء").assertExists()
     }
 
     @Test fun arabicInLargeTextKeepsEveryRowAndTheCheckNowTarget() {

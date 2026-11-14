@@ -28,6 +28,7 @@ import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.CornerRadius
@@ -134,13 +135,16 @@ val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
     }
 }
 /** [centered] is for a state that sits under a centred picture (a null [icon] when the picture is already there). */
-@Composable fun EmptyState(title: String, description: String, icon: ImageVector? = Icons.Rounded.ChatBubbleOutline, action: String = "", onAction: () -> Unit = {}, centered: Boolean = false) {
+@Composable fun EmptyState(title: String, description: String, icon: ImageVector? = Icons.Rounded.ChatBubbleOutline, action: String = "", onAction: () -> Unit = {}, centered: Boolean = false,
+    secondaryAction: String = "", onSecondaryAction: () -> Unit = {}, selectable: Boolean = false) {
     val align = if (centered) androidx.compose.ui.text.style.TextAlign.Center else androidx.compose.ui.text.style.TextAlign.Start
     Column(Modifier.fillMaxWidth().padding(32.dp), verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = if (centered) androidx.compose.ui.Alignment.CenterHorizontally else androidx.compose.ui.Alignment.Start) {
         if (icon != null) Icon(icon, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
         Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.headlineSmall, textAlign = align)
-        Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = align)
-        if (action.isNotBlank()) Button(onClick = onAction, modifier = Modifier.heightIn(min = 48.dp)) { Text(action) }
+        val body: @Composable () -> Unit = { Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = align) }
+        if (description.isNotBlank()) { if (selectable) androidx.compose.foundation.text.selection.SelectionContainer { body() } else body() }
+        if (action.isNotBlank()) Button(onClick = onAction, modifier = Modifier.padding(top = if (description.isBlank()) 8.dp else 0.dp).heightIn(min = 48.dp)) { Text(action) }
+        if (secondaryAction.isNotBlank()) OutlinedButton(onClick = onSecondaryAction, modifier = Modifier.heightIn(min = 48.dp)) { Text(secondaryAction) }
     }
 }
 
@@ -202,15 +206,19 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
     PluginInstallFailure.Unsupported -> uiText("This Hermes can't add plugins from the app.")
     PluginInstallFailure.Busy -> uiText("Hermes is busy. Wait a moment and try again.")
     PluginInstallFailure.NotYet, PluginInstallFailure.GatewayDown -> uiText("Hermes isn't answering yet. Try again in a moment.")
+    PluginInstallFailure.NoRelease -> uiText("Couldn't find the latest Beacon release.")
+    PluginInstallFailure.GitHubBusy -> uiText("GitHub is busy. Try again later.")
+    PluginInstallFailure.Blocked -> uiText("Hermes' security scan blocked it.")
     PluginInstallFailure.Error, null -> uiText("Hermes couldn't do that. Try again.")
 }
 
 /**
- * "Add the Beacon plugin to Hermes": the owner confirms, Hermes installs the plugin from GitHub, and a restart is offered only when Hermes says its
+ * "Add Beacon to Hermes": the owner confirms, Hermes installs the plugin from GitHub, and a restart is offered only when Hermes says its
  * gateway needs one. [update] is a Beacon too old for this app, which opens the update screen. Where no install can be reached (previews,
  * tests) the button opens the install steps instead. [illustration] is false where the screen already has its own picture, as in setup.
+ * [brief] is for a page that already says what is missing (the wizard's last page): the idle prompt is just the button, "Add it".
  */
-@Composable internal fun MissingBeaconPluginState(modifier: Modifier = Modifier, compact: Boolean = false, update: Boolean = false, illustration: Boolean = true) {
+@Composable internal fun MissingBeaconPluginState(modifier: Modifier = Modifier, compact: Boolean = false, update: Boolean = false, illustration: Boolean = true, brief: Boolean = false) {
     val uriHandler = LocalUriHandler.current
     val install = PluginInstallHub.controller
     val progress by (install?.state ?: NoInstall).collectAsStateWithLifecycle()
@@ -219,27 +227,28 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
     DisposableEffect(install) { onDispose { install?.let { if (it.state.value.stage == PluginInstallStage.Done) it.reset() } } }
     val link = { uriHandler.openUri(BEACON_PLUGIN_INSTALL_URL) }
     val buttonHeight = Modifier.heightIn(min = 48.dp)
-    val centered = androidx.compose.ui.text.style.TextAlign.Center
+    // On the wizard's last page ([brief]) the button sits under the page's own start-aligned line, like the page's text, not centred on its own.
+    val centered = if (brief) androidx.compose.ui.text.style.TextAlign.Start else androidx.compose.ui.text.style.TextAlign.Center
     Column(
-        modifier.fillMaxWidth().padding(if (compact) 8.dp else 24.dp),
-        horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally,
+        modifier.fillMaxWidth().padding(if (brief) 0.dp else if (compact) 8.dp else 24.dp),
+        horizontalAlignment = if (brief) androidx.compose.ui.Alignment.Start else androidx.compose.ui.Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(if (compact) 8.dp else 14.dp),
     ) {
         if (illustration) Box(Modifier.testTag("missing-plugin-illustration").size(if (compact) 64.dp else 108.dp), contentAlignment = androidx.compose.ui.Alignment.Center) {
             BeaconDustCore(if (compact) 64.dp else 108.dp)
             BeaconMark(size = if (compact) 36.dp else 60.dp)
         }
-        Text(when {
-            progress.stage == PluginInstallStage.Done -> uiText("The Beacon plugin is ready.")
+        if (!(brief && progress.stage == PluginInstallStage.Idle)) Text(when {
+            progress.stage == PluginInstallStage.Done -> uiText("Beacon is ready on Hermes.")
             progress.stage == PluginInstallStage.NeedsRestart || progress.stage == PluginInstallStage.Restarting -> uiText("Restart Hermes to finish")
-            update -> uiText("Update the Beacon plugin")
-            else -> uiText("Add the Beacon plugin to Hermes")
+            update -> uiText("Update Beacon on Hermes")
+            else -> uiText("Add Beacon to Hermes")
         }, Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }, style = if (compact) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.titleMedium, textAlign = centered)
         when (progress.stage) {
             PluginInstallStage.Idle -> Button(
                 onClick = { if (install == null) link() else if (update) install.openUpdates() else confirming = true },
                 modifier = buttonHeight.testTag("missing-plugin-install"),
-            ) { Text(uiText(if (update) "Update Beacon" else "Install Beacon")) }
+            ) { Text(uiText(if (update) "Update Beacon" else if (brief) "Add it" else "Install Beacon")) }
             PluginInstallStage.Installing, PluginInstallStage.Checking, PluginInstallStage.Restarting -> Button(onClick = {}, enabled = false, modifier = buttonHeight.testTag("missing-plugin-working")) {
                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(8.dp))
@@ -250,7 +259,7 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
                 })
             }
             PluginInstallStage.NeedsRestart -> {
-                Text(uiText(if (progress.busy) "Hermes is working right now. Restarting stops that work." else "Restarting stops any reply or scheduled task that is running."),
+                Text(uiText(if (progress.busy) "Hermes is busy. Restarting stops what it's doing." else "Restarting stops any reply or scheduled task that is running."),
                     style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = centered)
                 progress.failure?.let { Text(installFailureText(it), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error, textAlign = centered) }
                 Button(onClick = { install?.restart() }, modifier = buttonHeight.testTag("missing-plugin-restart")) { Text(uiText("Restart Hermes")) }
@@ -275,8 +284,8 @@ private val NoInstall = MutableStateFlow(PluginInstallUi()).asStateFlow()
     }
     if (confirming && install != null) AlertDialog(
         onDismissRequest = { confirming = false },
-        title = { Text(uiText("Add the Beacon plugin to Hermes")) },
-        text = { Text(uiText("Hermes downloads the Beacon plugin from GitHub and turns it on.")) },
+        title = { Text(uiText("Add Beacon to Hermes")) },
+        text = { Text(uiText("Adds Beacon's calls and phone tools to Hermes.")) },
         confirmButton = { TextButton(onClick = { confirming = false; install.install() }, modifier = Modifier.testTag("missing-plugin-confirm")) { Text(uiText("Install Beacon")) } },
         dismissButton = { TextButton(onClick = { confirming = false }) { Text(uiText("Cancel")) } },
     )
@@ -448,17 +457,12 @@ internal fun resolveChoiceStyle(style: ChoiceStyle, labels: List<String>, fontSc
     }
 }
 
-/** Where an own message stands: still going out, accepted by Hermes, or with an unknown outcome. */
-internal enum class SendTick { Sending, Sent, Unconfirmed }
-
+/** One grey tick, two grey ticks, or two blue ticks (see [SendTick]); the words are only for TalkBack. */
 @Composable internal fun SendTickIcon(state: SendTick, modifier: Modifier = Modifier) {
-    val ink = LocalContentColor.current.copy(alpha = .72f)
-    val (icon, label, tint) = when (state) {
-        SendTick.Sending -> Triple(Icons.Rounded.Schedule, "Sending", ink)
-        SendTick.Sent -> Triple(Icons.Rounded.Check, "Sent", ink)
-        SendTick.Unconfirmed -> Triple(Icons.Rounded.ErrorOutline, "Not confirmed", MaterialTheme.colorScheme.error)
-    }
-    Icon(icon, uiText(label), modifier.size(14.dp).testTag("send-tick:" + state.name.lowercase()), tint = tint)
+    // An own message sits on the primary container; the blue is the one that reads on that bubble, light or dark, whatever the accent colour.
+    val bubble = MaterialTheme.colorScheme.primaryContainer
+    val tint = if (sendTickBlue(state)) Color(answeredTickBlueArgb(bubble.toArgb().toLong() and 0xFFFFFFFFL)) else LocalContentColor.current.copy(alpha = .72f)
+    Icon(if (sendTickCount(state) == 2) Icons.Rounded.DoneAll else Icons.Rounded.Check, uiText(sendTickLabel(state)), modifier.size(16.dp).testTag("send-tick:" + state.name.lowercase()), tint = tint)
 }
 
 /** Large corners all round; the sender's side is tighter where bubbles of one group meet, and the last bubble carries the tail. */

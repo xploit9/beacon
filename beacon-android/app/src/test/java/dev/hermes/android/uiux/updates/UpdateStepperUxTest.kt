@@ -69,13 +69,13 @@ class UpdateStepperUxTest {
         var read = 0
         val calls = mutableListOf<String>()
         override suspend fun version(): PluginVersions = reads[minOf(read++, reads.lastIndex)].also { calls += "version" }
-        override suspend fun update(acceptCapabilities: Boolean): JSONObject { calls += "update"; return JSONObject().put("ok", true) }
+        override suspend fun update(): JSONObject { calls += "update"; return JSONObject().put("ok", true) }
         override suspend fun restart(last: RestartMemo, remember: (RestartMemo) -> Unit): RestartResult { calls += "gateway"; return gateway }
         override suspend fun restartDashboard(onReconnecting: (Boolean) -> Unit): DashboardRestartResult { calls += "dashboard"; return dashboard }
     }
 
     private fun run(endpoint: PluginEndpoint, tracker: StepTracker = StepTracker(), restartOnly: Boolean = false) =
-        runBlocking { runPluginUpdate(endpoint, target, accept = false, restartOnly = restartOnly, steps = tracker, pause = {}) }
+        runBlocking { runPluginUpdate(endpoint, target, restartOnly = restartOnly, steps = tracker, pause = {}) }
 
     private fun state(plugin: PluginRow, phase: UpdatePhase = UpdatePhase.Available, release: Release? = null, pluginSteps: List<StepRow> = emptyList(), appSteps: List<StepRow> = emptyList()) =
         AppUpdateUi(phase = phase, release = release, latest = this.release, plugin = plugin, pluginSteps = pluginSteps, appSteps = appSteps)
@@ -87,7 +87,7 @@ class UpdateStepperUxTest {
         val row = run(Fake(listOf(versions("1.1.22", "1.1.23", "1.1.23")), dashboard = DashboardRestartResult.Failed), tracker)
         assertEquals(PluginRow(PluginStatus.DashboardFailed, "1.1.23", target), row)
         // Not the gateway's failure, and not the sentence the reviewer found misleading.
-        assertEquals("The plugin is updated. The Hermes dashboard didn't restart.", row.text)
+        assertEquals("Beacon is updated. The Hermes dashboard didn't restart.", row.text)
         assertFalse(row.text.contains("Couldn't restart Hermes"))
         assertEquals(StepRow(UpdateStep.PluginDashboard, StepState.Failed, "Didn't restart"), tracker.rows.failed)
 
@@ -122,7 +122,7 @@ class UpdateStepperUxTest {
         val tracker = StepTracker()
         val row = run(Fake(listOf(versions("1.1.22", "1.1.23", "1.1.22")), gateway = RestartResult.Failed), tracker, restartOnly = true)
         assertEquals(PluginStatus.RestartFailed, row.status)
-        assertEquals("Hermes gateway didn't restart", row.text)
+        assertEquals("Hermes didn't restart", row.text)
         val hero = heroActions(state(row, pluginSteps = tracker.rows), UpdatePhase.Available)
         assertEquals(HeroActions(primary = HeroPrimary.TryAgain), hero)
         assertFalse(stepperRetryShown(state(row, pluginSteps = tracker.rows), tracker.rows, hero))
@@ -147,7 +147,6 @@ class UpdateStepperUxTest {
             PluginStatus.Available to HeroActions(primary = HeroPrimary.Update),
             PluginStatus.Waiting to HeroActions(),
             PluginStatus.Newer to HeroActions(),
-            PluginStatus.NeedsReview to HeroActions(),
             PluginStatus.DashboardRestart to HeroActions(secondary = HeroSecondary.How),
         )
         expected.forEach { (status, actions) -> assertEquals(status.name, actions, heroActions(state(PluginRow(status, "1.1.23", target)), UpdatePhase.Available)) }
@@ -217,18 +216,20 @@ class UpdateStepperUxTest {
     // ---- UX-15: the owner's progressive labels, and what TalkBack says
 
     @Test fun theStepLabelsAreTheOwnersProgressiveWords() {
-        assertEquals(listOf("Downloading", "Installing", "Restarting Hermes gateway", "Restarting Hermes dashboard", "Done"),
+        assertEquals(listOf("Downloading", "Installing", "Restarting Hermes", "Restarting the dashboard", "Done"),
             listOf(UpdateStep.PluginDownload, UpdateStep.PluginInstall, UpdateStep.PluginGateway, UpdateStep.PluginDashboard, UpdateStep.PluginDone).map { it.label })
         assertEquals(listOf("Downloading", "Verifying", "Installing", "Done"),
             listOf(UpdateStep.AppDownload, UpdateStep.AppVerify, UpdateStep.AppInstall, UpdateStep.AppDone).map { it.label })
-        assertTrue(UpdateStepStrings.containsAll(listOf("Restarting Hermes gateway", "Restarting Hermes dashboard")))
+        assertTrue(UpdateStepStrings.containsAll(listOf("Restarting Hermes", "Restarting the dashboard")))
+        // The steps say Hermes and the dashboard; "gateway" stays a Health word.
+        assertFalse(UpdateStepStrings.any { it.contains("gateway", ignoreCase = true) })
     }
 
     @Test fun talkBackReadsAFinishedStepAsItsLabelAndDone() {
-        assertEquals("Restarting Hermes gateway, Done", stepReading(StepRow(UpdateStep.PluginGateway, StepState.Done)))
-        assertEquals("Restarting Hermes dashboard, Working", stepReading(StepRow(UpdateStep.PluginDashboard, StepState.Active)))
+        assertEquals("Restarting Hermes, Done", stepReading(StepRow(UpdateStep.PluginGateway, StepState.Done)))
+        assertEquals("Restarting the dashboard, Working", stepReading(StepRow(UpdateStep.PluginDashboard, StepState.Active)))
         assertEquals("Installing, Waiting", stepReading(StepRow(UpdateStep.PluginInstall)))
-        assertEquals("Restarting Hermes dashboard, Didn't restart, Failed", stepReading(StepRow(UpdateStep.PluginDashboard, StepState.Failed, StepNote.DashboardFailed)))
+        assertEquals("Restarting the dashboard, Didn't restart, Failed", stepReading(StepRow(UpdateStep.PluginDashboard, StepState.Failed, StepNote.DashboardFailed)))
         assertEquals("Verifying, Done", stepReading(StepRow(UpdateStep.AppVerify, StepState.Done)))
     }
 
@@ -250,7 +251,7 @@ class UpdateStepperUxTest {
 
     @Test fun failureNotesDoNotRepeatTheirButton() {
         assertEquals("Didn't restart", StepNote.DashboardFailed)
-        assertEquals("Hermes gateway didn't restart", StepNote.GatewayFailed)
+        assertEquals("Hermes didn't restart", StepNote.GatewayFailed)
         assertEquals("Didn't update", StepNote.PluginFailed)
         assertEquals("Hermes is busy", StepNote.HermesBusy)
         StepNote.all.forEach { assertFalse(it, it.contains("Try again", ignoreCase = true)) }
@@ -319,12 +320,13 @@ class UpdateStepperUxTest {
         val state = source("PluginUpdateState.kt")
         val steps = source("UpdateSteps.kt")
         listOf(screen, state, steps).forEach { text -> assertFalse(text.contains("\"Hermes plugin")) }
-        assertEquals(3, Regex("""uiText\("Beacon plugin"\)""").findAll(screen).count())
-        assertTrue(screen.contains("uiText(\"Updating the Beacon plugin…\")"))
-        assertTrue(screen.contains("uiText(\"Review what's changing\")"))
-        assertTrue(screen.contains("uiText(\"This update changes what the Beacon plugin can do on Hermes.\")"))
-        assertEquals("The Beacon plugin is newer than this app. Update the app.", PluginRow(PluginStatus.Newer).text)
-        assertNotNull(PluginRowStrings.firstOrNull { it == "The Beacon plugin is newer than this app. Update the app." })
+        assertEquals(2, Regex("""uiText\("Beacon plugin"\)""").findAll(screen).count())
+        assertTrue(screen.contains("uiText(\"Updating Beacon on Hermes…\")"))
+        assertFalse(screen.contains("Updating the Beacon plugin"))
+        // The install route never asks for a review (see HermesPluginUpdater), so the review dialog and its words are gone.
+        listOf("Review what's changing", "This update changes what the Beacon plugin can do on Hermes.", "No change list", "Allow and update", "PluginReviewDialog").forEach { assertFalse(it, screen.contains(it)) }
+        assertEquals("Beacon on Hermes is newer than this app. Update the app.", PluginRow(PluginStatus.Newer).text)
+        assertNotNull(PluginRowStrings.firstOrNull { it == "Beacon on Hermes is newer than this app. Update the app." })
         assertTrue(HeroActionStrings.containsAll(listOf("Restart dashboard", "How", "Cancel", "Try again")))
     }
 

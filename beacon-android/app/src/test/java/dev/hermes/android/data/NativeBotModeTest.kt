@@ -205,7 +205,7 @@ class NativeBotModeTest {
         val data = JSONObject("""{"capabilities":{"approval":true},"driver_status":{"pending_actions":[{"kind":"retry","task_id":"unknown-task"},{"kind":"approval","task_id":"task","member_id":"writer","request_id":"request","execution_generation":3,"approval":{"description":"Write a QA file","choices":["once","deny","always"]}}]}}""")
         val actions = botModeActions(data)
         assertEquals("unavailable", actions[0].kind)
-        assertTrue(actions[0].description.contains("unknown"))
+        assertEquals("Finish this in Hermes. It may already have run.", actions[0].description)
         assertTrue(runCatching { actions[0].payload() }.isFailure)
         assertEquals(listOf("once", "deny"), actions[1].choices)
         assertEquals("request", actions[1].payload("once").getString("request_id"))
@@ -249,7 +249,9 @@ class NativeBotModeTest {
             controller.deleteSpace(); awaitIdle(controller)
             assertEquals("room", controller.state.value.selectedSpace)
             assertEquals("Keep this draft", controller.state.value.draft)
-            assertTrue(controller.state.value.error.contains("stopping"))
+            // The plugin's own sentence ("Deletion is unconfirmed; bots may be stopping…") is not shown; the person reads the app's line for a busy Hermes.
+            assertEquals("Hermes is reconnecting. Try again in a moment.", controller.state.value.error)
+            assertFalse(controller.state.value.error.contains("unconfirmed"))
             assertEquals(1, readsAfterFailure)
             allowDelete = true
             controller.deleteSpace(); awaitIdle(controller)
@@ -369,11 +371,26 @@ class NativeBotModeTest {
         controller.clear()
     }
 
+    @Test fun aFailedRequestSaysOnePlainLineAndNeverHermesOwnDetailOrAnInternalMessage() {
+        // Slop list, section C3 (13 Nov 2026): the screen showed e.message, for example the plugin's "Native Bot Mode service unavailable; refresh before retrying".
+        assertEquals("Hermes is reconnecting. Try again in a moment.", botModeFailureText(ApiFailure(503, "Native Bot Mode service unavailable; refresh before retrying")))
+        assertEquals("Hermes didn't allow that.", botModeFailureText(ApiFailure(403, "room access refused for this owner")))
+        assertEquals("Bot Mode isn't available right now.", BOT_MODE_UNAVAILABLE)
+        assertEquals(BOT_MODE_UNAVAILABLE, botModeFailureText(IllegalStateException("Native Bot Chat identity changed")))
+        assertEquals(BOT_MODE_UNAVAILABLE, botModeFailureText(IllegalStateException("")))
+        // A parser's or the runtime's message is never shown.
+        assertEquals(BOT_MODE_UNAVAILABLE, botModeFailureText(org.json.JSONException("No value for room_id")))
+        assertEquals(BOT_MODE_UNAVAILABLE, botModeFailureText(NumberFormatException("For input string: \"x\".")))
+        assertEquals(BOT_MODE_UNAVAILABLE, botModeFailureText(IndexOutOfBoundsException("Index 3 out of bounds for length 2.")))
+        // The app's own sentence from a require passes as written.
+        assertEquals("The new name was not confirmed. Refresh before retrying.", botModeFailureText(IllegalArgumentException("The new name was not confirmed. Refresh before retrying.")))
+    }
+
     @Test fun nativeFailedTurnsShowSanitizedProviderReason() {
         val events = botModeEvents(JSONObject("""{"events":[{"event_id":"failed-1","kind":"turn.failed","payload":{"member_id":"cybercb","error":"HTTP 402 insufficient balance secret-token-do-not-display","reason_code":"provider_quota_limit"}}]}"""))
         assertTrue(events.single().failed)
         assertEquals("cybercb", events.single().speaker)
-        assertTrue(events.single().text.contains("balance or quota"))
+        assertEquals("This bot's provider is out of credit. Check it in Profiles.", events.single().text)
         assertFalse(events.single().text.contains("secret-token"))
     }
     @Test fun draftBeforeAuthorizationNeverWritesNullScope() {

@@ -51,14 +51,14 @@ internal fun historySourceLabel(source: String): String = when (source.trim().lo
     "android" -> "Beacon"
     // Thread sources are never offered as a filter (historySources drops them); this label only sorts and is listed.
     BEACON_THREAD_SOURCE -> "Beacon threads"
-    "phone" -> "Relay threads"
+    "phone" -> "Older phone threads"
     "webui" -> "Web"
     "desktop" -> "Desktop"
     "tui" -> "Terminal"
     "cli" -> "Command line"
     "api_server" -> "API"
-    "bot_room" -> "Bot rooms"
-    "subagent" -> "Subagents"
+    "bot_room" -> "Shared spaces"
+    "subagent" -> "Helper chats"
     "oneshot" -> "One-off runs"
     else -> source.trim().replace('_', ' ').replaceFirstChar { it.titlecase(Locale.ROOT) }
 }
@@ -259,7 +259,9 @@ internal fun chatListLine(latest: dev.hermes.android.Message?): Pair<String, Str
 private val previewCronLabel = Regex("^\\[Cron delivery: [^\\]\\n]{1,200}]\\s*(?:[-–—:•]\\s*)?")
 
 /** One line of a message for a list: Markdown marks and line breaks gone, bounded. */
-internal fun chatPreviewText(raw: String): String {
+internal fun chatPreviewText(source: String): String {
+    // A stored first message carries Hermes' note and the file's path in front of the owner's words: a preview shows the words only, wherever it is built.
+    val raw = if (mentionsHermesNote(source)) splitAttachedMedia(source).text else source
     // Hermes labels a scheduled post "[Cron delivery: <job>]"; the list shows the post itself.
     val unlabelled = raw.trimStart().let { trimmed -> previewCronLabel.find(trimmed)?.let { trimmed.substring(it.range.last + 1) } ?: raw }
     // Like the bubble: an attached or generated file shows as its safe name, never its path on the computer.

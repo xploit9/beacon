@@ -87,6 +87,7 @@ import dev.hermes.android.assist.liveStatusLabel
 import dev.hermes.android.assist.orbFace
 import dev.hermes.android.core.json
 import dev.hermes.android.phone.PhoneLine
+import dev.hermes.android.phone.PhoneTime
 import dev.hermes.android.preferences
 import dev.hermes.android.ui.AssistantSettings
 import dev.hermes.android.ui.CallBackground
@@ -102,6 +103,7 @@ import dev.hermes.android.ui.PhoneApprovalCard
 import dev.hermes.android.ui.PhoneCallCountdownDialog
 import dev.hermes.android.ui.callStatusText
 import dev.hermes.android.ui.phoneLineText
+import dev.hermes.android.ui.uiLocale
 import dev.hermes.android.ui.uiText
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallToolApproval
@@ -385,7 +387,9 @@ class ComponentsTourDeviceTest {
 
     /** The calendar request the assistant waits on: a headline, two detail lines and a note of exactly 500 characters, shown whole. */
     @Composable private fun eventApproval(): CallToolApproval {
-        val headline = phoneLineText(PhoneLine("Add '{0}' {1} to {2}", listOf("Dentist", "Tue 4 Nov 3:00 PM", "Personal")))
+        // The time is what the phone's own formatter writes for the language the tour is shown in (Tue 4 Nov 2025, 3:00 PM UTC), not a fixed English string.
+        val when4Nov = PhoneTime.dayTime(1_762_268_400_000L, java.time.ZoneOffset.UTC, uiLocale())
+        val headline = phoneLineText(PhoneLine("Add '{0}' {1} to {2}", listOf("Dentist", when4Nov, "Personal")))
         val place = phoneLineText(PhoneLine("Place: {0}", listOf("Clinic on the second floor")))
         val alert = phoneLineText(PhoneLine("Alert {0} min before", listOf("30")))
         return CallToolApproval("tour-event", "e".repeat(32), "phone_calendar_create", "{}", allowCall = false,

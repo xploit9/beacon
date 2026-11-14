@@ -1645,7 +1645,8 @@ def test_cold_discovery_has_a_deadline_and_does_not_invent_a_tool_list(tmp_path,
     worker=threading.Thread(target=discover);worker.start()
     try:
         assert entered.wait(1) and finished.wait(.5), 'a cold metadata lookup must release its request admission at the deadline'
-        assert not result and len(errors)==1 and errors[0].status_code==504
+        # Owner trial, 7 Nov 2026: a cold catalogue is answered as "still starting", not as an error the phone reports as a failure.
+        assert not errors and len(result)==1 and result[0]['status']=='starting' and result[0]['tools']==[]
     finally:
         release.set();worker.join(2)
         g.DISCOVER_LOOKUPS[profile][0].join(2)

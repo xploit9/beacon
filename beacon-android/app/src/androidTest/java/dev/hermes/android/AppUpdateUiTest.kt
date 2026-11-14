@@ -63,14 +63,13 @@ class AppUpdateUiTest {
     private var retries = 0
     private var cancels = 0
     private var allows = 0
-    private var reviews = 0
     private var alerts = 0
 
     private fun show(state: AppUpdateUi, callBusy: Boolean = false, fontScale: Float = 1f, alertsBlocked: Boolean = false, dark: Boolean = true) = compose.setContent {
         CompositionLocalProvider(LocalDensity provides Density(LocalDensity.current.density, fontScale)) {
             dev.hermes.android.ui.NativeLocalization("en") { BeaconTheme(dark = dark) { Surface { Box(Modifier.widthIn(max = 411.dp)) {
                 AppUpdateContent(state, "1.1.2", callBusy, now, onCheck = { checks++ }, onUpdate = { updates++ }, onRetry = { retries++ },
-                    onCancel = { cancels++ }, onAllow = { allows++ }, onReview = { reviews++ }, alertsBlocked = alertsBlocked, onAllowAlerts = { alerts++ })
+                    onCancel = { cancels++ }, onAllow = { allows++ }, alertsBlocked = alertsBlocked, onAllowAlerts = { alerts++ })
             } } } }
         }
     }
@@ -112,11 +111,13 @@ class AppUpdateUiTest {
         show(available())
         compose.onNodeWithTag("update-state:Available").assertIsDisplayed()
         compose.onNodeWithTag("update-hero-title").assertTextEquals("Beacon 1.1.3")
-        compose.onNodeWithText("Update available").assertIsDisplayed()
-        compose.onNodeWithTag("update-badge-new").assertIsDisplayed()
+        // The hero and the two rows now say the same words for the same state (slop list, UX P2-32), so the text is on screen more than once.
+        compose.onAllNodesWithText("Update available").onFirst().assertIsDisplayed()
+        // "Update available" says it; the "New" badge beside it is gone.
+        compose.onAllNodesWithTag("update-badge-new").assertCountEquals(0)
         compose.onNodeWithTag("update-meta").assertIsDisplayed()
         reveal("update-row-plugin")
-        compose.onNodeWithTag("update-row-app").assertTextContains("1.1.2 → 1.1.3").assertTextContains("Ready to update")
+        compose.onNodeWithTag("update-row-app").assertTextContains("1.1.2 → 1.1.3").assertTextContains("Update available")
         compose.onNodeWithText("Beacon plugin").assertIsDisplayed()
         compose.onNodeWithText("1.1.1 → 1.1.3").assertIsDisplayed()
         compose.onAllNodesWithTag("update-row-plugin").assertCountEquals(1)
@@ -173,7 +174,7 @@ class AppUpdateUiTest {
     @Test fun aRestartHermesRefusedWhileBusyWaitsWithoutAButton() {
         show(pluginOnly(PluginRow(PluginStatus.Waiting, "1.1.3", "1.1.3")))
         compose.onAllNodesWithText("Waiting").onFirst().assertIsDisplayed()
-        compose.onNodeWithText("Hermes is busy — restarts when it's idle").assertIsDisplayed()
+        compose.onNodeWithText("Hermes is busy. It restarts when idle.").assertIsDisplayed()
         compose.onAllNodesWithTag("update-primary").assertCountEquals(0)
         reveal("update-row-plugin")
         compose.onNodeWithTag("update-row-plugin").assertTextContains("Waiting")
@@ -189,14 +190,14 @@ class AppUpdateUiTest {
 
     @Test fun aFailedRestartOffersTryAgain() {
         show(pluginOnly(PluginRow(PluginStatus.RestartFailed, "1.1.3", "1.1.3")))
-        compose.onNodeWithText("Hermes gateway didn't restart").assertIsDisplayed()
+        compose.onNodeWithText("Hermes didn't restart").assertIsDisplayed()
         compose.onNodeWithTag("update-primary").assertTextEquals("Try again").performClick()
         assertEquals(1, updates)
     }
 
     @Test fun aPluginNewerThanTheAppIsAttentionNotUpToDate() {
         show(AppUpdateUi(checkedAt = now - 60_000, latest = release, plugin = PluginRow(PluginStatus.Newer, "1.2.0", "1.1.3"), phase = UpdatePhase.Available))
-        compose.onNodeWithText("The Beacon plugin is newer than this app. Update the app.").assertIsDisplayed()
+        compose.onNodeWithText("Beacon on Hermes is newer than this app. Update the app.").assertIsDisplayed()
         compose.onAllNodesWithText("Newer than app").onFirst().assertIsDisplayed()
         compose.onAllNodesWithTag("update-primary").assertCountEquals(0)
         compose.onAllNodesWithText("You're up to date").assertCountEquals(0)
@@ -205,16 +206,8 @@ class AppUpdateUiTest {
     @Test fun withAnAppUpdateTheRestartSentenceSitsOnThePluginRow() {
         show(available(PluginRow(PluginStatus.Waiting, "1.1.3", "1.1.3")))
         reveal("update-row-plugin")
-        compose.onNodeWithTag("update-row-plugin").assertTextContains("Hermes is busy — restarts when it's idle", substring = true).assertTextContains("Waiting")
+        compose.onNodeWithTag("update-row-plugin").assertTextContains("Hermes is busy. It restarts when idle.", substring = true).assertTextContains("Waiting")
         compose.onNodeWithTag("update-primary").assertTextEquals("Update").assertIsEnabled()
-    }
-
-    @Test fun aPluginThatNeedsReviewNeverBlocksTheAppUpdate() {
-        show(available(PluginRow(PluginStatus.NeedsReview, "1.1.1", "1.1.3", listOf("Reads files"))))
-        reveal("update-row-plugin")
-        compose.onNodeWithTag("update-row-plugin").assertTextContains("Review changes").assertTouchHeightIsAtLeast(48.dp).performClick()
-        assertEquals(1, reviews)
-        compose.onNodeWithTag("update-primary").assertIsEnabled()
     }
 
     @Test fun aCallDisablesUpdateAndSaysWhy() {
@@ -235,7 +228,7 @@ class AppUpdateUiTest {
 
     @Test fun thePluginStepComesFirstAndSaysSo() {
         show(AppUpdateUi(phase = UpdatePhase.Downloading, release = release, latest = release, plugin = PluginRow(PluginStatus.Updating, "1.1.1", "1.1.3")))
-        compose.onNodeWithText("Updating the Beacon plugin…").assertIsDisplayed()
+        compose.onNodeWithText("Updating Beacon on Hermes…").assertIsDisplayed()
         // Hermes carries on installing whatever the phone does, so the plugin step offers no Cancel.
         compose.onAllNodesWithTag("update-cancel").assertCountEquals(0)
     }
@@ -265,7 +258,7 @@ class AppUpdateUiTest {
 
     @Test fun aDownloadFailureHasOneShortReasonAndTryAgain() = failed(UpdateFailure.Download, "Couldn't download the update. Check your connection.")
 
-    @Test fun aFailedVerificationHasOneShortReasonAndTryAgain() = failed(UpdateFailure.Verification, "The update didn't pass verification.")
+    @Test fun aFailedVerificationHasOneShortReasonAndTryAgain() = failed(UpdateFailure.Verification, "The download didn't check out. Nothing was installed.")
 
     @Test fun previewBuildsAreInstalledByHand() {
         show(AppUpdateUi(supported = false))

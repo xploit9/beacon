@@ -122,6 +122,14 @@ class BusyTurnSendUiTest {
         compose.onNodeWithTag("message-send").performClick()
     }
 
+    private fun submits(fixture: NativeExperienceFixture) = fixture.requests.count { it.string("method") == "prompt.submit" }
+
+    /** The words of a message in the chat transcript itself (not the box row above the composer, not the composer). */
+    private fun inTranscript(text: String) = hasText(text) and hasAnyAncestor(hasTestTag("conversation-transcript"))
+
+    /** One of the two ticks a message Hermes has taken shows (grey: Hermes has it; blue: a reply is on its way or follows). */
+    private fun hasDeliveredTick() = hasTestTag("send-tick:delivered") or hasTestTag("send-tick:answered")
+
     private fun queueCanonicalHead(vm: BeaconViewModel, fixture: NativeExperienceFixture): Pair<String, String> {
         fixture.queueNextCanonicalSubmission.set(true)
         enqueueThroughComposer("First queued input")
@@ -153,6 +161,69 @@ class BusyTurnSendUiTest {
         assertEquals(0, fixture.liveCollectorSubscriptions.get())
     }
 
+    /**
+     * Round 13 (T1 left this case unproven): the reply-end case on the canonical fixture, where Hermes names the admission and the finished turn can be proven.
+     * A message typed in Queue mode while a reply runs waits in the box and is not a chat bubble; when the reply ends it is sent by itself, exactly once, and
+     * moves from the box into the chat, once, with its ticks.
+     */
+    @Test fun aMessageQueuedWhileAReplyRunsIsSentOnceByItselfWhenTheReplyEndsAndMovesFromTheBoxIntoTheChat() = withFixture(canonical = true) { vm, fixture ->
+        openWatchedChat(vm)
+        // A quiet stream asks Hermes soon, so the end of the turn is found even if the fixture's done event reaches a socket nobody reads.
+        compose.runOnIdle { field(vm, "streamSilenceMs", 500L); vm.setBusySendAction("queue") }
+        compose.waitUntil(15_000) { vm.preferences.value.busySendAction == "queue" && vm.preferences.value.busySendLoaded }
+        // A reply is running: the first message started a turn on Hermes and the chat follows its stream.
+        compose.onNodeWithTag("message-input").performTextInput("Begin a synthetic turn")
+        compose.onNodeWithTag("message-send").performClick()
+        compose.waitUntil(15_000) { submits(fixture) == 1 }
+        compose.waitUntil(15_000) { vm.chat.value.streamId == "chat-a" && fixture.liveCollectorSubscriptions.get() > 0 }
+        val admission = fixture.canonicalAdmissions.keys.single()
+        val head = compose.runOnIdle { vm.chat.value.queued.single { it.admissionId == admission } }
+
+        // 1. Typed in Queue mode while the reply runs: it is in the box and not in the chat.
+        compose.onNodeWithText("Queue a message…").assertExists()
+        compose.onNodeWithTag("message-input").performTextInput("Newer message while it runs")
+        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Queue")
+        compose.onNodeWithTag("message-send").performClick()
+        compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == "Newer message while it runs" && it.state == "queued" } && vm.composer.value.text.isBlank() }
+        val id = vm.chat.value.queued.single { it.text == "Newer message while it runs" }.id
+        compose.onNodeWithTag("queue-box").assertIsDisplayed()
+        compose.onNodeWithTag("queue-text:$id").assertTextEquals("Newer message while it runs")
+        compose.onAllNodesWithTag("queued-message:$id").assertCountEquals(0)
+        compose.onAllNodes(inTranscript("Newer message while it runs"), useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodesWithText("Newer message while it runs").assertCountEquals(1)
+        assertEquals("Hermes has only the first message", 1, submits(fixture))
+        // It waits for as long as the reply runs: nothing is sent, and it stays in the box and out of the chat.
+        runCatching { compose.waitUntil(2_500) { submits(fixture) > 1 } }
+        assertEquals("Nothing is sent while the reply runs", 1, submits(fixture))
+        compose.onNodeWithTag("queue-text:$id").assertIsDisplayed()
+        compose.onAllNodesWithTag("queued-message:$id").assertCountEquals(0)
+
+        // 2. The reply ends, as Hermes ends one: the turn is terminal and its done event carries the proof (both rows are in the saved history).
+        val rows = fixture.sessions.getValue("chat-a").getJSONArray("messages")
+        rows.put(json("id" to 9001, "role" to "user", "text" to "Begin a synthetic turn")).put(json("id" to 9002, "role" to "assistant", "text" to "Synthetic reply"))
+        fixture.setCanonicalAdmission(admission, "terminal", "completed")
+        runCatching {
+            fixture.emitNativeEvent("message.complete", json("text" to "Synthetic reply", "admission_id" to admission, "status" to "completed",
+                "persisted_turn" to json("complete" to true, "user_row_id" to 9001, "user_row_ids" to org.json.JSONArray(listOf(9001)),
+                    "final_assistant_row_id" to 9002, "row_ids" to org.json.JSONArray(listOf(9001, 9002)))))
+        }
+        compose.waitUntil(30_000) { submits(fixture) == 2 }
+        runCatching { compose.waitUntil(3_000) { submits(fixture) > 2 } }
+        assertEquals("The queued message was sent by itself, exactly once", 2, submits(fixture))
+        val sent = fixture.requests.filter { it.string("method") == "prompt.submit" }.last().getJSONObject("params")
+        assertEquals("Newer message while it runs", sent.string("text")); assertEquals("chat-a", sent.string("session_id")); assertEquals("default", sent.string("profile"))
+        assertNotEquals("a new submission, not the first message again", head.submissionId, sent.string("submission_id"))
+
+        // 3. The box is empty and the message is in the chat, once, with its ticks.
+        compose.waitUntil(15_000) { compose.onAllNodesWithTag("queue-box").fetchSemanticsNodes().isEmpty() }
+        compose.onAllNodesWithTag("queue-text:$id").assertCountEquals(0)
+        compose.waitUntil(15_000) { vm.chat.value.queued.firstOrNull { it.id == id }?.state in setOf("accepted", "sent", "settled") }
+        compose.waitUntil(15_000) { compose.onAllNodes(inTranscript("Newer message while it runs"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodes(inTranscript("Newer message while it runs"), useUnmergedTree = true).assertCountEquals(1)
+        compose.onNode(hasDeliveredTick() and hasAnyAncestor(hasTestTag("queued-message:$id")), useUnmergedTree = true).assertExists()
+        assertEquals("still exactly one send after the box emptied", 2, submits(fixture))
+    }
+
     private fun retryAfterIdleWithoutStream(failFirstProbe: Boolean) = withFixture { vm, fixture ->
         fixture.nativeTurnStatus = if (failFirstProbe) "idle" else "working"
         fixture.nativeStatusFailure = failFirstProbe
@@ -181,8 +252,7 @@ class BusyTurnSendUiTest {
         enqueueThroughComposer("Removed while checking")
         compose.waitUntil(10_000) { vm.chat.value.queued.singleOrNull()?.state == "queued" && fixture.requests.count { it.string("method") == "session.active_list" } > before }
         val first = vm.chat.value.queued.single()
-        compose.onNodeWithTag("queued-actions:${first.id}").performClick()
-        compose.onNodeWithText("Remove queued message").performClick()
+        compose.onNodeWithTag("queue-remove:${first.id}").performClick()
         compose.waitUntil(10_000) { vm.chat.value.queued.isEmpty() }
         enqueueThroughComposer("The replacement message")
         compose.waitUntil(10_000) { vm.chat.value.queued.singleOrNull()?.text == "The replacement message" }
@@ -305,7 +375,7 @@ class BusyTurnSendUiTest {
         val item = vm.chat.value.queued.single()
         fixture.sessions.getValue("chat-a").getJSONObject("info").put("model", "different-synthetic-model")
         fixture.nativeTurnStatus = "idle"
-        compose.waitUntil(10_000) { vm.ui.value.notice == "The queued message's model changed. Select its saved model before sending it." && vm.chat.value.queued.singleOrNull()?.state == "queued" }
+        compose.waitUntil(10_000) { vm.ui.value.notice == "The model changed. Pick this message's model to send it." && vm.chat.value.queued.singleOrNull()?.state == "queued" }
         val probes = fixture.nativeStatusProbes.size
         val metadata = fixture.requests.count { it.string("path") == "/api/sessions/chat-a" && it.string("method") == "GET" }
         compose.waitUntil(10_000) { fixture.requests.count { it.string("path") == "/api/sessions/chat-a" && it.string("method") == "GET" } >= metadata + 2 }
@@ -313,8 +383,7 @@ class BusyTurnSendUiTest {
         assertTrue(fixture.requests.none { it.string("method") == "prompt.submit" })
         fixture.sessions.getValue("chat-a").getJSONObject("info").put("model", item.model)
         fixture.holdPromptAcknowledgement = true
-        compose.onNodeWithTag("queued-actions:${item.id}").performClick()
-        compose.onNodeWithText("Retry queued message").performClick()
+        compose.onNodeWithTag("queue-send:${item.id}").performClick()
         compose.waitUntil(10_000) { fixture.requests.any { it.string("method") == "prompt.submit" } }
         assertEquals("Keep this model snapshot", fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params").string("text"))
     }
@@ -387,8 +456,9 @@ class BusyTurnSendUiTest {
         compose.onNodeWithTag("message-input").performTextInput("/queue Explicit next turn")
         compose.onNodeWithTag("message-send").performClick()
         compose.waitUntil(15_000) { vm.chat.value.queued.isNotEmpty() || vm.ui.value.notice.isNotBlank() }
-        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasText("Explicit next turn"))
-        compose.onNode(hasText("Explicit next turn") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertExists()
+        // A queued message waits in the box above the composer; it is not in the transcript until it is sent.
+        compose.onNode(hasText("Explicit next turn") and hasAnyAncestor(hasTestTag("queue-box")), useUnmergedTree = true).assertExists()
+        compose.onAllNodes(hasText("Explicit next turn") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(0)
         compose.onNodeWithTag("composer-queue").assertDoesNotExist()
         compose.waitUntil(15_000) { vm.composer.value.text.isBlank() }
         assertEquals("A phone queue does not submit during the running turn", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
@@ -409,20 +479,24 @@ class BusyTurnSendUiTest {
         assertNotSame(fixture.client, streamClient)
         fixture.holdSteerAcknowledgement = true
         compose.onNodeWithTag("message-input").performTextInput("Please be concise")
-        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Change the reply")
-        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Change the reply").performClick()
+        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Send now")
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send now").performClick()
         compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
         val sent = fixture.requests.single { it.string("method") == "session.steer" }.getJSONObject("params")
         assertEquals("runtime-chat-a", sent.string("session_id")); assertEquals("default", sent.string("profile")); assertEquals("Please be concise", sent.string("text"))
         assertEquals("Steer must use the live collector's socket", collectorSocket, fixture.nativeSocketMethods.single { it.second == "session.steer" }.first)
         compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasText("Please be concise"))
-        compose.onNodeWithText("Sending guidance").assertExists()
+        // A steer is in the chat at once, marked Steer, with one grey tick until Hermes acknowledges it.
+        val steerId = vm.chat.value.queued.single().id
+        compose.onNode(hasTestTag("steer-marker:$steerId") and hasAnyAncestor(hasTestTag("queued-message:$steerId")), useUnmergedTree = true).assertExists()
+        compose.onNode(hasTestTag("send-tick:pending") and hasAnyAncestor(hasTestTag("queued-message:$steerId")), useUnmergedTree = true).assertExists()
         assertEquals("Existing live output", vm.chat.value.liveText)
         assertEquals("runtime-chat-a", vm.chat.value.streamId)
         fixture.releasePromptAcknowledgement()
         compose.waitUntil(15_000) { vm.chat.value.queued.single().state == "accepted" }
         compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasText("Please be concise"))
-        compose.onNodeWithText("Accepted; delivery pending").assertExists()
+        // Hermes has it and Beacon's reply is streaming now, so the two ticks are blue.
+        compose.onNode(hasTestTag("send-tick:answered") and hasAnyAncestor(hasTestTag("queued-message:$steerId")), useUnmergedTree = true).assertExists()
         assertEquals("Existing live output", vm.chat.value.liveText)
         assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
     }
@@ -433,7 +507,7 @@ class BusyTurnSendUiTest {
         compose.onNodeWithTag("message-input").performTextInput("/queue")
         compose.onNodeWithTag("message-send").performClick()
         assertEquals("/queue", vm.composer.value.text)
-        assertEquals("Usage: /queue <message>", vm.ui.value.notice)
+        assertEquals("Type a message after /queue", vm.ui.value.notice)
         compose.runOnIdle { vm.notice(""); vm.composer(TextFieldValue("/queuefoo")) }
         compose.onNodeWithTag("message-send").performClick()
         assertEquals("/queuefoo", vm.composer.value.text)
@@ -442,6 +516,14 @@ class BusyTurnSendUiTest {
         compose.onNodeWithTag("message-send").performClick()
         compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == "list" } && vm.composer.value.text.isBlank() }
         assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
+    }
+
+    private fun captureShot(name: String) {
+        compose.waitForIdle()
+        val directory = java.io.File(compose.activity.filesDir, "native-experience/queue-box").apply { mkdirs() }
+        val bitmap = requireNotNull(androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
+        java.io.File(directory, "$name.png").outputStream().use { bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+        bitmap.recycle()
     }
 
     @Test fun localPreferenceWorksOfflineAndSurvivesViewModelRecreation() = withFixture { vm, _ ->
@@ -454,6 +536,11 @@ class BusyTurnSendUiTest {
             showSettings.value = true
         }
         compose.onNodeWithText("If you send while Beacon replies").assertExists()
+        // The two choices say what they do (Send now, Queue), so the line that explained them is gone.
+        compose.onNodeWithText("Steer changes the reply now. Queue sends it after.").assertDoesNotExist()
+        // The page slides in over the chat: let the transition finish and a frame draw before the picture (the first attempt caught the chat underneath).
+        compose.waitForIdle(); Thread.sleep(1_000); compose.waitForIdle()
+        captureShot("r7-2-setting-hint")
         // Both choices are on screen as segments: Steer starts selected, so Queue is one tap.
         compose.onNodeWithTag("choice-option:While Beacon is replying:steer").assertIsSelected()
         compose.onNodeWithTag("choice-option:While Beacon is replying:queue").performClick()
@@ -473,7 +560,7 @@ class BusyTurnSendUiTest {
         startTurn(vm, fixture)
         repeat(2) {
             compose.onNodeWithTag("message-input").performTextInput("Same follow-up")
-            compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send after").performClick()
+            compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Queue").performClick()
             compose.waitUntil(15_000) { vm.chat.value.queued.size == it + 1 && vm.composer.value.text.isBlank() }
         }
         val ids = vm.chat.value.queued.map { it.id }
@@ -483,6 +570,22 @@ class BusyTurnSendUiTest {
         fixture.holdPromptAcknowledgement = true
         fixture.nativeTurnStatus = "idle"
         fixture.emitNativeEvent("message.complete", json("text" to "First reply"))
+        // 1.1.34 (93c0090b): a queued follow-up is sent once the finished turn is proven (FinishedTurnTest.aQueuedFollowUpIsSentOnlyOnceTheFinishedTurnIsProven; on the device
+        // terminalCanonicalAdmissionWakesTheNextPhoneMessageWithoutManualReview). This legacy gateway names no admission, so nothing can prove the turn: both identical
+        // messages stay queued with their ids, the newer draft stays in the composer, and nothing is sent until the chat is opened again.
+        compose.waitUntil(15_000) { vm.chat.value.streamId.isBlank() }
+        runCatching { compose.waitUntil(3_000) { fixture.requests.count { it.string("method") == "prompt.submit" } > 1 } }
+        assertEquals("Nothing is sent before the turn is proven", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        assertEquals("Both identical messages stay queued with their ids", ids, vm.chat.value.queued.filter { it.state == "queued" }.map { it.id })
+        assertEquals("The newer draft stays in the composer", "Same follow-up", vm.composer.value.text)
+        // Where a held message shows (T1): both identical messages are rows of the queue box above the composer, never chat bubbles, until sent.
+        compose.onNodeWithTag("queue-box").assertIsDisplayed()
+        ids.forEach { held ->
+            compose.onNodeWithTag("queue-text:$held").assertIsDisplayed()
+            compose.onAllNodesWithTag("queued-message:$held").assertCountEquals(0)
+        }
+        compose.onAllNodes(inTranscript("Same follow-up"), useUnmergedTree = true).assertCountEquals(0)
+        compose.runOnIdle { vm.selectSession("chat-a") }
         compose.waitUntil(15_000) { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
         val next = fixture.requests.filter { it.string("method") == "prompt.submit" }.last().getJSONObject("params")
         assertEquals("Same follow-up", next.string("text")); assertEquals("runtime-chat-a", next.string("session_id")); assertEquals("default", next.string("profile"))
@@ -503,6 +606,16 @@ class BusyTurnSendUiTest {
         assertEquals(firstTime, saved.queued.first { it.id == ids.first() }.createdAt)
         assertEquals("synthetic-model", saved.queued.first { it.id == ids.first() }.model)
         assertEquals("Same follow-up", saved.text)
+        runCatching { compose.waitUntil(3_000) { fixture.requests.count { it.string("method") == "prompt.submit" } > 2 } }
+        assertEquals("Opening the chat again sent the first queued message once", 2, fixture.requests.count { it.string("method") == "prompt.submit" })
+        // The sent one left the box and is in the chat once, as its saved row, with its ticks; the second identical message still waits in the box, not in the chat.
+        compose.waitUntil(15_000) { compose.onAllNodesWithTag("queue-text:${ids.first()}").fetchSemanticsNodes().isEmpty() }
+        compose.onNodeWithTag("queue-text:${ids[1]}").assertIsDisplayed()
+        compose.onAllNodesWithTag("queued-message:${ids[1]}").assertCountEquals(0)
+        val sentRow = "message-row:${vm.chat.value.queued.first { it.id == ids.first() }.rowId}"
+        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag(sentRow))
+        compose.onAllNodes(inTranscript("Same follow-up"), useUnmergedTree = true).assertCountEquals(1)
+        compose.onNode(hasDeliveredTick() and hasAnyAncestor(hasTestTag(sentRow)), useUnmergedTree = true).assertExists()
     }
 
     @Test fun queuedBubbleKeepsEditAndRemoveActions() = withFixture { vm, fixture ->
@@ -515,15 +628,11 @@ class BusyTurnSendUiTest {
             compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == text } && vm.composer.value.text.isBlank() }
         }
         val first = vm.chat.value.queued.first().id
-        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-actions:$first"))
-        compose.onNodeWithTag("queued-actions:$first").performClick()
-        compose.onNodeWithText("Edit queued message").performClick()
+        compose.onNodeWithTag("queue-edit:$first").performClick()
         compose.waitUntil(15_000) { vm.composer.value.text == "Edit this queued text" && vm.chat.value.queued.size == 1 }
         compose.runOnIdle { vm.composer(TextFieldValue()) }
         val second = vm.chat.value.queued.single().id
-        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-actions:$second"))
-        compose.onNodeWithTag("queued-actions:$second").performClick()
-        compose.onNodeWithText("Remove queued message").performClick()
+        compose.onNodeWithTag("queue-remove:$second").performClick()
         compose.waitUntil(15_000) { vm.chat.value.queued.isEmpty() }
         assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
     }
@@ -638,18 +747,28 @@ class BusyTurnSendUiTest {
                 flow<AppState>(recreated, "_ui").value = AppState(origin = fixture.scope.origin, owner = fixture.scope.owner, profile = fixture.scope.profile, authenticated = true, connected = true, restoringSession = false)
                 rendered.value = recreated; recreated.selectSession("chat-a")
             }
-            compose.waitUntil(15_000) { recreated.chat.value.sessionId == "chat-a" && recreated.chat.value.queued.any { it.id == item.id } }
+            // The queued copy comes back from the saved draft before the chat's history is read, and the transcript list exists only after it is:
+            // the screen is waited for, not only the view model, or the first lookup below can find the skeleton.
+            compose.waitUntil(15_000) {
+                recreated.chat.value.sessionId == "chat-a" && recreated.chat.value.queued.any { it.id == item.id } &&
+                    compose.onAllNodesWithTag("conversation-transcript").fetchSemanticsNodes().isNotEmpty()
+            }
             assertEquals("admission-synthetic", recreated.chat.value.queued.single { it.id == item.id }.admissionId)
             fixture.admissionReceiptStatus = "terminal"; fixture.admissionReceiptOutcome = "failed"
             val before = fixture.requests.count { it.string("method") == "prompt.receipt" }
-            compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-actions:${item.id}"))
-            compose.onNodeWithTag("queued-actions:${item.id}").performClick()
-            compose.onNodeWithText("Check receipt").performClick()
+            compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-bubble:${item.id}"))
+            compose.onNodeWithTag("queued-bubble:${item.id}").performTouchInput { longClick() }
+            compose.onNodeWithText("Check if it arrived").performClick()
             compose.waitUntil(15_000) { recreated.chat.value.queued.single { it.id == item.id }.state == "settled" && fixture.requests.count { it.string("method") == "prompt.receipt" } > before }
             val sent = fixture.requests.last { it.string("method") == "prompt.receipt" }.getJSONObject("params")
             assertEquals("chat-a", sent.string("session_id")); assertEquals("default", sent.string("profile")); assertEquals("admission-synthetic", sent.string("admission_id"))
             assertEquals("failed", recreated.chat.value.queued.single { it.id == item.id }.outcome)
-            compose.onNodeWithText("Turn failed; check history").assertExists()
+            // Hermes started this admission (it only settles a started one as failed), so the message reached the agent: it stays in the chat with
+            // two blue ticks (Hermes started it), is not offered again, and nothing is sent.
+            compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-message:${item.id}"))
+            compose.onNode(hasTestTag("send-tick:answered") and hasAnyAncestor(hasTestTag("queued-message:${item.id}")), useUnmergedTree = true).assertExists()
+            compose.onAllNodesWithTag("queue-not-sent:${item.id}").assertCountEquals(0)
+            compose.onAllNodesWithTag("queue-retry:${item.id}").assertCountEquals(0)
             assertTrue(fixture.requests.none { it.string("method") == "prompt.submit" })
         } finally { compose.runOnUiThread { recreatedStore.clear(); rendered.value = vm } }
     }

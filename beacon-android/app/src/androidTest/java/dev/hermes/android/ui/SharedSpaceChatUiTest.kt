@@ -89,8 +89,9 @@ class SharedSpaceChatUiTest {
 
     @Test fun anEmptySpaceKeepsItsPromptAndAFailureIsACompactNotice() {
         show()
-        compose.onNodeWithText("Send the bots a task to start the discussion.").assertIsDisplayed()
-        compose.runOnIdle { state = state.copy(events = listOf(BotModeEvent("f1", "coder", "This bot’s turn was cancelled.", failed = true, at = day))) }
+        compose.onNodeWithText("No messages yet").assertIsDisplayed()
+        compose.onNodeWithText("Send the bots a task to start the discussion.").assertDoesNotExist()
+        compose.runOnIdle { state = state.copy(events = listOf(BotModeEvent("f1", "coder", "This bot's reply was cancelled.", failed = true, at = day))) }
         compose.onNodeWithText("coder · failed").assertIsDisplayed()
         compose.onNodeWithText("Review bot profiles").assertIsDisplayed()
     }

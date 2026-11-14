@@ -2,7 +2,7 @@
 
 ## Install the app
 
-Download the latest `Beacon-*.apk` from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest), open it on your phone, paste your Hermes link and sign in with Hermes. Signing in links the phone. When the Beacon plugin is not on your Hermes yet, the setup wizard offers to install it ("Add the Beacon plugin to Hermes"): Hermes downloads it from GitHub and turns it on, and the wizard shows each step as it happens. Hermes loads a new plugin without restarting the dashboard; it asks for a Hermes restart only when it says one is needed. Then the wizard asks for your voice key, the permissions calls need, and Keep connected. If the install fails, the wizard says why and offers only what can help: Try again, Sign in again, Skip for now, or the PC steps below ("Set up from a computer").
+Download the latest `Beacon-*.apk` from [GitHub Releases](https://github.com/xploit9/beacon/releases/latest), open it on your phone, paste your Hermes link and sign in with Hermes. Signing in links the phone. When the Beacon plugin is not on your Hermes yet, the setup wizard offers to install it ("Add Beacon to Hermes"): Hermes downloads it from GitHub and turns it on, and the wizard shows each step as it happens. Hermes loads a new plugin without restarting the dashboard; it asks for a Hermes restart only when it says one is needed. Then the wizard asks for your voice key, the permissions calls need, and Keep connected. If the install fails, the wizard says why and offers only what can help: Try again, Sign in again, Skip for now, or the PC steps below ("Set up from a computer (steps)").
 
 The link is your dashboard's HTTPS address, such as `https://<your-pc>.<your-tailnet>.ts.net`. The dashboard's **Beacon** tab also shows it once Beacon is installed.
 
@@ -51,7 +51,7 @@ Or give your agent this prompt:
 ### Manual steps
 
 1. Choose the Hermes home and profile that run your dashboard; ask if more than one could be it.
-2. Install with `hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --enable`, or update with `hermes -p <profile> plugins update beacon`. Let Hermes' security scan and prompts run unchanged.
+2. Install or update with `hermes -p <profile> plugins install xploit9/beacon/hermes-plugin/beacon --force --ref <commit of the latest release> --enable` (`beacon_install.py` looks the commit up and runs this). `plugins update beacon` does not work once Beacon is pinned. Hermes' security scan still runs; a dangerous verdict still stops the install.
 3. Restart the selected dashboard through its actual scheduled task, service or verified manual process, preserving its home, profile and port. Use native idle and lifecycle safeguards before stopping it; obtain approval if the owner has not already authorized the restart. The broad `dashboard --stop` command can stop other dashboards on the machine.
 4. Give the dashboard a public HTTPS address; that address is the link you paste into Beacon. No address yet? Use the Tailscale prompt above, or run `tailscale serve --bg 9119` (your dashboard's port) and save the HTTPS address it shows with `hermes -p <profile> config set dashboard.public_url https://<your machine's Tailscale name>`. `python beacon_install.py --tailscale` does both.
 

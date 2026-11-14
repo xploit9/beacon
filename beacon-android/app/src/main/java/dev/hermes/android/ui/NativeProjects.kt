@@ -117,7 +117,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
     // The actions below run outside composition, so their words are looked up here.
     val projectUpdated = uiText("Project updated")
     val folderLinked = uiText("Folder linked")
-    val deleteConsequence = uiText("Its conversations and files on your computer will remain.")
+    val deleteConsequence = uiText("Its chats and files stay.")
     val you = uiText("You"); val oneMessage = uiText("1 message"); val manyMessages = uiText("{0} messages")
     val is24Hour = android.text.format.DateFormat.is24HourFormat(androidx.compose.ui.platform.LocalContext.current)
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client, selected) { vm.loadNativeProjects(selected) }
@@ -141,7 +141,6 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
         vm.openForm(ActionForm("New project", "/api/projects/create",
             listOf(Field("name", "Name", required = true), Field("description", "Description", FieldType.MULTILINE)),
             seed = json("request_id" to java.util.UUID.randomUUID().toString()),
-            explanation = "Organize chats around a project, then link its folders on your computer.",
             onResult = { result -> selected = result.getJSONObject("project").getString("id"); vm.loadNativeProjects(selected) }))
     }
     fun requestEditDismiss() {
@@ -222,7 +221,6 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                             Column(Modifier.fillMaxWidth().padding(24.dp), horizontalAlignment = androidx.compose.ui.Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(12.dp)) {
                                 BeaconDustCore(56.dp)
                                 Text(uiText("Your projects"), Modifier.semantics { heading() }, style = MaterialTheme.typography.titleLarge)
-                                Text(uiText("Create a project to keep related chats and folders together."), color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Button(onClick = { edit() }) { Text(uiText("New project")) }
                             }
                         }
@@ -237,7 +235,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                         }
                     }
                 }
-                project == null -> item { EmptyState(uiText("Project not found"), uiText("It may have been removed on another device."), action = uiText("All projects"), onAction = { selected = "" }) }
+                project == null -> item { EmptyState(uiText("Project not found"), "", action = uiText("All projects"), onAction = { selected = "" }) }
                 else -> {
                     if (project.string("description").isNotBlank()) item { Text(project.string("description"), color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     item { SettingsSection(uiText("Linked folders")) {
@@ -249,7 +247,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                                 onMakeMain = if (primary) null else ({ vm.action("/api/projects/folders/primary", json("id" to selected, "path" to path), refresh = false, onSuccess = { _, _ -> vm.loadNativeProjects(selected) }) }),
                                 onUnlink = {
                                     vm.openForm(ActionForm("Unlink folder?", "/api/projects/folders/remove", emptyList(), seed = json("id" to selected, "path" to path),
-                                        explanation = "Files stay on your computer. Chats in this folder may appear outside this project.", actionLabel = "Unlink", onResult = { vm.loadNativeProjects(selected); refreshOpenChatProject(vm) }, destructive = true))
+                                        explanation = "Files stay on your computer.", actionLabel = "Unlink", onResult = { vm.loadNativeProjects(selected); refreshOpenChatProject(vm) }, destructive = true))
                                 })
                             SettingsDivider()
                         }
@@ -259,8 +257,8 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                     val allowed = tree?.optJSONArray("sessionIds")?.strings().orEmpty().toSet()
                     val rows = (tree?.rows("repos").orEmpty().flatMap { it.rows("groups").flatMap { group -> group.rows("sessions") } } + tree?.rows("previewSessions").orEmpty())
                         .filter { nativeProjectSessionAllowed(it.string("id", it.string("session_id")), it.string("profile"), ui.profile, allowed, it.optBoolean("archived")) }.distinctBy { it.string("id", it.string("session_id")) }
-                    item { SettingsSection(uiText("Conversations"), testTag = "project-conversations") {
-                        if (rows.isEmpty()) SettingsEmpty(uiText("Open a chat’s menu and choose Add to project to move it here."), Icons.Rounded.ChatBubbleOutline)
+                    item { SettingsSection(uiText("Chats"), testTag = "project-conversations") {
+                        if (rows.isEmpty()) SettingsEmpty(uiText("No chats yet"), Icons.Rounded.ChatBubbleOutline)
                         rows.forEach { row ->
                             val sessionId = row.string("id", row.string("session_id"))
                             var actions by remember(sessionId) { mutableStateOf(false) }
@@ -270,7 +268,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                             val time = rowActivityMillis(history).takeIf { it > 0 }?.let { chatListTime(it, is24Hour = is24Hour) }.orEmpty()
                             // The same row as the drawer's chat list, with the project's own menu beside it.
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                                ChatListRow(sessionId, row.string("title").ifBlank { uiText("Untitled conversation") }, preview = preview, time = time,
+                                ChatListRow(sessionId, row.string("title").ifBlank { uiText("Untitled chat") }, preview = preview, time = time,
                                     modifier = Modifier.weight(1f).clickable { vm.tab("Chat"); vm.selectSession(sessionId) })
                                 Box {
                                     SettingsIconButton(Icons.Rounded.MoreVert, uiText("Chat project actions"), { actions = true })
@@ -437,7 +435,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                 else if (record.has("_error")) item { Text(uiText("Couldn't load projects. Check your connection and try again."), color = MaterialTheme.colorScheme.error); TextButton(onClick = { vm.loadNativeProjects() }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Retry")) } }
                 else if (selected == null) {
                     val projects = record.rows("projects").filterNot { it.optBoolean("archived") }
-                    if (projects.isEmpty()) item { Text(uiText("Create a project and link a folder to get started.")) }
+                    if (projects.isEmpty()) item { Text(uiText("No projects yet")) }
                     items(projects, key = { it.getString("id") }) { project ->
                         val here = project.string("id") == current?.string("id")
                         val folderCount = project.rows("folders").size

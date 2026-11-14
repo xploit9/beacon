@@ -31,7 +31,7 @@ internal fun safeRichHtml(source: String): String {
     doc.select("script,style,iframe,object,embed,svg,math,form,input,button,link,meta,base").remove()
     return Jsoup.clean(doc.body().html(), allowed)
 }
-internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foreground: String = if(dark) "#F4EEE5" else "#20272D", background: String = if(dark) "#151C22" else "#ECE7DE", fontScale: Float = 1f, rendering: String = "Rendering diagram...", failed: String = "Diagram could not be rendered. Open Source to read the original."): String {
+internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foreground: String = if(dark) "#F4EEE5" else "#20272D", background: String = if(dark) "#151C22" else "#ECE7DE", fontScale: Float = 1f, rendering: String = "Drawing diagram…", failed: String = "Can't draw this diagram. Tap Source to read it."): String {
     require(source.length <= RICH_LIMIT) { "Preview exceeds the 64,000 character limit" }
     val body = if (diagram) "<pre class=mermaid>" + org.jsoup.nodes.Entities.escape(source) + "</pre><p id=status>" + org.jsoup.nodes.Entities.escape(rendering) + "</p><p id=failed hidden>" + org.jsoup.nodes.Entities.escape(failed) + "</p>" else safeRichHtml(source)
     val scripts = if (diagram) """<script src="https://rich.invalid/polyfills.js"></script><script src="https://rich.invalid/mermaid.js"></script><script>
@@ -52,8 +52,8 @@ internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foregroun
     val foreground="#%06X".format(MaterialTheme.colorScheme.onSurface.toArgb() and 0xFFFFFF)
     val background="#%06X".format(MaterialTheme.colorScheme.surfaceContainer.toArgb() and 0xFFFFFF)
     val fontScale=LocalDensity.current.fontScale
-    val rendering = uiText("Rendering diagram...")
-    val failed = uiText("Diagram could not be rendered. Open Source to read the original.")
+    val rendering = uiText("Drawing diagram…")
+    val failed = uiText("Can't draw this diagram. Tap Source to read it.")
     val contentKey = listOf(source,diagram,dark,foreground,background,fontScale,rendering,failed)
     val prepared by produceState<PreparedContent<Result<String>>?>(null,contentKey) { value=PreparedContent("",contentKey,withContext(Dispatchers.Default) { runCatching { richPage(source,diagram,dark,foreground,background,fontScale,rendering,failed) } }) }
     val page = prepared?.forContext("",contentKey) ?: run { LinearProgressIndicator(); return }
@@ -79,7 +79,7 @@ internal fun richPage(source: String, diagram: Boolean, dark: Boolean, foregroun
     var rendererFailed by remember(page) { mutableStateOf(false) }
     val description = uiText(if(diagram) "Mermaid diagram preview" else "HTML card")
     if (rendererFailed) {
-        Column(modifier.padding(16.dp)) { Text(uiText("Preview stopped. Your message is unchanged.")); TextButton(onClick = { rendererFailed = false }) { Text(uiText("Retry preview")) } }
+        Column(modifier.padding(16.dp)) { Text(uiText("Preview stopped.")); TextButton(onClick = { rendererFailed = false }) { Text(uiText("Retry preview")) } }
         return
     }
     AndroidView(factory = { context -> WebView(context).apply {

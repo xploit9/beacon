@@ -108,6 +108,17 @@ class BeaconSettingsTest {
             proactiveErrorMessage(ApiFailure(409, "Choose an owned assistant conversation before enabling Proactive", plugin = true), "fallback"))
         assertEquals("fallback", proactiveErrorMessage(RuntimeException(""), "fallback"))
     }
+    /** Review R25 Should 1: the refusal is built from Hermes' answer, which already maps the plugin's sentence, so the special case must match the mapped line too. */
+    @Test fun turningOnWhatNeedsYouBeforeAnyChatSaysToSendBeaconAMessageFirst() {
+        val answer = JSONObject().put("detail", "Choose an owned assistant conversation before enabling Proactive")
+        val refused = ApiFailure(409, dev.hermes.android.data.nativeErrorMessage(answer, 409), plugin = true)
+        assertEquals("Send Beacon a message first, then turn this on.", proactiveErrorMessage(refused, "fallback"))
+        val locales = JSONObject(java.io.File(listOf(".", "app", "beacon-android/app").first { java.io.File(it, "src/main/assets/native-locales.json").isFile }, "src/main/assets/native-locales.json").readText())
+        for (language in locales.keys()) {
+            val shown = locales.getJSONObject(language).optString("send beacon a message first, then turn this on.")
+            assertTrue("$language: $shown", shown.isNotBlank() && "Beacon" in shown && (language == "en" || shown != "Send Beacon a message first, then turn this on."))
+        }
+    }
     @Test fun callsCountAsOnWhenThePluginSaysSo() {
         val on = dev.hermes.android.data.mergeOptionalFeatures(JSONObject(), JSONObject().put("plugin", "available").put("capabilities", JSONObject().put("callbacks", true)))
         assertTrue(callbacksAvailable(on))

@@ -194,6 +194,31 @@ class Source:
         return target is None or self.has(target, attribute) or optional
 
 
+# The one Hermes module the plugin reaches by a private spelling because Hermes has no public route for the job (cron.manage cannot create a
+# script job, change a job's own fields or list the paused ones). A gap in it names the features that stop, not only the Hermes name.
+PRIVATE_MODULE = 'hermes_cli.web_server_cron'
+PRIVATE_STOPS = 'The Watch, check-in calls and scheduled callbacks need a Beacon update for this Hermes'
+# The other private spelling: Hermes' own plugin activation, which turns Beacon on for another profile from the phone (admin_api.enable_plugin_for_profile).
+ENABLE_MODULE = 'hermes_cli.plugins_cmd'
+ENABLE_STOPS = 'Turning Beacon on for another profile from the phone needs a Beacon update for this Hermes'
+
+
+# The saved-card tool reaches Hermes' vault fill by private names too (browser_vault's page origin, card approval and fill); a gap in what
+# any_site_card.py needs stops that one feature, and browser_vault itself keeps working.
+CARD_FILE = 'any_site_card.py'
+CARD_STOPS = 'Using a saved card on any site needs a Beacon update for this Hermes'
+
+
+def stopped(gone):
+    """The sentences for the features that a gap in missing()'s answer stops."""
+    sentences = [PRIVATE_STOPS] if any(line.startswith(PRIVATE_MODULE + '.') for line in gone) else []
+    if any(line.startswith(ENABLE_MODULE + '.') for line in gone):
+        sentences.append(ENABLE_STOPS)
+    if any(f'({CARD_FILE})' in line for line in gone):
+        sentences.append(CARD_STOPS)
+    return sentences
+
+
 def missing(groups, hermes_root):
     """Each requirement this Hermes source cannot satisfy, as 'module.name.attribute (file)'."""
     source = Source(hermes_root)

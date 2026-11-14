@@ -44,6 +44,11 @@ class NativeActivityDeviceTest {
             assertEquals("Urgent requests must be eligible for heads-up popups",NotificationManager.IMPORTANCE_HIGH,manager.getNotificationChannel(notification.channelId).importance)
             assertEquals(Notification.VISIBILITY_PRIVATE, notification.visibility)
             assertEquals("Read the synthetic test folder", notification.extras.getString(Notification.EXTRA_TEXT))
+            // The plugin's fixed title and button label are shown in the app's words (slop list rows 10.14, 10.15); a question's own choices stay as written.
+            assertEquals("Approval needed", notification.extras.getString(Notification.EXTRA_TITLE))
+            assertEquals("Question for you", dev.hermes.android.push.activityTitleWords(context, "Beacon asks"))
+            assertEquals("Allow for this chat", dev.hermes.android.push.activityLabelWords(context, "approval", "Allow session"))
+            assertEquals("Allow session", dev.hermes.android.push.activityLabelWords(context, "clarify", "Allow session"))
             assertFalse(notification.publicVersion.extras.getString(Notification.EXTRA_TEXT).orEmpty().contains("folder"))
             assertEquals(if(kind=="approval") listOf("once", "session", "deny") else listOf("once","session","Answer"), notification.actions.map { it.title.toString() })
             if(kind=="clarify") assertEquals("answer",notification.actions.last().remoteInputs.single().resultKey)

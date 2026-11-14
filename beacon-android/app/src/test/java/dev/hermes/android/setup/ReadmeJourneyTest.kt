@@ -2,6 +2,7 @@ package dev.hermes.android.setup
 
 import dev.hermes.android.ui.BEACON_PC_INSTALL_URL
 import dev.hermes.android.updates.BEACON_PLUGIN_SOURCE
+import dev.hermes.android.updates.pluginInstallBody
 import java.io.File
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -67,10 +68,10 @@ class ReadmeJourneyTest {
     @Test fun theGuideNamesTheWizardPageTheAppShows() {
         // The page title and actions the guide quotes are the ones the setup page uses, so the README journey and the app do not drift apart.
         val page = File(root, "beacon-android/app/src/main/java/dev/hermes/android/ui/SetupPluginStep.kt").readText()
-        val title = "Add the Beacon plugin to Hermes"
+        val title = "Add Beacon to Hermes"
         assertTrue("uiText(\"$title\")" in page)
         assertTrue("\"$title\"" in guide)
-        for (action in listOf("Try again", "Sign in again", "Skip for now", "Set up from a computer")) {
+        for (action in listOf("Try again", "Sign in again", "Skip for now", "Set up from a computer (steps)")) {
             assertTrue("the guide names $action", action in guide)
             assertTrue("the page shows $action", "uiText(\"$action\")" in page)
         }
@@ -96,8 +97,16 @@ class ReadmeJourneyTest {
 
     @Test fun thePcRouteInstallsTheSameSourceTheAppDoes() {
         assertEquals("xploit9/beacon/hermes-plugin/beacon", BEACON_PLUGIN_SOURCE)
-        assertTrue("plugins install $BEACON_PLUGIN_SOURCE --enable" in guide)
-        assertTrue(File(root, "hermes-plugin/beacon/install/beacon_install.py").readText().contains("INSTALL_SOURCE = \"$BEACON_PLUGIN_SOURCE\""))
+        // The guide and the installer script install the way the app does: replaced if there, pinned to the release commit, turned on.
+        assertTrue("plugins install $BEACON_PLUGIN_SOURCE --force --ref" in guide && guide.contains("--enable`"))
+        val script = File(root, "hermes-plugin/beacon/install/beacon_install.py").readText()
+        assertTrue(script.contains("INSTALL_SOURCE = \"$BEACON_PLUGIN_SOURCE\""))
+        assertTrue(script.contains("\"plugins\", \"install\", INSTALL_SOURCE, \"--force\", \"--ref\", commit, \"--enable\""))
+        val body = pluginInstallBody("0123456789abcdef0123456789abcdef01234567")
+        assertTrue(body.getBoolean("force") && body.getBoolean("enable") && body.getString("ref").length == 40)
+        // Hermes refuses `plugins update` for a pinned plugin, so no document tells the reader to use it.
+        assertFalse("plugins update beacon" in readme.replace("`plugins update beacon` does not work", ""))
+        assertFalse("plugins update beacon" in guide.replace("`plugins update beacon` does not work", ""))
     }
 
     @Test fun theAppLinksLandOnRealReadmeSections() {

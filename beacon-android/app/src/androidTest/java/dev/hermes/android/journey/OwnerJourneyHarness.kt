@@ -78,17 +78,12 @@ internal class OwnerJourneyHarness(
     }
 
     /** All profile-scoped writes require a separately created, coordinator-selected QA profile. */
-    fun qa(healing: Boolean = false) {
+    fun qa() {
         val args = InstrumentationRegistry.getArguments()
         val requested = args.getString("beaconQaProfile").orEmpty()
         val allowed = requested.matches(Regex("qa-[0-9a-f]{32}")) && requested == scope.profile
         if (!allowed) mark("X-01", "qa_profile_required", "needs_human")
         assumeTrue(allowed)
-        if (healing) {
-            val optedIn = args.getString("beaconHealingQa") == "1"
-            if (!optedIn) mark("X-02", "healing_qa_opt_in_required", "needs_human")
-            assumeTrue(optedIn)
-        }
         current()
         val unsettled = vm.chat.value.queued.count { it.state !in setOf("sent", "settled") }
         if(vm.chat.value.streamId.isNotBlank()) mark("X-04", "qa_stream_active", "not_run")
@@ -101,13 +96,6 @@ internal class OwnerJourneyHarness(
         check(vm.client === client && client.scope.copy(session = "") == scope &&
             client.nativeAuthorityVersion() == epoch && client.incidentAdmission() == admission &&
             vm.ui.value.authenticated && vm.ui.value.connected)
-    }
-
-    fun ownsJournalItem(item: JSONObject): Boolean {
-        val binding = item.optJSONObject("binding") ?: return false
-        return binding.optString("origin") == scope.origin && binding.optString("owner") == scope.owner &&
-            binding.optString("profile") == scope.profile && binding.optString("auth_provider") == scope.nativeProvider &&
-            binding.optString("admission") == admission
     }
 
     suspend fun await(timeout: Long = 15_000, ready: suspend () -> Boolean) {

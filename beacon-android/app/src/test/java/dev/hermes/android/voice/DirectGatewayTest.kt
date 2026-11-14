@@ -33,7 +33,7 @@ class DirectGatewayTest {
             assertEquals(original,result.toString())
             // The original production event omitted presence, despite returning valid lookup evidence to speech.
             event.remove("result_present")
-            assertEquals("Completion not confirmed",CallToolReceipt.from(event)!!.chipLabel())
+            assertEquals("Not confirmed",CallToolReceipt.from(event)!!.chipLabel())
         }
     }
     @Test fun emptyReadIsAResultButUnavailableAndFailedLookupsNeverConfirmCompletion() {
@@ -57,7 +57,7 @@ class DirectGatewayTest {
         for(name in listOf("send_email","hermes_memory")) {
             val completed=registered().record("request",receipt("completed").put("tool_name",name).put("result_present",true))
             assertFalse(CallToolReceipt.from(completed)!!.hasResult)
-            assertEquals("Completion not confirmed",CallToolReceipt.from(completed)!!.chipLabel())
+            assertEquals("Not confirmed",CallToolReceipt.from(completed)!!.chipLabel())
         }
     }
     @Test fun ownerDecisionNeedsAnExactKnownProposalAndArguments() {

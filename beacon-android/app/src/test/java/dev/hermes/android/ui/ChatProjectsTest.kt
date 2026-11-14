@@ -25,12 +25,12 @@ class ChatProjectsTest {
     @Test fun thinkingTypingAndACallTakeTheLineOverFromTheProject() {
         assertEquals(ChatHeaderLine("", "thinking…"), line("Research", streaming = true))
         assertEquals(ChatHeaderLine("", "typing…"), line("Research", streaming = true, replyText = true))
-        assertEquals(ChatHeaderLine("", "Voice conversation"), line("Research", inCall = true, assistantChat = true))
+        assertEquals(ChatHeaderLine("", "On a call"), line("Research", inCall = true, assistantChat = true))
     }
 
     @Test fun aProjectReplacesTheAssistantTaglineButNeverTheModel() {
         assertEquals(ChatHeaderLine("Research", ""), line("Research", model = "", assistantChat = true))
-        assertEquals(ChatHeaderLine("", "Text and voice, together"), line("", model = "", assistantChat = true))
+        assertEquals(ChatHeaderLine("", "Chat and calls"), line("", model = "", assistantChat = true))
         assertEquals(ChatHeaderLine("Research", ""), line("Research", model = ""))
     }
 

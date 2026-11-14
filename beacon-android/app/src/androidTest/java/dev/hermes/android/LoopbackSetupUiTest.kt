@@ -15,6 +15,7 @@ import dev.hermes.android.data.cachedScopeFor
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.AuthStore
 import dev.hermes.android.data.BeaconClient
+import dev.hermes.android.data.CachedIdentityMismatch
 import dev.hermes.android.data.LoopbackSessionRecord
 import dev.hermes.android.data.NativeBearerRecord
 import dev.hermes.android.ui.NativeLocalization
@@ -215,7 +216,9 @@ class LoopbackSetupUiTest {
         try {
             store.clear(origin)
             val detached = client.detached()
-            try { detached.bootstrap() } finally { detached.closeNative() }
+            // 8a344aec (BeaconClient.retainCookieRotationLocked): the credential epoch moved with the clear, so this stale view's bootstrap is refused
+            // before it can persist anything.
+            try { assertTrue(runCatching { detached.bootstrap() }.exceptionOrNull() is CachedIdentityMismatch) } finally { detached.closeNative() }
             val restored = store.read(origin)
             assertTrue(restored.owner.isBlank())
             assertNull(restored.bearer)

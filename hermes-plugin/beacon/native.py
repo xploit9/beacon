@@ -665,6 +665,49 @@ def conversation_list(owner, provider, profile, archived=False,principal=None):
     return dict(result, sessions=selected)
 
 THREAD_SOURCES = ('android_thread', 'phone')  # the app's Threads lane: Beacon threads and Relay threads
+# Hermes' session authority creates a chat only under one of its own surfaces (gateway/session_policy.py SURFACES), so a thread made on one
+# cannot carry the `android_thread` source. The plugin keeps that marker itself, in its own store, and never writes Hermes' source column.
+THREAD_MARKS_DDL = 'CREATE TABLE IF NOT EXISTS thread_marks(owner TEXT NOT NULL,profile TEXT NOT NULL,session TEXT NOT NULL,created REAL NOT NULL,PRIMARY KEY(owner,profile,session))'
+
+
+def mark_thread(owner, profile, stored):
+    """Remember that the owner's chat `stored` is a thread. Idempotent; the caller has verified that the owner holds the chat."""
+    mobile = sys.modules['beacon_mobile']
+    with mobile.LOCK, mobile.connect() as conn:
+        conn.execute(THREAD_MARKS_DDL)
+        conn.execute('INSERT OR IGNORE INTO thread_marks(owner,profile,session,created) VALUES(?,?,?,?)', (owner, profile, stored, time.time()))
+
+
+def _thread_mark_ids(owner, profile):
+    """The chats the owner marked as threads in this profile. A read never creates or migrates the store, so a plugin that never marked one reads none."""
+    import sqlite3
+    mobile = sys.modules.get('beacon_mobile')
+    database = mobile.home() / 'plugin-data' / 'beacon' / 'mobile.sqlite' if mobile else None
+    if database is None or not database.is_file(): return set()
+    with closing(sqlite3.connect(database.resolve().as_uri() + '?mode=ro', uri=True)) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='thread_marks'").fetchone(): return set()
+        return {row[0] for row in conn.execute('SELECT session FROM thread_marks WHERE owner=? AND profile=?', (owner, profile))}
+
+
+def marked_threads(owner, profile, listed):
+    """The marked thread ids still in Hermes. A mark whose chat Hermes no longer holds at all (deleted) is dropped here; a chat that is only
+    archived, hidden or past the list window keeps its mark."""
+    marked = _thread_mark_ids(owner, profile)
+    absent = marked - {row.get('id') for row in listed}
+    if not absent: return marked
+    gone = set()
+    try:
+        from tui_gateway import server
+        with server._profile_db({'profile': profile}) as db:
+            if db is not None: gone = {sid for sid in absent if not db.get_session(sid)}
+    except Exception: return marked  # a store that cannot be read says nothing about the chat; the mark waits
+    if gone:
+        try:
+            mobile = sys.modules['beacon_mobile']
+            with mobile.LOCK, mobile.connect() as conn:
+                conn.executemany('DELETE FROM thread_marks WHERE owner=? AND profile=? AND session=?', [(owner, profile, sid) for sid in gone])
+        except Exception: pass  # the next list drops it
+    return marked - gone
 POST_KIND = 'cron_delivery'
 # Hermes refuses a row while the thread's own turn runs or its context is being compressed; the post waits instead.
 POST_BUSY = ('SessionTurnLeaseLostError', 'SessionCompressionInProgressError')
@@ -674,8 +717,9 @@ def threads(owner, provider, profile,principal=None):
     """The owner's open threads, newest first: the chats a scheduled job can post into."""
     rows = (conversation_list(owner,provider,profile,False,principal) if principal else
             conversation_list(owner,provider,profile))['sessions']
+    marked = marked_threads(owner, profile, rows)
     return [{'id': row['id'], 'title': row.get('title') or ''} for row in rows
-            if row.get('source') in THREAD_SOURCES or row.get('created_source') in THREAD_SOURCES]
+            if row.get('source') in THREAD_SOURCES or row.get('created_source') in THREAD_SOURCES or row['id'] in marked]
 
 
 def post(owner, provider, profile, stored, key, text, name):
@@ -696,28 +740,6 @@ def post(owner, provider, profile, stored, key, text, name):
         return add(target, key, '[Cron delivery: ' + name + ']\n' + text, POST_KIND, {'job': name})
 
 
-PROJECT_CREATION_LOCK = threading.Lock()
-
-
-def create_project(owner, provider, profile, request_id, name, description=''):
-    if (not isinstance(request_id, str) or str(uuid.UUID(request_id)) != request_id
-            or not isinstance(name, str) or not name.strip() or len(name) > 120
-            or any(ord(c) < 32 for c in name) or not isinstance(description, str) or len(description) > 2000):
-        raise ValueError('A stable request, project name and description are required')
-    slug = 'phone-' + request_id
-    # Keep the native lookup + create together even if the HTTP request is cancelled.
-    with PROJECT_CREATION_LOCK:
-        projects = rpc(owner, provider, 'projects.list', {'profile': profile}).get('projects')
-        if not isinstance(projects, list):
-            raise RuntimeError('Native project listing unavailable')
-        for project in projects:
-            if project.get('slug') == slug:
-                if project.get('name') != name.strip() or (project.get('description') or '') != description:
-                    raise ValueError('This project was already created. Refresh Projects to edit it; your draft is retained.')
-                return {'project': project}
-        return rpc(owner, provider, 'projects.create', {'profile': profile, 'name': name.strip(), 'description': description, 'slug': slug})
-
-
 def provision(owner,provider,profile):
     """Save an empty owned chat without a live session: this also runs in Hermes' cron process, where session.create would start an agent."""
     from hermes_state_ids import new_session_id
@@ -730,7 +752,26 @@ def provision(owner,provider,profile):
     return stored
 
 
-def create(owner,provider,profile,principal=None):
+def adopt_unused(owner,provider,profile,stored,principal):
+    """Give the exact login Beacon's record of a conversation the host stamped for every login, while it holds nothing.
+
+    The host stamps a conversation made through a login with its owner subject, which proves no login. A Bot Chat whose
+    first open stopped before Beacon recorded it stays behind like that, empty; only such a row is adopted, never one
+    with history and never one stamped for another subject."""
+    from tui_gateway import server
+    if not principal: return False
+    execution=execution_subject(owner,provider,principal)
+    with server._profile_db({'profile':profile}) as db:
+        if db is None: raise RuntimeError('Native conversation store unavailable')
+        row=db.get_session(stored)
+        count=getattr(db,'message_count',None)
+        if (not row or row.get('user_id')!=execution or row.get('message_count') or not callable(count) or count(stored)): return False
+    mobile=sys.modules.get('beacon_mobile')
+    return bool(mobile and bind_conversation(mobile,owner,provider,profile,stored,principal,execution,'legacy','adopt:'+stored))
+
+
+def create(owner,provider,profile,principal=None,title='Beacon voice call',params=None,named=None):
+    """[named] runs once the row exists, before Beacon records it, for a title the host must also hold."""
     from tui_gateway import server
     transport=ReplyTransport(owner,provider,principal)
     expected=server._transport_auth_user_id(transport)
@@ -739,7 +780,7 @@ def create(owner,provider,profile,principal=None):
     expected_home=server._profile_home(profile)
     expected_home=str(expected_home) if expected_home else None
     expected_fingerprint=profile_fingerprint(profile)
-    result=rpc(owner,provider,'session.create',{'profile':profile,'source':'android','title':'Beacon voice call','close_on_disconnect':False},transport=transport)
+    result=rpc(owner,provider,'session.create',{'profile':profile,'source':'android','title':title,'close_on_disconnect':False,**(params or {})},transport=transport)
     sid=result['session_id'];record=None
     def owned(current):
         return (current is record and current is not None and server._session_auth_user_id(current)==expected
@@ -755,6 +796,7 @@ def create(owner,provider,profile,principal=None):
         with server._sessions_lock:
             if not owned(server._sessions.get(sid)):
                 raise RuntimeError('Native reservation changed')
+        if named: named(sid)
         if principal:
             mobile=sys.modules.get('beacon_mobile')
             if mobile is None or not bind_conversation(mobile,owner,provider,profile,result['stored_session_id'],principal,

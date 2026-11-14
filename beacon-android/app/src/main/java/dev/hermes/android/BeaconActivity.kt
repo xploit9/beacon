@@ -352,10 +352,10 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true), modifier = Modifier.testTag("beacon-incoming-sheet"), sheetMaxWidth = 560.dp, containerColor = MaterialTheme.colorScheme.surfaceContainer,
         ) {
             IncomingCallContent(
-                reason = reason,
+                reason = dev.hermes.android.ui.callReasonWords(reason, dev.hermes.android.ui.uiTextLookup()).orEmpty(),
                 ringFraction = (remaining / (INCOMING_RING_SECONDS * 1000f)).coerceIn(0f, 1f),
                 error = ui.error.ifBlank { call.error },
-                answerLabel = when { requestingPermission -> uiText("Waiting for microphone permission"); busy -> uiText("Please wait"); else -> uiText("Answer") },
+                answerLabel = when { requestingPermission -> uiText("Waiting for microphone permission"); busy -> uiText("Connecting…"); else -> uiText("Answer") },
                 enabled = !requestingPermission && !busy,
                 onAnswer = { onAnswer(pending.source, pending.event) },
                 onDecline = { vm.declineIncoming(pending.source, pending.event) },
@@ -543,8 +543,8 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
                         Box(Modifier.weight(1f).then(modeMotion)) {
                         if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
                             Header(when(ui.tab) { "Tasks" -> uiText("Schedules"); "Spaces" -> uiText("Files"); else -> uiText(ui.tab) }, menu = openMenu)
-                            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network, then retry. Your saved drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
-                        } else when (ui.tab) { "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
+                            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network. Drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
+                        } else when (ui.tab) { "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
                         }
                     }
                 }
@@ -604,7 +604,7 @@ internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (Str
                 Text(summary.action, style = MaterialTheme.typography.titleMedium.merge(ContentDirection))
                 if (summary.service.isNotBlank()) Text(summary.service, style = MaterialTheme.typography.bodySmall)
                 if (summary.target.isNotBlank()) Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(uiText("Target"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(uiText("Applies to"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(summary.target, style = MaterialTheme.typography.bodyLarge.merge(ContentDirection))
                 }
                 if (summary.fields.isNotBlank()) Text(summary.fields, style = MaterialTheme.typography.bodyMedium.merge(ContentDirection))

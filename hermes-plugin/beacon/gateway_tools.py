@@ -31,8 +31,16 @@ MAX_SCHEMA_DEPTH = 48
 MAX_TOOL_NAME = 200
 # A call's tool search waits this long at most for this process's first MCP scan, then answers with what is ready.
 FIRST_SCAN_WAIT = 2.0
-# Hermes metadata can wait on configuration locks even when its tool list is already known.
-DISCOVER_LIST_WAIT = 8.0
+# A call's tool search answers inside this many seconds of the request's start (not of the lookup's), with the last good list or a
+# "still starting" result, so it always wins against the phone's own 15 s cap. Hermes metadata can wait on configuration locks even
+# when its tool list is already known; the lookup then finishes behind the answer.
+DISCOVER_LIST_WAIT = 4.5
+# A request that spent its budget before the lookup began still waits this long for a warm list (it is ready in milliseconds).
+DISCOVER_MIN_WAIT = 0.25
+# "Still starting" has an end: a lookup that has run this long (from the first search that started it) is stuck, for example on a hung MCP
+# server. A search with no earlier list then fails with a gateway timeout, which is what makes the model hand the request to
+# hermes_work, instead of being told to ask again for ever. A search with an earlier list gets that list without waiting.
+DISCOVER_STARTING_LIMIT = 20.0
 # Eight active calls at 128 receipts each; old closed or expired receipts make room.
 MAX_RECEIPTS = 1024
 MAX_CALL_ALLOWANCES = 32
@@ -40,9 +48,12 @@ MAX_ALLOWANCES = 1024
 DEADLINE = 90
 # A list built while some server still waits for its first live scan is rebuilt after this long.
 CATALOG_TTL = 15
+# A complete list (nothing left to scan) is current this long; an older one is served at once and rebuilt behind the call, which is
+# what keeps the list warm for the next call. The dashboard refreshes it on a shorter timer (plugin_api.TOOLS_REFRESH_SECONDS).
+CATALOG_REFRESH = 300
 # An older list is still served at once (and refreshed behind it) for this long, so a call never waits for a scan; the cache
 # key follows Hermes' config, MCP config, schema cache file and registered definitions.
-CATALOG_STALE_TTL = 600
+CATALOG_STALE_TTL = 1800
 BOOT = uuid.uuid4().hex
 LOADED_SHA = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix='beacon-mcp')
@@ -126,6 +137,40 @@ def worker_stack(thread):
         locations.append(f'{Path(frame.f_code.co_filename).name}:{frame.f_lineno} {frame.f_code.co_name}')
         frame=frame.f_back
     return ' <- '.join(locations) or 'not running'
+
+
+class StageTimer:
+    """Seconds spent in each stage of one tool lookup: authorise, scope (the profile binding and Hermes' metadata), catalog (the
+    list from the cache or a build) and response. Content-free by construction: stage names and numbers only, never a query, a
+    tool, a profile or a call identity. A stage that is still running when the summary is read is named, which is what tells the
+    owner's log which stage a slow request was stuck in."""
+    STAGES=('authorise','scope','catalog','response')
+
+    def __init__(self):
+        self.started=time.monotonic()
+        self.seconds={}
+        self.running=set()
+        self.answered=False
+        self._lock=threading.Lock()
+
+    def elapsed(self): return time.monotonic()-self.started
+
+    @contextmanager
+    def stage(self, name):
+        begin=time.monotonic()
+        with self._lock: self.running.add(name)
+        try: yield
+        finally:
+            with self._lock:
+                self.running.discard(name)
+                self.seconds[name]=self.seconds.get(name,0.0)+time.monotonic()-begin
+
+    def summary(self):
+        with self._lock:
+            parts=[f'{name}={self.seconds.get(name,0.0):.2f}s' for name in self.STAGES]
+            running=sorted(self.running)
+        text=' '.join(parts)+f' total={self.elapsed():.2f}s'
+        return text+(' still_running='+','.join(running) if running else '')
 
 
 def query_words(text):
@@ -635,9 +680,13 @@ def schema_file(scope, path):
 
 
 def schema_entry_expired(entry):
-    """Whether a cache entry is past the ttl its server gave with the list (Hermes itself then reconnects instead of using it)."""
+    """Whether a cache entry is past the ttl its server gave with the list (Hermes itself then reconnects instead of using it).
+    Hermes (tools/mcp_schema_cache.py get_cached_entry) treats a ttl of 0 as already expired. The call's list deliberately does not: it
+    would call such an entry stale on every look, connect its server again and rewrite the schema file, which changes the catalogue key
+    and leaves the next call a cold list. So a ttl of 0 (or less) is listed from the file as it stands; a new tool on such a server reaches
+    the call only after Hermes itself reconnects the server (its own periodic MCP refresh rewrites the file)."""
     ttl,written=entry.get('ttl_ms'),entry.get('written_at')
-    return (type(ttl) in (int,float) and type(written) in (int,float)) and (time.time()-written)*1000.0>=float(ttl)
+    return (type(ttl) in (int,float) and type(written) in (int,float) and ttl>0) and (time.time()-written)*1000.0>=float(ttl)
 
 
 class _McpLoopStarter:
@@ -1118,8 +1167,9 @@ class Gateway:
     @staticmethod
     def _fresh_for(key):
         """How long a stored list is current without a rescan. A list with nothing left to scan lasts: its key already follows the
-        config, the MCP config, registered definitions and Hermes' schema cache file."""
-        return CATALOG_STALE_TTL if key in CATALOG_SETTLED else CATALOG_TTL
+        config, the MCP config, registered definitions and Hermes' schema cache file. Past it the list is still served at once while
+        the next one is built behind it, until CATALOG_STALE_TTL."""
+        return CATALOG_REFRESH if key in CATALOG_SETTLED else CATALOG_TTL
 
     def _cached_catalog(self, profile):
         key=self._catalog_key(profile)
@@ -1251,28 +1301,35 @@ class Gateway:
         try: return self.scoped(profile,lambda _:pending())
         except Exception: return None
 
-    def _discover_catalog(self, profile):
+    def _discover_catalog(self, profile, timer=None):
         # Hermes' schema cache lists every server it has connected before, so that list is complete without any scan (asking registers it).
         # Only a server with no cached list is scanned live: wait briefly for a quick scan, then answer with what is ready; servers
         # still starting are named in the answer, so the call asks again instead of waiting out its deadline.
-        pending=self._pending(profile)
+        timer=timer or StageTimer()
+        with timer.stage('scope'): pending=self._pending(profile)
         if pending!=[]:
             self.warm_catalogue(profile)
             first=CATALOG_FIRST_WARM.get(profile)
             if first is not None and first is not threading.current_thread(): first.join(FIRST_SCAN_WAIT)
-        rows=self.catalog(profile,discover=False)
-        return rows,self._starting(profile,rows)
+        with timer.stage('catalog'): rows=self.catalog(profile,discover=False)
+        with timer.stage('scope'): starting=self._starting(profile,rows)
+        return rows,starting
 
-    def discover(self, profile, query=''):
+    def discover(self, profile, query='', timer=None):
         if not isinstance(query, str) or len(query)>240: raise HTTPException(400, 'Invalid tool query')
+        timer=timer or StageTimer()
         with CATALOG_LOCK:
             lookup=DISCOVER_LOOKUPS.get(profile)
             if lookup is None or not lookup[0].is_alive():
                 future=concurrent.futures.Future()
                 def run():
-                    try: future.set_result(self._discover_catalog(profile))
+                    try: future.set_result(self._discover_catalog(profile,timer))
                     except BaseException as error: future.set_exception(error)
+                    finally:
+                        # A lookup that outlived its answer says where its time went, so a slow stage shows in the log.
+                        if timer.answered: logger.warning('Beacon call tool lookup finished after its answer: %s',timer.summary())
                 thread=threading.Thread(target=contextvars.copy_context().run,args=(run,),name='beacon-tool-lookup',daemon=True)
+                thread.lookup_began=time.monotonic()
                 lookup=(thread,future)
                 DISCOVER_LOOKUPS[profile]=lookup
                 try: thread.start()
@@ -1280,16 +1337,30 @@ class Gateway:
                     DISCOVER_LOOKUPS.pop(profile,None)
                     raise
         thread,future=lookup
-        thread.join(DISCOVER_LIST_WAIT)
+        # The deadline counts from the request's start: authorisation has already spent part of it. A lookup past its age limit is stuck:
+        # it gets a glance, not another wait.
+        aged=time.monotonic()-getattr(thread,'lookup_began',time.monotonic())>=DISCOVER_STARTING_LIMIT
+        thread.join(0 if aged else max(min(DISCOVER_MIN_WAIT,DISCOVER_LIST_WAIT),DISCOVER_LIST_WAIT-timer.elapsed()))
         if future.done(): rows,starting=future.result()
         else:
+            timer.answered=True
             with CATALOG_LOCK: rows=LAST_CATALOG.get(profile)
+            if rows is None and aged:
+                logger.warning('Beacon call tool list not ready after %.0f s; answering unavailable; worker_stack=%s',
+                               DISCOVER_STARTING_LIMIT,worker_stack(thread))
+                # The build goes on behind this answer; the phone hands the request to Hermes and a later search finds the list ready.
+                raise HTTPException(504,'Tool list not ready')
             if rows is None:
                 logger.warning('Beacon cold discover metadata deadline; worker_stack=%s',worker_stack(thread))
-                raise HTTPException(504,'Tool catalogue is still starting; retry this read or use the native conversation')
+                # Not an error: the build goes on behind this answer, so the phone asks again in a moment and finds the list ready.
+                return {'tools':[],'total_matches':0,'truncated':False,'status':'starting'}
             else:
                 starting=[]
                 logger.warning('Beacon call discover using last tool list after metadata wait; worker_stack=%s',worker_stack(thread))
+        timer.answered=True
+        with timer.stage('response'): return self._answer(rows,starting,query)
+
+    def _answer(self, rows, starting, query):
         words = set(re.findall(r'[^\W_]+', query.casefold())) - QUERY_FILLER
         words = {word for word in words if not word.isdecimal()}
         # Task details ("latest five emails") need not occur verbatim in a tool's schema.

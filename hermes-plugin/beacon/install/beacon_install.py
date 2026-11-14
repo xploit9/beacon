@@ -16,14 +16,18 @@ import subprocess
 import sys
 import time
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlencode, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 
 PLUGIN = "beacon"
 INSTALL_SOURCE = "xploit9/beacon/hermes-plugin/beacon"
 PROBE_ROUTE = "/dashboard-plugins/beacon/manifest.json"
 RELEASE_URL = "https://github.com/xploit9/beacon/releases/latest"
+RELEASE_API = "https://api.github.com/repos/xploit9/beacon"
+RELEASE_TAG = re.compile(r"v?([0-9][A-Za-z0-9._-]{0,62})\Z")
+RELEASE_VERSION = re.compile(r"(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\Z")
+COMMIT_SHA = re.compile(r"[0-9a-f]{40}\Z")
 PROFILE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,79}\Z")
 
 
@@ -164,7 +168,8 @@ def _quiet(hermes: str, home: Path, profile: str, *args: str) -> subprocess.Comp
         raise InstallError(f"Hermes {' '.join(args[:2])} could not be queried.") from exc
 
 
-def _plugin_names(hermes: str, home: Path, profile: str) -> set[str]:
+def _installed_plugins(hermes: str, home: Path, profile: str, field: str = "version") -> dict[str, str]:
+    """Each installed plugin's name and the [field] ('version' or 'status') Hermes lists for it ('' when it lists none)."""
     result = _quiet(hermes, home, profile, "plugins", "list", "--json")
     if result.returncode:
         raise InstallError("Could not list Hermes plugins; nothing was changed.")
@@ -172,10 +177,18 @@ def _plugin_names(hermes: str, home: Path, profile: str) -> set[str]:
         rows = json.loads(result.stdout)
         if not isinstance(rows, list):
             raise ValueError("expected plugin list")
-        names = {row["name"] for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)}
+        plugins = {row["name"]: row[field] if isinstance(row.get(field), str) else ""
+                   for row in rows if isinstance(row, dict) and isinstance(row.get("name"), str)}
     except (TypeError, ValueError, KeyError) as exc:
         raise InstallError("Hermes returned an unreadable plugin list; nothing was changed.") from exc
-    return names
+    return plugins
+
+
+def _newer(installed: str, release: str) -> bool:
+    """True only when both are plain x.y.z versions and the installed one is higher; anything else cannot be compared, so the release is installed."""
+    if not (RELEASE_VERSION.match(installed) and RELEASE_VERSION.match(release)):
+        return False
+    return tuple(map(int, installed.split("."))) > tuple(map(int, release.split(".")))
 
 
 def _run_mutation(hermes: str, home: Path, profile: str, *args: str) -> None:
@@ -191,6 +204,43 @@ def _run_stream(hermes: str, home: Path, profile: str, *args: str) -> None:
         raise InstallError(f"Could not start Hermes {' '.join(args[:2])}.") from exc
     if result.returncode:
         raise InstallError(f"Hermes {' '.join(args[:2])} failed (exit {result.returncode}).")
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def _github(path: str, accept: str) -> bytes:
+    unavailable = "Could not read the latest Beacon release from GitHub; nothing was changed."
+    request = Request(RELEASE_API + path, headers={"Accept": accept, "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Beacon-Installer"})
+    try:
+        with build_opener(_NoRedirect).open(request, timeout=15) as response:
+            raw = response.read(262145)
+    except HTTPError as exc:
+        raise InstallError("GitHub is busy. Try again later; nothing was changed." if exc.code in (403, 429) else unavailable) from exc
+    except (OSError, URLError) as exc:
+        raise InstallError(unavailable) from exc
+    if len(raw) > 262144:
+        raise InstallError(unavailable)
+    return raw
+
+
+def _release_commit() -> tuple[str, str]:
+    """The commit the latest Beacon release was built from, found the way the app finds it, so the install runs exactly the published release,
+    and that release's version."""
+    try:
+        release = json.loads(_github("/releases/latest", "application/vnd.github+json"))
+        tag = release["tag_name"]
+        if (release.get("draft") or release.get("prerelease") or not isinstance(tag, str) or not RELEASE_TAG.match(tag)
+                or not RELEASE_VERSION.match(tag.removeprefix("v"))):
+            raise ValueError("the latest release has no usable tag")
+        commit = _github("/commits/" + quote(tag, safe=""), "application/vnd.github.sha").decode("ascii").strip()
+        if not COMMIT_SHA.match(commit):
+            raise ValueError("the release tag does not name a commit")
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise InstallError("Could not read the latest Beacon release from GitHub; nothing was changed.") from exc
+    return commit, tag.removeprefix("v")
 
 
 def _public_url(hermes: str, home: Path, profile: str) -> str | None:
@@ -517,7 +567,8 @@ def _install(args: argparse.Namespace) -> int:
     _line(True, "Hermes CLI found")
     home = _select_home(args.home)
     profile = _select_profile(home, args.profile)
-    beacon_installed = PLUGIN in _plugin_names(hermes, home, profile)
+    plugins = _installed_plugins(hermes, home, profile)
+    beacon_installed = PLUGIN in plugins
 
     running = _dashboard_running(hermes, home, profile)
 
@@ -525,13 +576,19 @@ def _install(args: argparse.Namespace) -> int:
         _dry_run_summary(beacon_installed, running, _public_url(hermes, home, profile), _dashboard_port(hermes, home, profile))
         return 0
 
-    if beacon_installed:
-        _line(True, "Updating Beacon; Hermes installer output follows")
-        _run_stream(hermes, home, profile, "plugins", "update", PLUGIN)
+    # Pinned like the app's own install and repair: Hermes refuses `plugins update` for a pinned plugin, and a pinned install is the published release.
+    commit, release = _release_commit()
+    if beacon_installed and _newer(plugins[PLUGIN], release):
+        # An older release over a newer Beacon would be a downgrade (a candidate build, or a release not yet published here).
+        _line(True, f"Beacon {plugins[PLUGIN]} is newer than the latest release {release}; leaving it as it is")
+        # Left alone but switched off, it would still give the dashboard no Beacon tab behind the link printed below.
+        if _installed_plugins(hermes, home, profile, "status").get(PLUGIN) != "enabled":
+            _run_mutation(hermes, home, profile, "plugins", "enable", PLUGIN)
+            _line(True, "Beacon was switched off; it is on again")
     else:
-        _line(True, "Installing Beacon; Hermes security scan and prompts follow")
-        _run_stream(hermes, home, profile, "plugins", "install", INSTALL_SOURCE, "--enable")
-    _line(True, "Beacon plugin installation completed")
+        _line(True, f"{'Updating' if beacon_installed else 'Installing'} Beacon to the latest release; Hermes' security scan still runs; a dangerous verdict still stops the install")
+        _run_stream(hermes, home, profile, "plugins", "install", INSTALL_SOURCE, "--force", "--ref", commit, "--enable")
+        _line(True, "Beacon plugin installation completed")
 
     public_url = _public_url(hermes, home, profile)
     port = _dashboard_port(hermes, home, profile)

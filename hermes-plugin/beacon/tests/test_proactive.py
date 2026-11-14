@@ -1622,6 +1622,194 @@ def test_job_specs_watch_connected_sources_and_keep_nightly_memory(harness):
     assert api.proactive._specs(setup, [night_rule])[0]["schedule"] == "*/15 * * * *"
 
 
+def test_watch_model_is_its_own_setting_and_nightly_keeps_the_saved_model(harness):
+    # Owner (7 Nov): the model is chosen for the watch only. Nightly memory upkeep keeps the saved model, and a setup
+    # without a watch model keeps the saved model for the watch exactly as before.
+    api = harness[0]
+    proactive = api.proactive
+    saved = {**proactive.default_setup(), "model": "assistant-model", "provider": "assistant-provider"}
+    watch, nightly = proactive._specs(proactive.validate_setup({"enabled": True, **saved}))
+    assert (watch["model"], watch["provider"]) == ("assistant-model", "assistant-provider")
+    assert (nightly["model"], nightly["provider"]) == ("assistant-model", "assistant-provider")
+
+    chosen = proactive.validate_setup({"enabled": True, **saved, "watch_model": "watch-model", "watch_provider": "watch-provider"})
+    watch, nightly = proactive._specs(chosen)
+    assert (watch["model"], watch["provider"]) == ("watch-model", "watch-provider")
+    assert (nightly["model"], nightly["provider"]) == ("assistant-model", "assistant-provider")
+    # A watch job still on the assistant's model no longer matches, so the next save updates it to the watch's model.
+    pinned_to_assistant = {"name": watch["name"], "prompt": watch["prompt"], "schedule_display": watch["schedule"],
+                           "deliver": "local", "skills": None, "enabled_toolsets": None,
+                           "model": "assistant-model", "provider": "assistant-provider"}
+    assert not proactive._job_definition_matches(pinned_to_assistant, watch)
+
+    proactive._meta_set(api.mobile, proactive._key("owner", "default", "setup"), json.dumps(chosen))
+    assert proactive._setup(api.mobile, "owner", "default")["watch_model"] == "watch-model"
+
+    existing = {key: value for key, value in saved.items() if not key.startswith("watch_")}
+    watch, nightly = proactive._specs(existing)
+    assert (watch["model"], watch["provider"]) == ("assistant-model", "assistant-provider")
+    assert (nightly["model"], nightly["provider"]) == ("assistant-model", "assistant-provider")
+
+
+def test_validate_setup_leaves_an_absent_watch_model_out(harness):
+    # Ponytail review 1134, N4: a key the request omits is not a value. Only an explicit value, even "", names the watch model.
+    proactive = harness[0].proactive
+    base = {"enabled": False, "delivery": "notify", "check_minutes": 15, "quiet_start": "22:00", "quiet_end": "07:00"}
+    assert "watch_model" not in proactive.validate_setup(base)
+    assert "watch_provider" not in proactive.validate_setup(base)
+    assert proactive.validate_setup({**base, "watch_model": ""})["watch_model"] == ""
+    assert proactive.validate_setup({**base, "watch_model": "m", "watch_provider": "p"})["watch_provider"] == "p"
+    with pytest.raises(ValueError):
+        proactive.validate_setup({**base, "watch_model": 5})
+
+
+def test_a_save_without_the_watch_model_keeps_the_saved_one(harness, monkeypatch):
+    # N4: a phone still on 1.1.33 never sends the watch model, so changing its check interval must not clear the owner's choice.
+    api, client, _, home, _ = harness
+    monkeypatch.setattr(api.proactive, "_home", lambda profile: home)
+    monkeypatch.setattr(api.proactive, "_write_profile_instructions", lambda *args: None)
+    monkeypatch.setattr(api.proactive, "_validate_profile_instructions", lambda *args: None)
+    monkeypatch.setattr(api.proactive, "_cron_helpers", lambda: (lambda *args: [], None, None, None))
+    path = "/api/plugins/beacon/mobile/proactive"
+    setup = {"enabled": False, "delivery": "call", "check_minutes": 30, "quiet_start": "22:15", "quiet_end": "07:15"}
+    chosen = client.put(path, json={**setup, "watch_model": "watch-model", "watch_provider": "watch-provider"})
+    assert chosen.status_code == 200, chosen.text
+    older = client.put(path, json={**setup, "check_minutes": 15})
+    assert older.status_code == 200, older.text
+    assert older.json()["check_minutes"] == 15
+    assert older.json()["watch_model"] == "watch-model" and older.json()["watch_provider"] == "watch-provider"
+    assert api.proactive._setup(api.mobile, "owner", "default")["watch_model"] == "watch-model"
+    cleared = client.put(path, json={**setup, "watch_model": "", "watch_provider": ""})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["watch_model"] == "" and cleared.json()["watch_provider"] == ""
+
+
+def test_watch_model_and_provider_come_as_one_pair(harness):
+    # Ponytail review 1134, R3-3: one of the two keys makes the pair the request's own, so a missing half is empty.
+    proactive = harness[0].proactive
+    base = {"enabled": False, "delivery": "notify", "check_minutes": 15, "quiet_start": "22:00", "quiet_end": "07:00"}
+    only_model = proactive.validate_setup({**base, "watch_model": "m"})
+    assert (only_model["watch_model"], only_model["watch_provider"]) == ("m", "")
+    only_provider = proactive.validate_setup({**base, "watch_provider": "p"})
+    assert (only_provider["watch_model"], only_provider["watch_provider"]) == ("", "p")
+
+
+def test_one_watch_key_in_a_save_takes_the_whole_pair_from_that_save(harness, monkeypatch):
+    # R3-3 through the route: a save that names only the provider leaves no model behind; a save with neither keeps both.
+    api, client, _, home, _ = harness
+    monkeypatch.setattr(api.proactive, "_home", lambda profile: home)
+    monkeypatch.setattr(api.proactive, "_write_profile_instructions", lambda *args: None)
+    monkeypatch.setattr(api.proactive, "_validate_profile_instructions", lambda *args: None)
+    monkeypatch.setattr(api.proactive, "_cron_helpers", lambda: (lambda *args: [], None, None, None))
+    path = "/api/plugins/beacon/mobile/proactive"
+    setup = {"enabled": False, "delivery": "call", "check_minutes": 30, "quiet_start": "22:15", "quiet_end": "07:15"}
+    chosen = client.put(path, json={**setup, "watch_model": "watch-model", "watch_provider": "watch-provider"})
+    assert chosen.status_code == 200, chosen.text
+    provider_only = client.put(path, json={**setup, "watch_provider": "other-provider"})
+    assert provider_only.status_code == 200, provider_only.text
+    assert (provider_only.json()["watch_model"], provider_only.json()["watch_provider"]) == ("", "other-provider")
+    neither = client.put(path, json=setup)
+    assert neither.status_code == 200, neither.text
+    assert (neither.json()["watch_model"], neither.json()["watch_provider"]) == ("", "other-provider")
+
+
+def test_a_watch_already_on_saves_its_choices_without_a_stored_owned_conversation(harness, monkeypatch):
+    # Live check 8 Nov (F2): the app sends enabled=true with every choice, and the route refused it with 409 "Choose an owned
+    # assistant conversation before enabling Proactive" on a phone with no stored one, so the model never saved. That
+    # precondition is for turning the watch on; the choices of a watch that is already on are not blocked by it.
+    api, client, cfg, home, _ = harness
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    path = "/api/plugins/beacon/mobile/proactive"
+    setup = {"enabled": True, "delivery": "notify", "check_minutes": 15, "quiet_start": "22:00", "quiet_end": "07:00",
+             "model": "assistant-model", "provider": "assistant-provider"}
+    assert client.put(path, json=setup).status_code == 200
+    cfg.pop("scheduled_callback_conversation_id")
+
+    chosen = client.put(path, json={**setup, "watch_model": "watch-model", "watch_provider": "watch-provider"})
+
+    assert chosen.status_code == 200, chosen.text
+    assert chosen.json()["enabled"] is True
+    assert (chosen.json()["watch_model"], chosen.json()["watch_provider"]) == ("watch-model", "watch-provider")
+    status = client.get(path).json()
+    assert (status["watch_model"], status["watch_provider"]) == ("watch-model", "watch-provider")
+    watch = next(row for row in jobs if row["name"] == "Beacon: what needs you")
+    nightly = next(row for row in jobs if row["name"].endswith("Nightly memory upkeep"))
+    assert (watch["model"], watch["provider"]) == ("watch-model", "watch-provider")
+    assert (nightly["model"], nightly["provider"]) == ("assistant-model", "assistant-provider")
+    # The other choices of a running watch save the same way, and "Same as assistant" clears the watch's own model.
+    interval = client.put(path, json={**setup, "check_minutes": 30, "watch_model": "", "watch_provider": ""})
+    assert interval.status_code == 200, interval.text
+    assert interval.json()["check_minutes"] == 30 and interval.json()["watch_model"] == ""
+    watch = next(row for row in jobs if row["name"] == "Beacon: what needs you")
+    assert (watch["model"], watch["provider"]) == ("assistant-model", "assistant-provider")
+
+
+def test_a_watch_already_on_saves_its_choices_when_the_stored_conversation_no_longer_verifies(harness, monkeypatch):
+    # (b) Root, 8 Nov: a stored conversation that Hermes no longer has (native.verify 404) blocks turning the watch on, not a save of a watch that is on.
+    api, client, cfg, home, _ = harness
+    jobs, _ = _fake_cron(api, monkeypatch, home)
+    path = "/api/plugins/beacon/mobile/proactive"
+    setup = {"enabled": True, "delivery": "notify", "check_minutes": 15, "quiet_start": "22:00", "quiet_end": "07:00"}
+    assert client.put(path, json=setup).status_code == 200
+
+    def gone(*args):
+        raise HTTPException(404, "Not found")
+    monkeypatch.setattr(api.native, "verify", gone)
+    assert cfg["scheduled_callback_conversation_id"] == "assistant-chat"
+
+    chosen = client.put(path, json={**setup, "watch_model": "watch-model", "watch_provider": "watch-provider"})
+
+    assert chosen.status_code == 200, chosen.text
+    assert (chosen.json()["watch_model"], chosen.json()["watch_provider"]) == ("watch-model", "watch-provider")
+    watch = next(row for row in jobs if row["name"] == "Beacon: what needs you")
+    assert (watch["model"], watch["provider"]) == ("watch-model", "watch-provider")
+    # Turning it on from off still refuses on the same 404.
+    assert client.put(path, json={"enabled": False}).status_code == 200
+    assert client.put(path, json=setup).status_code == 409
+    assert client.put(path, json={"enabled": True}).status_code == 409
+
+
+def test_a_save_with_the_watch_off_is_unaffected_by_the_stored_conversation(harness, monkeypatch):
+    # (e) enabled=false never needed the conversation, and the watch model chosen while it is off is kept.
+    api, client, cfg, home, _ = harness
+    _fake_cron(api, monkeypatch, home)
+    path = "/api/plugins/beacon/mobile/proactive"
+    cfg.pop("scheduled_callback_conversation_id")
+    off = {"enabled": False, "delivery": "call", "check_minutes": 30, "quiet_start": "22:15", "quiet_end": "07:15",
+           "watch_model": "watch-model", "watch_provider": "watch-provider"}
+
+    saved = client.put(path, json=off)
+
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["enabled"] is False and saved.json()["check_minutes"] == 30
+    assert (saved.json()["watch_model"], saved.json()["watch_provider"]) == ("watch-model", "watch-provider")
+    assert client.put(path, json={"enabled": False}).status_code == 200
+
+
+def test_turning_the_watch_on_still_needs_a_stored_owned_conversation(harness, monkeypatch):
+    # The guard stays whole: with the watch off, no stored conversation (or one that no longer verifies) refuses both the
+    # switch and a full save that enables it; a watch that is off is also not enabled by a model change.
+    api, client, cfg, home, _ = harness
+    _fake_cron(api, monkeypatch, home)
+    path = "/api/plugins/beacon/mobile/proactive"
+    setup = {"enabled": True, "delivery": "notify", "check_minutes": 15, "quiet_start": "22:00", "quiet_end": "07:00",
+             "watch_model": "watch-model", "watch_provider": "watch-provider"}
+    stored = cfg.pop("scheduled_callback_conversation_id")
+    for body in ({"enabled": True}, setup):
+        refused = client.put(path, json=body)
+        assert refused.status_code == 409, refused.text
+        assert "owned assistant conversation" in refused.json()["detail"]
+    assert client.get(path).json()["enabled"] is False
+
+    cfg["scheduled_callback_conversation_id"] = stored
+    assert client.put(path, json=setup).status_code == 200
+    # Turned off again, the guard applies to the next turn-on.
+    assert client.put(path, json={"enabled": False}).status_code == 200
+    cfg.pop("scheduled_callback_conversation_id")
+    assert client.put(path, json=setup).status_code == 409
+    assert client.put(path, json={"enabled": True}).status_code == 409
+
+
 @pytest.mark.parametrize(("legacy", "check_minutes", "delivery"), [
     ({"signals": {"email": "mcp:mail", "calendar": None, "tasks": None, "news": None},
       "schedule": {"brief": "08:00", "wrap_up": None, "watch_minutes": 60,
@@ -1644,6 +1832,7 @@ def test_v4_migrates_v2_and_v3_saved_setups(harness, legacy, check_minutes, deli
     assert setup["quiet_end"] == legacy["schedule"]["quiet_end"]
     assert setup.get("model", "") == legacy.get("model", "")
     assert setup.get("provider", "") == legacy.get("provider", "")
+    assert setup["watch_model"] == "" and setup["watch_provider"] == ""
     assert not {"signals", "watch", "schedule", "urgent"} & set(setup)
 
 
@@ -1665,7 +1854,7 @@ def test_v4_routes_are_topic_free_fast_and_strict(harness, monkeypatch):
     body = result.json()
     assert set(body) == {"enabled", "setup_complete", "timezone", "delivery", "check_minutes",
                          "quiet_start", "quiet_end", "health", "rules", "learned", "learned_proposal", "jobs", "sources",
-                         "source_choices", "sources_all"}
+                         "source_choices", "sources_all", "watch_model", "watch_provider"}
     assert body["timezone"] == "America/Los_Angeles" and body["learned"] == ['Important: "A client review"']
     assert body["health"]["state"] == "unknown"
 
@@ -1674,6 +1863,14 @@ def test_v4_routes_are_topic_free_fast_and_strict(harness, monkeypatch):
     saved = client.put(path, json=setup)
     assert saved.status_code == 200, saved.text
     assert saved.json()["delivery"] == "call" and saved.json()["check_minutes"] == 30
+    # The watch's own model saves through the same route; a bad value or an unknown field is still refused.
+    watch_setup = {**setup, "watch_model": "watch-model", "watch_provider": "watch-provider"}
+    chosen = client.put(path, json=watch_setup)
+    assert chosen.status_code == 200, chosen.text
+    assert chosen.json()["watch_model"] == "watch-model" and chosen.json()["watch_provider"] == "watch-provider"
+    assert client.put(path, json={**watch_setup, "watch_model": 5}).status_code == 400
+    assert client.put(path, json={**watch_setup, "watch_provider": "x" * 201}).status_code == 400
+    assert client.put(path, json={**watch_setup, "watch_mode": "watch-model"}).status_code == 400
     assert client.put(path, json={**setup, "topics": ["email"]}).status_code == 400
     assert client.put(path, json={**setup, "check_minutes": True}).status_code == 400
     assert client.put(path, json={**setup, "check_minutes": 60}).status_code == 400

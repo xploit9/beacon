@@ -75,7 +75,7 @@ class HubAndRoutesGapsUiTest {
         compose.runOnIdle { vm.tab("More"); vm.more("category:Tools & MCP") }
         compose.waitUntil(5_000) { vm.ui.value.morePage == "category:Tools & MCP" }
         compose.showPage { MoreScreen(vm) }
-        compose.onNodeWithTag("settings-row:Tools & commands").assertIsDisplayed().assertTextContains("Tool groups and commands")
+        compose.onNodeWithTag("settings-row:Tools & commands").assertIsDisplayed().assertTextContains("Tools and commands")
         compose.runOnIdle {
             vm.storeData("native-tools", json("items" to JSONArray().put(json("enabled" to true)).put(json("enabled" to false)).put(json("enabled" to true))))
             vm.storeData("native-mcp", json("servers" to JSONArray().put(json("name" to "synthetic_server", "enabled" to true))))
@@ -83,7 +83,7 @@ class HubAndRoutesGapsUiTest {
         compose.onNodeWithTag("settings-row:Tools & commands").assertTextContains("2 on")
         compose.onNodeWithTag("settings-row:MCP servers").assertTextContains("1 server")
         compose.runOnIdle { vm.storeData("native-tools", json("_error" to "Synthetic failure")) }
-        compose.onNodeWithTag("settings-row:Tools & commands").assertTextContains("Tool groups and commands")
+        compose.onNodeWithTag("settings-row:Tools & commands").assertTextContains("Tools and commands")
         compose.onNodeWithTag("settings-row:MCP servers").assertTextContains("1 server")
     }
 
@@ -93,7 +93,7 @@ class HubAndRoutesGapsUiTest {
         compose.onNodeWithTag("settings-wide-list").assertExists()
         compose.onNodeWithTag("settings-wide-detail").assertExists()
         compose.onNodeWithText("Choose a setting").assertExists()
-        compose.onNodeWithText("Pick one from the list to see it here.").assertExists()
+        compose.onNodeWithText("Pick one from the list to see it here.").assertDoesNotExist()
         compose.onNodeWithTag("settings-row:Appearance").assertExists()
         compose.runOnIdle { vm.tab("More"); vm.more("Appearance") }
         compose.waitUntil(5_000) { vm.ui.value.morePage == "Appearance" }
@@ -116,12 +116,13 @@ class HubAndRoutesGapsUiTest {
 
     @Test fun theGateKeepsItsBackArrowExceptOnTheTopLevelHermesPages() = withClientlessVm(compose) { vm ->
         compose.showPage { MoreScreen(vm) }
-        for (route in listOf("Session usage", "Commands", "Notifications", "Health")) {
+        // 8a344aec: Memory sits under Settings (Profiles), so its gate keeps the Back arrow; the drawer's top-level pages are Skills, Vault and Bots.
+        for (route in listOf("Session usage", "Commands", "Notifications", "Health", "Memory")) {
             compose.runOnIdle { vm.tab("More"); vm.more(route) }
             compose.waitUntil(5_000) { vm.ui.value.morePage == route }
             compose.onNodeWithContentDescription("Back").assertIsDisplayed()
         }
-        for (route in listOf("Skills", "Memory", "Bots")) {
+        for (route in listOf("Skills", "Bots")) {
             compose.runOnIdle { vm.tab("More"); vm.more(route) }
             compose.waitUntil(5_000) { vm.ui.value.morePage == route }
             compose.onNodeWithTag("settings-reconnect").assertIsDisplayed()

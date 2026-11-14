@@ -111,7 +111,7 @@ class PhoneAccessUiTest {
     @Test fun theCallsRowSaysSavedContactsAreCalledAfterThreeSecondsAndTheSectionSaysBeaconAsksFirst() {
         show()
         // Short enough for its two lines at large text, so nothing of it is cut off; the section's line covers every other number.
-        compose.onNodeWithText("Call saved contacts after 3 seconds").performScrollTo().assertExists()
+        compose.onNodeWithText("Call saved contacts. 3 seconds to cancel.").performScrollTo().assertExists()
         compose.onNodeWithText("Write message drafts").performScrollTo().assertExists()
         // The section says what Approvals does now (Manual by default).
         compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
@@ -134,7 +134,7 @@ class PhoneAccessUiTest {
         show()
         compose.onAllNodesWithTag("phone-access-hermes-ask").assertCountEquals(0)
         compose.onAllNodesWithTag("phone-access-hermes-ask-acts").assertCountEquals(0)
-        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Approvals").assertTextContains("Manual")
+        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Phone actions").assertTextContains("Always ask")
         compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
 
         compose.onNodeWithTag("approval-choice").performClick()
@@ -160,7 +160,7 @@ class PhoneAccessUiTest {
     @Test fun theMenuShowsEvenWithHermesAccessOffBecauseItAlsoCoversCallsAndTheSideButton() {
         PhoneAccess.setApprovalChoice(context, ApprovalChoice.Changes)
         show()
-        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Auto")
+        compose.onNodeWithTag("approval-choice").performScrollTo().assertTextContains("Ask for risky ones")
     }
 
     @Test fun withNotificationsOffAndHermesAccessOnThePageSaysRequestsShowOnlyInTheOpenApp() {

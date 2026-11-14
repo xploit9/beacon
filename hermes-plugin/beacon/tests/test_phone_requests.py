@@ -481,6 +481,8 @@ def test_tools_register_in_their_own_toolset_and_hide_while_access_is_off(tools)
     api, client, cfg, module = tools
     registered = {}
     module.register(type('Ctx', (), {'register_tool': lambda self, **kw: registered.update({kw['name']: kw})})())
+    card = registered.pop('beacon_pay_with_card')  # registered through this registrar, in the browser toolset (test_any_site_card.py)
+    assert card['toolset'] == 'browser'
     assert sorted(registered) == sorted(ALL_TOOLS)
     for name, kw in registered.items():
         assert kw['toolset'] == 'beacon-phone' and kw['schema']['name'] == name and kw['schema']['parameters']['type'] == 'object'

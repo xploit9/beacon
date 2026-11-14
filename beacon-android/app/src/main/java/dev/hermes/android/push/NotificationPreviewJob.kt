@@ -15,13 +15,13 @@ import dev.hermes.android.preferences
 fun notificationFallback(kind: String): Pair<String, String> = when (kind) {
     "working" -> "Beacon · Working" to "${dev.hermes.android.data.currentAssistantName} is working on your chat."
     "failure" -> "Beacon · Work failed" to "Open Beacon to see what went wrong."
-    "completion" -> "Beacon · Reply ready" to "A chat reply is ready. Open Beacon to read it."
+    "completion" -> "Beacon · Reply ready" to "A reply is ready."
     "approval" -> "Beacon · Approval needed" to "A chat needs your approval before continuing."
     "clarify" -> "Beacon · Question for you" to "A chat needs your answer before continuing."
     "task_result" -> "Beacon · Task update" to "A task has an update. Open Beacon to review it."
-    "test" -> "Beacon · Notification test" to "Your notification test reached this device."
-    "incoming_call" -> "Beacon · Callback" to "A Beacon callback is available. Open Beacon to view its history."
-    else -> "Beacon · Activity" to "Activity is available. Open Beacon to view it."
+    "test" -> "Beacon · Notification test" to "Test notification received."
+    "incoming_call" -> "Beacon · Call" to "Open Beacon to see the call."
+    else -> "Beacon · Activity" to "Open Beacon to see it."
 }
 fun boundedNotificationText(value: String, limit: Int, preserveWhitespace:Boolean=false): String {
     require(limit >= 2)
@@ -133,7 +133,7 @@ private suspend fun sendEmailFeedback(context: Context, source: String, event: S
         val tag = "$source\u0000$event".digest()
         val posted = manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 } ?: return@withTimeout
         if (!authorized() || manager.activeNotifications.firstOrNull { it.tag == tag && it.id == 1 }?.postTime != posted.postTime) return@withTimeout
-        val body = if (saved) "Thanks — ${dev.hermes.android.data.currentAssistantName} will remember." else "Couldn't save your choice. Try again."
+        val body = if (saved) "${dev.hermes.android.data.currentAssistantName} will remember that." else "Couldn't save your choice. Try again."
         val updated = NotificationCompat.Builder(context, posted.notification)
             .apply { if (saved) clearActions() }.setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true).build()
         try { manager.notify(tag, 1, updated) } catch (_: SecurityException) { }

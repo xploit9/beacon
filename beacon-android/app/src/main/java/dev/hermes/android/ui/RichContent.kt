@@ -76,6 +76,9 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 internal fun androidx.compose.ui.text.TextStyle.contentDirection(): androidx.compose.ui.text.TextStyle = copy(textDirection = androidx.compose.ui.text.style.TextDirection.Content)
 
 /** Lines a rendered paragraph may take before it ends in an ellipsis; unbounded unless a card (a folded Memory note) asks for fewer. */
+/** What a preview says when it cannot be shown: one plain line, never the exception's own words. */
+private const val PREVIEW_FAILED = "Can't show this preview."
+private const val PREVIEW_OTHER_PROFILE = "Switch to the profile this came from to see it."
 internal val LocalMarkdownMaxLines = compositionLocalOf { Int.MAX_VALUE }
 /** Told when a paragraph was cut by [LocalMarkdownMaxLines], so the card can offer to open it. */
 internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
@@ -137,7 +140,7 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
 @Composable private fun RichInline(node: Node, vm: BeaconViewModel, origin: Scope?, snapshots: Map<String, String>, style: TextStyle = MaterialTheme.typography.bodyLarge) {
     val uriHandler = LocalUriHandler.current
     var linkedMedia by remember(node, origin?.key) { mutableStateOf<Pair<NativeReference, String>?>(null) }
-    val needsConversation = uiText("Select an authenticated conversation to open this reference")
+    val needsConversation = uiText("Open this from its chat.")
     val attachmentLabel = uiText("Attachment")
     val linkFailed = uiText("This link could not be opened")
     MathParagraph(node, origin?.key ?: vm.client?.scope?.key.orEmpty(), style) { destination ->
@@ -145,7 +148,7 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
             is NativeReference.Conversation, is NativeReference.Workspace -> vm.followNativeReference(reference, origin)
             is NativeReference.LocalMedia, is NativeReference.DataImage -> linkedMedia = reference to node.descendants().filterIsInstance<org.commonmark.node.Link>().firstOrNull { it.destination == destination }?.plain().orEmpty().ifBlank { attachmentLabel }
             is NativeReference.ExternalLink -> runCatching { uriHandler.openUri(reference.url) }.onFailure { vm.notice(linkFailed) }
-            is NativeReference.Unsupported -> vm.notice(reference.reason)
+            is NativeReference.Unsupported -> vm.notice(linkFailed)
             else -> Unit
         }
     }
@@ -160,7 +163,7 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
                     if (loadExternalImage) NativeReferencePreview(vm, resolved, label, origin)
                     else OutlinedButton(onClick = { loadExternalImage = true }) { Text(uiText(if (media is org.commonmark.node.Image) "Load image from" else "Load media from") + " " + resolved.url.host) }
                 } else NativeReferencePreview(vm, resolved, label, origin)
-            } else Text("$reference · ${uiText("Select an authenticated conversation to preview")}", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else Text(uiText("Open this from its chat."), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
     linkedMedia?.let { (reference, label) -> AlertDialog(onDismissRequest = { linkedMedia = null }, title = { Text(label.take(160)) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState())) { if (origin != null) NativeReferencePreview(vm, reference, label, origin) } }, confirmButton = { TextButton(onClick = { linkedMedia = null }) { Text(uiText("Close")) } }) }
@@ -318,7 +321,7 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
     var open by remember(attachment, origin?.key) { mutableStateOf(false) }
     val name = attachment.string("name", attachment.string("filename", uiText("Attachment")))
     OutlinedButton(onClick = { open = !open }) { Icon(Icons.Rounded.AttachFile, null); Text(name, Modifier.padding(start = 8.dp)) }
-    if (open) { if (origin != null) NativeReferencePreview(vm, resolveAttachmentReference(attachment, origin, snapshots), name, origin, knownAspect(attachment.optInt("width"), attachment.optInt("height"))) else Text(uiText("No authorized file reference was supplied by the server"), color = MaterialTheme.colorScheme.error) }
+    if (open) { if (origin != null) NativeReferencePreview(vm, resolveAttachmentReference(attachment, origin, snapshots), name, origin, knownAspect(attachment.optInt("width"), attachment.optInt("height"))) else Text(uiText("This file isn't available."), color = MaterialTheme.colorScheme.error) }
 }
 @Composable fun MediaPreview(vm: BeaconViewModel, path: String, name: String = path, endpoint: String = "/api/file/raw", origin: Scope? = vm.authenticatedScope()) {
     if (origin != null) NativeReferencePreview(vm, NativeReference.LocalMedia(path, origin.session, null, endpoint), name, origin)
@@ -341,15 +344,15 @@ private fun referenceFilename(reference: NativeReference, name: String): String 
         cachedMedia(cacheKey, reference, client != null)?.let { hit -> value = PreparedContent(origin.key, reference, hit, resultClient); return@produceState }
         value = null
         try { val payload = when (reference) {
-            is NativeReference.LocalMedia -> { require(client != null) { "Sign in to the originating profile to preview this file" }; NativeMediaBytes(client.bytes(reference.endpoint, reference.query())) }
-            is NativeReference.HistoryImage -> { require(client != null) { "Sign in to the originating profile to preview this image" }; client.historyImage(reference) }
+            is NativeReference.LocalMedia -> { require(client != null) { PREVIEW_OTHER_PROFILE }; NativeMediaBytes(client.bytes(reference.endpoint, reference.query())) }
+            is NativeReference.HistoryImage -> { require(client != null) { PREVIEW_OTHER_PROFILE }; client.historyImage(reference) }
             is NativeReference.DataImage -> withContext(Dispatchers.Default) { NativeMediaBytes(reference.bytes(), reference.mime) }
             is NativeReference.ExternalMedia -> externalMediaBytes(reference)
             is NativeReference.Unsupported -> kotlin.error(reference.reason)
             else -> kotlin.error("This reference opens a conversation or workspace rather than a media preview")
-        }; if (reference !is NativeReference.DataImage) MediaCache.payloads.put(cacheKey, payload, payload.bytes.size.toLong()); value = PreparedContent(origin.key, reference, payload, resultClient) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message ?: "Preview unavailable" }
+        }; if (reference !is NativeReference.DataImage) MediaCache.payloads.put(cacheKey, payload, payload.bytes.size.toLong()); value = PreparedContent(origin.key, reference, payload, resultClient) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message?.takeIf { it == PREVIEW_OTHER_PROFILE } ?: PREVIEW_FAILED }
     }
-    if (error.isNotBlank()) { Text(uiText(error), color = MaterialTheme.colorScheme.error); if (reference !is NativeReference.Unsupported) TextButton(onClick = { retry++ }) { Text(uiText("Retry preview")) }; Disclosure(uiText("Reference"), when (reference) { is NativeReference.Unsupported -> reference.source; is NativeReference.LocalMedia -> reference.path; is NativeReference.DataImage -> reference.source; is NativeReference.ExternalMedia -> reference.url.toString(); else -> name }); return }
+    if (error.isNotBlank()) { Text(uiText(error), color = MaterialTheme.colorScheme.error); if (reference !is NativeReference.Unsupported) TextButton(onClick = { retry++ }) { Text(uiText("Retry preview")) }; return }
     val filename = referenceFilename(reference, name)
     val payload = loaded?.forContext(origin.key, reference, resultClient) ?: run { MediaPlaceholder(placeholderShape(mediaKindOf(filename), aspect)); return }
     val data = payload.bytes
@@ -380,7 +383,7 @@ private fun referenceFilename(reference: NativeReference, name: String): String 
         }
         val full = remember(data, scopeKey, key) { suspend { MediaCache.picture(fullKey, data) ?: withContext(Dispatchers.Default) { sharperBitmap(data, width, maxHeight) }?.also { MediaCache.putPicture(fullKey, data, it) } } }
         val result = rendered?.forContext(scopeKey, data)
-        if (result == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect)) else result.bitmap?.let { ZoomImage(it, name, sharper = full) } ?: SelectionContainer { Text("$name · ${uiText("This media type could not be decoded by Android")}", style = MaterialTheme.typography.bodyMedium) }
+        if (result == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect)) else result.bitmap?.let { ZoomImage(it, name, sharper = full) } ?: SelectionContainer { Text(uiText("Can't show this file."), style = MaterialTheme.typography.bodyMedium) }
     }
 }
 /** The loading state of a preview, reserving the shape it will fill so nothing around it jumps when it arrives. */
@@ -390,7 +393,7 @@ private fun referenceFilename(reference: NativeReference, name: String): String 
 }
 @Composable private fun AnimatedPreview(data: ByteArray, name: String, reducedMotion: Boolean, scopeKey: String, aspect: Float? = null) {
     var error by remember(data, scopeKey) { mutableStateOf("") }
-    val decoded by produceState<PreparedContent<Drawable>?>(null, data, scopeKey) { value = null; try { value = PreparedContent(scopeKey, data, withContext(Dispatchers.Default) { ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(data))) { decoder, info, _ -> val scale = minOf(1f, 2048f / info.size.width, 2048f / info.size.height); decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1)) } }) } catch (e: Throwable) { if (e is CancellationException) throw e; error = "Animated image could not be decoded" } }
+    val decoded by produceState<PreparedContent<Drawable>?>(null, data, scopeKey) { value = null; try { value = PreparedContent(scopeKey, data, withContext(Dispatchers.Default) { ImageDecoder.decodeDrawable(ImageDecoder.createSource(ByteBuffer.wrap(data))) { decoder, info, _ -> val scale = minOf(1f, 2048f / info.size.width, 2048f / info.size.height); decoder.setTargetSize((info.size.width * scale).toInt().coerceAtLeast(1), (info.size.height * scale).toInt().coerceAtLeast(1)) } }) } catch (e: Throwable) { if (e is CancellationException) throw e; error = "Can't show this image." } }
     val drawable = decoded?.forContext(scopeKey, data)
     if (error.isNotBlank()) Text(uiText(error), color = MaterialTheme.colorScheme.error)
     else if (drawable == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect))
@@ -414,18 +417,18 @@ private fun referenceFilename(reference: NativeReference, name: String): String 
             val height = if (ratio <= 1) 1440 else (1440 / ratio).toInt().coerceAtLeast(1)
             svg.setDocumentWidth(width.toFloat()); svg.setDocumentHeight(height.toFloat())
             Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { svg.renderToCanvas(android.graphics.Canvas(it)) }
-        }; value = PreparedContent(scopeKey, data, bitmap) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message ?: "SVG preview failed" }
+        }; value = PreparedContent(scopeKey, data, bitmap) } catch (e: Throwable) { if (e is CancellationException) throw e; error = "Can't show this image." }
     }
     val bitmap = rendered?.forContext(scopeKey, data)
     if (error.isNotBlank()) { Text(uiText(error), color = MaterialTheme.colorScheme.error); Disclosure(uiText("SVG source"), data.take(2 * 1024 * 1024).toByteArray().toString(Charsets.UTF_8)) } else if (bitmap == null) MediaPlaceholder(placeholderShape(MediaKind.Image, aspect)) else ZoomImage(bitmap!!, name)
 }
 @Composable private fun JsonTree(value: Any, label: String = "", depth: Int = 0) {
-    if (depth > 12) { Text(uiText("Nested value · view source for more")); return }
+    if (depth > 12) { Text(uiText("View source for more")); return }
     if (value is JSONObject || value is org.json.JSONArray) {
         var expanded by rememberSaveable(label, depth) { mutableStateOf(depth == 0) }
         val count = if (value is JSONObject) value.length() else (value as org.json.JSONArray).length()
         TextButton(onClick = { expanded = !expanded }, contentPadding = PaddingValues(horizontal = 4.dp)) { Icon(if (expanded) Icons.Rounded.ExpandMore else Icons.AutoMirrored.Rounded.KeyboardArrowRight, null); Text("$label ${if (value is JSONObject) "{ $count }" else "[ $count ]"}", fontFamily = FontFamily.Monospace) }
-        if (expanded) Column(Modifier.padding(start = 16.dp)) { if (value is JSONObject) value.keys().asSequence().take(24).forEach { key -> JsonTree(value.opt(key) ?: JSONObject.NULL, key, depth + 1) } else (0 until minOf((value as org.json.JSONArray).length(), 24)).forEach { index -> JsonTree(value.opt(index) ?: JSONObject.NULL, "[$index]", depth + 1) }; if (count > 24) Text(uiText("First 24 values shown · view source for the rest")) }
+        if (expanded) Column(Modifier.padding(start = 16.dp)) { if (value is JSONObject) value.keys().asSequence().take(24).forEach { key -> JsonTree(value.opt(key) ?: JSONObject.NULL, key, depth + 1) } else (0 until minOf((value as org.json.JSONArray).length(), 24)).forEach { index -> JsonTree(value.opt(index) ?: JSONObject.NULL, "[$index]", depth + 1) }; if (count > 24) Text(uiText("View source for more")) }
     } else SelectionContainer { Text("${label.takeIf(String::isNotBlank)?.plus(": ").orEmpty()}$value", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace) }
 }
 private data class DecodedBitmap(val bitmap: Bitmap?)
@@ -443,7 +446,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
                 val index = contentKey.second.coerceIn(0, renderer.pageCount - 1)
                 renderer.openPage(index).use { p -> require(p.width > 0 && p.height > 0) { "PDF has an invalid page" }; val scale = minOf(1440f / p.width, 2400f / p.height, 2f); val bitmap = Bitmap.createBitmap((p.width * scale).toInt().coerceAtLeast(1), (p.height * scale).toInt().coerceAtLeast(1), Bitmap.Config.ARGB_8888).apply { eraseColor(android.graphics.Color.WHITE); p.render(this, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY) }; PdfPage(bitmap, renderer.pageCount, index) }
             } } } finally { file.delete() }
-        }; value = PreparedContent(scopeKey, contentKey, result) } catch (e: Throwable) { if (e is CancellationException) throw e; error = e.message ?: "PDF could not be rendered" }
+        }; value = PreparedContent(scopeKey, contentKey, result) } catch (e: Throwable) { if (e is CancellationException) throw e; error = "Can't show this PDF." }
     }
     val result = rendered?.forContext(scopeKey, contentKey)
     Column {
@@ -473,7 +476,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
             val file = withContext(Dispatchers.IO) { File.createTempFile("preview", ".$extension", vm.app.cacheDir).also { created = it; it.writeBytes(data); currentCoroutineContext().ensureActive() } }
             value = PreparedContent(scopeKey, contentKey, file)
             awaitDispose { created?.delete() }
-        } catch (e: Throwable) { created?.delete(); if (e is CancellationException) throw e; fileError = e.message ?: "Media preview could not be prepared" }
+        } catch (e: Throwable) { created?.delete(); if (e is CancellationException) throw e; fileError = "Can't show this file." }
     }
     if (fileError.isNotBlank()) { SelectionContainer { Text(uiText(fileError), color = MaterialTheme.colorScheme.error) }; return }
     val playable = produced?.forContext(scopeKey, contentKey) ?: run { MediaPlaceholder(placeholderShape(if (video) MediaKind.Video else MediaKind.Audio)); return }
@@ -484,7 +487,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
     var position by remember(playable) { mutableFloatStateOf(0f) }
     var duration by remember(playable) { mutableIntStateOf(0) }
     var mediaError by remember(playable) { mutableStateOf("") }
-    DisposableEffect(playable) { if (!video) { runCatching { player = MediaPlayer().apply { setDataSource(playable.absolutePath); setOnPreparedListener { duration = it.duration }; setOnCompletionListener { playing = false }; setOnErrorListener { _, _, _ -> playing = false; mediaError = "Audio playback failed"; true }; prepareAsync() } }.onFailure { mediaError = it.message.orEmpty() } }; onDispose { player?.release(); playable.delete() } }
+    DisposableEffect(playable) { if (!video) { runCatching { player = MediaPlayer().apply { setDataSource(playable.absolutePath); setOnPreparedListener { duration = it.duration }; setOnCompletionListener { playing = false }; setOnErrorListener { _, _, _ -> playing = false; mediaError = "Audio playback failed"; true }; prepareAsync() } }.onFailure { mediaError = "Audio playback failed" } }; onDispose { player?.release(); playable.delete() } }
     fun pausePreview() { runCatching { player?.pause() }; runCatching { videoView?.pause() }; videoControls?.hide(); playing = false }
     DisposableEffect(playable, lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_STOP) pausePreview() }
@@ -496,7 +499,7 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
     if (call.active) Text(uiText("End the call to play attachments."), style = MaterialTheme.typography.bodySmall)
     if (mediaError.isNotBlank()) SelectionContainer { Text(uiText(mediaError), color = MaterialTheme.colorScheme.error) }
     if (video) key(scopeKey, data, playable.absolutePath) { AndroidView(factory = { context -> VideoView(context).apply { tag = playable.absolutePath; setVideoPath(playable.absolutePath); videoView = this; videoControls = android.widget.MediaController(context).also { setMediaController(it) }; setOnPreparedListener { duration = it.duration }; setOnErrorListener { _, _, _ -> mediaError = "Video playback failed"; true } } }, update = { it.setMediaController(if (call.active) null else videoControls); if (call.active) { it.pause(); videoControls?.hide() }; if (it.tag != playable.absolutePath) { it.stopPlayback(); it.tag = playable.absolutePath; it.setVideoPath(playable.absolutePath) } }, modifier = Modifier.fillMaxWidth().height(260.dp), onRelease = { it.stopPlayback(); if (videoView === it) videoView = null }) }
-    else Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { FilledIconButton(onClick = { runCatching { if (playing) player?.pause() else player?.start(); playing = !playing }.onFailure { mediaError = it.message.orEmpty() } }, enabled = duration > 0 && !call.active && mediaError.isBlank()) { Icon(if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, uiText(if (playing) "Pause audio" else "Play audio")) }; Slider(position, { position = it; player?.seekTo(it.toInt()) }, valueRange = 0f..duration.coerceAtLeast(1).toFloat(), modifier = Modifier.weight(1f), enabled = duration > 0 && !call.active && mediaError.isBlank()); Text("${(position / 1000).toInt()}s", style = MaterialTheme.typography.bodySmall) }
+    else Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) { FilledIconButton(onClick = { runCatching { if (playing) player?.pause() else player?.start(); playing = !playing }.onFailure { mediaError = "Audio playback failed" } }, enabled = duration > 0 && !call.active && mediaError.isBlank()) { Icon(if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow, uiText(if (playing) "Pause audio" else "Play audio")) }; Slider(position, { position = it; player?.seekTo(it.toInt()) }, valueRange = 0f..duration.coerceAtLeast(1).toFloat(), modifier = Modifier.weight(1f), enabled = duration > 0 && !call.active && mediaError.isBlank()); Text("${(position / 1000).toInt()}s", style = MaterialTheme.typography.bodySmall) }
 }
 
 private fun bitmapBounds(data: ByteArray): Pair<Int, Int>? { val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }; BitmapFactory.decodeByteArray(data, 0, data.size, bounds); return if (bounds.outWidth <= 0 || bounds.outHeight <= 0) null else bounds.outWidth to bounds.outHeight }

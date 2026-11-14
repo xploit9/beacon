@@ -967,3 +967,125 @@ def test_limits_http_proof_deadline_closes_stalled_socket(transport,monkeypatch)
     with pytest.raises(ValueError):
         transport.exchange(endpoint,'qa','synthetic-token','a'*64,timeout=0.05)
     assert stopped.is_set()
+
+
+# ---- the relay vouches for a card payment prompt ---------------------------------------------------------------------------------------
+# Hermes' canonical prompts (gateway/session_pending_controls.py) carry no `surface`. The plugin recorded which prompt ids are Hermes' own
+# card consent (any_site_card.surface_for); the relay adds that one field to those prompts, in live events, replayed events and the
+# snapshot's prompts, and strips it from every other prompt so the phone can trust it.
+
+PROMPT_ID = '0123456789abcdef0123456789abcdef'
+OTHER_ID = 'fedcba9876543210fedcba9876543210'
+CARD_LINE = "Fill payment card 'Test card' on http://127.0.0.1:8793"
+
+
+def prompt(prompt_id=PROMPT_ID, kind='approval', **extra):
+    value = {'kind': kind, 'prompt_id': prompt_id, 'execution_generation': 7, 'command': CARD_LINE, 'choices': ['once', 'deny'], 'timeout_s': 300,
+             'description': 'The agent wants to enter your saved card details into this checkout page.'}
+    value.update(extra)
+    return value
+
+
+def published(payload, event_type='approval.request', seq=5):
+    """session_events.publish's frame, as the socket carries it."""
+    return json.dumps({'jsonrpc': '2.0', 'method': 'event', 'params': {'type': event_type, 'session_id': 'local-1234', 'payload': payload,
+                                                                        'replay_epoch': 'epoch-1', 'seq': seq}})
+
+
+@pytest.fixture
+def marked(monkeypatch):
+    ids = {}
+    monkeypatch.setitem(sys.modules, 'beacon_any_site_card',
+                        SimpleNamespace(surface_for=lambda prompt_id: ids.get(prompt_id), has_surfaces=lambda: bool(ids)))
+    ids[PROMPT_ID] = 'vault-payment'
+    return ids
+
+
+def test_relay_marks_the_card_payment_prompt_in_a_live_event(transport, marked):
+    raw = published(prompt())
+    out = json.loads(transport.annotate(raw))
+    assert out['params']['payload'] == {**prompt(), 'surface': 'vault-payment'}
+    assert {key: value for key, value in out['params'].items() if key != 'payload'} == {key: value for key, value in json.loads(raw)['params'].items() if key != 'payload'}
+    assert out['method'] == 'event' and out['jsonrpc'] == '2.0'
+
+
+def test_relay_marks_the_prompt_in_the_snapshot_and_in_replayed_events(transport, marked):
+    snapshot = json.dumps({'jsonrpc': '2.0', 'id': 'r1', 'result': {'session_id': 'local-1234', 'running': True, 'execution_generation': 7,
+                                                                      'prompts': [prompt(kind='clarify', prompt_id=PROMPT_ID, question='Which?'), prompt(), prompt(OTHER_ID)]}})
+    out = json.loads(transport.annotate(snapshot))['result']['prompts']
+    assert out[1] == {**prompt(), 'surface': 'vault-payment'}
+    assert 'surface' not in out[0], 'only an approval is vouched for'
+    assert out[2] == prompt(OTHER_ID)
+    replay = json.dumps({'jsonrpc': '2.0', 'id': 'r2', 'result': {'epoch': 'epoch-1', 'latest_seq': 6, 'events': [
+        {'type': 'message.delta', 'session_id': 'local-1234', 'seq': 4, 'payload': {'text': 'hi'}},
+        {'type': 'approval.request', 'session_id': 'local-1234', 'seq': 5, 'payload': prompt()},
+        {'type': 'approval.settled', 'session_id': 'local-1234', 'seq': 6, 'payload': {'prompt_id': PROMPT_ID, 'execution_generation': 7}}]}})
+    events = json.loads(transport.annotate(replay))['result']['events']
+    assert events[1]['payload']['surface'] == 'vault-payment'
+    assert events[0]['payload'] == {'text': 'hi'} and events[2]['payload'] == {'prompt_id': PROMPT_ID, 'execution_generation': 7}
+
+
+def test_relay_never_vouches_for_a_prompt_the_plugin_did_not_mark_and_strips_a_claimed_surface(transport, marked):
+    smuggled = published(prompt(OTHER_ID, surface='vault-payment'))
+    assert 'surface' not in json.loads(transport.annotate(smuggled))['params']['payload']
+    snapshot = json.dumps({'id': 'r1', 'result': {'prompts': [prompt(OTHER_ID, surface='vault-payment'), prompt(PROMPT_ID)]}})
+    prompts = json.loads(transport.annotate(snapshot))['result']['prompts']
+    assert 'surface' not in prompts[0] and prompts[1]['surface'] == 'vault-payment'
+
+
+def test_relay_leaves_every_frame_it_has_nothing_to_say_about_exactly_as_it_came(transport, marked):
+    frames = [published(prompt(OTHER_ID)), published({'text': 'hello'}, 'message.delta'),
+              '{"id":"approval","result":{"choice":"yes"}}', '{"method":"event","params":{"type":"request.cancel","payload":{"request_id":"abc"}}}',
+              '{"id": 3, "result": {"prompts": []}}', 'not json but prompt_id and approval', '{"a": 1, "a": 2, "prompt_id": "x", "kind": "approval"}']
+    for raw in frames:
+        assert transport.annotate(raw) is raw, raw
+
+
+def test_relay_does_no_work_when_no_card_prompt_is_waiting(transport, monkeypatch):
+    raw = published(prompt())
+    monkeypatch.setitem(sys.modules, 'beacon_any_site_card', SimpleNamespace(surface_for=lambda prompt_id: None, has_surfaces=lambda: False))
+    assert transport.annotate(raw) is raw
+    monkeypatch.delitem(sys.modules, 'beacon_any_site_card')
+    assert transport.annotate(raw) is raw
+    monkeypatch.setitem(sys.modules, 'beacon_any_site_card', SimpleNamespace())
+    assert transport.annotate(raw) is raw
+
+
+def test_relay_still_forwards_when_the_marker_lookup_fails(transport, monkeypatch):
+    def broken(prompt_id):
+        raise RuntimeError('lookup failed')
+    monkeypatch.setitem(sys.modules, 'beacon_any_site_card', SimpleNamespace(surface_for=broken, has_surfaces=lambda: True))
+    raw = published(prompt())
+    assert transport.annotate(raw) is raw
+
+
+def test_relay_delivers_the_marked_prompt_to_the_phone_and_changes_nothing_else(transport, marked):
+    class Client:
+        def __init__(self):
+            self.incoming, self.outgoing = asyncio.Queue(), asyncio.Queue()
+        async def receive(self):
+            return await self.incoming.get()
+        async def send_text(self, value):
+            await self.outgoing.put(value)
+    class Upstream:
+        def __init__(self):
+            self.incoming, self.outgoing = asyncio.Queue(), asyncio.Queue()
+        async def send(self, value):
+            await self.outgoing.put(value)
+        async def recv(self):
+            return await self.incoming.get()
+    async def exercise():
+        client, upstream = Client(), Upstream()
+        task = asyncio.create_task(transport.relay_sockets(client, upstream, 'work'))
+        delta = published({'text': 'hi'}, 'message.delta', 4)
+        await upstream.incoming.put(delta)
+        assert await asyncio.wait_for(client.outgoing.get(), 1) == delta
+        await upstream.incoming.put(published(prompt()))
+        arrived = json.loads(await asyncio.wait_for(client.outgoing.get(), 1))
+        assert arrived['params']['payload']['surface'] == 'vault-payment' and arrived['params']['payload']['prompt_id'] == PROMPT_ID
+        request = '{"id":9,"method":"approval.respond","params":{"profile":"work","prompt_id":"%s","choice":"once"}}' % PROMPT_ID
+        await client.incoming.put({'type': 'websocket.receive', 'text': request})
+        assert await asyncio.wait_for(upstream.outgoing.get(), 1) == request, 'what the phone sends is never rewritten'
+        await client.incoming.put({'type': 'websocket.disconnect'})
+        await asyncio.wait_for(task, 1)
+    asyncio.run(exercise())

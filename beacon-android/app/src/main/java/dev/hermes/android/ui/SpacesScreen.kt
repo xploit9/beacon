@@ -123,6 +123,13 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
     return 0L
 }
 
+/** The plugin's reasons a file cannot be edited here, in plain words; anything else is shown as it is. */
+internal fun editBlockedWords(reason: String): String = when (reason) {
+    "This file is not valid UTF-8. Download it to edit." -> "This file isn't plain text. Download it to edit."
+    "This preview is shortened. Download the complete file to edit it." -> "Only part of this file is shown. Download it to edit."
+    else -> reason
+}
+internal val EditBlockedStrings = listOf("This file isn't plain text. Download it to edit.", "Only part of this file is shown. Download it to edit.", "This file can't be edited here.")
 @Composable fun SpacesScreen(vm: BeaconViewModel) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val data by vm.data.collectAsStateWithLifecycle()
@@ -145,8 +152,8 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
     fun changeDirectory(path: String) { vm.closeEditor(); navigated = true; directory = path; vm.rememberPcFolder(path) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, directory) { refresh() }
     BackHandler(editor.path.isNotBlank() && editor.scope?.copy(session = "") == scope) { vm.closeEditor() }
-    val reopenUpload = uiText("Reopen upload in the original account and profile.")
-    val reopenDownload = uiText("Reopen download in the original account and profile.")
+    val reopenUpload = uiText("The profile changed. Upload again.")
+    val reopenDownload = uiText("The profile changed. Download again.")
     var uploadRequest by remember { mutableStateOf<Triple<BeaconClient, Scope?, String>?>(null) }
     val upload = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         val request = uploadRequest; uploadRequest = null
@@ -194,8 +201,8 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
                                         val allEntries = record.rows("entries")
                                         // Dot files and folders (settings, caches) stay out of the way unless asked for, like a desktop file manager.
                                         val entries = if (showHidden) allEntries else allEntries.filterNot { it.string("name").startsWith(".") }
-                                        if (allEntries.isEmpty()) item { EmptyState(uiText("This folder is empty"), uiText("Create or upload a file to start working here."), Icons.Rounded.FolderOpen, action = if (actual.isNotBlank()) uiText("Create file") else "", onAction = createFile) }
-                                        else if (entries.isEmpty()) item { EmptyState(uiText("Only hidden items here"), uiText("Show hidden files to see them."), Icons.Rounded.VisibilityOff, action = uiText("Show hidden files"), onAction = { showHidden = true }) }
+                                        if (allEntries.isEmpty()) item { EmptyState(uiText("This folder is empty"), "", Icons.Rounded.FolderOpen, action = if (actual.isNotBlank()) uiText("Create file") else "", onAction = createFile) }
+                                        else if (entries.isEmpty()) item { EmptyState(uiText("Only hidden items here"), "", Icons.Rounded.VisibilityOff, action = uiText("Show hidden files"), onAction = { showHidden = true }) }
                                         items(entries, key = ::fileRowKey) { file ->
                                             val path = file.getString("path")
                                             val folder = file.optBoolean("is_directory")
@@ -293,7 +300,7 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
     val editor by vm.editor.collectAsStateWithLifecycle()
     var preview by rememberSaveable(editor.path) { mutableStateOf(false) }
     var review by remember(editor.scope, editor.path) { mutableStateOf(false) }
-    if (editor.path.isBlank()) { Box(modifier) { EmptyState(uiText("Open a file"), uiText("Browse your computer to edit text, inspect documents or preview media."), Icons.Rounded.Description) }; return }
+    if (editor.path.isBlank()) { Box(modifier) { EmptyState(uiText("Open a file"), "", Icons.Rounded.Description) }; return }
     val extension = editor.path.substringAfterLast('.').lowercase()
     val media = extension in setOf("png", "jpeg", "jpg", "webp", "gif", "bmp", "svg", "pdf", "mp4", "webm", "mov", "mp3", "wav", "m4a", "ogg", "flac", "aac")
     val editable = !editor.loading && !editor.metadata.optBoolean("truncated") && !media && (editor.metadata.string("preview_kind") != "office" || editor.metadata.optBoolean("editable")) && !editor.metadata.optBoolean("binary")
@@ -304,12 +311,12 @@ internal fun fileModifiedMillis(row: JSONObject): Long {
         }
         if (editor.error.isNotBlank()) Text(uiText(editor.error), Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
         if (editor.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-        if (editor.metadata.string("edit_blocked_reason").isNotBlank()) Text(editor.metadata.string("edit_blocked_reason"), Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
+        if (editor.metadata.string("edit_blocked_reason").isNotBlank()) Text(uiText(editBlockedWords(editor.metadata.string("edit_blocked_reason"))), Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall)
         if (editor.reviewRequired) {
             Text(uiText("The file changed since your draft. Compare before saving."), Modifier.padding(horizontal = 16.dp), style = MaterialTheme.typography.bodyMedium)
             OutlinedButton(onClick = { review = true }, enabled = !editor.saving, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Review changes")) }
         }
-        if (editor.dirty || editor.reviewRequired) OutlinedButton(enabled = !editor.saving && !editor.loading, onClick = { vm.openForm(ActionForm("Discard local changes", "", emptyList(), explanation = "Discard your edits and show the saved file again.", actionLabel = "Discard", onResult = { vm.discardEditor() }, destructive = true)) }, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Discard changes")) }
+        if (editor.dirty || editor.reviewRequired) OutlinedButton(enabled = !editor.saving && !editor.loading, onClick = { vm.openForm(ActionForm("Discard local changes", "", emptyList(), actionLabel = "Discard", onResult = { vm.discardEditor() }, destructive = true)) }, modifier = Modifier.heightIn(min = 48.dp), colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)) { Text(uiText("Discard changes")) }
         if (media) Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(16.dp)) { MediaPreview(vm, editor.path, endpoint = if (editor.metadata.optBoolean("_pc")) "/api/files/download" else "/api/file/raw", origin = editor.scope) }
         else if (extension == "xlsx") LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp)) { editor.text.text.split(Regex("(?m)(?=^Sheet: )")).forEach { sheet -> item { Text(sheet.lineSequence().firstOrNull().orEmpty(), style = MaterialTheme.typography.titleMedium); NativeTable(sheet.lineSequence().drop(1).filter(String::isNotBlank).map { it.split('\t') }.toList(), vm) } } }
         else if (extension == "pptx") LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(24.dp)) { editor.text.text.split(Regex("(?m)(?=^Slide )")).forEach { slide -> item { Surface(color = MaterialTheme.colorScheme.surfaceContainer) { Text(slide, Modifier.padding(24.dp), style = MaterialTheme.typography.bodyLarge) } } } }

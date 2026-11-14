@@ -5,7 +5,7 @@ internal enum class StepState { Waiting, Active, Done, Failed }
 
 /** The steps an update can pass through; a step the update does not need is removed from the list, never shown as done. */
 internal enum class UpdateStep(val label: String, val app: Boolean = false) {
-    PluginDownload("Downloading"), PluginInstall("Installing"), PluginGateway("Restarting Hermes gateway"), PluginDashboard("Restarting Hermes dashboard"), PluginDone("Done"),
+    PluginDownload("Downloading"), PluginInstall("Installing"), PluginGateway("Restarting Hermes"), PluginDashboard("Restarting the dashboard"), PluginDone("Done"),
     AppDownload("Downloading", app = true), AppVerify("Verifying", app = true), AppInstall("Installing", app = true), AppDone("Done", app = true);
     val last: Boolean get() = this == PluginDone || this == AppDone
 }
@@ -20,12 +20,13 @@ internal object StepNote {
     const val Reconnecting = "Reconnecting…"
     const val DashboardFailed = "Didn't restart"
     const val DashboardManual = "Restart the Hermes dashboard on your computer."
-    const val GatewayFailed = "Hermes gateway didn't restart"
+    const val GatewayFailed = "Hermes didn't restart"
     const val PluginFailed = "Didn't update"
-    const val Busy = "Hermes is busy — restarts when it's idle"
+    const val PluginBlocked = "Hermes' security scan blocked it."
+    const val Busy = "Hermes is busy. It restarts when idle."
     const val HermesBusy = "Hermes is busy"
     const val Call = "End your call before updating Beacon."
-    val all = listOf(Reconnecting, DashboardFailed, DashboardManual, GatewayFailed, PluginFailed, Busy, HermesBusy, Call)
+    val all = listOf(Reconnecting, DashboardFailed, DashboardManual, GatewayFailed, PluginFailed, PluginBlocked, Busy, HermesBusy, Call)
 }
 
 /** What TalkBack says after a step's label; each goes through uiText when shown. */

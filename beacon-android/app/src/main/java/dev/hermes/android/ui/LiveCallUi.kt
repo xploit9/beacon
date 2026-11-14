@@ -326,7 +326,7 @@ private val CallCompactHangupSize = 60.dp
         "beacon-camera",
         call.active && (cameraOn || !call.held && call.state != "connecting") && !call.screenSharing && !call.screenBusy && !call.screenStopPending,
         call.cameraSharing,
-        if (call.cameraStopPending) uiText("Camera stop unconfirmed. Retry stopping.") else if (call.cameraBusy) uiText("Camera changing") else if (call.cameraSharing) uiText("Camera sharing") else uiText("Camera stopped"),
+        if (call.cameraStopPending) uiText("Camera may still be on. Tap to stop.") else if (call.cameraBusy) uiText("Camera changing") else if (call.cameraSharing) uiText("Camera sharing") else uiText("Camera stopped"),
         actions.camera,
         modifier,
         size = CallSecondarySize,
@@ -338,7 +338,7 @@ private val CallCompactHangupSize = 60.dp
         "beacon-share-screen",
         call.active && (screenOn || !call.held && call.state != "connecting" && !call.cameraStopPending),
         call.screenSharing,
-        if (call.screenStopPending) uiText("Screen stop unconfirmed. Retry stopping.") else if (call.screenSharing) uiText("Screen sharing") else uiText("Screen stopped"),
+        if (call.screenStopPending) uiText("Screen may still be shared. Tap to stop.") else if (call.screenSharing) uiText("Screen sharing") else uiText("Screen stopped"),
         actions.screen,
         modifier,
         size = CallSecondarySize,
@@ -456,7 +456,7 @@ internal fun shouldAskCallBubble(wasActive: Boolean, bubbleWasMissing: Boolean, 
             onConversation,
             Modifier.size(48.dp).testTag("beacon-view-conversation"),
             colors = IconButtonDefaults.filledTonalIconButtonColors(containerColor = CallSurfaceRaised, contentColor = CallGoldBright),
-        ) { Icon(Icons.Rounded.ChatBubbleOutline, uiText("View conversation")) }
+        ) { Icon(Icons.Rounded.ChatBubbleOutline, uiText("View chat")) }
     }
 }
 

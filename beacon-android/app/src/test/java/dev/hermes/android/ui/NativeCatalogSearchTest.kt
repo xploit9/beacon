@@ -9,7 +9,7 @@ class NativeCatalogSearchTest {
         assertEquals("model-1", modelSubtitle("Friendly model", "model-1"))
         assertEquals("Extra high", reasoningLevelLabel("xhigh"))
         assertTrue(reasoningLevelDescription("xhigh").contains("difficult"))
-        assertTrue(reasoningLevelDescription("max").contains("maximum"))
+        assertEquals("Thinks as long as it needs", reasoningLevelDescription("max"))
     }
     @Test fun providerAndVisibleModelFieldsDefineResultsAndEmptyState() {
         val rows = listOf(Triple("Configured provider", "model-1", "Friendly model"))

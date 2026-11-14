@@ -41,11 +41,14 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
 import dev.hermes.android.data.NativePairing
+import dev.hermes.android.data.ThreadMarks
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.ui.*
 import dev.hermes.android.voice.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.launch
 import org.json.JSONObject
@@ -119,16 +122,21 @@ class NativeExperienceUiTest {
         // A profile switch opens a new chat in the other profile too, so the coder profile starts clean as well.
         val profiles = listOf(fixture.scope, fixture.scope.copy(profile = "coder"))
         runBlocking { profiles.forEach { owner -> listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session").forEach { app.cache.delete(owner, it) } } }
-        // Fixture chat ids (new-N) repeat across cases and runs; drop their per-chat receipts, drafts and projections too.
-        // shortcut: ids come from one counter shared with projects and branches; 24 covers every current case, widen it if one creates more.
-        runBlocking { profiles.forEach { owner -> (1..24).forEach { n -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(owner.session("new-$n"), it) } } } }
-        // A reply another case left running marks its chat (the reattach marker), so this case would ask Hermes once on open.
-        runBlocking { profiles.forEach { owner -> (fixture.sessions.keys + (1..24).map { "new-$it" }).forEach { app.cache.delete(owner.session(it), "running-turn") } } }
+        dropReusedChatCaches(profiles, fixture)
         runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "beacon-session"); app.cache.delete(fixture.scope, "beacon-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         lateinit var vm: BeaconViewModel
         val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.BeaconClient = { auth -> fixture.freshClientFor(auth, app.auth) }
         try {
             compose.runOnUiThread { vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java] }
+            diagnosticVm = vm; diagnosticFixture = fixture
+            // Every notice the app shows is short-lived: by the time a wait times out it is gone. Keep what was said, so a refusal that left no other trace can be read from the failure text.
+            noticeLog.clear()
+            val caseStart = android.os.SystemClock.elapsedRealtime()
+            compose.runOnUiThread {
+                noticeWatch = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate).launch {
+                    vm.ui.map { it.notice }.distinctUntilChanged().collect { if (it.isNotBlank()) noticeLog += "+${android.os.SystemClock.elapsedRealtime() - caseStart}ms '$it'" }
+                }
+            }
             compose.runOnIdle {
                 field(vm, "originGeneration", 100)
                 field(vm, "client", fixture.client)
@@ -157,7 +165,7 @@ class NativeExperienceUiTest {
             if (restoration == null) compose.setContent(content) else restoration.setContent(content)
             block(vm, fixture)
         } finally {
-            compose.runOnUiThread { store.clear(); fixture.client.closeNative(); fixture.clearCustomTabSeam(); app.calls.ownerScope = null }
+            compose.runOnUiThread { noticeWatch?.cancel(); noticeWatch = null; store.clear(); fixture.client.closeNative(); fixture.clearCustomTabSeam(); app.calls.ownerScope = null }
             // Restore every preference, including setup_* written by wizard and sign-out cases, so the real app never reopens on the wizard.
             runBlocking { app.preferences.updateData { prior } }
             shellRun(if (priorAnimatorScale == "null" || priorAnimatorScale.isBlank()) "settings delete global animator_duration_scale" else "settings put global animator_duration_scale $priorAnimatorScale")
@@ -168,21 +176,114 @@ class NativeExperienceUiTest {
             runBlocking { app.cache.delete(fixture.scope, "bot-mode-return"); app.cache.delete(fixture.scope, "beacon-session"); app.cache.delete(fixture.scope, "beacon-opening"); app.cache.delete(fixture.scope, "phone-editors"); app.cache.delete(fixture.scope, "editor:C:/synthetic-workspace/notes.md") }
         }
     }
+    /**
+     * Fixture chat ids repeat across cases and runs: every fixture counts its new chats (new-N) from 1, and a branch it makes (branch-N) takes the next number, so the app's
+     * per-chat receipts, drafts and cached sessions from an earlier case sit under the same key. Hermes' own ids are never reused, so this is the fixture's to clean, not the app's.
+     * #292 opened branch-N and read the title "Renamed branch" an earlier case (#275) had cached for the same id.
+     * shortcut: ids come from one counter shared with projects and branches; 24 covers every current case, widen it if one creates more.
+     */
+    private fun dropReusedChatCaches(profiles: List<Scope>, fixture: NativeExperienceFixture) {
+        val reused = (1..24).flatMap { listOf("new-$it", "branch-$it") }
+        // Recorded, not asserted: which cached branch an earlier case left behind at the moment this case starts (the ordered G3F run reads these lines).
+        runBlocking { profiles.forEach { owner -> (1..6).forEach { n ->
+            app.cache.read(owner.session("branch-$n"), "session")?.let { println("FIXTURE_LEFTOVER branch-$n profile=${owner.profile.ifBlank { "default" }} title=${runCatching { JSONObject(it).optString("title") }.getOrDefault("")}") }
+        } } }
+        runBlocking { profiles.forEach { owner -> reused.forEach { id -> listOf("pending", "draft", "session", "client-created-shell", "side-question").forEach { app.cache.delete(owner.session(id), it) } } } }
+        // A reply another case left running marks its chat (the reattach marker), so this case would ask Hermes once on open.
+        runBlocking { profiles.forEach { owner -> (fixture.sessions.keys + reused).forEach { app.cache.delete(owner.session(it), "running-turn") } } }
+    }
     private fun clickText(text: String) = compose.onNodeWithText(text, useUnmergedTree = true).performScrollTo().performClick()
+    /** The confirmation is a dialog window of its own, there a moment after the click that asks for it: the tap waits for it (fl5-final-2 tapped before it existed). */
+    private fun clickDiscardChanges() {
+        await { compose.onAllNodesWithText("Discard changes").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Discard changes").performClick()
+    }
     private fun clickLabel(label: String) = compose.onNodeWithContentDescription(label, useUnmergedTree = true).performScrollTo().performClick()
     /** Schedule rows keep their actions in one overflow menu: open it, then pick the action by its tag. */
     private fun scheduleAction(id: String, action: String) {
         compose.onNodeWithTag("schedule-menu:$id", useUnmergedTree = true).performScrollTo().performClick()
         compose.onNodeWithTag("schedule-action:$id:$action").performClick()
     }
-    private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    private var diagnosticVm: BeaconViewModel? = null
+    private var diagnosticFixture: NativeExperienceFixture? = null
+    private val noticeLog = java.util.concurrent.CopyOnWriteArrayList<String>()
+    private var noticeWatch: kotlinx.coroutines.Job? = null
+    private fun await(condition: () -> Boolean) = AwaitDiagnostics.await(compose, { waitState() }, condition)
+    /** What a timed-out wait reports about the case: the chat, the notice, Bot Mode and the last calls Hermes (the fixture) received. */
+    private fun waitState(): String {
+        val vm = diagnosticVm ?: return "no case running"
+        val chat = vm.chat.value; val ui = vm.ui.value; val room = vm.botMode.state.value
+        return "client=${vm.client?.scope?.profile} uiProfile=${ui.profile} newChatOpening=${ui.newChatOpening} newChatError='${ui.newChatError}'; ${internals(vm)}; " +
+            "chat=${chat.sessionId} streamId='${chat.streamId}' status='${chat.status}' ready=${chat.projectionReady}; tab=${ui.tab} assistantSessionId='${ui.assistantSessionId}' listed=${ui.sessions.size} historyLoading=${ui.historyLoading}; notice='${ui.notice}' error='${ui.error}'; " +
+            "botMode loading=${room.loading} sending=${room.sending} space='${room.selectedSpace}' draft='${room.draft.take(30)}' error='${room.error}'; " +
+            "history revision=${historyRevision(vm)}; sockets (id, method): ${diagnosticFixture?.nativeSocketMethods?.toList().orEmpty().takeLast(10)}; " +
+            "last calls: ${diagnosticFixture?.let { recentCalls(it).joinToString() }}; " +
+            "Hermes (fixture): chats with no saved row=${diagnosticFixture?.unpromptedShellIds()} chats the gateway was asked to resume=${diagnosticFixture?.resumedSessionIds()?.takeLast(6)}; ${sendState(vm)}"
+    }
+    /**
+     * Whether a send is still unsettled and what the queue and the composer hold, with the notices the app showed (they are gone by the time a wait times out). A queue asked while the send is
+     * unsettled is refused with a notice and nothing else (G3 run F6, #273: the chat said Working, the queue was empty, and no notice was left to read).
+     */
+    private fun sendState(vm: BeaconViewModel): String = runCatching {
+        val chat = vm.chat.value
+        @Suppress("UNCHECKED_CAST") val pending = (BeaconViewModel::class.java.getDeclaredField("pending").apply { isAccessible = true }.get(vm) as Map<String, *>).keys
+        "send: uncertain='${chat.uncertain}' pending=$pending queued=${chat.queued.map { "${it.kind}/${it.state}:${it.text.take(16)}" }} composer='${vm.composer.value.text.take(24)}' notices=${noticeLog.toList().takeLast(4)}"
+    }.getOrElse { "send state unavailable: $it" }
+    private fun originGeneration(vm: BeaconViewModel): Int = runCatching { BeaconViewModel::class.java.getDeclaredField("originGeneration").apply { isAccessible = true }.getInt(vm) }.getOrDefault(-1)
+    /** The view model's counter of rendered chat copies (a render bumps it); a completion read that finds it changed leaves the screen steps alone. */
+    private fun historyRevision(vm: BeaconViewModel): Long = runCatching { BeaconViewModel::class.java.getDeclaredField("chatHistoryRevision").apply { isAccessible = true }.getLong(vm) }.getOrDefault(-1L)
+    private fun bumpHistoryRevision(vm: BeaconViewModel) {
+        val revision = BeaconViewModel::class.java.getDeclaredField("chatHistoryRevision").apply { isAccessible = true }
+        compose.runOnUiThread { revision.setLong(vm, revision.getLong(vm) + 1) }
+    }
     /** Hermes reports display names on its first profile read; a case that adds them after the UI loaded the catalog reloads it. */
     private fun showProfileDisplayNames(vm: BeaconViewModel, fixture: NativeExperienceFixture) {
         fixture.profileDisplayNames = mapOf("default" to "Personal profile", "coder" to "Code profile")
         compose.runOnIdle { vm.load("navigation-profiles", "/api/profiles", force = true) }
         await { vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Code profile" } == true }
     }
-    private fun recentCalls(fixture: NativeExperienceFixture) = fixture.requests.takeLast(10).map { "${it.string("method")} ${it.string("path")}".trim() }
+    /**
+     * The send is accepted once its receipt is cleared and the chat is no longer unsure about it; accepted() attaches its stream in that same step. A test that cancels the streams has to wait
+     * for this: reattachMarkedRun can set streamId earlier (fl6 trace under load), and the stream attached afterwards would survive the cancel. The same race can make aNewChatsFirstReply stick.
+     */
+    private fun sendAccepted(vm: BeaconViewModel, fixture: NativeExperienceFixture, session: String): Boolean {
+        @Suppress("UNCHECKED_CAST") val pending = BeaconViewModel::class.java.getDeclaredField("pending").apply { isAccessible = true }.get(vm) as Map<String, *>
+        return !pending.containsKey(fixture.scope.session(session).key) && vm.chat.value.uncertain.isBlank()
+    }
+    /** The last calls Hermes (the fixture) received, each with the profile it named: a session.create names it in its params, a plugin or stock route in its query. */
+    private fun recentCalls(fixture: NativeExperienceFixture) = fixture.requests.takeLast(14).map { call ->
+        val profile = call.optString("profile").ifBlank { call.optJSONObject("params")?.optString("profile").orEmpty() }
+        "${call.string("method")} ${call.string("path")}".trim() + profile.takeIf(String::isNotBlank)?.let { " [$it]" }.orEmpty()
+    }
+    /** The view model's own counters and jobs that decide whether a profile switch or a new chat is still going on or was dropped; read by reflection, so a wait that times out says which. */
+    private fun internals(vm: BeaconViewModel): String = runCatching {
+        @Suppress("UNCHECKED_CAST") fun <T> read(name: String): T? = BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm) as T?
+        val creating = read<Map<String, kotlinx.coroutines.Job>>("newChatJobs").orEmpty().values.count { it.isActive }
+        "foreground=${read<Boolean>("foreground")} storedProfile=${diagnosticFixture?.let { app.auth.read(it.scope.origin).profile }}; " +
+            "generations origin=${read<Int>("originGeneration")} session=${read<Int>("sessionGeneration")} navigation=${read<Int>("navigationGeneration")}; " +
+            "sourceScope=${read<dev.hermes.android.core.Scope>("sourceScope")?.let { "${it.profile}/${it.session}" }}; selectionActive=${read<kotlinx.coroutines.Job>("selectionJob")?.isActive}; newChatJobsActive=$creating"
+    }.getOrElse { "internals unavailable: $it" }
+    /**
+     * The same 15-second wait, but a timeout names which of its conditions held and which did not: a bare "Condition still not satisfied" cannot tell a client on the wrong profile from a
+     * chat that never settled (G3 run F5, #379).
+     */
+    private fun awaitAll(vararg conditions: Pair<String, () -> Boolean>, extra: () -> String = { "" }) {
+        try { await { conditions.all { it.second() } } }
+        catch (timeout: AssertionError) {
+            throw AssertionError("${timeout.message}\nConditions: " + conditions.joinToString("; ") { (name, check) -> "$name=${runCatching(check).getOrElse { "error $it" }}" } +
+                extra().let { if (it.isBlank()) "" else "\n$it" }, timeout)
+        }
+    }
+    /** The four things a profile switch that opened a chat must end with. */
+    private fun awaitProfileChat(vm: BeaconViewModel, profile: String, extra: Pair<String, () -> Boolean>? = null) = awaitAll(
+        *listOfNotNull(
+            "client profile is $profile" to { vm.client?.scope?.profile == profile },
+            "chat id starts with new-" to { vm.chat.value.sessionId.startsWith("new-") },
+            "chat is ready" to { vm.chat.value.projectionReady },
+            "no new chat is opening" to { !vm.ui.value.newChatOpening },
+            extra,
+        ).toTypedArray(),
+    )
     /** Menus and sheets are checked with the IME away, so neither a keyboard nor a stale focus can cover them. */
     private fun closeKeyboard() {
         compose.runOnIdle { compose.activity.getSystemService(android.view.inputmethod.InputMethodManager::class.java).hideSoftInputFromWindow(compose.activity.window.decorView.windowToken, 0) }
@@ -363,9 +464,13 @@ class NativeExperienceUiTest {
                 flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(uncertain = receipt.id)
                 vm.composer(TextFieldValue("Keep this message"))
             }
+            // A tap on the bubble opens the menu (the composer's Send is off while the outcome is unknown, so the bubble is the way out).
+            compose.onNodeWithTag("unconfirmed-bubble").assertIsDisplayed().performClick()
+            compose.onNodeWithTag("send-check").assertIsDisplayed()
             compose.onNodeWithTag("send-resend").assertIsDisplayed().performClick()
-            compose.onNodeWithText("Resend retained draft").assertIsDisplayed()
+            compose.onNodeWithText("Resend?").assertIsDisplayed()
             compose.runOnIdle { vm.dismissForm() }
+            compose.onNodeWithTag("unconfirmed-bubble").performTouchInput { longClick() }
             compose.onNodeWithTag("send-dismiss").performClick()
             await { vm.chat.value.uncertain.isBlank() }
             assertNull(runBlocking { app.cache.read(scope, "pending") })
@@ -387,6 +492,12 @@ class NativeExperienceUiTest {
         capture("audit-history-id-alias")
     }
 
+    /** A card that takes the front from another card stays unanswerable for a moment (a repeat tap must not answer it); a test that answers such a card waits for it. */
+    private fun tapWhenAnswerable(text: String) {
+        compose.waitUntil(8_000) { runCatching { compose.onNodeWithText(text).assertIsEnabled() }.isSuccess }
+        compose.onNodeWithText(text).performScrollTo().performClick()
+    }
+
     @Test fun stalePromptButtonsCannotApproveOrAnswerTheNextRequest() = withFixture { vm, fixture ->
         fun approval(id: String) = json("request_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
         fun shownApproval(id: String) = json("approval_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
@@ -398,16 +509,19 @@ class NativeExperienceUiTest {
         fixture.emitNativeServerRequest("approval", "wire-old-approval", approval("old-approval"))
         await { vm.chat.value.approval?.string("approval_id") == "queue-old-approval" }
         val staleApproval = requireNotNull(compose.onNodeWithText("Allow once").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
+        // A second request while the first is open waits behind it (Hermes holds both); the first stays on screen until it ends.
         fixture.emitNativeServerRequest("approval", "wire-new-approval", approval("new-approval"))
+        await { vm.chat.value.waitingApprovals.size == 1 }
+        assertEquals("queue-old-approval", vm.chat.value.approval?.string("approval_id"))
+        fixture.emitNativeEvent("request.cancel", json("id" to "wire-old-approval", "method" to "approval", "reason" to "test"))
         await { vm.chat.value.approval?.string("approval_id") == "queue-new-approval" }
         compose.runOnIdle { assertTrue(staleApproval()); assertTrue(vm.ui.value.notice.contains("request changed")) }
         compose.waitForIdle()
         assertTrue(fixture.nativeServerResponses.isEmpty())
-        fixture.emitNativeEvent("request.cancel", json("id" to "wire-old-approval", "method" to "approval", "reason" to "test"))
         compose.runOnIdle { vm.clearMessage() }
         await { compose.onAllNodesWithText("This request changed. Refresh it before responding.").fetchSemanticsNodes().isEmpty() }
         await { compose.onAllNodesWithText("Synthetic new-approval").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        tapWhenAnswerable("Allow once")
         await { fixture.nativeServerResponses.size == 1 }
         assertEquals("wire-new-approval", fixture.nativeServerResponses.last().getString("id"))
         assertEquals("once", fixture.nativeServerResponses.last().getJSONObject("result").getString("choice"))
@@ -418,17 +532,19 @@ class NativeExperienceUiTest {
         }
         fixture.emitNativeServerRequest("approval", "wire-racing-approval", approval("racing-approval"))
         await { vm.chat.value.approval?.string("approval_id") == "queue-racing-approval" }
-        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        tapWhenAnswerable("Allow once")
         await { fixture.nativeServerResponses.size == 2 }
         assertEquals("wire-racing-approval", fixture.nativeServerResponses.last().getString("id"))
         await { vm.chat.value.approval?.string("approval_id") == "queue-replacement-approval" }
+        // The injected replacement is not a Hermes request the fixture holds: clear it so the next request is the only open one.
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = null) }
 
         compose.runOnIdle {
             fixture.rejectPromptResponse = true
         }
         fixture.emitNativeServerRequest("approval", "wire-failed-approval", approval("failed-approval"))
         await { vm.chat.value.approval?.string("approval_id") == "queue-failed-approval" }
-        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        tapWhenAnswerable("Allow once")
         await { vm.ui.value.error == dev.hermes.android.data.APP_CONNECTION_ERROR }
         assertEquals(2, fixture.nativeServerResponses.size)
         assertEquals("A failed socket send retains the displayed prompt", "queue-failed-approval", vm.chat.value.approval?.string("approval_id"))
@@ -442,16 +558,18 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Your answer").performScrollTo().performTextInput("Old answer")
         val staleAnswer = requireNotNull(compose.onNodeWithText("Continue").performScrollTo().fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action)
         fixture.emitNativeServerRequest("clarify", "wire-new-question", question("new-question"))
+        await { vm.chat.value.waitingClarifications.size == 1 }
+        assertEquals("wire-old-question", vm.chat.value.clarification?.string("clarify_id"))
+        fixture.emitNativeEvent("request.cancel", json("id" to "wire-old-question", "method" to "clarify", "reason" to "test"))
         await { vm.chat.value.clarification?.string("clarify_id") == "wire-new-question" }
         compose.runOnIdle { assertTrue(staleAnswer()); assertTrue(vm.ui.value.notice.contains("request changed")) }
         compose.waitForIdle()
         assertEquals(2, fixture.nativeServerResponses.size)
-        fixture.emitNativeEvent("request.cancel", json("id" to "wire-old-question", "method" to "clarify", "reason" to "test"))
         compose.runOnIdle { vm.clearMessage() }
         await { compose.onAllNodesWithText("This request changed. Refresh it before responding.").fetchSemanticsNodes().isEmpty() }
         await { compose.onAllNodesWithText("Synthetic new-question").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Your answer").performScrollTo().performTextInput("Keep rollback ready")
-        compose.onNodeWithText("Continue").performScrollTo().performClick()
+        tapWhenAnswerable("Continue")
         await { fixture.nativeServerResponses.size == 3 }
         assertEquals("wire-new-question", fixture.nativeServerResponses.last().getString("id"))
         assertEquals("Keep rollback ready", fixture.nativeServerResponses.last().getJSONObject("result").getJSONObject("answers").getString("qid-new-question"))
@@ -460,6 +578,154 @@ class NativeExperienceUiTest {
         assertTrue(fixture.requests.none { it.string("method") in setOf("approval.respond", "request.answer") })
         receipts += "A retained click from a replaced approval/question sends nothing; fresh actions carry only their displayed request ID."
         capture("audit-prompt-identity")
+    }
+
+    @Test fun twoApprovalsAtOnceShowOneCardAtATimeAndEachIsAnsweredOnItsOwnRequest() = withFixture { vm, fixture ->
+        fun approval(id: String) = json("request_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.composer(TextFieldValue("Ask for two permissions")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+
+        // Hermes holds both at once (parallel tool calls): the phone shows the oldest and keeps the other behind it.
+        fixture.emitNativeServerRequest("approval", "wire-first", approval("first"))
+        fixture.emitNativeServerRequest("approval", "wire-second", approval("second"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-first" && vm.chat.value.waitingApprovals.size == 1 }
+        await { compose.onAllNodesWithText("Synthetic first").fetchSemanticsNodes().isNotEmpty() }
+        assertTrue(compose.onAllNodesWithText("Synthetic second").fetchSemanticsNodes().isEmpty())
+        tapWhenAnswerable("Allow once")
+        await { fixture.nativeServerResponses.size == 1 }
+        assertEquals("wire-first", fixture.nativeServerResponses.last().getString("id"))
+        assertEquals("once", fixture.nativeServerResponses.last().getJSONObject("result").getString("choice"))
+
+        // Answering the first brings up the second, which is answered on its own request.
+        await { vm.chat.value.approval?.string("approval_id") == "queue-second" }
+        await { compose.onAllNodesWithText("Synthetic second").fetchSemanticsNodes().isNotEmpty() }
+        assertTrue(compose.onAllNodesWithText("Synthetic first").fetchSemanticsNodes().isEmpty())
+        tapWhenAnswerable("Deny")
+        await { fixture.nativeServerResponses.size == 2 }
+        assertEquals("wire-second", fixture.nativeServerResponses.last().getString("id"))
+        assertEquals("deny", fixture.nativeServerResponses.last().getJSONObject("result").getString("choice"))
+        await { vm.chat.value.approval == null }
+        assertTrue(vm.chat.value.waitingApprovals.isEmpty())
+
+        // A request Hermes ended while it waited behind another leaves the queue without ever being shown, and the open one is untouched.
+        fixture.emitNativeServerRequest("approval", "wire-third", approval("third"))
+        fixture.emitNativeServerRequest("approval", "wire-fourth", approval("fourth"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-third" && vm.chat.value.waitingApprovals.size == 1 }
+        fixture.emitNativeEvent("request.cancel", json("id" to "wire-fourth", "method" to "approval", "reason" to "test"))
+        await { vm.chat.value.waitingApprovals.isEmpty() }
+        assertEquals("queue-third", vm.chat.value.approval?.string("approval_id"))
+        tapWhenAnswerable("Allow once")
+        await { fixture.nativeServerResponses.size == 3 }
+        assertEquals("wire-third", fixture.nativeServerResponses.last().getString("id"))
+        await { vm.chat.value.approval == null }
+        assertEquals(listOf("wire-first", "wire-second", "wire-third"), fixture.nativeServerResponses.map { it.getString("id") })
+        receipts += "Two approvals open at once: one card at a time, oldest first; answering shows the next; each answer carries its own request id; an ended waiting request leaves the queue unseen."
+    }
+
+    @Test fun aTapOnACardHermesAlreadyEndedSaysSoAndClosesItWithoutSendingAnything() = withFixture { vm, fixture ->
+        // On a Hermes with session authority a card can outlive its prompt (Hermes ends it after its own wait and tells the phone only when a snapshot runs).
+        fixture.canonicalAuthority = true
+        // The app's gateway socket opened before this flag and learned "no authority" from its ready event; the next one reads the new answer.
+        compose.runOnIdle { vm.client?.closeNative() }
+        try {
+            val ended = json("id" to "ended-prompt", "approval_id" to "ended-prompt", "command" to "Synthetic ended request", "choices" to JSONArray().put("once").put("deny"))
+            compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = ended) }
+            await { compose.onAllNodesWithText("Synthetic ended request").fetchSemanticsNodes().isNotEmpty() }
+            tapWhenAnswerable("Allow once")
+            await { vm.chat.value.approval == null }
+            await { vm.ui.value.notice == "This request has ended." }
+            assertEquals("A request Hermes ended is not a lost connection", "", vm.ui.value.error)
+            assertTrue("Nothing is sent for a prompt Hermes no longer holds", fixture.requests.none { it.string("method") in setOf("approval.respond", "clarify.respond") })
+        } finally { fixture.canonicalAuthority = false }
+        receipts += "A late tap on an approval card Hermes already ended says the request has ended, closes the card and sends nothing (not \"Can't reach Hermes\")."
+    }
+
+    @Test fun theCardThatComesUpAfterAnAnswerCannotBeAnsweredByARepeatTap() = withFixture { vm, fixture ->
+        fun approval(id: String) = json("request_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.composer(TextFieldValue("Ask for two permissions")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        // Wide enough that a slow emulator cannot outrun it; the production value (700 ms) is pinned by the JVM tests.
+        val production = PromptGuard.windowMs
+        PromptGuard.windowMs = 4_000L
+        try {
+            fixture.emitNativeServerRequest("approval", "wire-first", approval("first"))
+            fixture.emitNativeServerRequest("approval", "wire-second", approval("second"))
+            await { vm.chat.value.approval?.string("approval_id") == "queue-first" && vm.chat.value.waitingApprovals.size == 1 }
+            await { compose.onAllNodesWithText("Synthetic first").fetchSemanticsNodes().isNotEmpty() }
+            // The first card is answerable at once and is not labelled as a next request.
+            compose.onNodeWithText("Allow once").assertIsEnabled()
+            assertTrue(compose.onAllNodesWithText("Next request").fetchSemanticsNodes().isEmpty())
+            compose.onNodeWithText("Allow once").performScrollTo().performClick()
+            await { fixture.nativeServerResponses.size == 1 && vm.chat.value.approval?.string("approval_id") == "queue-second" }
+            await { compose.onAllNodesWithText("Synthetic second").fetchSemanticsNodes().isNotEmpty() }
+
+            // The second card is shown as a new request and its buttons are off; a repeat tap, or a tap on Deny, answers nothing.
+            compose.onNodeWithText("Next request").assertIsDisplayed()
+            compose.onNodeWithText("Allow once").assertIsNotEnabled()
+            compose.onNodeWithText("Deny").assertIsNotEnabled()
+            compose.onNodeWithText("Allow once").performScrollTo().performClick()
+            compose.onNodeWithText("Deny").performScrollTo().performClick()
+            // Even a call that is not a tap on the screen is ignored for the card in that moment.
+            compose.runOnIdle { vm.approval("once", vm.chat.value.approval!!, fixture.scope.session("chat-a")) }
+            compose.waitForIdle()
+            Thread.sleep(500)
+            assertEquals("The repeat tap answered nothing", 1, fixture.nativeServerResponses.size)
+            assertEquals("queue-second", vm.chat.value.approval?.string("approval_id"))
+
+            // Once the moment has passed the card is answered on its own request.
+            tapWhenAnswerable("Allow once")
+            await { fixture.nativeServerResponses.size == 2 }
+            assertEquals(listOf("wire-first", "wire-second"), fixture.nativeServerResponses.map { it.getString("id") })
+            await { vm.chat.value.approval == null }
+
+            // The other order: nothing waits behind the card. The owner answered it and a request is asked right afterwards, before the repeat tap lands. It never replaced a card,
+            // but it is a new request all the same: labelled, buttons off, and the repeat tap and a direct call answer nothing.
+            fixture.emitNativeServerRequest("approval", "wire-third", approval("third"))
+            await { vm.chat.value.approval?.string("approval_id") == "queue-third" }
+            await { compose.onAllNodesWithText("Synthetic third").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithText("Next request").assertIsDisplayed()
+            compose.onNodeWithText("Allow once").assertIsNotEnabled()
+            compose.onNodeWithText("Deny").assertIsNotEnabled()
+            compose.onNodeWithText("Allow once").performScrollTo().performClick()
+            compose.onNodeWithText("Deny").performScrollTo().performClick()
+            compose.runOnIdle { vm.approval("once", vm.chat.value.approval!!, fixture.scope.session("chat-a")) }
+            compose.waitForIdle()
+            Thread.sleep(500)
+            assertEquals("The repeat tap answered nothing", 2, fixture.nativeServerResponses.size)
+            assertEquals("queue-third", vm.chat.value.approval?.string("approval_id"))
+            tapWhenAnswerable("Deny")
+            await { fixture.nativeServerResponses.size == 3 }
+            assertEquals(listOf("wire-first", "wire-second", "wire-third"), fixture.nativeServerResponses.map { it.getString("id") })
+            assertEquals("deny", fixture.nativeServerResponses.last().getJSONObject("result").getString("choice"))
+            await { vm.chat.value.approval == null }
+        } finally { PromptGuard.windowMs = production }
+        receipts += "The card that comes up after an answer, behind another card or on its own, says Next request, has its buttons off for a moment, and a repeat tap answers nothing; afterwards it is answered on its own request."
+    }
+
+    @Test fun aRequestThatRanOutOfTimeLeavesAndTheLiveOneBehindItComesUpWithoutATap() = withFixture { vm, fixture ->
+        fun approval(id: String) = json("request_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.composer(TextFieldValue("Ask for two permissions")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        // Hermes gives the first request 2 s; the owner is away, so nothing settles it, and a second request waits behind it.
+        fixture.emitNativeServerRequest("approval", "wire-short", approval("short").put("timeout_s", 2))
+        fixture.emitNativeServerRequest("approval", "wire-live", approval("live"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-short" && vm.chat.value.waitingApprovals.size == 1 }
+        // No tap and no event: the first one's own wait runs out and the live one is on screen.
+        await { vm.chat.value.approval?.string("approval_id") == "queue-live" }
+        await { compose.onAllNodesWithText("Synthetic live").fetchSemanticsNodes().isNotEmpty() }
+        assertTrue(vm.chat.value.waitingApprovals.isEmpty())
+        assertTrue(compose.onAllNodesWithText("Synthetic short").fetchSemanticsNodes().isEmpty())
+        assertTrue("Nothing was answered for the request that ran out", fixture.nativeServerResponses.isEmpty())
+        // It came up in front of the owner, so it is a next request: shown as one, answerable after a moment, on its own request.
+        compose.onNodeWithText("Next request").assertIsDisplayed()
+        tapWhenAnswerable("Allow once")
+        await { fixture.nativeServerResponses.size == 1 }
+        assertEquals("wire-live", fixture.nativeServerResponses.single().getString("id"))
+        await { vm.chat.value.approval == null }
+        receipts += "A request whose own wait ran out leaves the queue with no tap and no event; the live request behind it comes up and is answered on its own request."
     }
 
     @Test fun restoringALongComposerIsNotTreatedAsAPaste() = withFixture { vm, fixture ->
@@ -474,7 +740,9 @@ class NativeExperienceUiTest {
         assertFalse(fixture.requests.any { it.string("path").contains("upload") })
         compose.runOnIdle { vm.composer(TextFieldValue()) }
         compose.onNodeWithTag("message-input").performTextInput(text)
-        await { vm.attachments.value.size == 1 }
+        // BeaconViewModel.composer stages the file and then, in the next statement of the same main-thread task, puts the composer back (:3808-3809).
+        // Waiting on the file alone can read the composer between the two, so the wait is on the end of the staging: file staged AND composer restored.
+        await { vm.attachments.value.size == 1 && vm.composer.value.text.isBlank() }
         val staged = vm.attachments.value.single()
         assertEquals("pasted-text.txt", staged.string("name"))
         assertEquals(text, String(android.util.Base64.decode(staged.string("staged_base64"), android.util.Base64.DEFAULT), Charsets.UTF_8))
@@ -489,6 +757,8 @@ class NativeExperienceUiTest {
         await { vm.data.value["crons"] != null }
         scheduleAction("task-a", "pause"); await { fixture.jobs.getValue("task-a").optBoolean("paused") }
         compose.waitForIdle(); scheduleAction("task-a", "pause"); await { !fixture.jobs.getValue("task-a").optBoolean("paused") }
+        // The card shows "Running..." on this button for as long as its own pause or resume is in flight (TasksScreen: both set `pending`), which outlasts the fixture's flag.
+        await { runCatching { compose.onNodeWithTag("schedule-run:task-a").assertTextContains("Run now") }.isSuccess }
         // The button merges its icon and word, so its text is read from the merged node.
         compose.onNodeWithTag("schedule-run:task-a").assertTextContains("Run now")
         // Owner, 4 Nov 2026: Run now runs at once, with no window to wait in; the card shows the run.
@@ -547,7 +817,7 @@ class NativeExperienceUiTest {
         // A callback is titled Callback, shows no hash and has no Edit; Delete stays.
         list.performScrollToNode(hasTestTag("schedule-card:task-callback"))
         val callback = hasAnyAncestor(hasTestTag("schedule-card:task-callback"))
-        compose.onNode(hasText("Callback") and callback, useUnmergedTree = true).assertExists()
+        compose.onNode(hasText("Call back") and callback, useUnmergedTree = true).assertExists()
         compose.onAllNodesWithText(hash.take(12), substring = true, useUnmergedTree = true).assertCountEquals(0)
         compose.onAllNodesWithText("Beacon callback", substring = true, useUnmergedTree = true).assertCountEquals(0)
         compose.onNodeWithTag("schedule-menu:task-callback", useUnmergedTree = true).performScrollTo().performClick()
@@ -569,7 +839,9 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("schedule-action:task-daily:edit").performClick()
         await { vm.form.value != null }
         assertEquals("Daily", vm.form.value!!.values["_schedule_mode"]); assertEquals("8", vm.form.value!!.values["_hour"]); assertEquals("0", vm.form.value!!.values["_minute"])
-        compose.onNodeWithText("$dailyText · Asia/Dubai", useUnmergedTree = true).assertExists()
+        // 1.1.34 (scheduleSummaryWithZone): the form names the zone in plain words ("Dubai"), never its id ("Asia/Dubai").
+        compose.onNodeWithText("$dailyText · Dubai", useUnmergedTree = true).assertExists()
+        compose.onNodeWithText("$dailyText · Asia/Dubai", useUnmergedTree = true).assertDoesNotExist()
         compose.onAllNodesWithText("Day of the month", useUnmergedTree = true).assertCountEquals(0)
         compose.runOnIdle { vm.formValue("name", "Security digest") }
         compose.onNodeWithText("Save").assertIsDisplayed().performClick()
@@ -596,7 +868,7 @@ class NativeExperienceUiTest {
         compose.onAllNodesWithContentDescription("Task actions").onFirst().performClick()
         compose.onNode(hasText("Move to Done") and hasAnyAncestor(isPopup())).performClick()
         compose.onNodeWithTag("kanban-completion-result").assertExists()
-        compose.onNodeWithText("A worker is on this task. This change overrides its claim.").assertDoesNotExist()
+        compose.onNodeWithText("A bot is working on this task. Change it anyway?").assertDoesNotExist()
         compose.onNode(hasText("Move") and hasClickAction() and hasAnyAncestor(isDialog())).assertIsNotEnabled()
         compose.onNodeWithTag("kanban-completion-result").performTextInput("Reviewed the work and confirmed the result.")
         compose.onNode(hasText("Move") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
@@ -608,7 +880,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("kanban-tab:running").assertTextEquals("Running", "1").performClick()
         compose.onAllNodesWithContentDescription("Task actions").onFirst().performClick()
         compose.onNode(hasText("Move to Done") and hasAnyAncestor(isPopup())).performClick()
-        compose.onNodeWithText("A worker is on this task. This change overrides its claim.").assertExists()
+        compose.onNodeWithText("A bot is working on this task. Change it anyway?").assertExists()
         compose.onNodeWithText("Cancel").performClick()
     }
 
@@ -688,7 +960,7 @@ class NativeExperienceUiTest {
         fixture.roomActions += json("kind" to "retry", "task_id" to "task-retry")
         compose.runOnIdle { vm.botMode.refresh() }
         await { vm.botMode.state.value.actions.isNotEmpty() && !vm.botMode.state.value.loading }
-        compose.onNodeWithText("This Hermes version cannot safely resolve work", substring = true).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Finish this in Hermes. It may already have run.", substring = true).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Retry bot task").assertDoesNotExist()
         assertEquals(1, fixture.roomActions.size)
         assertFalse(fixture.requests.any { it.string("path").endsWith("/action") && it.getJSONObject("body").string("kind") == "retry" })
@@ -711,8 +983,8 @@ class NativeExperienceUiTest {
             compose.onNodeWithTag("message-actions:${original.id}").assertExists()
         }
         openMenu()
-        listOf("Copy", "Quote in reply", "Share", "Read aloud", "Copy source", "Branch from here", "Edit and branch").forEach { compose.onNodeWithText(it).assertExists() }
-        compose.onNodeWithText("Copy source").performClick()
+        listOf("Copy", "Quote in reply", "Share", "Read aloud", "Copy as plain text", "Branch from here", "Edit and branch").forEach { compose.onNodeWithText(it).assertExists() }
+        compose.onNodeWithText("Copy as plain text").performClick()
         val clipboard = app.getSystemService(android.content.ClipboardManager::class.java)
         assertEquals(original.text, clipboard.primaryClip!!.getItemAt(0).text.toString())
         openMenu()
@@ -724,8 +996,8 @@ class NativeExperienceUiTest {
         openMenu()
         compose.onNodeWithText("Branch from here").performClick()
         await { vm.chat.value.sessionId.startsWith("branch-") }
-        await { vm.ui.value.notice == "Branched into a new conversation" }
-        compose.onNodeWithText("Branched into a new conversation").assertExists()
+        await { vm.ui.value.notice == "Branched into a new chat" }
+        compose.onNodeWithText("Branched into a new chat").assertExists()
         // History lists the new branch without a manual refresh, and the open branch carries its own title, not its parent's.
         await { vm.ui.value.sessions.any { it.string("session_id") == vm.chat.value.sessionId } }
         assertEquals("Branch", vm.chat.value.title)
@@ -737,7 +1009,7 @@ class NativeExperienceUiTest {
         await { vm.chat.value.sessionId.startsWith("branch-") && vm.composer.value.text == original.text }
         assertEquals(1, fixture.requests.last { it.string("method") == "session.branch" }.getJSONObject("params").getInt("count"))
         assertFalse(fixture.requests.any { it.string("method") == "prompt.submit" })
-        receipts += "Copy source preserves the selected message; system Share opens and cancels without sending; branch and edit/branch use exact native message boundaries."
+        receipts += "Copy as plain text preserves the selected message; system Share opens and cancels without sending; branch and edit/branch use exact native message boundaries."
         capture("audit-message-actions")
     }
 
@@ -827,8 +1099,8 @@ class NativeExperienceUiTest {
 
     @Test fun searchingWhileHistoryArrivesAndMalformedQuestionsRemainRecoverable() = withFixture { vm, _ ->
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList(), anchor = 15, anchorId = "row-15") }
-        compose.onNodeWithContentDescription("Search this conversation").performClick()
-        val search = compose.onNode(hasSetTextAction() and hasText("Find in conversation"))
+        compose.onNodeWithContentDescription("Search in chat").performClick()
+        val search = compose.onNode(hasSetTextAction() and hasText("Find in chat"))
         search.performTextInput("needle")
         compose.runOnIdle {
             flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = (0 until 60).map { i ->
@@ -1183,7 +1455,7 @@ class NativeExperienceUiTest {
                 vm.load("native-tools", path, force = false).join()
             }
             assertEquals(before + 1, fixture.requests.count { it.string("path") == path })
-            assertTrue(vm.refreshing.value.isEmpty())
+            assertTrue("Still refreshing: ${vm.refreshing.value}", vm.refreshing.value.isEmpty())
             receipts += "Profile-scoped metadata is reused across UI aliases without loading pulses; an actual fixture mutation invalidates it and triggers a new read."
         } finally { observer.cancel() }
     }
@@ -1208,6 +1480,66 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Retry commands").performScrollTo().performClick()
         await { recordError(vm.data.value["slash:catalog"]).isBlank() && vm.data.value["slash:catalog"]?.optBoolean("available") == true }
         receipts += "Background command metadata failures retain scoped suggestions quietly and never turn an unavailable slash command into an ordinary prompt; explicit retry recovers."
+    }
+
+    /** Review R25 Nice 1: a command the phone leaves out, typed by hand, is answered on the phone and never reaches the model as a message. */
+    @Test fun aComputerOnlyCommandTypedByHandSaysSoAndSendsNothing() = withFixture { vm, fixture ->
+        fixture.extraCommands = listOf("/copy" to "Copy the last assistant response to clipboard")
+        try {
+            runBlocking { vm.loadSlashCatalog(force = true).join() }
+            await { vm.data.value["slash:catalog"]?.rows("commands")?.any { it.string("name") == "copy" } == true }
+            compose.runOnIdle { vm.composer(TextFieldValue("/copy")) }
+            compose.onNodeWithTag("message-send").performClick()
+            await { vm.ui.value.notice == "This command works only on a computer." }
+            assertEquals("/copy", vm.composer.value.text)
+            assertFalse(fixture.requests.any { it.string("method") in setOf("prompt.submit", "slash.exec", "command.dispatch") })
+        } finally { fixture.extraCommands = emptyList() }
+        receipts += "A computer-only command typed by hand says it works only on a computer, keeps the draft and sends nothing."
+    }
+
+    /** Review R25 Should 4: a Hermes with session authority runs only its reviewed built-ins for a phone (gateway/session_commands.py), so only those are offered. */
+    @Test fun onASharedGatewayTheCommandListHoldsOnlyWhatHermesRunsForThePhone() = withFixture { vm, fixture ->
+        fixture.canonicalAuthority = true
+        fixture.extraCommands = listOf("/new" to "Start a new session", "/history" to "Show conversation history", "/usage" to "Show token usage")
+        // The app's socket learned "no authority" when it opened; the next one reads the new answer.
+        compose.runOnIdle { vm.client?.closeNative() }
+        try {
+            runBlocking { vm.loadSlashCatalog(force = true).join() }
+            await { vm.data.value["slash:catalog"]?.rows("commands")?.any { it.string("name") == "new" && it.has("runs") } == true }
+            compose.runOnIdle { vm.composer(TextFieldValue("/")) }
+            for (shown in listOf("/help", "/model", "/usage")) await { compose.onAllNodes(hasText(shown, substring = false) and hasAnyAncestor(hasTestTag("slash-suggestions")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+            for (hidden in listOf("/new", "/history")) assertTrue(hidden, compose.onAllNodes(hasText(hidden, substring = false) and hasAnyAncestor(hasTestTag("slash-suggestions")), useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+            compose.runOnIdle { vm.composer(TextFieldValue("/new")) }
+            compose.onNodeWithTag("message-send").performClick()
+            await { vm.ui.value.notice == "This command works only on a computer." }
+            assertFalse(fixture.requests.any { it.string("method") in setOf("prompt.submit", "slash.exec", "command.dispatch") })
+        } finally { fixture.canonicalAuthority = false; fixture.extraCommands = emptyList() }
+        receipts += "On a shared gateway the command list holds only what Hermes runs for the phone; a refused built-in typed by hand sends nothing."
+    }
+
+    /** Owner-Hermes check of F9, K1: a long report opens whole in a dialog the owner closes, with its Markdown drawn, and the composer empties. */
+    @Test fun aLongCommandReportOpensInADialogTheOwnerClosesAndTheComposerEmpties() = withFixture { vm, fixture ->
+        fixture.extraCommands = listOf("/context" to "Show context usage")
+        fixture.commandDispatchResult = json("type" to "exec", "output" to "**Context Window**\n\n" + (1..40).joinToString("\n") { "- Part $it: `${it * 300}` tokens" })
+        try {
+            runBlocking { vm.loadSlashCatalog(force = true).join() }
+            await { vm.data.value["slash:catalog"]?.rows("commands")?.any { it.string("name") == "context" } == true }
+            // As the command list inserts it: the name and a trailing space.
+            compose.runOnIdle { vm.composer(TextFieldValue("/context ")) }
+            compose.onNodeWithTag("message-send").performClick()
+            await { compose.onAllNodesWithTag("command-report").fetchSemanticsNodes().isNotEmpty() }
+            assertTrue(fixture.requests.any { it.string("method") == "command.dispatch" && it.getJSONObject("params").string("name") == "context" })
+            compose.onNode(hasText("Context Window") and hasAnyAncestor(hasTestTag("command-report")), useUnmergedTree = true).assertExists()
+            assertTrue("no raw Markdown is shown", compose.onAllNodes(hasText("**", substring = true) and hasAnyAncestor(hasTestTag("command-report")), useUnmergedTree = true).fetchSemanticsNodes().isEmpty())
+            assertEquals("", vm.composer.value.text)
+            assertTrue("the report is not also a notice", vm.ui.value.notice.isBlank())
+            // It stays until the owner closes it.
+            Thread.sleep(1_500)
+            compose.onNodeWithTag("command-report").assertExists()
+            compose.onNodeWithTag("command-report-close").performClick()
+            await { compose.onAllNodesWithTag("command-report").fetchSemanticsNodes().isEmpty() }
+        } finally { fixture.extraCommands = emptyList(); fixture.commandDispatchResult = null }
+        receipts += "A long command report opens whole in a dialog with its Markdown drawn, stays until closed, and the composer empties."
     }
 
     @Test fun slashNamePrefixesPrecedeDescriptionsBeforeTheResultLimit() = withFixture { vm, fixture ->
@@ -1262,8 +1594,8 @@ class NativeExperienceUiTest {
         assertEquals((newChat.bottom - newChat.top).value, (newBot.bottom - newBot.top).value, 0.5f)
         assertEquals(newBot.top.value, newSpace.top.value, 0.5f)
         assertTrue(newSpace.bottom <= compose.onNodeWithTag("bot-row-default").getUnclippedBoundsInRoot().top)
-        // Bot Mode keeps the same tiles as the normal drawer; Bots shows on.
-        for (name in navigationTiles) compose.onNodeWithTag("navigation-${name.lowercase()}").assertExists()
+        // Bot Mode keeps the same eight slots as the normal drawer (Memory takes the Projects slot); Bots shows on.
+        for (name in navigationTilesFor(true)) compose.onNodeWithTag("navigation-${name.lowercase()}").assertExists()
         compose.onNodeWithTag("navigation-bots").assertIsSelected().assertHeightIsAtLeast(48.dp)
         // A suggested role opens New bot with its name and role filled in; New bot alone opens it empty.
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-mode-suggested-role:researcher"))
@@ -1307,7 +1639,7 @@ class NativeExperienceUiTest {
         toggle()
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && vm.botMode.state.value.bots.size == 2 }
         // Bot Mode keeps the tiles exactly where they were: New bot and New space take the place of New chat and New thread.
-        for ((name, before) in normalTiles) assertEquals("$name moved when Bot Mode opened", before, compose.onNodeWithTag("navigation-${name.lowercase()}").getUnclippedBoundsInRoot())
+        for ((name, before) in normalTiles) assertEquals("$name moved when Bot Mode opened", before, compose.onNodeWithTag("navigation-${navigationBotTile(name).lowercase()}").getUnclippedBoundsInRoot())
         compose.onNodeWithTag("bot-mode-sidebar-new-bot").assertIsDisplayed()
         compose.onNodeWithTag("bot-mode-sidebar-new-chat").assertIsDisplayed()
         receipts += "Bot Mode's drawer leads with New bot and New space and keeps every tile in place."
@@ -1317,7 +1649,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("navigation-mode-chats").assertDoesNotExist()
         compose.onNodeWithTag("bot-mode-sidebar").performScrollToNode(hasTestTag("bot-row-coder"))
         compose.onNodeWithTag("bot-row-coder").assertTextContains("Code profile")
-        compose.onNodeWithText("Search conversations").assertDoesNotExist()
+        compose.onNodeWithText("Search chats").assertDoesNotExist()
         capture("bot-mode-toggle-on")
         coder()
         await { vm.ui.value.profile == "coder" && vm.botMode.state.value.activeBot?.profile == "coder" }
@@ -1343,7 +1675,7 @@ class NativeExperienceUiTest {
         receipts += "Leaving Bot Mode restores the normal drawer's tile grid at its original widths."
         // History search folds the destinations away, so it is typed here, after leaving Bot Mode.
         compose.onNodeWithTag("history-search-toggle").performClick()
-        compose.onNodeWithText("Search conversations").performTextInput("Travel")
+        compose.onNodeWithText("Search chats").performTextInput("Travel")
         await { vm.ui.value.query == "Travel" }
         compose.onNodeWithTag("navigation-menu").performScrollToNode(hasText("Travel"))
         // The chat header now names Travel as chat-a's project too, so look only inside the menu.
@@ -1375,7 +1707,7 @@ class NativeExperienceUiTest {
             compose.runOnIdle { vm.refreshSessions(""); vm.toggleSessions(true) }
             assertTrue(fixture.sessionListCaptured.await(5, java.util.concurrent.TimeUnit.SECONDS))
             compose.onNodeWithTag("history-loading").performScrollTo().assertIsDisplayed()
-            compose.onNodeWithText("No conversations here").assertDoesNotExist()
+            compose.onNodeWithText("No chats here").assertDoesNotExist()
         } finally { fixture.releaseSessionList.countDown() }
         await { !vm.ui.value.historyLoading && vm.ui.value.sessions.isNotEmpty() }
         compose.onNodeWithTag("history-loading").assertDoesNotExist()
@@ -1504,7 +1836,7 @@ class NativeExperienceUiTest {
         await { vm.ui.value.profile == "coder" }
         compose.runOnIdle { vm.toggleSessions(true) }
         await { fixture.requests.any { it.string("path") == "/api/sessions" && it.string("profile") == "coder" } && !vm.ui.value.historyLoading }
-        compose.onNodeWithText("No conversations here").assertExists()
+        compose.onNodeWithText("No chats here").assertExists()
         compose.onNodeWithTag("history-filter").performScrollTo().performClick()
         compose.onNodeWithTag("history-all-profiles").performClick()
         await { vm.ui.value.sessions.count { it.string("profile") == "default" } == 2 && !vm.ui.value.historyLoading }
@@ -1514,8 +1846,8 @@ class NativeExperienceUiTest {
         fixture.sessionListFailures = mapOf("coder" to noStore, "default" to (503 to "Session store is busy (disk I/O or lock). Retry; the list was not cleared."))
         compose.runOnIdle { vm.refreshSessions() }
         await { vm.ui.value.historyUnreadable == listOf("default") && !vm.ui.value.historyLoading && vm.data.value["navigation-profiles"]?.rows("profiles")?.any { it.string("display_name") == "Personal profile" } == true }
-        compose.onNodeWithTag("history-unreadable:default").assertTextEquals("Couldn't load conversations: Personal profile")
-        compose.onNodeWithText("No conversations here").assertDoesNotExist()
+        compose.onNodeWithTag("history-unreadable:default").assertTextEquals("Couldn't load chats: Personal profile")
+        compose.onNodeWithText("No chats here").assertDoesNotExist()
         receipts += "All Profiles lists another profile's chats when the current profile has no store yet, and names a profile whose chats could not be read."
     }
 
@@ -1550,6 +1882,32 @@ class NativeExperienceUiTest {
         receipts += "A thread whose name another conversation holds is renamed with the next free number instead of losing its name."
     }
 
+    /**
+     * The finished first turn is read from Hermes before the thread is named; if anything else renders this chat meanwhile (a reopen, a refresh, an
+     * action's re-read: each bumps the view model's history revision) the screen steps of the completion stand down, but the thread must still keep its name.
+     */
+    @Test fun aThreadKeepsItsNameWhenTheChatIsRenderedWhileItsFinishedTurnIsRead() = withFixture { vm, fixture ->
+        val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
+        fixture.dropCreateTitle = true
+        compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(sessions = emptyList()); vm.tab("Chat"); vm.newThread(taken) }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val thread = vm.chat.value.sessionId
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session(thread), "live:runtime-$thread") }
+        val subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First thread message")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        fixture.holdMessagesOf = thread
+        fixture.nativeTurnStatus = "idle"
+        fixture.emitNativeEvent("message.complete", json("text" to "Thread reply"))
+        try {
+            assertTrue("The completion should be reading the saved chat; last calls ${recentCalls(fixture)}", fixture.messagesHeld.await(15, java.util.concurrent.TimeUnit.SECONDS))
+            bumpHistoryRevision(vm)
+        } finally { fixture.releaseMessages.countDown() }
+        await { fixture.sessions.getValue(thread).getJSONObject("info").string("title") == "$taken 2" }
+        await { vm.chat.value.title == "$taken 2" }
+    }
+
     // Live 2026-10-27: a thread started from Beacon's chat was made in Hermes, but the screen stayed on the chat open before Beacon,
     // because that chat's return finished opening after the create began and the create took it for the owner moving elsewhere.
     private fun startFromBeaconsChat(vm: BeaconViewModel, fixture: NativeExperienceFixture, start: () -> Unit, expect: (ChatState) -> Boolean) {
@@ -1576,7 +1934,39 @@ class NativeExperienceUiTest {
         startFromBeaconsChat(vm, fixture, { vm.newChat() }) { it.messages.isEmpty() }
     }
 
-    @Test fun aThreadStopsRenamingAfterAnUnrelatedHermesError() = withFixture { vm, fixture ->
+    /**
+     * The reply of a first turn has been delivered and the first stream is reading the saved chat to settle it (the fixture holds that read); a second attach to the same turn starts now, as
+     * any of the callers that follow a running chat may. The turn is over, so the chat must settle (stream cleared, thread named), not be left on Working.
+     */
+    @Test fun aSecondAttachWhileTheFinishedTurnIsBeingSettledStillSettlesIt() = withFixture { vm, fixture ->
+        val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
+        fixture.dropCreateTitle = true
+        compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(sessions = emptyList()); vm.tab("Chat"); vm.newThread(taken) }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val thread = vm.chat.value.sessionId
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session(thread), "live:runtime-$thread") }
+        val subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First thread message")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        fixture.holdMessagesOf = thread
+        fixture.nativeTurnStatus = "idle"
+        fixture.emitNativeEvent("message.complete", json("text" to "Thread reply"))
+        try {
+            assertTrue("The first stream should be reading the saved chat; ${waitState()}", fixture.messagesHeld.await(15, java.util.concurrent.TimeUnit.SECONDS))
+            val attach = BeaconViewModel::class.java.getDeclaredMethod("attachStream", dev.hermes.android.data.BeaconClient::class.java, dev.hermes.android.core.Scope::class.java, String::class.java, Boolean::class.javaPrimitiveType, Long::class.javaPrimitiveType)
+                .apply { isAccessible = true }
+            val quiet = BeaconViewModel::class.java.getDeclaredField("streamSilenceMs").apply { isAccessible = true }.getLong(vm)
+            compose.runOnUiThread { attach.invoke(vm, requireNotNull(vm.client).detached(), fixture.scope.session(thread), "runtime-$thread", false, quiet) }
+        } finally { fixture.releaseMessages.countDown() }
+        await { vm.chat.value.streamId.isBlank() && fixture.sessions.getValue(thread).getJSONObject("info").string("title") == "$taken 2" }
+    }
+
+    /**
+     * R10 Nice 5: a name Hermes keeps refusing (not its duplicate answer) is asked for on the thread's next finished turn too, in case it was a blip, and then dropped: the second failed
+     * turn is the last request, and the third turn asks nothing. (A cancelled stream is not a failed turn: [aThreadKeepsItsWantedNameAfterAFailedRenameAndGetsItOnTheNextTurn] covers the retry.)
+     */
+    @Test fun aThreadStopsRenamingAfterTwoFailedTurnsWithAnUnrelatedHermesError() = withFixture { vm, fixture ->
         val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
         fixture.dropCreateTitle = true
         fixture.renameFailure = "Synthetic rename service failure"
@@ -1593,7 +1983,84 @@ class NativeExperienceUiTest {
 
         await { fixture.requests.count { it.string("method") == "session.title" } == 1 && vm.chat.value.streamId.isBlank() }
         assertEquals(1, fixture.requests.count { it.string("method") == "session.title" })
-        receipts += "A non-duplicate Hermes rename failure stops after one title request instead of cycling numbered titles."
+        // The second finished turn asks once more; the third asks nothing and shows no rename error.
+        for (turn in 2..3) {
+            val before = fixture.streamSubscriptions.get()
+            compose.runOnIdle { vm.composer(TextFieldValue("Thread message $turn")); vm.send() }
+            await { fixture.requests.count { it.string("method") == "prompt.submit" } == turn && vm.chat.value.streamId.isNotBlank() }
+            await { fixture.streamSubscriptions.get() > before }
+            fixture.nativeTurnStatus = "idle"
+            fixture.emitNativeEvent("message.complete", json("text" to "Thread reply $turn"))
+            if (turn == 2) await { fixture.requests.count { it.string("method") == "session.title" } == 2 && vm.chat.value.streamId.isBlank() }
+            else { await { vm.chat.value.streamId.isBlank() }; Thread.sleep(1_500) }
+        }
+        assertEquals("the name was dropped after the second failed turn", 2, fixture.requests.count { it.string("method") == "session.title" })
+        receipts += "A non-duplicate Hermes rename failure is asked for on two finished turns and then dropped, instead of cycling numbered titles or repeating for ever."
+    }
+
+    /**
+     * R9 Should 4: the thread's wanted name leaves the pending list only once the rename worked (or the name already matched). A rename that did not happen (a failed request;
+     * a cancelled stream throws from the same call) leaves it for the thread's next finished turn, so the thread is not stuck with Hermes' own title for good.
+     */
+    @Test fun aThreadKeepsItsWantedNameAfterAFailedRenameAndGetsItOnTheNextTurn() = withFixture { vm, fixture ->
+        val taken = fixture.sessions.getValue("chat-b").getJSONObject("info").string("title")
+        fixture.dropCreateTitle = true
+        fixture.renameFailure = "Synthetic rename service failure"
+        compose.runOnIdle { flow<AppState>(vm, "_ui").value = vm.ui.value.copy(sessions = emptyList()); vm.tab("Chat"); vm.newThread(taken) }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val thread = vm.chat.value.sessionId
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session(thread), "live:runtime-$thread") }
+        var subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("First thread message")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        fixture.nativeTurnStatus = "idle"
+        fixture.emitNativeEvent("message.complete", json("text" to "Thread reply"))
+        await { fixture.requests.count { it.string("method") == "session.title" } == 1 && vm.chat.value.streamId.isBlank() }
+        assertTrue("The failed rename left Hermes' own title", fixture.sessions.getValue(thread).getJSONObject("info").string("title") != "$taken 2")
+        // Hermes answers again; the thread's next finished turn gives it the wanted name.
+        fixture.renameFailure = null
+        subscriptionsBefore = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.composer(TextFieldValue("Second thread message")); vm.send() }
+        await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        fixture.nativeTurnStatus = "idle"
+        fixture.emitNativeEvent("message.complete", json("text" to "Second thread reply"))
+        await { fixture.sessions.getValue(thread).getJSONObject("info").string("title") == "$taken 2" }
+        await { vm.chat.value.title == "$taken 2" }
+    }
+
+    @Test fun aThreadOnAHermesWithSessionAuthorityIsStartedOpenedNamedAndListedInTheThreadsLane() = withFixture { vm, fixture ->
+        // Hermes' session authority refuses the thread source (the fixture does too), so the app makes a titled chat and marks it as a thread.
+        fixture.canonicalAuthority = true
+        // The app's gateway socket opened before this flag and learned "no authority" from its ready event; the next one reads the new answer.
+        compose.runOnIdle { vm.client?.closeNative() }
+        var thread = ""
+        try {
+            compose.runOnIdle { vm.toggleSessions(true) }
+            compose.onNodeWithTag("navigation-new-thread").performScrollTo().performClick()
+            compose.onNodeWithTag("new-thread-name").performTextInput("Authority trip")
+            compose.onNodeWithTag("new-thread-start").performClick()
+            await { fixture.requests.any { it.string("method") == "session.create" && it.getJSONObject("params").string("title") == "Authority trip" } }
+            val params = fixture.requests.last { it.string("method") == "session.create" }.getJSONObject("params")
+            assertFalse("The authority is not sent the thread source", params.has("source"))
+            await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.title == "Authority trip" && !vm.ui.value.newChatOpening }
+            thread = vm.chat.value.sessionId
+            assertEquals("Created once", 1, fixture.requests.count { it.string("method") == "session.create" && it.getJSONObject("params").string("title") == "Authority trip" })
+            await { fixture.pluginThreadMarks.contains(thread) }
+            // Listed as a thread at once, and the Threads lane (Hermes' thread-source filter finds nothing here) still shows it.
+            await { vm.ui.value.sessions.any { it.string("session_id") == thread && it.string("source") == "android_thread" } }
+            compose.runOnIdle { vm.toggleSessions(true) }
+            compose.onNodeWithTag("history-threads").performScrollTo().performClick()
+            compose.waitUntil(5_000) { fixture.sessionListQueries.any { it.string("sources") == "android_thread,phone" } }
+            await { vm.ui.value.sessions.any { it.string("session_id") == thread && it.string("source") == "android_thread" } }
+            assertTrue("The thread's mark outlives the list refresh", runBlocking { ThreadMarks.ids(fixture.scope).contains(thread) })
+        } finally {
+            fixture.canonicalAuthority = false
+            runBlocking { if (thread.isNotBlank()) ThreadMarks.remove(fixture.scope, thread) }
+            fixture.pluginThreadMarks.clear()
+        }
+        receipts += "On a Hermes with session authority a thread is made as a titled chat without the refused thread source, opened, named, marked in the plugin and listed in the Threads lane."
     }
 
     @Test fun threadsLaneStartsANamedThreadAndDrawerFiltersRunInHermes() = withFixture { vm, fixture ->
@@ -2170,7 +2637,8 @@ class NativeExperienceUiTest {
         capture("reference-skills")
         compose.runOnIdle { vm.navigate("Memory") }
         await { vm.phoneSettings.memory.value.documents.size == 2 && !vm.phoneSettings.memory.value.loading }
-        compose.onNodeWithContentDescription("Show navigation").assertIsDisplayed()
+        // 8a344aec: Memory is a page under Settings, so its header has Back, not the navigation button.
+        compose.onNodeWithContentDescription("Back").assertIsDisplayed()
         compose.onNodeWithText("Agent notes").assertExists()
         capture("reference-memory")
     }
@@ -2207,8 +2675,26 @@ class NativeExperienceUiTest {
             ```
         """.trimIndent()
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = listOf(Message.from(json("role" to "assistant", "text" to content, "row_id" to 700), 0, "chat-a"))) }
-        await { compose.onAllNodesWithContentDescription("Review the itinerary").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithContentDescription("Review the itinerary").performScrollTo().performClick().assertIsOn()
+        // The tick box is disabled until the saved ticks have been read (RichContent: enabled = reading.ready); a tap before that does nothing, and one just before the read ends is overwritten by it.
+        await { compose.onAllNodes(hasContentDescription("Review the itinerary") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+        // The box appears with the parsed text, but each preview below it is still a thin progress bar until its page is prepared; then it grows to its 320 dp view under the box (RichSandbox).
+        // The tap waits for that, so it does not race the list re-laying out: both previews have their own buttons once prepared.
+        await { compose.onAllNodesWithText("Fullscreen diagram").fetchSemanticsNodes().isNotEmpty() && compose.onAllNodesWithText("Fullscreen card").fetchSemanticsNodes().isNotEmpty() }
+        // Where the box is (unclipped, and whether any of it shows), what the list has scrolled and what the box shows, so a tap that did not stay shows whether the box was out of view, the list moved under it, or the state went back.
+        fun tickState() = runCatching {
+            val box = compose.onNodeWithContentDescription("Review the itinerary").fetchSemanticsNode()
+            val range = compose.onNodeWithTag("conversation-transcript").fetchSemanticsNode().config.getOrNull(androidx.compose.ui.semantics.SemanticsProperties.VerticalScrollAxisRange)
+            "box y=${box.positionInRoot.y.toInt()} shown=${box.boundsInRoot.height > 0} ${box.config.getOrNull(androidx.compose.ui.semantics.SemanticsProperties.ToggleableState)}, list ${range?.value?.invoke()?.toInt()}/${range?.maxValue?.invoke()?.toInt()}"
+        }.getOrElse { "gone: $it" }
+        val beforeScroll = tickState()
+        val tick = compose.onNodeWithContentDescription("Review the itinerary").performScrollTo()
+        val tickBefore = tickState()
+        tick.performClick()
+        val tickAfter = tickState()
+        try { tick.assertIsOn() } catch (error: AssertionError) {
+            val later = (1..10).map { Thread.sleep(100); tickState() }
+            throw AssertionError("The tick did not stay on. Before the scroll: $beforeScroll; before the tap: $tickBefore; right after: $tickAfter; every 100 ms after: $later; saved ticks: ${runBlocking { app.cache.read(fixture.scope.session("chat-a"), "reading-checklist:700") }}", error)
+        }
         capture("reference-checklist")
         compose.onNodeWithTag("rich-mermaid").performScrollTo()
         fun web(diagram: Boolean): android.webkit.WebView? {
@@ -2224,7 +2710,8 @@ class NativeExperienceUiTest {
         while (svgCount == 0 && System.currentTimeMillis() < deadline) {
             val latch = java.util.concurrent.CountDownLatch(1)
             compose.runOnUiThread { requireNotNull(web(true)).evaluateJavascript("document.querySelectorAll('svg').length") { svgCount = it.toIntOrNull() ?: 0; latch.countDown() } }
-            assertTrue(latch.await(3, java.util.concurrent.TimeUnit.SECONDS))
+            // The WebView answers a script from its own renderer process; on a loaded emulator that took more than 3 s (INT r16), so the callback gets up to 10 s.
+            assertTrue("The WebView did not answer a script within 10 s", latch.await(10, java.util.concurrent.TimeUnit.SECONDS))
             if (svgCount == 0) Thread.sleep(200)
         }
         assertTrue("Bundled Mermaid must render an actual SVG in Android WebView", svgCount > 0)
@@ -2236,7 +2723,8 @@ class NativeExperienceUiTest {
         dialogWebView.check { view, failure -> if (failure != null) throw failure; @Suppress("DEPRECATION") originalScale = (view as android.webkit.WebView).scale }
         compose.onNodeWithContentDescription("Zoom in preview").performClick()
         var zoomed = false
-        val zoomDeadline = System.currentTimeMillis() + 3000
+        // Root ruling (msg_5519ece7aa7c): was 3000. The scale changes after the WebView's next frame; on a loaded emulator that took longer. What is checked is unchanged.
+        val zoomDeadline = System.currentTimeMillis() + 10_000
         while (!zoomed && System.currentTimeMillis() < zoomDeadline) {
             dialogWebView.check { view, failure -> if (failure != null) throw failure; @Suppress("DEPRECATION") zoomed = (view as android.webkit.WebView).scale > originalScale }
             if (!zoomed) Thread.sleep(50)
@@ -2254,7 +2742,7 @@ class NativeExperienceUiTest {
                 override fun rendererPriorityAtExit() = android.webkit.WebView.RENDERER_PRIORITY_BOUND
             }))
         }
-        compose.onNodeWithText("Preview stopped. Your message is unchanged.").assertIsDisplayed()
+        compose.onNodeWithText("Preview stopped.").assertIsDisplayed()
         compose.onNodeWithText("Retry preview").performClick()
         compose.waitForIdle()
         compose.runOnUiThread { assertNotNull(web(false)) }
@@ -2317,9 +2805,9 @@ class NativeExperienceUiTest {
             assertTrue("$tag stays inside the usable window", control.left >= composerViewport.left && control.right <= composerViewport.right && control.bottom <= composerViewport.bottom)
         }
         capture("composer-keyboard")
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
-        compose.onNodeWithText("Delete conversation").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Delete chat").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Reasoning", useUnmergedTree = true).assertDoesNotExist()
         androidx.test.espresso.Espresso.pressBack()
         compose.onNodeWithTag("navigation-toggle").performClick()
@@ -2330,7 +2818,7 @@ class NativeExperienceUiTest {
         receipts += "Navigation open/close preserves draft and selected session."
         runBlocking { vm.setBusySendAction("queue").join() }
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", liveText = "Preparing the comparison.") }
-        compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed().assertContentDescriptionEquals("Send after")
+        compose.onNodeWithTag("message-send").assertIsEnabled().assertIsDisplayed().assertContentDescriptionEquals("Queue")
         val viewport = compose.onNodeWithTag("experience-viewport").fetchSemanticsNode().boundsInRoot
         val send = compose.onNodeWithTag("message-send").fetchSemanticsNode().boundsInRoot
         assertTrue("Queue must stay inside the usable window", send.left >= viewport.left && send.right <= viewport.right && send.bottom <= viewport.bottom)
@@ -2465,7 +2953,7 @@ class NativeExperienceUiTest {
         compose.onAllNodes(hasTestTag("tool-card-result") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertCountEquals(0)
         compose.onAllNodes(hasTestTag("tool-card-empty-result") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertCountEquals(0)
         compose.onAllNodes((hasText("Completed", substring = true) or hasContentDescription("Completed", substring = true)) and hasAnyAncestor(silentCard), useUnmergedTree = true).assertCountEquals(0)
-        compose.onNode(hasText("No completion was recorded for this tool.") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertExists()
+        compose.onNode(hasText("No result saved.") and hasAnyAncestor(silentCard), useUnmergedTree = true).assertExists()
         // The stored "running" sibling is also No result: no spinner, no Running label, no Completed.
         part(staleCard, "tool-card-meta").assertTextEquals("No result")
         compose.onAllNodes(hasProgressBarRangeInfo(androidx.compose.ui.semantics.ProgressBarRangeInfo.Indeterminate) and hasAnyAncestor(staleCard), useUnmergedTree = true).assertCountEquals(0)
@@ -2473,7 +2961,7 @@ class NativeExperienceUiTest {
         part(staleCard, "tool-card-status").assertContentDescriptionEquals("No result recorded")
         part(staleCard, "tool-card-arguments").assertTextEquals("target=notes.md")
         compose.onAllNodes((hasText("Running", substring = true) or hasText("Completed", substring = true) or hasContentDescription("Running", substring = true) or hasContentDescription("Completed", substring = true)) and hasAnyAncestor(staleCard), useUnmergedTree = true).assertCountEquals(0)
-        compose.onNode(hasText("No completion was recorded for this tool.") and hasAnyAncestor(staleCard), useUnmergedTree = true).assertExists()
+        compose.onNode(hasText("No result saved.") and hasAnyAncestor(staleCard), useUnmergedTree = true).assertExists()
         part(staleCard, "tool-card-details").performScrollTo()
         // Cards keep to the 840dp transcript column on every width and font scale; long text wraps or scrolls inside the card.
         val transcriptBounds = compose.onNodeWithTag("conversation-transcript").getUnclippedBoundsInRoot()
@@ -2540,22 +3028,21 @@ class NativeExperienceUiTest {
         receipts += "A live running preview keeps its spinner and Status: Running, while a live tool with a result is Completed even if its status still says running."
         runBlocking { vm.setBusySendAction("queue").join() }
         compose.runOnIdle { vm.composer(TextFieldValue("Then update the notes.")) }
-        compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Send after").performClick()
+        compose.onNodeWithTag("message-send").assertIsEnabled().assertContentDescriptionEquals("Queue").performClick()
         await { vm.chat.value.queued.size == 1 }
         val queuedId = vm.chat.value.queued.single().id
-        reveal(hasTestTag("queued-message:$queuedId"), towardOlder = false)
-        compose.onNodeWithText("Queued on this phone", useUnmergedTree = true).assertExists()
+        // A queued message waits in the box above the composer; it is not a bubble in the chat.
+        compose.onNodeWithTag("queue-row:$queuedId").assertExists()
+        compose.onAllNodesWithTag("queued-message:$queuedId").assertCountEquals(0)
         compose.onNodeWithTag("message-stop").assertIsDisplayed().assertIsEnabled()
         assertBackgroundStripExcludesReplyActivity()
         compose.onNodeWithTag("composer-queue").assertDoesNotExist()
         closeKeyboard()
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.onNodeWithText("Message queue", useUnmergedTree = true).assertExists()
         androidx.test.espresso.Espresso.pressBack()
         await { compose.onAllNodesWithTag("conversation-actions-menu").fetchSemanticsNodes().isEmpty() }
-        reveal(hasTestTag("queued-message:$queuedId"), towardOlder = false)
-        compose.onNodeWithTag("queued-actions:$queuedId").performClick()
-        compose.onNodeWithText("Remove queued message").performClick()
+        compose.onNodeWithTag("queue-remove:$queuedId").performClick()
         await { vm.chat.value.queued.isEmpty() }
         compose.runOnIdle {
             flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(approval = json("approval_id" to "ref-approval", "description" to "Run the synthetic build task", "command" to "gradle assembleDebug", "choices" to JSONArray().put("once").put("deny")))
@@ -2567,10 +3054,10 @@ class NativeExperienceUiTest {
 
         // The unchanged Beacon shell stays functional with work pending: top-right actions, then the left navigation.
         closeKeyboard()
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
         compose.onNodeWithText("Message queue", useUnmergedTree = true).assertDoesNotExist()
-        compose.onNodeWithText("Delete conversation").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Delete chat").performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Reasoning", useUnmergedTree = true).assertDoesNotExist()
         capture("migration-chat-actions-menu")
         androidx.test.espresso.Espresso.pressBack()
@@ -2701,7 +3188,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("navigation-toggle").assertIsDisplayed()
         compose.onNode(hasText("default", substring = true) and hasAnyAncestor(hasTestTag("settings-connection")), useUnmergedTree = true).assertExists()
         compose.onNode(hasText("Connected") and hasAnyAncestor(hasTestTag("settings-connection")), useUnmergedTree = true).assertExists()
-        summary("Settings", "Enter to send · Thinking shown").assertExists()
+        summary("Settings", "Enter sends · Thinking shown").assertExists()
         summary("Profiles", "default", substring = true).assertExists()
         summary("Appearance", settingsThemeLabels.getValue(vm.preferences.value.theme), substring = true).assertExists()
         val voiceStore = VoiceKeyStore(app)
@@ -2728,12 +3215,12 @@ class NativeExperienceUiTest {
         // A real preference write moves its summary, the row opens the page that holds the saved value, and Back returns to the overview.
         compose.runOnIdle { vm.nativePreferences(json("send_key" to "ctrl_enter", "show_thinking" to false)) }
         await { vm.data.value["profile-settings"]?.let { it.string("send_key") == "ctrl_enter" && !it.optBoolean("show_thinking", true) } == true }
-        await { compose.onAllNodes(hasText("Ctrl + Enter to send · Thinking hidden") and hasAnyAncestor(hasTestTag("settings-row:Settings")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        await { compose.onAllNodes(hasText("Enter adds a line · Thinking hidden") and hasAnyAncestor(hasTestTag("settings-row:Settings")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         capture("settings-summaries-updated")
         compose.onNodeWithTag("settings-row:Settings").performScrollTo().performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage == "Settings" }
-        compose.onNodeWithText("Send shortcut").assertExists()
-        compose.onNodeWithTag("choice-option:Send shortcut:ctrl_enter").assertIsSelected().assertTextContains("Ctrl + Enter")
+        compose.onNodeWithText("Enter key").assertExists()
+        compose.onNodeWithTag("choice-option:Send shortcut:ctrl_enter").assertIsSelected().assertTextContains("New line")
         compose.onNodeWithTag("choice-option:Send shortcut:enter").assertIsNotSelected()
         compose.onNode(hasText("Show thinking") and isToggleable()).performScrollTo().assertIsOff()
         compose.onNode(hasText("Format your messages") and isToggleable()).performScrollTo().assertIsOn()
@@ -2741,7 +3228,7 @@ class NativeExperienceUiTest {
         capture("settings-detail-saved")
         compose.onNodeWithContentDescription("Back").performClick()
         await { vm.ui.value.tab == "More" && vm.ui.value.morePage.isBlank() }
-        summary("Settings", "Ctrl + Enter to send · Thinking hidden").assertExists()
+        summary("Settings", "Enter adds a line · Thinking hidden").assertExists()
         compose.onNodeWithTag("navigation-toggle").performClick()
         compose.onNodeWithTag("navigation-menu").assertIsDisplayed()
         capture("settings-navigation-open")
@@ -2750,7 +3237,7 @@ class NativeExperienceUiTest {
         // Restore the fixture's own values, so the page captures below keep showing the defaults.
         compose.runOnIdle { vm.nativePreferences(json("send_key" to "enter", "show_thinking" to true)) }
         await { vm.data.value["profile-settings"]?.let { it.string("send_key") == "enter" && it.optBoolean("show_thinking", false) } == true }
-        summary("Settings", "Enter to send · Thinking shown").assertExists()
+        summary("Settings", "Enter sends · Thinking shown").assertExists()
         receipts += "Settings overview summarizes local state, including the phone-selected voice provider and key presence; loading server voice capabilities leaves that summary unchanged; native chat preference writes update their row, the row opens the saved page, Back returns to the overview, and the left navigation still opens and closes."
         compose.runOnIdle { vm.more("Settings") }
         compose.onNodeWithText("Unavailable in native Hermes").assertDoesNotExist()
@@ -2868,7 +3355,7 @@ class NativeExperienceUiTest {
         } finally { compose.runOnUiThread { recreatedStore.clear() } }
         androidx.test.espresso.Espresso.closeSoftKeyboard()
         clickText("Cancel edit")
-        compose.onNodeWithText("Discard changes").performClick()
+        clickDiscardChanges()
         await { vm.phoneSettings.memory.value.editing.isBlank() }
         runBlocking { kotlinx.coroutines.withTimeout(5000) {
             while (app.cache.read(fixture.scope, "phone-editors") != null) kotlinx.coroutines.delay(20)
@@ -2956,6 +3443,94 @@ class NativeExperienceUiTest {
         receipts += "Manual Source mode survives changing streamed JSON; automatic Tree mode waits for valid parsing."
     }
 
+    // G3F: the final G3 runs found "Open Beacon to finish answering Beacon." over the approval buttons of test 276, from the first frame of its screen. A call test earlier in the
+    // same process had left that line on the call state, which outlives every screen; each chat that opened afterwards showed it again, for about ten seconds, over the card.
+    @Test fun aCallLineAnEarlierCallLeftIsGoneBeforeTheChatOpensAndNeverComesOverIt() = withFixture { vm, _ ->
+        val before = app.calls.state.value
+        val line = "Open Beacon to finish answering Beacon."
+        CallLine.lifetimeForTest(1_500)
+        try {
+            // Left while another screen is open, as a call refused in the background leaves it.
+            compose.runOnIdle { vm.tab("More") }
+            await { vm.ui.value.tab == "More" }
+            compose.runOnIdle { app.calls.update { CallState(error = line) } }
+            await { app.calls.state.value.error.isBlank() }
+            compose.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.tab == "Chat" && compose.onAllNodesWithTag("conversation-transcript").fetchSemanticsNodes().isNotEmpty() }
+            compose.waitForIdle(); Thread.sleep(300); compose.waitForIdle()
+            assertEquals("The line of a call that is over is not shown over the chat", "", vm.ui.value.notice)
+            assertEquals("", vm.ui.value.error)
+            assertTrue(compose.onAllNodesWithText(line).fetchSemanticsNodes().isEmpty())
+        } finally { CallLine.lifetimeForTest(null); compose.runOnIdle { app.calls.update { before }; vm.clearMessage() } }
+        receipts += "A line a call leaves behind fades with its ring window and does not come over a chat opened later."
+    }
+
+    @Test fun aCallLineIsShownOnceAndDoesNotReturnWhenTheChatIsOpenedAgain() = withFixture { vm, _ ->
+        val before = app.calls.state.value
+        // Its own words: the controller remembers which line was shown, and another case may have shown a real one.
+        val line = "A call line that is shown once"
+        try {
+            // The fixture opens on a settings page: the chat has to be on screen for it to show the line.
+            compose.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.tab == "Chat" && compose.onAllNodesWithTag("conversation-transcript").fetchSemanticsNodes().isNotEmpty() }
+            compose.runOnIdle { app.calls.update { CallState(error = line) } }
+            await { vm.ui.value.notice == line }
+            compose.runOnIdle { vm.clearMessage() }
+            // Another screen and back: the chat is composed again with nothing remembered by the old screen.
+            compose.runOnIdle { vm.tab("More") }
+            await { vm.ui.value.tab == "More" }
+            compose.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.tab == "Chat" && compose.onAllNodesWithTag("conversation-transcript").fetchSemanticsNodes().isNotEmpty() }
+            compose.waitForIdle(); Thread.sleep(300); compose.waitForIdle()
+            assertEquals("A line the owner already saw is not shown again", "", vm.ui.value.notice)
+        } finally { compose.runOnIdle { app.calls.update { before }; vm.clearMessage() } }
+        receipts += "A call's line is shown once; going to another screen and back does not show it again."
+    }
+
+    @Test fun aNoticeNeverCoversTheApprovalButtonsAndTheTapStillReachesThem() = withFixture { vm, fixture ->
+        fun approval(id: String) = json("request_id" to "queue-$id", "command" to "Synthetic $id", "choices" to JSONArray().put("once").put("deny"))
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { vm.composer(TextFieldValue("Ask for a permission")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        fixture.emitNativeServerRequest("approval", "wire-only", approval("only"))
+        await { vm.chat.value.approval?.string("approval_id") == "queue-only" }
+        await { compose.onAllNodesWithText("Synthetic only").fetchSemanticsNodes().isNotEmpty() }
+        val notice = "Open Beacon to finish answering Beacon."
+        compose.runOnIdle { vm.notice(notice) }
+        await { compose.onAllNodesWithText(notice).fetchSemanticsNodes().isNotEmpty() }
+        compose.waitForIdle()
+        // The card's buttons have to stay clear of the notice, as the call controls do; the list moves up for it (a frame or two), so this is waited for.
+        fun apart(): Boolean {
+            val feedback = compose.onNodeWithTag("native-feedback").fetchSemanticsNode().boundsInRoot
+            return listOf("Allow once", "Deny").all { label ->
+                val button = compose.onNodeWithText(label).fetchSemanticsNode().boundsInRoot
+                button.bottom <= feedback.top || button.top >= feedback.bottom
+            }
+        }
+        try { await { apart() } }
+        catch (error: Throwable) {
+            val feedback = compose.onNodeWithTag("native-feedback").fetchSemanticsNode().boundsInRoot
+            val buttons = listOf("Allow once", "Deny").map { it to compose.onNodeWithText(it).fetchSemanticsNode().boundsInRoot }
+            throw AssertionError("The notice covers the approval buttons: notice=$feedback buttons=$buttons", error)
+        }
+        // The tap that found the bug: a finger on the button, by its place on the screen, while the notice is up.
+        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        await { fixture.nativeServerResponses.size == 1 }
+        assertEquals("wire-only", fixture.nativeServerResponses.last().getString("id"))
+        assertEquals("once", fixture.nativeServerResponses.last().getJSONObject("result").getString("choice"))
+        receipts += "A notice above the composer never covers the approval card's buttons, and a tap on Allow once reaches the card while it is up."
+    }
+
+    @Test fun aCaseStartsWithoutTheCachedChatsAnEarlierCaseLeftOnAnIdTheFixtureReuses() = withFixture { _, fixture ->
+        // #292: #275 renamed branch-1 to "Renamed branch" and the app cached that session; the next case's branch-1 opened with it.
+        val stale = fixture.scope.session("branch-1")
+        runBlocking { app.cache.write(stale, "session", json("session_id" to "branch-1", "title" to "Renamed branch").toString()) }
+        assertNotNull("The leftover is written", runBlocking { app.cache.read(stale, "session") })
+        dropReusedChatCaches(listOf(fixture.scope), fixture)
+        assertNull("A branch the fixture makes starts without an earlier case's cached title", runBlocking { app.cache.read(stale, "session") })
+        receipts += "The fixture clears cached sessions on the branch ids it reuses, not only on new-chat ids."
+    }
+
     @Test fun callFeedbackDoesNotCoverControlsAndHangupRemainsTappable() = withFixture { vm, fixture ->
         val before=app.calls.state.value
         try {
@@ -2987,7 +3562,8 @@ class NativeExperienceUiTest {
     @Test fun disconnectedSettingsAndProjectPickerExplainHowToRecover() = withFixture { vm, _ ->
         compose.runOnIdle { field(vm, "client", null); vm.more("Memory") }
         compose.onNodeWithText("Reconnect to Hermes").assertIsDisplayed()
-        compose.onNodeWithContentDescription("Show navigation").assertIsDisplayed()
+        // 8a344aec: Memory is a page under Settings, so its header has Back, not the navigation button.
+        compose.onNodeWithContentDescription("Back").assertIsDisplayed()
         compose.onNodeWithText("Reconnect").assertIsEnabled()
         compose.runOnIdle { vm.more("Connection") }
         assertEquals("Connection", vm.ui.value.morePage)
@@ -2999,7 +3575,7 @@ class NativeExperienceUiTest {
 
     @Test fun settingsReturnToEntryAndChatMenuHasOnePlaceForEachAction() = withFixture { vm, _ ->
         compose.runOnIdle { vm.composer(TextFieldValue("Keep this draft")) }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.onNodeWithText("Profiles", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("Spaces", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("Attachments, queue & status", useUnmergedTree = true).assertDoesNotExist()
@@ -3048,7 +3624,7 @@ class NativeExperienceUiTest {
         await { vm.composer.value.text.startsWith("> " + dev.hermes.android.ui.quoteExcerpt(message.text).take(12)) && vm.composer.value.text.endsWith("\n\n") }
 
         compose.runOnIdle { vm.composer(TextFieldValue("")) }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.onNodeWithTag("conversation-more").performScrollTo().performClick()
         compose.onNodeWithText("Copy conversation ID").performScrollTo().performClick()
         compose.runOnIdle {
@@ -3102,8 +3678,9 @@ class NativeExperienceUiTest {
         compose.onAllNodes(hasText("You") and hasAnyAncestor(hasTestTag("conversation-transcript"))).assertCountEquals(0)
         compose.onAllNodes(hasText(dev.hermes.android.data.currentAssistantName) and hasAnyAncestor(hasTestTag("conversation-transcript"))).assertCountEquals(0)
         compose.onNodeWithTag("message-time:tg-u1", useUnmergedTree = true).assertIsDisplayed()
-        compose.onNode(hasTestTag("send-tick:sent") and hasAnyAncestor(hasTestTag("message-row:tg-u1")), useUnmergedTree = true).assertExists()
-        compose.onAllNodes(hasTestTag("send-tick:sent") and hasAnyAncestor(hasTestTag("message-row:tg-a1")), useUnmergedTree = true).assertCountEquals(0)
+        // tg-u1 has a reply after it, so its two ticks are blue; no assistant message carries a tick.
+        compose.onNode(hasTestTag("send-tick:answered") and hasAnyAncestor(hasTestTag("message-row:tg-u1")), useUnmergedTree = true).assertExists()
+        listOf("pending", "delivered", "answered").forEach { compose.onAllNodes(hasTestTag("send-tick:$it") and hasAnyAncestor(hasTestTag("message-row:tg-a1")), useUnmergedTree = true).assertCountEquals(0) }
         // TalkBack gets each action by name.
         compose.onNodeWithTag("message-bubble:tg-a1").assert(SemanticsMatcher.keyIsDefined(androidx.compose.ui.semantics.SemanticsActions.CustomActions))
         // The day between messages is a centred chip.
@@ -3119,7 +3696,7 @@ class NativeExperienceUiTest {
         compose.onNode(inConversation(hasText("Top story: patch Tuesday.", substring = true))).assertExists()
         compose.onAllNodesWithText("[Cron delivery", substring = true).assertCountEquals(0)
         assertTrue("A post sits on the assistant's side", bounds("tg-post").left - layer.left < 24.dp)
-        compose.onAllNodes(hasTestTag("send-tick:sent") and hasAnyAncestor(hasTestTag("message-row:tg-post")), useUnmergedTree = true).assertCountEquals(0)
+        listOf("pending", "delivered", "answered").forEach { compose.onAllNodes(hasTestTag("send-tick:$it") and hasAnyAncestor(hasTestTag("message-row:tg-post")), useUnmergedTree = true).assertCountEquals(0) }
         receipts += "Bubbles: own on the right, the assistant's on the left, grouped 3dp apart and groups 10dp apart; no name labels, the time and sent tick inside the bubble, date chips between days, width capped at 80% or 560dp."
         capture("telegram-bubbles")
     }
@@ -3136,9 +3713,11 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("message-input").performTextInput("he")
         await { vm.composer.value.text == "/he" }
         compose.onNodeWithText("/help", substring = true).assertExists()
+        // Both boxes are measured at one settled layout: the list shrinks as the command is filtered, so two reads a frame apart can straddle the change.
+        compose.waitForIdle()
         val suggestions = compose.onNodeWithTag("slash-suggestions").getUnclippedBoundsInRoot()
         val input = compose.onNodeWithTag("message-input").getUnclippedBoundsInRoot()
-        assertTrue("The list sits above the field", suggestions.bottom <= input.top)
+        assertTrue("The list sits above the field: list ${suggestions.top}..${suggestions.bottom}, field ${input.top}..${input.bottom}", suggestions.bottom <= input.top)
         assertEquals("Opening the list creates nothing", 0, fixture.requests.count { it.string("method") == "session.create" })
         compose.runOnIdle { vm.composer(TextFieldValue("")) }
         compose.onNodeWithTag("composer-commands").assertIsDisplayed()
@@ -3207,21 +3786,47 @@ class NativeExperienceUiTest {
         // History learns the Beacon conversation's id, which is how the card tells its stream from another chat's.
         await { vm.chat.value.sessionId.isNotBlank() && vm.ui.value.assistantSessionId == vm.chat.value.sessionId }
         compose.onNodeWithTag("beacon-header-status", useUnmergedTree = true).assertDoesNotExist()
+        // The card and the header take "streaming" from a flow of the chat (BeaconPresenceCard: map, distinctUntilChanged, collectAsState), so they follow a change of the chat a moment later, off the compose clock:
+        // each assertion below waits for its node to show the change first, and is the same assertion.
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-beacon", liveText = "") }
+        await { compose.onAllNodesWithTag("beacon-header-status", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("beacon-header-status", useUnmergedTree = true).assertTextEquals("Working…")
+        await { compose.onAllNodes(hasText("Working…") and hasAnyAncestor(hasTestTag("history-beacon-row")), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("history-beacon-row").performScrollTo().assertTextContains("Working…")
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
+        await { compose.onAllNodesWithTag("beacon-header-status", useUnmergedTree = true).fetchSemanticsNodes().isEmpty() }
         compose.onNodeWithTag("beacon-header-status", useUnmergedTree = true).assertDoesNotExist()
         compose.onNode(hasText("Working…") and hasAnyAncestor(hasTestTag("history-beacon-row")), useUnmergedTree = true).assertDoesNotExist()
         receipts += "The Beacon card and the Beacon chat header both say Working… while the assistant's chat streams, and return to the last message or tagline when it stops."
     }
 
+    /**
+     * The card names the assistant's conversation from assistantSessionId, which a history read copies from the saved handle when the read starts. A read that ran before the conversation
+     * existed leaves it blank, and the drawer's own read is skipped while the last one is fresh, so the card (and its "Working…") did not know its conversation until some later read.
+     */
+    @Test fun theBeaconCardKnowsItsConversationAsSoonAsItExists() = withFixture { vm, _ ->
+        val read = compose.runOnIdle { vm.refreshSessions() }
+        runBlocking { read.join() }
+        assertEquals("", vm.ui.value.assistantSessionId)
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.projectionReady }
+        compose.runOnIdle { vm.toggleSessions(true) }
+        await { vm.chat.value.sessionId.isNotBlank() && vm.ui.value.assistantSessionId == vm.chat.value.sessionId }
+    }
+
     @Test fun aNewChatOffersStarterPromptsThatFillTheComposer() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.newChat() }
-        compose.waitUntil(10_000) { compose.onAllNodesWithTag("starter-prompts").fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithText("Plan my day").performClick()
-        await { vm.composer.value.text == "Plan my day" }
-        receipts += "A new chat offers starter prompts; a tap fills the composer for editing."
+        // Root, 13 Nov 2026 (slop list, finding 1): a new chat has no generic chips ("What can you do?", "Plan my day"); the composer stays the person's own.
+        compose.waitUntil(10_000) { compose.onAllNodesWithTag("message-input").fetchSemanticsNodes().isNotEmpty() }
+        compose.waitForIdle()
+        compose.onAllNodesWithTag("starter-prompts").assertCountEquals(0)
+        for (chip in listOf("What can you do?", "Plan my day", "Explain something simply")) compose.onAllNodesWithText(chip).assertCountEquals(0)
+        compose.onAllNodesWithText("Where shall we begin?").assertCountEquals(0)
+        // UX re-check of F9, NEW-P1-2: Hermes has no display name for this profile, so the empty chat is titled with the assistant's name, never "default".
+        await { compose.onAllNodes(isHeading() and hasText("Beacon"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodes(isHeading() and hasText("default"), useUnmergedTree = true).assertCountEquals(0)
+        assertEquals("", vm.composer.value.text)
+        receipts += "A new chat shows no starter chips and no chatbot hero; the composer stays empty."
     }
 
     @Test fun historyRowsHaveALongPressMenuForAnyConversation() = withFixture { vm, fixture ->
@@ -3237,8 +3842,8 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("conversation-project-remove").assertTextContains("Remove from Travel")
         compose.onNodeWithTag("conversation-pin").performClick()
         await { fixture.sessions.getValue("chat-b").getJSONObject("info").optBoolean("pinned") }
-        assertTrue("Pinning uses the gateway-safe plugin route", fixture.requests.any { it.string("method") == "POST" && it.string("path") == "/api/plugins/beacon/sessions/pin" && it.getJSONObject("body").string("session_id") == "chat-b" })
-        assertTrue(fixture.requests.none { it.string("method") == "PATCH" && it.string("path") == "/api/sessions/chat-b" })
+        assertTrue("Pinning is Hermes' own revision-checked PATCH", fixture.requests.any { it.string("method") == "PATCH" && it.string("path") == "/api/sessions/chat-b" && it.getJSONObject("body").getBoolean("pinned") })
+        assertTrue(fixture.requests.none { it.string("path") == "/api/plugins/beacon/sessions/pin" })
         await { vm.ui.value.sessions.single { sessionRowId(it) == "chat-b" }.optBoolean("pinned") }
 
         menu()
@@ -3267,7 +3872,7 @@ class NativeExperienceUiTest {
         fixture.projects["p_research"] = json("id" to "p_research", "name" to "Research", "archived" to false, "primary_path" to "C:/synthetic-workspace/research",
             "folders" to org.json.JSONArray().put(json("path" to "C:/synthetic-workspace/research", "label" to "research", "is_primary" to true)))
         fun menuShows(tag: String) {
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithContentDescription("Chat actions").performClick()
             compose.waitUntil(5_000) { compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty() }
         }
         fun headerShows(project: String) = compose.onAllNodes(hasTestTag("chat-header-project") and hasText(project, substring = true), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
@@ -3328,7 +3933,7 @@ class NativeExperienceUiTest {
         fixture.projectLookupFailure = true
         compose.runOnIdle { vm.loadConversationProject("chat-a") }
         await { vm.data.value["project-of:chat-a"]?.has("_error") == true }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-retry").fetchSemanticsNodes().isNotEmpty() }
         fixture.projectLookupFailure = false
         compose.onNodeWithTag("conversation-project-retry").performScrollTo().performClick()
@@ -3346,7 +3951,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("chat-header-subtitle", useUnmergedTree = true).assertTextEquals("thinking…")
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", liveText = "") }
         await { compose.onAllNodesWithTag("chat-header-project", useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-open").fetchSemanticsNodes().isNotEmpty() }
         // The chat menu is height-capped, so the item is scrolled into view before the tap.
         compose.onNodeWithTag("conversation-project-open").performScrollTo().assertHeightIsAtLeast(48.dp).performClick()
@@ -3361,7 +3966,7 @@ class NativeExperienceUiTest {
         fixture.projects["p_fresh"] = json("id" to "p_fresh", "name" to "Fresh start", "archived" to false, "folders" to org.json.JSONArray())
         compose.runOnIdle { vm.loadNativeProjects(force = true) }
         await { vm.data.value["native-projects"]?.rows("projects")?.any { it.string("id") == "p_fresh" } == true }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-move").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("conversation-project-move").performScrollTo().performClick()
         compose.onNodeWithText("Move to project").assertExists()
@@ -3449,7 +4054,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Use this folder").performClick()
         await { project.rows("folders").size == 1 }
         compose.runOnIdle { vm.tab("Chat"); vm.composer(TextFieldValue("Retain during project move")) }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("conversation-project-move").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("conversation-project-move").performScrollTo().performClick()
         compose.onNodeWithText("Move to project").assertExists()
@@ -3791,6 +4396,474 @@ class NativeExperienceUiTest {
         receipts += "A new chat after a profile switch is a real chat: the approvals shield shows the profile default and the model chip is enabled before the first message."
     }
 
+    @Test fun aProfileHermesDoesNotServeBeaconForOffersTurnOnAndTheFirstChatOpensAfterTheOwnerConfirms() = withFixture { vm, fixture ->
+        // Hermes serves the profile (sessions, models) but its own config does not list the Beacon plugin: the ticket is refused and no socket opens.
+        val line = "Beacon isn't turned on for this profile."
+        val enablePath = "/api/plugins/beacon/admin/profile-plugin/enable"
+        val coder = fixture.scope.copy(profile = "coder")
+        // Only the coder profile is under test. The default profile goes on with its own work (when depends on how fast the emulator is), so its chat is opened first and only
+        // the coder's own requests are counted: a session.create names its profile, and a stock ws-ticket, which names none, is recorded with the profile of the client that
+        // asked (review R29 Nice 3). Counting every profile's tickets failed this case when the default profile's came late (r28f-a, r28f-b).
+        fun coderCreates() = fixture.requests.count { it.string("method") == "session.create" && it.optJSONObject("params")?.optString("profile") == "coder" }
+        fun stockTickets() = fixture.requests.count { it.string("path") == "/api/auth/ws-ticket" && it.string("client_profile") == "coder" }
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val requestsBefore = fixture.requests.size
+        val createsBefore = coderCreates()
+        val stockTicketsBefore = stockTickets()
+        fun requestsSince() = fixture.requests.drop(requestsBefore).map { it.string("method") + " " + it.string("path") + " [" + it.string("profile") + "]" }.takeLast(20)
+        fun enableCalls() = fixture.requests.filter { it.string("path") == enablePath }
+        fixture.pluginOffProfiles = setOf("coder")
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && !vm.ui.value.newChatOpening && vm.ui.value.newChatError.isNotBlank() }
+        assertEquals(line, vm.ui.value.newChatError)
+        await { compose.onAllNodesWithText(line).fetchSemanticsNodes().isNotEmpty() }
+        // Review R29 Should 1: the page is titled with the profile's own name (its readable id here), not the assistant's "Beacon" over "Beacon isn't turned on".
+        compose.onAllNodes(isHeading() and hasText("Coder"), useUnmergedTree = true).assertCountEquals(1)
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+        compose.onNodeWithText("Check again").assertDoesNotExist()
+        compose.onNodeWithText("Conversation opening failed or was not confirmed", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Turn on").assertExists()
+        // The model picker says why too, instead of "Couldn't load models".
+        await { recordError(vm.data.value["profile-defaults"]) == line }
+        compose.onAllNodesWithText("Couldn't load models").assertCountEquals(0)
+        // Nothing was sent: no create, no stock-ticket fallback, no unconfirmed-attempt marker, no enable request, and the app still counts as connected.
+        assertEquals("The coder profile made a chat: ${requestsSince()}", createsBefore, coderCreates())
+        assertEquals("The coder profile asked for a stock ticket: ${fixture.requests.drop(requestsBefore).map { it.string("method") + " " + it.string("path") + " [" + it.string("profile") + ", client " + it.string("client_profile") + "]" }}", stockTicketsBefore, stockTickets())
+        assertTrue(fixture.rejectedRequests.any { it.string("path") == "/api/plugins/beacon/mobile/gateway-ticket" && it.optInt("status") == 403 })
+        // The coder's own requests carry its stamp, so the stock-ticket check above can fail.
+        assertTrue(fixture.requests.any { it.string("path") == "/api/plugins/beacon/mobile/gateway-ticket" && it.string("client_profile") == "coder" })
+        assertNull(runBlocking { app.cache.read(coder, "new-chat-attempt") })
+        assertTrue(vm.ui.value.connected)
+        assertTrue(enableCalls().isEmpty())
+        // One tap opens a confirm sheet that names the profile; Cancel sends nothing.
+        compose.onNodeWithText("Turn on").performClick()
+        // Hermes has no display name for coder, so the sheet names it by its readable id, never the bare id (UX re-check of F9, NEW-P1-2; review R29 Should 1).
+        await { compose.onAllNodes(hasText("Turn on Beacon for Coder?") and hasAnyAncestor(isDialog()), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Cancel") and hasAnyAncestor(isDialog())).performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isEmpty() }
+        assertTrue(enableCalls().isEmpty())
+        assertEquals(line, vm.ui.value.newChatError)
+        // Confirm: Hermes is asked for exactly this profile (the answer is held so "Turning on" can be seen), and the first chat opens by itself afterwards.
+        val gate = java.util.concurrent.CountDownLatch(1)
+        fixture.profileEnableGate = gate
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        await { compose.onAllNodesWithText("Turning on Beacon…").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Turn on").assertDoesNotExist()
+        gate.countDown()
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        assertEquals("", vm.ui.value.newChatError)
+        assertEquals(createsBefore + 1, coderCreates())
+        val asked = enableCalls()
+        assertEquals(1, asked.size)
+        assertEquals(json("profile" to "coder").toString(), asked.single().getJSONObject("body").toString())
+        assertEquals("coder", asked.single().string("profile"))
+        assertTrue(fixture.pluginOffProfiles.isEmpty())
+        receipts += "A profile Hermes does not serve Beacon for says so in one line with Turn on (no Retry, no Couldn't load models); Cancel sends nothing; Turn on asks Hermes for that profile only and the first chat opens by itself."
+    }
+
+    @Test fun aRememberedFirstChatInAProfileHermesDoesNotServeBeaconForShowsTurnOnNotAccessDenied() = withFixture { vm, fixture ->
+        // Beacon is on for coder, so its first chat opens: an empty chat the phone remembers. Hermes has no saved row for it (never sent), and the plugin is then turned off for the profile.
+        val line = "Beacon isn't turned on for this profile."
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val shell = vm.chat.value.sessionId
+        fixture.markUnpromptedShell(shell)
+        fixture.pluginOffProfiles = setOf("coder")
+        compose.runOnIdle { vm.switchProfile("default") }
+        await { vm.client?.scope?.profile == "default" && !vm.ui.value.newChatOpening }
+        // Back in coder the phone resumes the remembered chat over the gateway, where the ticket is refused: the Turn on card, not "Access denied" on a chat page.
+        // The chat must still be unsaved on Hermes then (a resume the app made in the background after the mark makes it a saved row; see the #381 case).
+        fixture.markUnpromptedShell(shell)
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && vm.ui.value.newChatError == line }
+        await { compose.onAllNodesWithText(line).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Turn on").assertExists()
+        compose.onAllNodesWithText("Not allowed · draft kept").assertCountEquals(0)
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+        assertEquals("", vm.chat.value.sessionId)
+        // Turn on, confirm: the remembered chat opens again.
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        await { vm.chat.value.sessionId == shell && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening && vm.ui.value.newChatError.isBlank() }
+        assertTrue(fixture.pluginOffProfiles.isEmpty())
+        receipts += "A remembered empty chat that cannot attach because Hermes does not serve Beacon for the profile shows the Turn on card, not Access denied, and Turn on opens the chat again."
+    }
+
+    @Test fun aTurnOnTheRouteCannotDoShowsTheCommandToCopyAndCheckAgainOpensTheChat() = withFixture { vm, fixture ->
+        // Pinned like every Beacon install (hermes-plugin beacon_install.py): the latest release's commit, --force, --ref, --enable.
+        val commit = "0123456789abcdef0123456789abcdef01234567"
+        val command = "hermes -p coder plugins install xploit9/beacon/hermes-plugin/beacon --force --ref $commit --enable"
+        val head = "Couldn't turn Beacon on from here. Run this on your Hermes computer:"
+        compose.runOnIdle { vm.releaseCommitForTurnOn = { commit } }
+        fixture.pluginOffProfiles = setOf("coder")
+        fixture.profileEnableStatus = 404
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && !vm.ui.value.newChatOpening && vm.ui.value.newChatError.isNotBlank() }
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        await { vm.ui.value.newChatError.startsWith(head) }
+        await { compose.onAllNodesWithText(command, substring = true).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+        compose.onNodeWithText("Copy command").assertExists()
+        compose.onNodeWithText("Check again").assertExists()
+        // Copy puts exactly the command on the clipboard.
+        compose.onNodeWithText("Copy command").performClick()
+        val clipboard = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().targetContext.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        await { clipboard.primaryClip?.getItemAt(0)?.text?.toString() == command }
+        // The person ran it on their Hermes computer: Check again opens the first chat.
+        fixture.profileEnableStatus = 200
+        fixture.pluginOffProfiles = emptySet()
+        val createsBefore = fixture.requests.count { it.string("method") == "session.create" }
+        compose.onNodeWithText("Check again").performClick()
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        assertEquals("", vm.ui.value.newChatError)
+        assertEquals(createsBefore + 1, fixture.requests.count { it.string("method") == "session.create" })
+        receipts += "When the plugin's turn-on route is missing the card shows one line with the exact command, Copy command puts it on the clipboard, and Check again opens the first chat once it has been run."
+    }
+
+    /** R10 Should 1: no release commit is known (the update check has not found one), so there is no pinned command to show: the card says to update the plugin first. */
+    @Test fun aTurnOnTheRouteCannotDoWithNoKnownReleaseShowsNoCommandOnlyCheckAgain() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.releaseCommitForTurnOn = { null } }
+        fixture.pluginOffProfiles = setOf("coder")
+        fixture.profileEnableStatus = 404
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && !vm.ui.value.newChatOpening && vm.ui.value.newChatError.isNotBlank() }
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        val line = "Update Beacon on Hermes first, then tap Check again."
+        await { vm.ui.value.newChatError == line }
+        await { compose.onAllNodesWithText(line).fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithText("plugins install", substring = true).assertCountEquals(0)
+        compose.onNodeWithText("Copy command").assertDoesNotExist()
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+        compose.onNodeWithText("Check again").assertExists()
+        // Updating the plugin turned Beacon on for the profile: Check again opens the first chat.
+        fixture.profileEnableStatus = 200
+        fixture.pluginOffProfiles = emptySet()
+        compose.onNodeWithText("Check again").performClick()
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        assertEquals("", vm.ui.value.newChatError)
+        receipts += "With no known release the Turn on card shows no command, only 'Update Beacon on Hermes first' with Check again."
+    }
+
+    /** R10 Nice 6: busy (409), updating (503) or slow (504) is not a missing route: no command, just Check again, and the work may already have finished. */
+    @Test fun aTurnOnThatHermesIsStillDoingShowsStillWorkingNotACommand() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.releaseCommitForTurnOn = { "0123456789abcdef0123456789abcdef01234567" } }
+        fixture.pluginOffProfiles = setOf("coder")
+        compose.runOnIdle { vm.switchProfile("coder") }
+        await { vm.client?.scope?.profile == "coder" && !vm.ui.value.newChatOpening && vm.ui.value.newChatError.isNotBlank() }
+        val line = "Hermes is still working. Tap Check again in a moment."
+        for (status in listOf(409, 503, 504)) {
+            fixture.profileEnableStatus = status
+            compose.onNodeWithText("Turn on").performClick()
+            await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+            compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+            await { vm.ui.value.newChatError == line }
+            await { compose.onAllNodesWithText(line).fetchSemanticsNodes().isNotEmpty() }
+            compose.onAllNodesWithText("plugins install", substring = true).assertCountEquals(0)
+            compose.onNodeWithText("Copy command").assertDoesNotExist()
+            compose.onNodeWithText("Retry").assertDoesNotExist()
+            // Check again asks Hermes again: still off for this profile, so the Turn on card is back for the next try.
+            compose.onNodeWithText("Check again").performClick()
+            await { vm.ui.value.newChatError == "Beacon isn't turned on for this profile." && compose.onAllNodesWithText("Turn on").fetchSemanticsNodes().isNotEmpty() }
+        }
+        // Hermes finished: Turn on works.
+        fixture.profileEnableStatus = 200
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        receipts += "A Turn on that Hermes is still doing (busy, updating, slow) says so and offers Check again only, never a command."
+    }
+
+    /**
+     * R10 Should 4 (Root: the card is for the remembered first-chat shell only): any other chat X opened in a profile Hermes does not serve Beacon for stays X. Its draft stays with X (saved,
+     * out of the composer), X shows the one-line status with Turn on, no other chat is made, and after Turn on X is reopened with its draft. No text moves to another chat.
+     */
+    @Test fun anOpenedChatInAProfileHermesDoesNotServeBeaconForStaysThatChatAndTurnOnReopensIt() = withFixture { vm, fixture ->
+        val line = "Beacon isn't turned on for this profile."
+        val draft = "Unsent words that belong to chat b"
+        val coder = fixture.scope.copy(profile = "coder")
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder")
+        val firstChat = vm.chat.value.sessionId
+        // Another chat the phone made and Hermes has not saved yet (a titled one, kept apart from the first chat), with an unsent draft.
+        compose.runOnIdle { vm.newChat(json("title" to "A chat kept apart")) }
+        awaitProfileChat(vm, "coder", "it is a new chat, not the first" to { vm.chat.value.sessionId != firstChat })
+        val other = vm.chat.value.sessionId
+        compose.runOnIdle { vm.composer(TextFieldValue(draft)) }
+        kotlinx.coroutines.runBlocking { vm.checkpointNow() }
+        fixture.markUnpromptedShell(other)
+        fixture.pluginOffProfiles = setOf("coder")
+        compose.runOnIdle { vm.switchProfile("default") }
+        awaitAll(
+            "client profile is default" to { vm.client?.scope?.profile == "default" },
+            "a chat is open" to { vm.chat.value.sessionId.isNotBlank() },
+            "chat is ready" to { vm.chat.value.projectionReady },
+            "no new chat is opening" to { !vm.ui.value.newChatOpening },
+        )
+        // What the default profile opens for itself may still be arriving (it varies with how fast the emulator is); only the coder profile is under test, so only its chats are counted.
+        fun createCalls() = fixture.requests.filter { it.string("method") == "session.create" && it.optJSONObject("params")?.optString("profile") == "coder" }
+        val createsBefore = createCalls().size
+        // Back in coder the phone resumes that chat over the gateway, where the ticket is refused. That needs the chat to be one Hermes has not saved: a saved chat opens over REST and never meets the
+        // ticket. The app reads the chat it shows once more by itself for a moment after it opens (the approvals shield asks Hermes with a lazy resume), and the fixture's resume makes the chat a
+        // saved row; one that landed after the mark above left it saved, the phone opened it over REST and the status never came (G3 run F6, #381). So put it back right before it matters.
+        fixture.markUnpromptedShell(other)
+        val originBeforeSwitchBack = originGeneration(vm)
+        var switchBack: kotlinx.coroutines.Job? = null
+        compose.runOnIdle { switchBack = vm.switchProfile("coder") }
+        awaitAll(
+            "client profile is coder" to { vm.client?.scope?.profile == "coder" },
+            "the screen's profile is coder" to { vm.ui.value.profile == "coder" },
+            "the chat is the one that was opened" to { vm.chat.value.sessionId == other },
+            "the chat says Beacon is off" to { vm.chat.value.status == line },
+            extra = {
+                "the switch back: job active=${switchBack?.isActive} completed=${switchBack?.isCompleted}; origin generation moved by ${originGeneration(vm) - originBeforeSwitchBack}; " +
+                    "Hermes has ${if (fixture.isUnpromptedShell(other)) "no saved row" else "a saved row"} for $other"
+            },
+        )
+        assertEquals("The chat stays the chat that was opened", other, vm.chat.value.sessionId)
+        assertNotEquals("It is not replaced by the first chat", firstChat, vm.chat.value.sessionId)
+        await { compose.onAllNodesWithText(line).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Turn on").assertExists()
+        compose.onAllNodesWithText("Not allowed · draft kept").assertCountEquals(0)
+        compose.onNodeWithText("Retry").assertDoesNotExist()
+        // The words stay with that chat: saved under it, still in the composer (the page does not clear it), and nothing of them in the first chat's draft.
+        assertEquals("The composer keeps the chat's draft", draft, vm.composer.value.text)
+        val saved = kotlinx.coroutines.runBlocking { coder.session(other).let { app.cache.read(it, "draft") } }.orEmpty()
+        assertTrue("$other keeps its draft: $saved", saved.contains(draft))
+        val firstChatDraft = kotlinx.coroutines.runBlocking { app.cache.read(coder, "initial-draft") }.orEmpty()
+        assertFalse("The words did not move to the first chat: $firstChatDraft", firstChatDraft.contains(draft))
+        assertEquals("No other chat was made: ${createCalls().map { it.toString().take(160) }}", createsBefore, createCalls().size)
+        // The person keeps typing on this page: what is typed is the chat's too, saved with it at once, never in the first chat's draft, and no chat is made by typing.
+        val typed = " and a line typed while Beacon is off"
+        val more = draft + typed
+        compose.runOnIdle { vm.composer(TextFieldValue(more)) }
+        kotlinx.coroutines.runBlocking { vm.checkpointNow() }
+        // Words are typed, yet Send and Attach go nowhere on this page, so they are off (R11 Nice 4 and 5).
+        compose.onNodeWithTag("message-send").assertIsNotEnabled()
+        compose.onNodeWithTag("composer-attach").assertIsNotEnabled()
+        // A draft that starts with "/" offers "Send as text" in the chat menu; on this page it goes nowhere either, so that row is off too (R12 Nice 5).
+        compose.runOnIdle { vm.composer(TextFieldValue("/status")) }
+        compose.onNodeWithContentDescription("Chat actions").performClick()
+        compose.onNodeWithTag("conversation-actions-menu").assertIsDisplayed()
+        compose.onNode(hasText("Send as text") and hasClickAction()).assertIsNotEnabled()
+        androidx.test.espresso.Espresso.pressBack()
+        await { compose.onAllNodesWithTag("conversation-actions-menu").fetchSemanticsNodes().isEmpty() }
+        compose.runOnIdle { vm.composer(TextFieldValue(more)) }
+        kotlinx.coroutines.runBlocking { vm.checkpointNow() }
+        val savedMore = kotlinx.coroutines.runBlocking { coder.session(other).let { app.cache.read(it, "draft") } }.orEmpty()
+        assertTrue("What is typed on the off page is saved with the chat: $savedMore", savedMore.contains(typed))
+        val firstChatDraftAfter = kotlinx.coroutines.runBlocking { app.cache.read(coder, "initial-draft") }.orEmpty()
+        assertFalse("What is typed did not go to the first chat: $firstChatDraftAfter", firstChatDraftAfter.contains(typed))
+        assertEquals("It is still the same chat", other, vm.chat.value.sessionId)
+        assertEquals("Typing made no chat: ${createCalls().map { it.toString().take(160) }}", createsBefore, createCalls().size)
+        // Turn on, confirm: that chat opens again with everything typed in it; still no other chat.
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        await { vm.chat.value.sessionId == other && vm.chat.value.projectionReady && vm.chat.value.status != line }
+        assertTrue(fixture.pluginOffProfiles.isEmpty())
+        await { vm.composer.value.text == more }
+        assertEquals("No other chat was made: ${createCalls().map { it.toString().take(160) }}", createsBefore, createCalls().size)
+        // The chat is open again: Send and Attach work.
+        await { compose.onAllNodes(hasTestTag("message-send") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("composer-attach").assertIsEnabled()
+        receipts += "A chat opened in a profile Hermes does not serve Beacon for stays that chat: its draft stays with it, it shows the one-line status with Turn on, text typed meanwhile is kept for it, and Turn on reopens it with everything typed."
+    }
+
+    /**
+     * G3G (#379). The profile the phone leaves may still be making its first chat; whatever it is doing, the profile asked for last is the one the phone ends on, with that profile's own
+     * chat. The default profile's first chat is made but Hermes' answer is held, so the phone is in default with that chat still opening when coder is asked for again.
+     */
+    @Test fun switchingBackWhileTheOtherProfilesFirstChatIsStillBeingMadeEndsOnTheProfileAskedFor() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder")
+        val coderChat = vm.chat.value.sessionId
+        val createsBefore = fixture.requests.count { it.string("method") == "session.create" }
+        fixture.holdCreateAcknowledgement = true
+        compose.runOnIdle { vm.switchProfile("default") }
+        awaitAll(
+            "client profile is default" to { vm.client?.scope?.profile == "default" },
+            "Hermes was asked for the default profile's chat" to { fixture.requests.count { it.string("method") == "session.create" } > createsBefore },
+        )
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitAll("client profile is coder" to { vm.client?.scope?.profile == "coder" })
+        fixture.releaseCreateAcknowledgement()
+        awaitProfileChat(vm, "coder", "it is the coder's own chat" to { vm.chat.value.sessionId == coderChat })
+        compose.waitForIdle()
+        assertEquals("The default profile's late answer did not take the screen back", coderChat, vm.chat.value.sessionId)
+        assertEquals("coder", vm.client?.scope?.profile)
+        assertEquals("coder", vm.ui.value.profile)
+    }
+
+    /** G3G (#379). The same, with no wait at all between the two switches: the second is asked for before the first has finished. */
+    @Test fun switchingTwiceInARowEndsOnTheLastProfileAskedFor() = withFixture { vm, _ ->
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder")
+        val coderChat = vm.chat.value.sessionId
+        compose.runOnIdle { vm.switchProfile("default"); vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder", "it is the coder's own chat" to { vm.chat.value.sessionId == coderChat })
+        compose.waitForIdle()
+        assertEquals("coder", vm.client?.scope?.profile)
+        assertEquals("coder", vm.ui.value.profile)
+        assertEquals(coderChat, vm.chat.value.sessionId)
+    }
+
+    /**
+     * G3G (#379). The failing run's order exactly (a chat kept apart in coder, Beacon off for coder, default, coder again), except that coder is asked for the moment the default profile has a
+     * chat open, before that chat is ready and before it is done opening. The chat that was open in coder is the one to come back, with the one-line status.
+     */
+    @Test fun switchingBackTheMomentTheOtherProfileOpensItsChatStillReopensTheChatThatWasOpen() = withFixture { vm, fixture ->
+        val line = "Beacon isn't turned on for this profile."
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder")
+        val firstChat = vm.chat.value.sessionId
+        compose.runOnIdle { vm.newChat(json("title" to "A chat kept apart")) }
+        awaitProfileChat(vm, "coder", "it is a new chat, not the first" to { vm.chat.value.sessionId != firstChat })
+        val other = vm.chat.value.sessionId
+        fixture.markUnpromptedShell(other)
+        fixture.pluginOffProfiles = setOf("coder")
+        compose.runOnIdle { vm.switchProfile("default") }
+        awaitAll("client profile is default" to { vm.client?.scope?.profile == "default" }, "a chat is open" to { vm.chat.value.sessionId.isNotBlank() })
+        // Still unsaved on Hermes when the phone opens it again (see the #381 case).
+        fixture.markUnpromptedShell(other)
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitAll(
+            "client profile is coder" to { vm.client?.scope?.profile == "coder" },
+            "the screen's profile is coder" to { vm.ui.value.profile == "coder" },
+            "the chat is the one that was opened" to { vm.chat.value.sessionId == other },
+            "the chat says Beacon is off" to { vm.chat.value.status == line },
+        )
+    }
+
+    /**
+     * G3H (#381). The app resumes the chat it shows by itself shortly after it opens (the approvals shield asks Hermes with a lazy resume), and the fixture's resume turns a chat Hermes had
+     * no saved row for into one. Here that resume is made to land after the chat was marked unsaved, every time: the case puts the chat back before the switch back, and the phone then
+     * meets the refused ticket and shows the one-line status, as it does for a chat that was never resumed.
+     */
+    @Test fun aChatTheAppResumedAfterItWasMarkedUnsavedStillShowsTurnOnOnceItIsUnsavedAgain() = withFixture { vm, fixture ->
+        val line = "Beacon isn't turned on for this profile."
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder")
+        val firstChat = vm.chat.value.sessionId
+        compose.runOnIdle { vm.newChat(json("title" to "A chat kept apart")) }
+        awaitProfileChat(vm, "coder", "it is a new chat, not the first" to { vm.chat.value.sessionId != firstChat })
+        val other = vm.chat.value.sessionId
+        fixture.markUnpromptedShell(other)
+        val resumesBefore = fixture.resumedSessionIds().size
+        // The app's own read of the chat it shows, without the passive flag: config.get, then a lazy resume.
+        compose.runOnIdle { vm.load("picker:approvals", "/api/approval/mode", mapOf("session_id" to other), force = true, quiet = true) }
+        awaitAll(
+            "Hermes was asked to resume the chat" to { fixture.resumedSessionIds().size > resumesBefore },
+            "the resume made it a saved row" to { !fixture.isUnpromptedShell(other) },
+        )
+        fixture.pluginOffProfiles = setOf("coder")
+        compose.runOnIdle { vm.switchProfile("default") }
+        awaitAll("client profile is default" to { vm.client?.scope?.profile == "default" }, "a chat is open" to { vm.chat.value.sessionId.isNotBlank() })
+        fixture.markUnpromptedShell(other)
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitAll(
+            "client profile is coder" to { vm.client?.scope?.profile == "coder" },
+            "the chat is the one that was opened" to { vm.chat.value.sessionId == other },
+            "the chat says Beacon is off" to { vm.chat.value.status == line },
+        )
+    }
+
+    /**
+     * G3H. In a profile where Hermes refuses the Beacon plugin, a saved chat opens over REST as an ordinary chat, and a send meets the refusal at the gateway ticket, before anything is sent. The chat
+     * stays that chat, its words stay in the composer and its draft, and it says so in the one line with Turn on, as an unsaved chat does when it opens: no other chat is made, nothing is sent, and no
+     * "Couldn't send the message" notice is shown. Turn on opens that chat again with its words, and the send then works.
+     */
+    @Test fun aSendInASavedChatWhereHermesRefusesBeaconShowsTurnOnKeepsTheWordsAndWorksOnceItIsTurnedOn() = withFixture { vm, fixture ->
+        val line = "Beacon isn't turned on for this profile."
+        val words = "Words for the saved chat"
+        val coder = fixture.scope.copy(profile = "coder")
+        compose.runOnIdle { vm.switchProfile("coder") }
+        awaitProfileChat(vm, "coder")
+        fixture.pluginOffProfiles = setOf("coder")
+        // A saved chat opens over REST, which the plugin does not gate: it looks ready.
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        awaitAll("chat-a is open and ready" to { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.raw.length() > 0 })
+        assertNotEquals("It opened as an ordinary chat", line, vm.chat.value.status)
+        fun createCalls() = fixture.requests.filter { it.string("method") == "session.create" && it.optJSONObject("params")?.optString("profile") == "coder" }
+        val createsBefore = createCalls().size
+        compose.runOnIdle { vm.composer(TextFieldValue(words)); vm.send() }
+        awaitAll("the chat says Beacon is off" to { vm.chat.value.status == line }, "it is still chat-a" to { vm.chat.value.sessionId == "chat-a" })
+        await { compose.onAllNodesWithText(line).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithText("Turn on").assertExists()
+        compose.onAllNodesWithText("Couldn't send the message. Review it and try again.").assertCountEquals(0)
+        assertTrue("No notice said the send failed: $noticeLog", noticeLog.none { it.contains("Couldn't send the message") })
+        // Nothing was sent, no other chat was made, and the words are where they were.
+        assertEquals("Nothing was sent", 0, fixture.requests.count { it.string("method") == "prompt.submit" })
+        assertEquals("No other chat was made: ${createCalls().map { it.toString().take(160) }}", createsBefore, createCalls().size)
+        assertEquals("The composer keeps the words", words, vm.composer.value.text)
+        kotlinx.coroutines.runBlocking { vm.checkpointNow() }
+        val saved = kotlinx.coroutines.runBlocking { app.cache.read(coder.session("chat-a"), "draft") }.orEmpty()
+        assertTrue("chat-a keeps the words in its draft: $saved", saved.contains(words))
+        val firstChatDraft = kotlinx.coroutines.runBlocking { app.cache.read(coder, "initial-draft") }.orEmpty()
+        assertFalse("The words did not move to another chat: $firstChatDraft", firstChatDraft.contains(words))
+        // Turn on, confirm: that chat opens again with its words, and the send goes out.
+        compose.onNodeWithText("Turn on").performClick()
+        await { compose.onAllNodes(isDialog()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNode(hasText("Turn on") and hasClickAction() and hasAnyAncestor(isDialog())).performClick()
+        awaitAll(
+            "it is chat-a again" to { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.raw.length() > 0 },
+            "the status is gone" to { vm.chat.value.status != line },
+            "the composer holds the words" to { vm.composer.value.text == words },
+        )
+        assertTrue(fixture.pluginOffProfiles.isEmpty())
+        compose.runOnIdle { vm.send() }
+        awaitAll("the words were submitted to chat-a" to { fixture.requests.any { it.string("method") == "prompt.submit" && it.optJSONObject("params")?.optString("text") == words } })
+        assertEquals("The message was sent once", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        assertEquals("No other chat was made: ${createCalls().map { it.toString().take(160) }}", createsBefore, createCalls().size)
+        receipts += "In a profile where Hermes refuses the Beacon plugin, a send in a saved chat shows the one-line status with Turn on, keeps the words in that chat, sends nothing and makes no other chat; Turn on opens that chat again with its words and the send works."
+    }
+
+    /**
+     * R10F-A round 3: a chat Hermes refuses to open (403) stays that chat, like the Beacon-off page. What was typed stays in the composer, what is typed there is saved with the chat
+     * (never lost), and when access is back the chat opens with its latest draft.
+     */
+    @Test fun aChatHermesRefusesToOpenStaysThatChatAndWhatIsTypedOnItsPageIsKeptForIt() = withFixture { vm, fixture ->
+        val denied = "Not allowed \u00b7 draft kept"
+        val draft = "Unsent words that belong to this chat"
+        val typed = " and a line typed after access was denied"
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.chat.value.raw.length() > 0 }
+        compose.runOnIdle { vm.composer(TextFieldValue(draft)) }
+        kotlinx.coroutines.runBlocking { vm.checkpointNow() }
+        // Hermes now refuses to read it: the page stays that chat and the draft stays in the composer.
+        fixture.deniedSessionIds = setOf("chat-b")
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        await { vm.chat.value.status == denied }
+        assertEquals("The chat stays the chat that was opened", "chat-b", vm.chat.value.sessionId)
+        assertEquals("The composer keeps the chat's draft", draft, vm.composer.value.text)
+        // The person keeps typing on this page: what is typed is saved with the chat at once.
+        compose.runOnIdle { vm.composer(TextFieldValue(draft + typed)) }
+        kotlinx.coroutines.runBlocking { vm.checkpointNow() }
+        // Words are typed, yet Send and Attach go nowhere on this page, so they are off (R11 Nice 4 and 5).
+        compose.onNodeWithTag("message-send").assertIsNotEnabled()
+        compose.onNodeWithTag("composer-attach").assertIsNotEnabled()
+        val saved = kotlinx.coroutines.runBlocking { fixture.scope.session("chat-b").let { app.cache.read(it, "draft") } }.orEmpty()
+        assertTrue("What is typed on the refused page is saved with the chat: $saved", saved.contains(typed))
+        assertEquals("It is still the same chat", "chat-b", vm.chat.value.sessionId)
+        // Access is back and the chat opens again: its composer holds the latest draft.
+        fixture.deniedSessionIds = emptySet()
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.status != denied && vm.chat.value.raw.length() > 0 }
+        await { vm.composer.value.text == draft + typed }
+        // Access is back: Send and Attach work again.
+        await { compose.onAllNodes(hasTestTag("message-send") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("composer-attach").assertIsEnabled()
+        receipts += "A chat Hermes refuses to open stays that chat: its draft stays in the composer, what is typed there is saved with it, and the chat opens again with the latest draft."
+    }
+
     @Test fun selectingTheCurrentSettingsDestinationClosesTheDrawerWithoutAddingBackHistory() = withFixture { vm, _ ->
         compose.runOnIdle { vm.composer(TextFieldValue("Keep this draft")); vm.more("") }
         compose.onNodeWithTag("navigation-toggle").performClick()
@@ -3925,17 +4998,17 @@ class NativeExperienceUiTest {
 
     @Test fun conversationManagementBranchesArchivesAndDeletesOnlyAnIdleOwnedConversation() = withFixture { vm, fixture ->
         fun menu(label: String) {
-            compose.onNodeWithContentDescription("Conversation actions").performClick()
+            compose.onNodeWithContentDescription("Chat actions").performClick()
             if (label in dev.hermes.android.ui.conversationMoreActions) compose.onNodeWithTag("conversation-more").performScrollTo().performClick()
             compose.onNodeWithTag("conversation-action:$label").performScrollTo().performClick()
         }
         menu("Archive")
         await { fixture.sessions.getValue("chat-a").getJSONObject("info").optBoolean("hidden") && vm.chat.value.raw.optBoolean("archived") }
-        compose.onNodeWithContentDescription("Conversation actions").performClick()
+        compose.onNodeWithContentDescription("Chat actions").performClick()
         compose.onNodeWithText("Unarchive").performScrollTo().performClick()
         await { !fixture.sessions.getValue("chat-a").getJSONObject("info").optBoolean("hidden") && !vm.chat.value.raw.optBoolean("archived") }
         menu("Compress context")
-        await { vm.ui.value.notice.contains("not needed") }
+        await { vm.ui.value.notice == "Nothing to shorten." }
         menu("Branch")
         compose.onNode(hasSetTextAction() and hasText("Branch title")).performTextReplacement("Branch for audit")
         compose.onNodeWithText("Save", useUnmergedTree = true).performClick()
@@ -3943,16 +5016,21 @@ class NativeExperienceUiTest {
         val branch = vm.chat.value.sessionId
         assertEquals(2, fixture.sessions.getValue("chat-a").getJSONArray("messages").length())
         menu("Rename")
-        compose.onNode(hasSetTextAction() and hasText("Conversation title *")).performTextReplacement("Renamed branch")
+        compose.onNode(hasSetTextAction() and hasText("Chat name *")).performTextReplacement("Renamed branch")
         compose.onNodeWithText("Save", useUnmergedTree = true).performClick()
         await { vm.chat.value.title == "Renamed branch" }
         menu("Undo last turn")
+        // Owner-Hermes check of F9, W2: the confirm is titled with the menu's words, not the action's id.
+        await { compose.onAllNodesWithText("Undo last message").fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithText("Undo last turn").assertCountEquals(0)
         compose.onNodeWithText("Undo", useUnmergedTree = true).performClick()
         await { vm.chat.value.messages.isEmpty() && vm.chat.value.raw.string("session_id") == branch }
         fixture.sessions.getValue(branch).put("running", true)
         menu("Delete conversation")
+        await { compose.onAllNodesWithText("Delete chat").fetchSemanticsNodes().isNotEmpty() }
+        compose.onAllNodesWithText("Delete conversation").assertCountEquals(0)
         compose.onNodeWithText("Delete", useUnmergedTree = true).performClick()
-        await { vm.form.value?.error?.contains("Stop the current reply") == true }
+        await { vm.form.value?.error == "Stop the reply before deleting this chat." }
         await { vm.submittingForm.value.isBlank() }
         assertTrue(fixture.sessions.containsKey(branch))
         assertFalse(fixture.closedSessions.contains(branch))
@@ -3993,7 +5071,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Keep editing").performClick()
         assertEquals("Unsaved instructions", vm.phoneSettings.skills.value.draft)
         compose.onNodeWithContentDescription("Back").performClick()
-        compose.onNodeWithText("Discard changes").performClick()
+        clickDiscardChanges()
         assertNotNull(vm.phoneSettings.skills.value.selected)
         assertEquals(fixture.skillText, vm.phoneSettings.skills.value.content?.content)
         compose.onNodeWithContentDescription("Back").performClick()
@@ -4032,7 +5110,7 @@ class NativeExperienceUiTest {
         compose.onNodeWithText("Cancel edit").performScrollTo().performClick()
         compose.onNodeWithText("Keep editing").performClick()
         compose.onNodeWithText("Cancel edit").performScrollTo().performClick()
-        compose.onNodeWithText("Discard changes").performClick()
+        clickDiscardChanges()
         compose.onNodeWithContentDescription("Refresh memory").performClick()
         await { !vm.phoneSettings.memory.value.loading }
         assertEquals("Prefers quiet places", fixture.memoryNotes["memory"])
@@ -4169,8 +5247,8 @@ class NativeExperienceUiTest {
         // R6M moved policy changes to profile Settings; this menu describes the chat's bypass.
         compose.onNodeWithText("Approvals in this chat").assertExists()
         await { vm.data.value["picker:approvals"]?.let { it.string("scope_key") == fixture.scope.key && it.string("session_id") == vm.chat.value.sessionId } == true && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Manual").assertExists()
-        compose.onNodeWithTag("approval-ask").assertTextContains("Manual").assertTextContains("Ask before actions").assertIsSelected()
+        compose.onNodeWithContentDescription("Approvals: Always ask").assertExists()
+        compose.onNodeWithTag("approval-ask").assertTextContains("Always ask").assertIsSelected()
     }
 
     @Test fun botOverviewKeepsUnsupportedMembershipAndConfirmedDeletionExplicit() = withFixture { vm, fixture ->
@@ -4212,11 +5290,11 @@ class NativeExperienceUiTest {
         await { vm.ui.value.botModeEnabled && !vm.ui.value.botModeSwitching && !vm.botMode.state.value.loading }
         compose.runOnIdle { vm.openBotSpace("fixture-room") }
         await { vm.botMode.state.value.selectedSpace == "fixture-room" && !vm.botMode.state.value.loading }
-        compose.onNodeWithText("Native approval support could not be confirmed.", substring = true).performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("Couldn't check approvals. Refresh this space.", substring = true).performScrollTo().assertIsDisplayed()
         compose.onNodeWithText("Allow once").assertDoesNotExist()
         compose.onNodeWithText("Deny").assertDoesNotExist()
         compose.onNodeWithContentDescription("Shared-space actions").performClick()
-        compose.onNodeWithText("Deletion unavailable").assertIsNotEnabled()
+        compose.onNodeWithText("Can't delete").assertIsNotEnabled()
         compose.onNodeWithText("Edit shared space").performClick()
         compose.onNodeWithText("Save").assertIsNotEnabled()
         compose.onNodeWithText("Cancel").performClick()
@@ -4258,16 +5336,33 @@ class NativeExperienceUiTest {
             assertTrue("Browsing never resumes, creates or sends", reads.none { it.string("method") in passive })
             assertFalse(vm.chat.value.raw.optBoolean("voice_transcripts_available"))
             assertFalse(vm.chat.value.status.contains("Could not load"))
+            compose.onNodeWithTag("message-input").performClick().performTextInput("Native send while the plugin is down")
+            // Send enables once the history read settles; a loaded device can take a moment.
+            await { compose.onAllNodes(hasTestTag("message-send") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
+            val submitsBefore = fixture.requests.count { it.string("method") == "prompt.submit" }
+            compose.onNodeWithTag("message-send").performClick()
+            if (status == 404) {
+                await { fixture.requests.count { it.string("method") == "prompt.submit" } == submitsBefore + 1 }
+                val submit = fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params")
+                assertEquals("The native send resumes only the selected conversation", "runtime-$id", submit.string("session_id"))
+                assertTrue(submit.string("text").contains("Native send while the plugin is down"))
+            } else {
+                // A failing plugin must not downgrade the native route (BeaconClient: only an unknown route is "not installed"), so the send is refused in plain words.
+                await { vm.ui.value.notice == "Couldn't send the message. Review it and try again." }
+                assertEquals("A refused send never reaches Hermes", submitsBefore, fixture.requests.count { it.string("method") == "prompt.submit" })
+                assertEquals("The refused message stays in the composer", "Native send while the plugin is down", vm.composer.value.text)
+                assertTrue("A plugin outage does not sign the user out", vm.ui.value.authenticated && vm.ui.value.connected)
+                // The plugin answers again: the next send connects by itself, with no new sign-in.
+                fixture.pluginStatus = null
+                compose.onNodeWithTag("message-send").performClick()
+                await { fixture.requests.count { it.string("method") == "prompt.submit" } == submitsBefore + 1 }
+                val resumed = fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params")
+                assertEquals("runtime-$id", resumed.string("session_id"))
+                assertTrue(resumed.string("text").contains("Native send while the plugin is down"))
+                assertTrue("The recovered send needed no sign-in", vm.ui.value.authenticated)
+            }
         }
-        compose.onNodeWithTag("message-input").performClick().performTextInput("Native send while the plugin is down")
-        // Send enables once the history read settles; a loaded device can take a moment.
-        await { compose.onAllNodes(hasTestTag("message-send") and isEnabled()).fetchSemanticsNodes().isNotEmpty() }
-        compose.onNodeWithTag("message-send").performClick()
-        await { fixture.requests.any { it.string("method") == "prompt.submit" } }
-        val submit = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
-        assertEquals("The native send resumes only the selected conversation", "runtime-chat-a", submit.string("session_id"))
-        assertTrue(submit.string("text").contains("Native send while the plugin is down"))
-        receipts += "With the optional plugin returning 404/500, saved history loads from stock /api/sessions routes without resuming an agent, and a native send still resumes and submits to the selected conversation."
+        receipts += "With the optional plugin returning 404/500, saved history loads from stock /api/sessions routes without resuming an agent; a plugin that is absent (404) still lets a native send resume and submit, a plugin that fails (500) refuses the send in plain words and keeps the draft, and the next send after the plugin recovers goes through without signing in again."
         capture("flow-stock-history-plugin-outage")
     }
 
@@ -4299,12 +5394,17 @@ class NativeExperienceUiTest {
         fixture.persistTerminalMessages = false
         fixture.emitNativeEvent("message.complete", json("text" to "A reply history never saved"))
         // An unconfirmed reply keeps its live output; what matters is that the queue does not advance.
-        // Every unproven ending (reply not confirmed, history changed, refresh failed) keeps live output and says so.
-        try { await { vm.chat.value.status.contains("live output retained") } }
+        // Every unproven ending keeps the streamed reply on screen as an ordinary reply, without any internal wording.
+        try { await { vm.chat.value.streamId.isBlank() && vm.chat.value.raw.rows("_unconfirmed_replies").any { it.string("text") == "A reply history never saved" } } }
         catch (error: Throwable) { throw AssertionError("Unproven ending not reported: status=${vm.chat.value.status} stream=${vm.chat.value.streamId} queued=${vm.chat.value.queued.map { it.text }} submits=${fixture.requests.count { it.string("method") == "prompt.submit" }}", error) }
         runCatching { compose.waitUntil(3_000) { fixture.requests.count { it.string("method") == "prompt.submit" } > 1 } }
         assertEquals("The queued prompt waits for review", "Queued follow-up", vm.chat.value.queued.single().text)
         assertEquals("Nothing more is sent after an unconfirmed reply", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        // Where the held message shows (T1): a row of the queue box, never a chat bubble, until it is sent.
+        val held = vm.chat.value.queued.single().id
+        compose.onNodeWithTag("queue-text:$held").assertIsDisplayed()
+        compose.onAllNodesWithTag("queued-message:$held").assertCountEquals(0)
+        compose.onAllNodes(hasText("Queued follow-up") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(0)
     }
 
     // Live 2026-10-26: a message sent seconds after the network returned finished in Hermes, but the chat stayed "Working" until the app was backgrounded.
@@ -4348,7 +5448,7 @@ class NativeExperienceUiTest {
         await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
         val stored = vm.chat.value.sessionId
         compose.runOnIdle { vm.composer(TextFieldValue("Still there?")); vm.send() }
-        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId.isNotBlank() && sendAccepted(vm, fixture, stored) }
         @Suppress("UNCHECKED_CAST")
         val streams = BeaconViewModel::class.java.getDeclaredField("streams").apply { isAccessible = true }.get(vm) as MutableMap<String, kotlinx.coroutines.Job>
         compose.runOnIdle { streams.values.toList().forEach { it.cancel() }; streams.clear() }
@@ -4372,7 +5472,7 @@ class NativeExperienceUiTest {
         val creatingRuntime = "runtime-$stored"
         fixture.persistTerminalMessages = true
         compose.runOnIdle { vm.composer(TextFieldValue("QA unfolded check. Reply ok.")); vm.send() }
-        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == creatingRuntime }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == creatingRuntime && sendAccepted(vm, fixture, stored) }
         // The stream that should follow the reply is gone, as in the live run.
         @Suppress("UNCHECKED_CAST")
         val streams = BeaconViewModel::class.java.getDeclaredField("streams").apply { isAccessible = true }.get(vm) as MutableMap<String, kotlinx.coroutines.Job>
@@ -4385,10 +5485,41 @@ class NativeExperienceUiTest {
         val resumesBefore = storedResumes()
         // Within the silence window (45 s), without leaving the app.
         try { compose.waitUntil(40_000) { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == "ok" } } }
-        catch (error: Throwable) { throw AssertionError("Chat stayed on its turn: status=${vm.chat.value.status} stream=${vm.chat.value.streamId} requests=${recentCalls(fixture)}", error) }
+        catch (error: Throwable) {
+            // What the app held at the time, so a stuck chat says whether a stream was running, whether the watcher was alive and which submission the chat was following.
+            fun held(name: String) = BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.get(vm)
+            val inner = runCatching {
+                "streams=${(held("streams") as Map<*, *>).mapValues { (it.value as kotlinx.coroutines.Job).isActive }} watcher=${(held("sessionWatch") as kotlinx.coroutines.Job?)?.isActive} " +
+                    "foreground=${held("foreground")} generation=${held("sessionGeneration")} source=${(held("sourceScope") as dev.hermes.android.core.Scope?)?.session} " +
+                    "submission='${vm.chat.value.raw.string("_display_submission_id")}' frames=${(held("liveFrames") as Map<*, *>).entries.joinToString { f -> "${f.key}=${(f.value as JSONObject).let { j -> j.string("cursor") + "/" + j.optBoolean("terminal") }}" }} " +
+                    "resumes=${storedResumes() - resumesBefore} nativeTurn=${fixture.nativeTurnStatus} reply=${vm.chat.value.messages.map { it.text }.takeLast(3)}"
+            }.getOrElse { "unreadable: $it" }
+            throw AssertionError("Chat stayed on its turn: status=${vm.chat.value.status} stream=${vm.chat.value.streamId} $inner requests=${recentCalls(fixture)}", error)
+        }
         assertEquals("Settling reads history; it never sends the prompt again", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
         assertTrue("The stored conversation was resumed, not the dropped runtime", storedResumes() > resumesBefore)
         receipts += "A new chat whose first reply nothing followed asks Hermes after a quiet spell, finds the runtime gone, and settles the finished turn from history without leaving the app."
+    }
+
+    /**
+     * Hermes accepted the prompt and runs the turn whatever the screen does meanwhile; the answer to the send reaches the phone after the same chat was opened again (a new selection of the open chat).
+     * The send must still learn its outcome (stream followed, nothing left unconfirmed), not be dropped because the selection counter moved.
+     */
+    @Test fun aLateAcknowledgementStillSettlesTheSendWhenTheSameChatWasOpenedAgainMeanwhile() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.newChat() }
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+        val shellId = vm.chat.value.sessionId
+        fixture.persistTerminalMessages = true
+        fixture.holdPromptAcknowledgement = true
+        try {
+            compose.runOnIdle { vm.composer(TextFieldValue("First words")); vm.send() }
+            await { fixture.requests.any { it.string("method") == "prompt.submit" } }
+            compose.runOnIdle { vm.selectSession(shellId) }
+            runBlocking { vm.awaitSelection() }
+            await { vm.chat.value.sessionId == shellId && vm.chat.value.projectionReady }
+        } finally { fixture.releasePromptAcknowledgement() }
+        await { vm.chat.value.uncertain.isBlank() && vm.chat.value.streamId.isNotBlank() }
+        assertEquals("The prompt is sent once", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
     }
 
     @Test fun matchingHistoryTextDoesNotSettleAFirstSendWithoutItsAcknowledgement() = withFixture { vm, fixture ->
@@ -4423,7 +5554,8 @@ class NativeExperienceUiTest {
                 await { fixture.requests.any { it.string("method") == "prompt.submit" } }
                 // The row is visible, but its identity is not known until the held acknowledgement arrives.
                 compose.runOnIdle { vm.reconcileSend() }
-                await { vm.chat.value.status.contains("unknown", ignoreCase = true) && vm.chat.value.messages.any { it.text == "First words" } }
+                // The uncertain send is the field, not a status word (1.1.34 chat: the status line "Send outcome unknown" is gone; the message shows its own ticks).
+                await { vm.chat.value.uncertain.isNotBlank() && vm.chat.value.messages.any { it.text == "First words" } }
                 assertTrue("Equal text is not a receipt", vm.chat.value.uncertain.isNotBlank())
                 val historyRowId = vm.chat.value.messages.single { it.role == "user" && it.text == "First words" }.id
                 assertTrue("The history row itself has an identity", historyRowId.isNotBlank())
@@ -4519,6 +5651,7 @@ class NativeExperienceUiTest {
         val created = mutableListOf<String>()
         fun creates() = fixture.requests.count { it.string("method") == "session.create" }
         fun marker(id: String) = runBlocking { app.cache.read(owner.session(id), "client-created-shell") }
+        var earlierPlain: String? = null
         try {
             for (options in listOf(json("title" to "An unsent thread", "thread" to true), json("title" to "A titled chat", "model" to "other-model", "model_provider" to "fixture"))) {
                 compose.runOnIdle { vm.newChat(options) }
@@ -4527,9 +5660,19 @@ class NativeExperienceUiTest {
                 assertEquals("A chat with options is remembered as one kept apart", "apart", marker(apart))
                 val createsBefore = creates()
                 compose.runOnIdle { vm.newChat() }
-                await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId !in created && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
-                val plain = vm.chat.value.sessionId.also { created += it }
-                assertEquals("New conversation does not reuse it", createsBefore + 1, creates())
+                val plain: String
+                if (earlierPlain == null) {
+                    await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId !in created && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+                    plain = vm.chat.value.sessionId.also { created += it }
+                    assertEquals("New conversation does not reuse it", createsBefore + 1, creates())
+                    earlierPlain = plain
+                } else {
+                    // S6 (9 Nov): the empty plain chat made before is reopened instead of adding another empty session; the kept-apart chat is still never the one reused.
+                    await { vm.chat.value.sessionId == earlierPlain && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+                    plain = vm.chat.value.sessionId
+                    assertEquals("New conversation reopens the empty plain chat and makes no other session", createsBefore, creates())
+                    assertNotEquals("and it is not the kept-apart chat", apart, plain)
+                }
                 assertEquals("A plain chat keeps the plain marker", "1", marker(plain))
             }
             receipts += "Plain New conversation opens its own chat after an unsent thread or a chat opened with a title or model."
@@ -4685,6 +5828,58 @@ class NativeExperienceUiTest {
         receipts += "A text-only message Hermes saved mid-turn is shown once while the turn goes on with tool steps."
     }
 
+    /** Lane G3M, 12 Nov 2026: a 68 s turn showed the model's progress sentence for 0.3 s and then an empty Working state for 50 s. Hermes' own order is turn_tool_round.py:133-164. */
+    @Test fun theWordsBeforeALongToolStayOnScreenThroughTheNextStepAndAreShownOnceWhenSaved() = withFixture { vm, fixture ->
+        val first = "I'll look at the picture first, then run the check."
+        val second = "The picture is clear; now the command."
+        val done = "Done. The picture shows a few shapes."
+        kotlinx.coroutines.runBlocking { app.cache.delete(fixture.scope.session("chat-a"), "live:runtime-chat-a") }
+        val subscriptionsBeforeSend = fixture.streamSubscriptions.get()
+        compose.runOnIdle { fixture.persistTerminalMessages = true; vm.composer(TextFieldValue("Inspect this picture")); vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } && vm.chat.value.streamId == "runtime-chat-a" }
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeSend }
+        fun shownTimes(words: String, under: String) = compose.onAllNodes(hasText(words) and hasAnyAncestor(hasTestTag(under)), useUnmergedTree = true).fetchSemanticsNodes().size
+
+        // The words, the interim seal, the empty chunk that is only the segment boundary, then a tool that keeps running.
+        fixture.emitNativeEvent("message.delta", json("text" to first))
+        fixture.emitNativeEvent("message.interim", json("text" to first, "already_streamed" to true))
+        fixture.emitNativeEvent("message.delta", json("text" to null))
+        fixture.emitNativeEvent("tool.start", json("tool_call_id" to "vision-0", "name" to "vision_analyze", "context" to ""))
+        await { vm.chat.value.liveTools.size == 1 }
+        compose.waitForIdle()
+        assertEquals("The words stay while the tool runs", first, vm.chat.value.liveText)
+        assertEquals(1, shownTimes(first, "live-reply"))
+
+        // The next model step begins: the words stay as an ordinary bubble above the new ones.
+        fixture.emitNativeEvent("tool.complete", json("tool_call_id" to "vision-0", "name" to "vision_analyze"))
+        fixture.emitNativeEvent("message.delta", json("text" to second))
+        await { vm.chat.value.liveSealed == listOf(first) && vm.chat.value.liveText == second }
+        compose.waitForIdle()
+        assertEquals("The sealed words are a bubble of the live column", 1, shownTimes(first, "live-sealed:0"))
+        assertEquals(1, shownTimes(second, "live-reply"))
+
+        // Hermes saved the first message before its tool ran; the history is read while the turn goes on: it is shown once, as its row.
+        val saved = fixture.sessions.getValue("chat-a").getJSONArray("messages")
+        saved.put(json("role" to "assistant", "text" to first, "row_id" to "saved-first", "tool_calls" to JSONArray().put(json("id" to "vision-0"))))
+        val subscriptionsBeforeReconnect = fixture.streamSubscriptions.get()
+        fixture.interruptActiveNativeStream()
+        await { fixture.streamSubscriptions.get() > subscriptionsBeforeReconnect }
+        await { vm.chat.value.messages.any { it.id == "saved-first" } }
+        compose.waitForIdle()
+        assertEquals(emptyList<String>(), vm.chat.value.liveSealed)
+        assertEquals("The turn goes on with its newer words", second, vm.chat.value.liveText)
+        assertEquals(1, shownTimes(first, "conversation-transcript"))
+        assertEquals(1, shownTimes(second, "conversation-transcript"))
+
+        saved.put(json("role" to "assistant", "text" to second, "row_id" to "saved-second"))
+        fixture.emitNativeEvent("message.complete", json("text" to done))
+        await { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == done } }
+        compose.waitForIdle()
+        assertEquals("Nothing is left of the live words after the turn", emptyList<String>(), vm.chat.value.liveSealed)
+        listOf(first, second, done).forEach { assertEquals("$it is shown once", 1, shownTimes(it, "conversation-transcript")) }
+        receipts += "The words a model says before a tool step stay on screen through the tool and the next step, and are shown once when Hermes' saved rows arrive."
+    }
+
     @Test fun theBeaconChatNamedOnlyByTheCacheIsRestoredWhenTheAssistantProfileDiffersFromTheChats() = withFixture { vm, fixture ->
         val coder = fixture.scope.copy(profile = "coder")
         fun handle(): String? = BeaconViewModel::class.java.getDeclaredMethod("readBeaconSessionHandle", Scope::class.java).apply { isAccessible = true }.invoke(vm, coder) as String?
@@ -4738,7 +5933,13 @@ class NativeExperienceUiTest {
         assertEquals("The interrupted runtime remains selected", "runtime-chat-a", vm.chat.value.streamId)
         assertEquals("Live text survives passive history without active_stream_id", "Partial answer", vm.chat.value.liveText)
         assertEquals("The queued draft is retained", "Queued follow-up", vm.chat.value.queued.single().text)
-        assertTrue("The UI keeps explicit recovery uncertainty", vm.chat.value.status.contains("unknown", ignoreCase = true))
+        // Where the retained message shows (T1): a row of the queue box, not a chat bubble, while the turn is interrupted.
+        val heldId = vm.chat.value.queued.single().id
+        compose.onNodeWithTag("queue-text:$heldId").assertIsDisplayed()
+        compose.onAllNodesWithTag("queued-message:$heldId").assertCountEquals(0)
+        compose.onAllNodes(hasText("Queued follow-up") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(0)
+        // Either line says the outcome is not known: "Reply status unknown", or "Couldn't check the reply \u00b7 your messages are kept".
+        assertTrue("The UI keeps explicit recovery uncertainty: ${vm.chat.value.status}", vm.chat.value.status.let { it.contains("unknown", ignoreCase = true) || it.startsWith("Couldn't check the reply") })
         assertFalse("An unproven outcome is not shown as complete", vm.chat.value.status.contains("complete", ignoreCase = true))
         assertEquals("No queued prompt is submitted on an unproven outcome", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
         // The recovery reads the active list on its own schedule; the emulator can be a beat behind (4 Nov 2026 run).
@@ -4751,21 +5952,41 @@ class NativeExperienceUiTest {
         val requestsBeforeCompletion = fixture.requests.size
         fixture.terminalOnActiveList = json("text" to "Completed answer")
         fixture.interruptActiveNativeStream()
-        await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
-        val queuedSubmitIndex = fixture.requests.indexOfLast { it.string("method") == "prompt.submit" }
-        val beforeQueuedSubmit = fixture.requests.toList().subList(requestsBeforeCompletion, queuedSubmitIndex)
-        assertTrue("The terminal history refresh happens before the queued prompt", beforeQueuedSubmit.any { it.string("path") == "/api/sessions/chat-a/messages" })
-        assertTrue("The FIFO send follows a scoped status read", beforeQueuedSubmit.any { it.string("method") == "session.active_list" && it.getJSONObject("params").string("current_session_id") == "runtime-chat-a" && it.getJSONObject("params").string("profile") == fixture.scope.profile })
+        // 1.1.34 (93c0090b): the replayed terminal event ends the stream and the final reply is read from the saved history and shown, but this legacy gateway names no
+        // admission, so the turn cannot be proven and the queued follow-up stays queued (FinishedTurnTest.aQueuedFollowUpIsSentOnlyOnceTheFinishedTurnIsProven covers the
+        // proven case; on the device terminalCanonicalAdmissionWakesTheNextPhoneMessageWithoutManualReview).
+        await { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == "Completed answer" } }
+        val afterTerminal = fixture.requests.toList().drop(requestsBeforeCompletion)
+        assertTrue("The terminal history refresh happens", afterTerminal.any { it.string("path") == "/api/sessions/chat-a/messages" })
+        assertTrue("The terminal read follows a scoped status read", afterTerminal.any { it.string("method") == "session.active_list" && it.getJSONObject("params").string("current_session_id") == "runtime-chat-a" && it.getJSONObject("params").string("profile") == fixture.scope.profile })
         assertTrue("The completed fixture turn reported idle", fixture.nativeStatusProbes.contains("idle"))
-        assertTrue("The final assistant reply is visible before another history poll", vm.chat.value.messages.any { it.text == "Completed answer" })
         // Once in the conversation; the closed drawer may preview the same line, so look in the transcript.
         assertEquals(1, vm.chat.value.messages.count { it.text == "Completed answer" })
         compose.onNode(hasText("Completed answer") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertIsDisplayed()
+        runCatching { compose.waitUntil(3_000) { fixture.requests.count { it.string("method") == "prompt.submit" } > 1 } }
+        assertEquals("Nothing is sent before the turn is proven", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+        assertEquals("The queued follow-up is kept, once, and not sent", listOf("Queued follow-up" to "queued"), vm.chat.value.queued.map { it.text to it.state })
+        // Still the box's row, and still not a chat bubble: only the final reply is in the conversation.
+        compose.onNodeWithTag("queue-text:$heldId").assertIsDisplayed()
+        compose.onAllNodesWithTag("queued-message:$heldId").assertCountEquals(0)
+        compose.onAllNodes(hasText("Queued follow-up") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(0)
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { fixture.requests.count { it.string("method") == "prompt.submit" } == 2 }
+        assertTrue("The send after reopening follows a scoped status read", fixture.requests.toList().drop(requestsBeforeCompletion).any { it.string("method") == "session.active_list" && it.getJSONObject("params").string("current_session_id") == "runtime-chat-a" })
         await { vm.chat.value.queued.singleOrNull()?.state == "sent" }
         val retained = vm.chat.value.queued.single()
         assertTrue("The sent queue record carries the exact row identity", retained.rowId.isNotBlank())
+        // The saved row reaches the conversation with the next history read after the send (the acknowledgement only names its id).
+        await { vm.chat.value.messages.any { it.role == "user" && it.text == "Queued follow-up" } }
         assertEquals(retained.rowId, vm.chat.value.messages.single { it.role == "user" && it.text == "Queued follow-up" }.id)
         assertEquals("The follow-up is submitted once", 2, fixture.requests.count { it.string("method") == "prompt.submit" })
+        // Sent: it left the box and is in the conversation once, as its saved row, with its ticks.
+        await { compose.onAllNodesWithTag("queue-text:$heldId").fetchSemanticsNodes().isEmpty() }
+        compose.onAllNodesWithTag("queue-box").assertCountEquals(0)
+        val sentRow = "message-row:${retained.rowId}"
+        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag(sentRow))
+        compose.onAllNodes(hasText("Queued follow-up") and hasAnyAncestor(hasTestTag("conversation-transcript")), useUnmergedTree = true).assertCountEquals(1)
+        compose.onNode((hasTestTag("send-tick:delivered") or hasTestTag("send-tick:answered")) and hasAnyAncestor(hasTestTag(sentRow)), useUnmergedTree = true).assertExists()
         receipts += "A real synthetic WebSocket failure preserves partial progress and the queued follow-up while native status is unknown; a replayed terminal event persists the final assistant row, refreshes history immediately, and only then advances the queue."
     }
 
@@ -4786,6 +6007,10 @@ class NativeExperienceUiTest {
         val clientCreatedSessions = BeaconViewModel::class.java.getDeclaredField("clientCreatedSessions").apply { isAccessible = true }.get(vm) as Set<String>
         assertFalse("The creating-client marker ends after the first accepted prompt", clientCreatedSessions.contains(fixture.scope.session(vm.chat.value.sessionId).key))
         await { fixture.streamSubscriptions.get() > subscriptionsBefore }
+        // The follow-up is queued once the first send is settled, as the Queue control allows it (it is off while the send is unsure, ChatScreen composerSendEnabled) and as queue() requires (it refuses,
+        // with a short-lived notice and nothing else, while the chat is unsure about the send). A stream can be shown before the send is settled: the chat's own open can follow the run by itself
+        // (reattachMarkedRun sets the stream while the send still holds its receipt). G3 run F6, #273: the queue was asked at that moment, refused, and the wait below never saw it.
+        await { sendAccepted(vm, fixture, vm.chat.value.sessionId) }
         compose.runOnIdle { vm.composer(TextFieldValue("Queued follow-up")); vm.queue() }
         await { vm.chat.value.queued.singleOrNull()?.text == "Queued follow-up" }
 

@@ -152,6 +152,23 @@ def test_current_future_tool_parity_brief_preserves_native_state_and_result_trut
     assert result['tool_catalogue'] == 'Synthetic current catalogue'
 
 
+def test_the_brief_sends_long_or_tool_heavy_requests_to_hermes_work_without_discovery(harness, monkeypatch):
+    """Owner trial, 7 Nov 2026: the model said it was routing a request through Hermes and never called hermes_work."""
+    api, client, _, root, _ = harness
+    call_id = reserve(client)
+    voice = api.voice_context
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
+    monkeypatch.setattr(voice, 'config', lambda root: {})
+    monkeypatch.setattr(voice, 'personality', lambda root: '')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: '')
+    monkeypatch.setattr(voice, 'owner_name_in_memory', lambda *args: '')
+    monkeypatch.setattr(voice, 'ready_tools', lambda profile: '')
+    brief = voice.context('owner', 'basic', 'default', 'native-stored', call_id)['system_instruction']
+    assert 'hermes_work is always available' in brief and 'without discover_tools first' in brief
+    assert 'Never say you are routing' in brief and 'unless you call hermes_work in that same turn' in brief
+    assert 'native Hermes jobs are optional' not in brief, 'hand-off is not described as optional for long work'
+
+
 def test_unowned_history_blocks_profile_reads(harness, monkeypatch):
     api, client, _, _, _ = harness
     call_id = reserve(client)

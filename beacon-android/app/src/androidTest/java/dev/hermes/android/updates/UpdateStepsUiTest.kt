@@ -51,7 +51,7 @@ class UpdateStepsUiTest {
 
     private fun show(dark: Boolean, installed: String = "1.1.23") = compose.setContent {
         dev.hermes.android.ui.NativeLocalization("en") { BeaconTheme(dark = dark) { Surface { Box(Modifier.widthIn(max = 411.dp)) {
-            AppUpdateContent(ui.value, installed, false, now, onCheck = {}, onUpdate = { tries++ }, onRetry = {}, onCancel = {}, onAllow = {}, onReview = {})
+            AppUpdateContent(ui.value, installed, false, now, onCheck = {}, onUpdate = { tries++ }, onRetry = {}, onCancel = {}, onAllow = {})
         } } } }
     }
 
@@ -79,7 +79,7 @@ class UpdateStepsUiTest {
         val reconnecting = CompletableDeferred<Unit>()
         private var read = 0
         override suspend fun version(): PluginVersions = versions[minOf(read++, versions.lastIndex)]
-        override suspend fun update(acceptCapabilities: Boolean): JSONObject { update.await(); return JSONObject().put("ok", true) }
+        override suspend fun update(): JSONObject { update.await(); return JSONObject().put("ok", true) }
         override suspend fun restart(last: RestartMemo, remember: (RestartMemo) -> Unit): RestartResult { gateway.await(); return RestartResult.Completed }
         override suspend fun restartDashboard(onReconnecting: (Boolean) -> Unit): DashboardRestartResult {
             onReconnecting(true)
@@ -96,7 +96,7 @@ class UpdateStepsUiTest {
             PluginVersions("1.1.22", "1.1.22", "1.1.22"), PluginVersions("1.1.22", "1.1.23", "1.1.22"),
             PluginVersions("1.1.22", "1.1.23", "1.1.23"), PluginVersions("1.1.23", "1.1.23", "1.1.23")))
         val tracker = StepTracker { rows -> ui.value = ui.value.copy(pluginSteps = rows) }
-        val result = CoroutineScope(Dispatchers.Default).async { runPluginUpdate(fake, "1.1.23", accept = false, steps = tracker, pause = {}) }
+        val result = CoroutineScope(Dispatchers.Default).async { runPluginUpdate(fake, "1.1.23", steps = tracker, pause = {}) }
         val name = if (dark) "dark" else "light"
 
         // Hermes is fetching the plugin: the download is running and nothing after it has started.
@@ -117,8 +117,8 @@ class UpdateStepsUiTest {
 
         fake.gateway.complete(Unit)
         waitForRow(UpdateStep.PluginDashboard, "Reconnecting")
-        row(UpdateStep.PluginGateway).shows("Restarting Hermes gateway").shows("Done")
-        row(UpdateStep.PluginDashboard).shows("Restarting Hermes dashboard").shows("Working")
+        row(UpdateStep.PluginGateway).shows("Restarting Hermes").shows("Done")
+        row(UpdateStep.PluginDashboard).shows("Restarting the dashboard").shows("Working")
         // The closing row waits as "Done, Not yet", not "Done, Waiting".
         row(UpdateStep.PluginDone).shows("Not yet")
         capture("plugin-dashboard-$name")
@@ -143,11 +143,11 @@ class UpdateStepsUiTest {
             StepRow(UpdateStep.PluginDownload, StepState.Done), StepRow(UpdateStep.PluginInstall, StepState.Done), StepRow(UpdateStep.PluginGateway, StepState.Done),
             StepRow(UpdateStep.PluginDashboard, StepState.Failed, StepNote.DashboardFailed), StepRow(UpdateStep.PluginDone)))
         show(dark)
-        compose.onNodeWithText("The plugin is updated. The Hermes dashboard didn't restart.").assertIsDisplayed()
+        compose.onNodeWithText("Beacon is updated. The Hermes dashboard didn't restart.").assertIsDisplayed()
         compose.onNodeWithTag("update-primary").assertTextEquals("Restart dashboard")
         compose.onAllNodesWithTag("update-steps-plugin-retry").assertCountEquals(0)
         reveal("update-step:PluginDone")
-        row(UpdateStep.PluginDashboard).shows("Restarting Hermes dashboard").shows("Didn't restart").shows("Failed")
+        row(UpdateStep.PluginDashboard).shows("Restarting the dashboard").shows("Didn't restart").shows("Failed")
         row(UpdateStep.PluginDone).shows("Done").shows("Not yet")
         capture("plugin-failed-${if (dark) "dark" else "light"}")
         compose.onNodeWithTag("update-screen").performScrollToNode(hasTestTag("update-primary"))
@@ -175,7 +175,7 @@ class UpdateStepsUiTest {
         compose.onNodeWithTag("update-restart-how").assertTextEquals("How").assertIsDisplayed()
         compose.onNodeWithTag("update-plugin-line").assertTextEquals("Restart the Hermes dashboard on your computer.")
         reveal("update-steps-plugin-retry")
-        row(UpdateStep.PluginDashboard).shows("Restarting Hermes dashboard").shows("Failed")
+        row(UpdateStep.PluginDashboard).shows("Restarting the dashboard").shows("Failed")
         // The sentence is said once, by the hero, not again on the step.
         compose.onAllNodesWithText("Restart the Hermes dashboard on your computer.").assertCountEquals(1)
         compose.onNodeWithTag("update-steps-plugin-retry").performScrollTo().performClick()
@@ -189,7 +189,7 @@ class UpdateStepsUiTest {
                 StepRow(UpdateStep.PluginDashboard), StepRow(UpdateStep.PluginDone)),
             appSteps = listOf(StepRow(UpdateStep.AppDownload), StepRow(UpdateStep.AppVerify), StepRow(UpdateStep.AppInstall), StepRow(UpdateStep.AppDone)))
         show(dark = true, installed = "1.1.22")
-        compose.onNodeWithText("Updating the Beacon plugin…").assertIsDisplayed()
+        compose.onNodeWithText("Updating Beacon on Hermes…").assertIsDisplayed()
         compose.onAllNodesWithTag("update-cancel").assertCountEquals(0)
         compose.onAllNodesWithTag("update-progress").assertCountEquals(0)
         reveal("update-step:AppDone")

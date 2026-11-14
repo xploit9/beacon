@@ -28,7 +28,7 @@ class ErrorTextGapsTest {
 
     @Test fun aRefusedRecordNamesItsMessageOrASafeDefault() {
         assertEquals("Hermes refused", recordError(json("success" to false, "message" to "Hermes refused")))
-        assertEquals("The server could not load this content. Try again.", recordError(json("success" to false)))
+        assertEquals("Hermes couldn't load this. Try again.", recordError(json("success" to false)))
         assertEquals("A success flag that is true is not an error", "", recordError(json("success" to true, "message" to "ignored")))
     }
 
@@ -42,7 +42,7 @@ class ErrorTextGapsTest {
      * and neither is in the catalog, so a non-English phone reads English in the error row.
      */
     @Test fun theOfflineAndDefaultErrorTextsAreTranslated() {
-        val texts = listOf("Reconnect to refresh this page.", "The server could not load this content. Try again.")
+        val texts = listOf("Reconnect to refresh this page.", "Hermes couldn't load this. Try again.")
         val missing = texts.flatMap { text -> GapsAssets.languages.filter { it != "en" && GapsAssets.translated(it, text).isBlank() }.map { "$it: $text" } }
         assertTrue("Error text without a translation:\n" + missing.take(20).joinToString("\n"), missing.isEmpty())
     }

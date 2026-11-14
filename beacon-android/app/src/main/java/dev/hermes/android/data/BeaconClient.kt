@@ -38,19 +38,6 @@ private val GATEWAY_JSON_VALUE = """(?:$GATEWAY_JSON_STRING|true|false|null|-?(?
 private val GATEWAY_JSON_PAIR = """$GATEWAY_JSON_STRING[ \t\r\n]*:[ \t\r\n]*$GATEWAY_JSON_VALUE"""
 private val GATEWAY_JSON_OBJECT = Regex("""[ \t\r\n]*\{[ \t\r\n]*(?:$GATEWAY_JSON_PAIR(?:[ \t\r\n]*,[ \t\r\n]*$GATEWAY_JSON_PAIR)*)?[ \t\r\n]*\}[ \t\r\n]*""")
 private const val OPTIONAL_BOOTSTRAP_PATH = BEACON_PLUGIN_PATH + "mobile/bootstrap"
-private const val VAULT_PATH = BEACON_PLUGIN_PATH + "mobile/vault"
-private val VAULT_RESPONSE_KEYS = setOf("items", "item", "capabilities", "identity", "request_id", "removed", "id", "kind", "label", "origin",
-    "identifier_type", "identifier", "has_otp", "created_at", "backend", "supported", "local", "signup", "otp", "secure_prompts", "name", "email", "status")
-internal fun vaultMetadataOnly(value: Any?, depth: Int = 0): Boolean {
-    if (depth > 32) return false
-    return when (value) {
-        is JSONObject -> value.keys().asSequence().all { key ->
-            key in VAULT_RESPONSE_KEYS && vaultMetadataOnly(value.opt(key), depth + 1)
-        }
-        is JSONArray -> (0 until value.length()).all { vaultMetadataOnly(value.opt(it), depth + 1) }
-        else -> true
-    }
-}
 /** Carry the request's authority to each target, including work deferred until after the response. */
 internal class DeviceRemovalAuthority(val scope: Scope, private val removeIfCurrent: (() -> Unit) -> Boolean) {
     fun ifCurrent(remove: () -> Unit): Boolean = removeIfCurrent(remove)
@@ -182,6 +169,8 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     internal suspend fun bindProfile(profile: String) {
         closeNative(); auth = auth.copy(profile = profile, bearer = auth.bearer?.copy(profile = profile))
         authStore?.takeIf { !detachedView }?.let {
+            // A bearer or loopback client that missed an unrelated write still saves its profile (adoptSameAccountEpoch); a cookie session does not.
+            withContext(Dispatchers.IO) { synchronized(this@BeaconClient) { val held = cookieVersion; if (held == null || !it.authorityEpoch.current(held)) adoptSameAccountEpoch(it) } }
             if (it.persistIfUnchanged(auth, cookieVersion, snapshot = true, selectProfileIf = { true })) markAuthPersisted()
         }
     }
@@ -206,15 +195,47 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             }
         }
     }
+    /**
+     * The credential epoch a bearer or loopback client takes over after a write that was not its own: a sign-in or logout on another origin, a loopback renewal, an
+     * issuer a sibling learned. A cookie session never does, and nothing is taken once the stored record is no longer this client's account (logout, another owner
+     * or issuer, another kind of sign-in). Null when it cannot be taken.
+     */
+    private fun adoptSameAccountEpoch(store: AuthStore): Long? {
+        val held = auth
+        if (held.bearer == null && held.loopbackSession == null) return null
+        repeat(300) {
+            val candidate = store.authorityEpoch.readVersion()
+            // A writer is mid-commit, which takes milliseconds.
+            if (candidate == null) Thread.sleep(10)
+            else {
+                val stored = store.read(held.origin)
+                if (store.authorityEpoch.current(candidate)) {
+                    if (!stored.keepsSignInOf(held)) return null
+                    // A sibling may have renewed the loopback session since this client last saw it. Take the stored one with the epoch, as the 401 path does, so the
+                    // profile selection that follows (a snapshot keeps this client's own loopback session) can never write an older token over a newer one.
+                    if (held.loopbackSession != null) stored.loopbackSession?.takeIf { it.origin == held.origin && it.owner == held.owner }?.let { newest ->
+                        if (auth.loopbackSession == held.loopbackSession && newest != held.loopbackSession) auth = auth.copy(loopbackSession = newest)
+                    }
+                    cookieVersion = candidate
+                    return candidate
+                }
+            }
+        }
+        return null
+    }
     private fun retainCookieRotationLocked() {
         if (cookieAuthorityLost) throw CachedIdentityMismatch()
         val cookies = jar.snapshot()
         val store = authStore
-        val version = cookieVersion
+        var version = cookieVersion
         if (store != null && (version == null || !store.authorityEpoch.current(version))) {
-            cookieAuthorityLost = true
-            jar.replaceIfUnchanged(cookies, emptyList())
-            throw CachedIdentityMismatch()
+            // Only a cookie session holds authority this epoch protects. A bearer or loopback sign-in goes on while the store still holds its own account.
+            version = adoptSameAccountEpoch(store)
+            if (version == null) {
+                cookieAuthorityLost = true
+                jar.replaceIfUnchanged(cookies, emptyList())
+                throw CachedIdentityMismatch()
+            }
         }
         val normalized = expectedCookies.mapNotNull { Cookie.parse(origin, it)?.toString() }
         if (cookies == normalized) return
@@ -292,8 +313,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         }
     }
     private val native = NativeGateway(this, socketFactory ?: http.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(30, TimeUnit.SECONDS).build())
-    suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = try { native.rpc(method, params) }
-        catch (error: Throwable) { reportIncident("gateway", if (method in setOf("session.list", "session.history", "session.active_list", "status", "health")) "lookup" else "invoke_tool", error); throw error }
+    suspend fun nativeRpc(method: String, params: JSONObject = JSONObject()): JSONObject = native.rpc(method, params)
     internal suspend fun nativeSessionAuthority(): Boolean = native.sessionAuthority()
     internal suspend fun nativeTurnLease(storedSessionId: String, expectedRuntimeSessionId: String? = null): NativeTurnLease =
         native.turnLease(storedSessionId, expectedRuntimeSessionId)
@@ -304,13 +324,16 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         native.voiceSubmit(binding, params, jpeg, legacyJobCapacity, sendLock, callOwned, markAttempt, permitted)
     internal fun nativeAnswerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject =
         native.answerServerRequest(method, requestId, sessionId, payload)
-    suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap()): JSONObject {
+    /** Asks the plugin to turn Beacon on for the profile this client is signed in to (never another one); the answer waits for Hermes. */
+    internal suspend fun turnOnBeaconForProfile(): JSONObject =
+        nativeRequest(PROFILE_PLUGIN_ENABLE_PATH, "POST", JSONObject().put("profile", auth.profile), timeoutMillis = PROFILE_TURN_ON_TIMEOUT_MS)
+    suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap(), timeoutMillis: Long? = null): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         val bound = requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
         if (body?.has("profile") == true) require(body.string("profile") == bound.scope.profile) { "Native request belongs to another profile" }
         val query = if (path.startsWith(BEACON_PLUGIN_PATH)) beaconPluginProfileQuery(params, bound.scope.profile) else params
         val deviceId = NativePairing.deviceHeader(path, bound.scope)
-        val result = rawCall(path, query = query, method = method, data = body, maxBytes = if (path == CANONICAL_TICKET_PATH) 8192 else 32 * 1024 * 1024, boundRequest = bound)
+        val result = rawCall(path, query = query, method = method, data = body, maxBytes = if (path == CANONICAL_TICKET_PATH) 8192 else 32 * 1024 * 1024, timeoutMillis = timeoutMillis, boundRequest = bound)
         if (method == "DELETE" && deviceId != null && path == "/api/plugins/beacon/devices/$deviceId") removeDeviceIfCurrent(bound, query)
         return result
     }
@@ -353,11 +376,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         if (storedRows.singleOrNull() !== row) return null
         return (row.opt("status") as? String)?.takeIf { it in setOf("idle", "working", "waiting") }
     }
-    suspend fun nativeEvents(onEvent: suspend (JSONObject) -> Unit) = try { native.events(onEvent) }
-        catch (error: Throwable) { reportIncident("gateway", "sync", error); throw error }
-    internal fun reportIncident(component: String, operation: String, error: Throwable) {
-        runCatching { authStore?.incidentSink?.invoke(this, component, operation, error) }
-    }
+    suspend fun nativeEvents(onEvent: suspend (JSONObject) -> Unit) = native.events(onEvent)
     fun closeNative() = native.close()
     private fun bearerAuthInterceptor() = Interceptor { chain ->
         val request = chain.request()
@@ -469,23 +488,13 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         withContext(Dispatchers.IO) { execute(request, timeoutMillis, retainCookies = true, read) }
     suspend fun get(path: String, query: Map<String, String> = emptyMap(), maxBytes: Int = 32 * 1024 * 1024): JSONObject = call(path, query, maxBytes = maxBytes)
     suspend fun post(path: String, body: JSONObject = JSONObject()): JSONObject = call(path, method = "POST", data = body)
-    private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true, timeoutMillis: Long? = null, sensitive: Boolean = false, boundRequest: RequestAuthority? = null, sensitiveDeviceId: String? = null): JSONObject = withContext(Dispatchers.IO) {
+    private suspend fun rawCall(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true, timeoutMillis: Long? = null, boundRequest: RequestAuthority? = null): JSONObject = withContext(Dispatchers.IO) {
+        require(NativeOperationPolicy.installBodyAllowed(path, data)) { "Unsupported native endpoint" }
         val requestBound = boundRequest ?: requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
         require(maxBytes in 1..32 * 1024 * 1024) { "Invalid response size limit" }
-        val body = if (sensitive) object : RequestBody() {
-            private val encoded = (data?.toString() ?: "{}").toByteArray(Charsets.UTF_8)
-            override fun contentType() = "application/json; charset=utf-8".toMediaType()
-            override fun contentLength() = encoded.size.toLong()
-            override fun isOneShot() = true
-            override fun writeTo(sink: okio.BufferedSink) { sink.write(encoded) }
-        } else data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())
+        val body = data?.toString()?.toRequestBody("application/json; charset=utf-8".toMediaType())
         // /auth/me credentials are retained by bootstrap only after identity verification.
-        suspend fun fetch() = execute(request(path, query, method, body).apply {
-            if (sensitive) {
-                if (sensitiveDeviceId == null) removeHeader("X-Beacon-Device-ID") else header("X-Beacon-Device-ID", sensitiveDeviceId)
-            }
-        }.build(), timeoutMillis, retainCookies = persistAuth || path != "/api/auth/me") { response ->
-            if (sensitive && !response.isSuccessful) throw ApiFailure(response.code, "Vault change could not be confirmed. Refresh Vault before trying again.", plugin = true)
+        suspend fun fetch() = execute(request(path, query, method, body).build(), timeoutMillis, retainCookies = persistAuth || path != "/api/auth/me") { response ->
             val input = response.body?.source()
             val payload = java.io.ByteArrayOutputStream()
             val chunk = ByteArray(32768)
@@ -500,74 +509,26 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
                     parsed
                 } else JSONObject(raw)
             }.getOrElse {
-                if (sensitive) throw ApiFailure(502, "Vault response could not be verified.", plugin = true)
                 if (path == CANONICAL_TICKET_PATH) throw IOException("Canonical gateway response is not a JSON object", it)
                 if (raw.trim().startsWith('[')) json("items" to org.json.JSONArray(raw)) else json("message" to raw.take(2048))
             }
             if (path == CANONICAL_TICKET_PATH && response.code == 404 && raw.matches(Regex("""[ \t\r\n]*\{[ \t\r\n]*"detail"[ \t\r\n]*:[ \t\r\n]*"Not Found"[ \t\r\n]*\}[ \t\r\n]*""")))
                 throw CanonicalRouteMissing()
-            if (sensitive && (!vaultMetadataOnly(result) || result.has("error") && !result.isNull("error"))) throw ApiFailure(502, "Vault response could not be verified.", plugin = true)
             if (response.code == 403 && path.startsWith(BEACON_PLUGIN_PATH) && listOf("code", "error", "detail").any { result.string(it) == "device_removed" }) removeDeviceIfCurrent(requestBound, query)
             if (!response.isSuccessful || result.has("error") && !result.isNull("error") && result.string("error").isNotBlank()) throw ApiFailure(response.code, nativeErrorMessage(result, response.code), plugin = path.startsWith(BEACON_PLUGIN_PATH))
             result
         }
         val bound = requestBound.scope; val authority = requestBound.version
-        try {
-            try { fetch() }
-            catch (error: IOException) {
-                if (error !is java.net.SocketException && error !is java.net.UnknownHostException) throw error
-                if (sensitive || method != "GET" || authority == null || scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
-                kotlinx.coroutines.delay(150)
-                if (scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
-                fetch()
-            }
-        } catch (error: Throwable) {
-            if (error !is CanonicalRouteMissing && !path.startsWith(BEACON_PLUGIN_PATH + "mobile/incidents") && path != BEACON_PLUGIN_PATH + "mobile/healing/capabilities")
-                reportIncident(if (path.startsWith(VAULT_PATH)) "vault" else "network", if (method == "GET") "request" else "save", error)
-            throw error
+        try { fetch() }
+        catch (error: IOException) {
+            if (error !is java.net.SocketException && error !is java.net.UnknownHostException) throw error
+            if (method != "GET" || authority == null || scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
+            kotlinx.coroutines.delay(150)
+            if (scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
+            fetch()
         }
     }
     suspend fun call(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024): JSONObject = operationLock.withLock { NativeOperations(this).call(path, query, method, data, maxBytes) }
-    /** Write-only secret input: no transport retry, response-body error echo, draft or mutation cache. */
-    suspend fun nativeSensitiveRequest(path: String, method: String, body: JSONObject?): JSONObject {
-        val bound = requestAuthority(trackRemoval = true)
-        if (bound.version == null || authStore != null && bound.admission == null) throw ApiFailure(409, "Vault needs a stable signed-in account.", plugin = true)
-        val origin = bound.scope.origin.toHttpUrl()
-        require(origin.isHttps || origin.host in setOf("localhost", "127.0.0.1", "::1")) { "Vault requires a secure connection" }
-        require((path == VAULT_PATH || path.startsWith("$VAULT_PATH/")) && method in setOf("POST", "PUT", "DELETE") && NativeOperationPolicy.direct(path, method)) { "Unsupported sensitive request" }
-        val captured = synchronized(this) {
-            if (scope != bound.scope || scopeGeneration.get() != bound.generation) throw ApiFailure(409, "Vault needs a stable signed-in account.", plugin = true)
-            if (auth.bearer == null && auth.loopbackSession == null) { adoptCookieRotation(); retainCookieRotationLocked() }
-            requestAuth().also { require(it.scope() == bound.scope) }.copy(cookies = jar.snapshot())
-        }
-        if (!requestStillCurrent(bound)) throw ApiFailure(409, "Vault needs a stable signed-in account.", plugin = true)
-        val device = NativePairing.deviceHeader(path, bound.scope)
-        // The isolated jar and credentials cannot adopt a later profile or token rotation.
-        val isolated = BeaconClient(captured, null, socketFactory, http, detachedView = true, persistContext = false,
-            credentialSource = null, configureHttp = configureHttp)
-        try {
-            currentCoroutineContext().ensureActive()
-            val frozen = try { withContext(Dispatchers.IO) { JSONObject(if (body == null) "{}" else requireNotNull(body.toString())) } }
-                catch (error: kotlinx.coroutines.CancellationException) { throw error }
-                catch (_: Exception) { throw ApiFailure(400, "Vault input could not be verified.", plugin = true) }
-            require(!frozen.has("profile") || frozen.string("profile") == bound.scope.profile) { "Vault belongs to another profile" }
-            val result = isolated.rawCall(path, beaconPluginProfileQuery(emptyMap(), bound.scope.profile), method, frozen, 1024 * 1024,
-                timeoutMillis = 15000, sensitive = true, sensitiveDeviceId = device)
-            if (!requestStillCurrent(bound)) throw ApiFailure(409, "Vault change could not be confirmed after the account or profile changed.", plugin = true)
-            return result
-        } catch (error: Throwable) {
-            reportIncident("vault", "save", error)
-            throw error
-        } finally {
-            try {
-                val returned = isolated.jar.snapshot()
-                if (captured.loopbackSession?.verified != false && returned != captured.cookies && requestStillCurrent(bound)) synchronized(this) {
-                    if (scope == bound.scope && scopeGeneration.get() == bound.generation && jar.replaceIfUnchanged(captured.cookies, returned))
-                        retainCookieRotationLocked()
-                }
-            } finally { isolated.closeNative() }
-        }
-    }
     internal suspend fun nativeGet(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024, persistAuth: Boolean = true): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "This capability is unavailable in native Hermes" }
         val bound = requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
@@ -771,9 +732,9 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     suspend fun upload(path: String, file: File, name: String, mime: String, sessionId: String, directory: String = "."): JSONObject = withContext(Dispatchers.IO) {
         operationLock.withLock {
             try {
-                require(file.length() <= 32L * 1024 * 1024) { "Attachment exceeds 32 MiB" }
+                require(file.length() <= 32L * 1024 * 1024) { "This file is too large (32 MB at most)." }
                 require(path in setOf("/api/upload", "/api/workspace/upload")) { "This upload capability is unavailable in native Hermes" }
-                require(validUploadName(name)) { "Choose a filename without quotes, slashes, dollar signs, percent signs or control characters." }
+                require(validUploadName(name)) { "Choose a file name without quotes, slashes, \$ or %." }
                 if (path == "/api/upload") {
                     val encoded = android.util.Base64.encodeToString(file.readBytes(), android.util.Base64.NO_WRAP)
                     json("file" to json("id" to java.util.UUID.randomUUID().toString(), "state" to "ready", "scope_key" to scope.session(sessionId).key, "staged_base64" to encoded, "name" to name, "mime" to mime))
@@ -786,7 +747,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
                     execute(request("/api/files/upload-stream", mapOf("profile" to auth.profile), "POST", body).build(), retainCookies = true) { response ->
                         val raw = response.peekBody(1024 * 1024L + 1).string()
                         if (!response.isSuccessful) throw ApiFailure(response.code,
-                            runCatching { nativeErrorMessage(JSONObject(raw), response.code) }.getOrDefault("Upload failed (${response.code})"))
+                            runCatching { nativeErrorMessage(JSONObject(raw), response.code) }.getOrDefault("Upload failed. Try again."))
                         require(raw.toByteArray(Charsets.UTF_8).size <= 1024 * 1024) { "Upload response is too large" }
                         val result = runCatching { JSONObject(raw) }.getOrElse { throw IOException("Hermes couldn't confirm the upload.", it) }
                         result
@@ -809,7 +770,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         execute(request(mapped, scopedQuery, if (data == null) "GET" else "POST", data?.toString()?.toRequestBody("application/json".toMediaType())).build(), retainCookies = true) { response ->
             if (!response.isSuccessful) throw ApiFailure(response.code, "Download failed (${response.code})")
             val body = response.body ?: error("Missing file")
-            require(body.contentLength() <= limit) { "Download exceeds permitted size" }
+            require(body.contentLength() <= limit) { "This file is too large to download here." }
             val digest = snapshot?.let { java.security.MessageDigest.getInstance("SHA-256") }
             val count = copyDownload(body.byteStream(), digest?.let { java.security.DigestOutputStream(output, it) } ?: output, limit)
             require(snapshot == null || digest!!.digest().joinToString("") { "%02x".format(it) }.equals(snapshot, true)) { "The file changed since this message. Refresh before previewing it." }
@@ -881,7 +842,7 @@ internal suspend fun copyDownload(input: InputStream, output: OutputStream, limi
         currentCoroutineContext().ensureActive()
         val count = input.read(buffer)
         if (count < 0) return total
-        require(count.toLong() <= limit - total) { "Download exceeds permitted size" }
+        require(count.toLong() <= limit - total) { "This file is too large to download here." }
         output.write(buffer, 0, count)
         total += count
     }

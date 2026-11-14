@@ -109,7 +109,7 @@ class OwnerChatLiveTest {
                 var chooserClosed = false
                 try {
                     compose.onNodeWithTag("chat-header-title").performClick()
-                    compose.onNodeWithText(translateUi(dictionary, "Share conversation")).performClick()
+                    compose.onNodeWithText(translateUi(dictionary, "Share chat")).performClick()
                     await(10_000) { chooser.hits > 0 }
                     await(10_000) { !compose.activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) }
                     check(instrumentation.uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK))

@@ -10,8 +10,8 @@ import org.junit.Test
 class NativeLocalErrorTest {
     @Test fun localConversationRefusalsKeepTheirRecoveryInstructions() {
         for (message in listOf(
-            "Stop the current reply before deleting this conversation.",
-            "End this call before changing its conversation.",
+            "Stop the reply before deleting this chat.",
+            "End the call before changing this chat.",
         )) assertEquals(message, appErrorText(IllegalArgumentException(message)))
         assertEquals("Hermes couldn't do that. Try again.", appErrorText(IllegalArgumentException("Stop the worker at C:/private/account")))
     }

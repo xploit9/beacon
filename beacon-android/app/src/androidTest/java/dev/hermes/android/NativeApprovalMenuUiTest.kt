@@ -24,6 +24,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.assertCountEquals
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.unit.dp
@@ -38,6 +39,7 @@ import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.*
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.json.JSONArray
@@ -45,6 +47,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Rule
 import org.junit.Test
 
@@ -77,6 +80,7 @@ class NativeApprovalMenuUiTest {
             compose.runOnUiThread {
                 vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
             }
+            diagnosticVm = vm; diagnosticFixture = fixture
             compose.runOnIdle {
                 field(vm, "originGeneration", 100)
                 field(vm, "client", fixture.client)
@@ -108,7 +112,16 @@ class NativeApprovalMenuUiTest {
         }
     }
 
-    private fun await(condition: () -> Boolean) = compose.waitUntil(15_000, condition)
+    private var diagnosticVm: BeaconViewModel? = null
+    private var diagnosticFixture: NativeExperienceFixture? = null
+    private fun await(condition: () -> Boolean) = AwaitDiagnostics.await(compose, { waitState() }, condition)
+    /** What a timed-out wait reports about the case: the chat, the notice and the last calls Hermes (the fixture) received. */
+    private fun waitState(): String {
+        val vm = diagnosticVm ?: return "no case running"
+        val chat = vm.chat.value; val ui = vm.ui.value
+        val calls = diagnosticFixture?.requests?.toList().orEmpty().takeLast(12).joinToString { "${it.string("method")} ${it.string("path")}".trim() }
+        return "chat=${chat.sessionId} streamId='${chat.streamId}' status='${chat.status}' ready=${chat.projectionReady}; notice='${ui.notice}' error='${ui.error}'; last calls: $calls"
+    }
     private fun open(vm: BeaconViewModel) {
         compose.onNodeWithTag("composer-approvals").performClick()
         await { vm.data.value["picker:approvals"]?.string("session_id") == vm.chat.value.sessionId && "picker:approvals" !in vm.refreshing.value }
@@ -122,8 +135,8 @@ class NativeApprovalMenuUiTest {
 
     @Test fun yoloRequiresConfirmationAndAskFirstOnlyClearsThisChatsBypass() = withFixture { vm, fixture ->
         open(vm)
-        compose.onNodeWithText("Manual", useUnmergedTree = true).assertIsDisplayed()
-        compose.onNodeWithText("Ask before actions", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask before actions", useUnmergedTree = true).assertDoesNotExist()
+        compose.onNodeWithText("Always ask", useUnmergedTree = true).assertIsDisplayed()
         // The chat menu only changes this chat: no profile-wide shortcuts in it.
         compose.onNodeWithText("Profile default", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("Change for all chats").assertDoesNotExist()
@@ -136,7 +149,7 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
         compose.onNode(hasText("Skip approvals") and hasAnyAncestor(isDialog())).performClick()
         await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
         open(vm)
         compose.onNodeWithTag("approval-yolo", useUnmergedTree = true).performScrollTo().assert(isSelected()).assert(hasAnyDescendant(hasContentDescription("Selected")))
         compose.onNodeWithTag("approval-ask").performScrollTo().performClick()
@@ -145,7 +158,7 @@ class NativeApprovalMenuUiTest {
         assertEquals(listOf("1", "0"), writes.map { it.string("value") })
         assertTrue(writes.all { it.string("key") == "yolo" && it.string("scope") == "session" && it.string("session_id") == "runtime-chat-a" })
         assertEquals("manual", fixture.approvalMode)
-        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()
     }
 
     // Live 2026-10-26: enabling YOLO in a just-created chat showed "Approvals: Unknown" for about 5 s while Hermes saved it.
@@ -155,11 +168,11 @@ class NativeApprovalMenuUiTest {
         fixture.holdConfigAcknowledgement = true
         compose.onNode(hasText("Skip approvals") and hasAnyAncestor(isDialog())).performClick()
         await { vm.conversationPending.value.isNotEmpty() }
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
         compose.onNodeWithContentDescription("Approvals: Unknown").assertDoesNotExist()
         fixture.releaseCreateAcknowledgement()
         await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
     }
 
     @Test fun profileOffIsHonestAndHasNoChatOffChoice() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "off" }) { vm, fixture ->
@@ -173,10 +186,10 @@ class NativeApprovalMenuUiTest {
 
     @Test fun autoLoadsBeforeTheMenuIsOpenedInsteadOfDefaultingToManual() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "smart" }) { vm, fixture ->
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
-        compose.onNodeWithContentDescription("Approvals: Auto").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
         open(vm)
-        compose.onNodeWithText("Auto", useUnmergedTree = true).assertIsDisplayed()
-        compose.onNodeWithText("Ask only for risky actions", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask for risky ones", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask only for risky actions", useUnmergedTree = true).assertDoesNotExist()
         val resumes = fixture.requests.filter { it.string("method") == "session.resume" }
         assertTrue(resumes.isNotEmpty() && resumes.all { it.getJSONObject("params").optBoolean("lazy") && it.getJSONObject("params").optBoolean("omit_messages") })
     }
@@ -186,7 +199,7 @@ class NativeApprovalMenuUiTest {
     }) { vm, fixture ->
         // A browsed chat shows its own saved choice (not YOLO), so the shield shows the profile's mode instead of Unknown.
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "manual" }
-        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()
         assertTrue("Browsing never resumes, creates or sends", fixture.requests.none {
             it.string("method") in setOf("session.resume", "session.history", "session.create", "prompt.submit")
         })
@@ -251,6 +264,10 @@ class NativeApprovalMenuUiTest {
                 val originalLegacy = byteArrayOf(4, 5, 6)
                 val replacementPhoto = byteArrayOf(9, 8, 7)
                 val fileBytes = "Saved ordinary file".toByteArray()
+                // Which step of the test each recorded request came from (the index into fixture.requests where the step began), for the resume assertion below.
+                val steps = mutableListOf<Pair<Int, String>>()
+                fun step(name: String) { steps += fixture.requests.size to name }
+                step("setup")
                 val assistantModel = vm.preferences.value.assistantModel
                 val assistantProvider = vm.preferences.value.assistantProvider
                 val photoCaption = if (cachedUpload) "Original photo caption" else "Canonical photo\n@image:$photoPath\n[image]"
@@ -321,16 +338,19 @@ class NativeApprovalMenuUiTest {
                     assertArrayEquals(fileBytes, runBlocking { fixture.client.bytes(local.endpoint, local.query()) })
                 }
 
+                step("1 open chat-b (passive history)")
                 compose.runOnIdle { vm.selectSession("chat-b") }
                 await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.chat.value.messages.map { it.id } == listOf("201", "202", "203") }
                 assertSavedRows()
                 assertTrue("Opening history is passive", fixture.requests.none { it.string("method") == "session.resume" })
 
+                step("2 pick the model (config.set held)")
                 fixture.holdConfigAcknowledgement = true
                 compose.runOnIdle { vm.pickModel("other-model", "fixture") }
                 await { fixture.requests.any { it.string("method") == "config.set" } && vm.modelSaving.value.isNotBlank() }
                 assertEquals("fixture:other-model", vm.modelSaving.value)
                 assertTrue("The actual model action remains pending", vm.conversationPending.value.isNotEmpty())
+                step("3 config.set released")
                 fixture.releaseCreateAcknowledgement()
                 await { vm.modelSaving.value.isBlank() && vm.conversationPending.value.isEmpty() && vm.chat.value.raw.string("model") == "other-model" }
                 assertEquals("fixture", vm.chat.value.raw.string("model_provider"))
@@ -338,8 +358,10 @@ class NativeApprovalMenuUiTest {
                 assertEquals("chat-b", vm.chat.value.raw.string("stored_session_id"))
                 assertSavedRows()
 
+                step("4 open chat-a")
                 compose.runOnIdle { vm.selectSession("chat-a") }
                 await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.messages.any { it.id == "10" } }
+                step("5 open chat-b again")
                 compose.runOnIdle { vm.selectSession("chat-b") }
                 await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.chat.value.raw.string("model") == "other-model" }
                 assertSavedRows()
@@ -359,9 +381,16 @@ class NativeApprovalMenuUiTest {
                 assertEquals(assistantModel, vm.preferences.value.assistantModel)
                 assertEquals(assistantProvider, vm.preferences.value.assistantProvider)
                 assertEquals("synthetic-model", fixture.sessions.getValue("chat-a").getJSONObject("info").string("model"))
+                step("6 final checks")
                 val resumes = fixture.requests.filter { it.string("method") == "session.resume" }
-                assertTrue(resumes.isNotEmpty())
-                assertTrue(resumes.all { it.getJSONObject("params").let { p -> p.string("session_id") == "chat-b" && p.opt("inline_images") == false && p.opt("omit_messages") == false } })
+                // Every session.resume the fixture recorded, with the step of the test it came from (a failure here must say which request broke the rule).
+                val resumeLog = fixture.requests.toList().withIndex().filter { it.value.string("method") == "session.resume" }.joinToString("; ") { (index, request) ->
+                    val p = request.getJSONObject("params")
+                    "#$index step='${steps.lastOrNull { it.first <= index }?.second}' session_id=${p.opt("session_id")} inline_images=${p.opt("inline_images")} omit_messages=${p.opt("omit_messages")} params=$p"
+                }
+                assertTrue("The chat was resumed at least once. Recorded session.resume requests: [$resumeLog]", resumes.isNotEmpty())
+                assertTrue("Every session.resume must be chat-b with inline_images=false and omit_messages=false. Recorded session.resume requests (cachedUpload=$cachedUpload): [$resumeLog]",
+                    resumes.all { it.getJSONObject("params").let { p -> p.string("session_id") == "chat-b" && p.opt("inline_images") == false && p.opt("omit_messages") == false } })
                 assertTrue(fixture.requests.filter { it.has("params") && it.string("method") != "client.capabilities" }.all { it.getJSONObject("params").string("profile") == scope.profile })
                 assertEquals("Every read names this profile", emptyList<String>(), fixture.requests.filter { it.has("path") && it.string("profile") != scope.profile }.map { it.string("path") + " profile=" + it.string("profile") })
                 assertTrue(fixture.requests.none { it.string("method") in setOf("prompt.submit", "session.create", "session.history", "session.events.since") })
@@ -378,11 +407,13 @@ class NativeApprovalMenuUiTest {
 
     @Test fun unreportedBypassStaysUnknownAndExplicitDefaultResetsThisSession() = withFixture(prepare = { _, fixture -> fixture.omitResumeYolo = true }) { vm, fixture ->
         await { vm.data.value["picker:approvals"] != null }
-        compose.onNodeWithContentDescription("Approvals: Unknown").assertIsDisplayed()
+        // 1.1.34 (shieldDescription): a chat whose bypass is not reported has a plain shield with no mode word, never "Unknown".
+        compose.onNodeWithContentDescription("Approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Unknown").assertDoesNotExist()
         open(vm)
         compose.onNodeWithTag("approval-ask").assert(isNotSelected())
         compose.onNodeWithTag("approval-yolo").assert(isNotSelected())
-        compose.onNodeWithText("Ask before actions", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Always ask", useUnmergedTree = true).assertIsDisplayed()
         fixture.omitResumeYolo = false
         compose.onNodeWithTag("approval-ask").performClick()
         await { fixture.requests.any { it.string("method") == "config.set" && it.getJSONObject("params").string("key") == "yolo" } }
@@ -391,7 +422,7 @@ class NativeApprovalMenuUiTest {
         assertEquals("session", reset.string("scope"))
         assertEquals("runtime-chat-a", reset.string("session_id"))
         await { vm.data.value["picker:approvals"]?.optBoolean("session_status_known") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()
     }
 
     // Without the plugin an unsent chat stays unsaved: YOLO on is taken from Hermes' own confirmation, but YOLO off cannot be proven
@@ -406,13 +437,13 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithTag("approval-yolo").performScrollTo().performClick()
         compose.onNode(hasText("Skip approvals") and hasAnyAncestor(isDialog())).performClick()
         await { vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value && vm.data.value.keys.any { it.startsWith("approvals-chosen:") } }
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
         open(vm)
         compose.onNodeWithTag("approval-ask").performScrollTo().performClick()
         await { vm.ui.value.error.isNotBlank() && vm.conversationPending.value.isEmpty() }
         assertTrue(vm.ui.value.error, vm.ui.value.error.contains("approvals", ignoreCase = true))
-        compose.onNodeWithContentDescription("Approvals: Auto").assertDoesNotExist()
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
     }
 
     @Test fun aSavedChatsYoloNeverUsesThePlugin() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "smart" }) { vm, fixture ->
@@ -438,7 +469,7 @@ class NativeApprovalMenuUiTest {
         compose.onNode(hasText("Skip approvals") and hasAnyAncestor(isDialog())).performClick()
         await { vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value && vm.data.value.keys.any { it.startsWith("approvals-chosen:") } }
         compose.waitForIdle()
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
         compose.onNodeWithContentDescription("Approvals: Unknown").assertDoesNotExist()
         // The chat is saved before YOLO is set, so Hermes keeps the choice on its row.
         val reserve = fixture.requests.indexOfFirst { it.string("path") == "/api/plugins/beacon/mobile/sessions/$chatId/reserve" }
@@ -452,7 +483,7 @@ class NativeApprovalMenuUiTest {
         flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList())
     }) { vm, _ ->
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
-        compose.onNodeWithContentDescription("Approvals: Auto").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
         open(vm)
         compose.onNodeWithTag("approval-ask").assert(isSelected())
         compose.onNodeWithTag("approval-yolo").assert(isNotSelected())
@@ -463,7 +494,7 @@ class NativeApprovalMenuUiTest {
         fixture.sessions.getValue("chat-a").put("model_config", json("yolo_mode" to true).toString())
     }) { vm, _ ->
         await { vm.data.value["picker:approvals"]?.optBoolean("session_bypass") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Skip approvals").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
     }
 
     @Test fun changingChatAKeepsProfileDefaultsAndSwitchingLoadsChatBsValues() = withFixture { vm, fixture ->
@@ -480,7 +511,7 @@ class NativeApprovalMenuUiTest {
         // A cached chat B also sets projectionReady; wait for its live read.
         await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.data.value["picker:approvals"]?.string("session_id") == "chat-b" && vm.chat.value.raw.string("model") == "chat-b-model" }
         assertEquals("low", vm.chat.value.sessionReasoningEffort)
-        compose.onNodeWithContentDescription("Approvals: Manual").assertIsDisplayed()  // chat B keeps its own setting: not YOLO
+        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()  // chat B keeps its own setting: not YOLO
         val writes = fixture.requests.filter { it.string("method") == "config.set" }.map { it.getJSONObject("params") }
         assertEquals(setOf("model", "reasoning", "yolo"), writes.map { it.string("key") }.toSet())
         assertTrue(writes.all { it.string("scope") == "session" && it.string("session_id") == "runtime-chat-a" })
@@ -508,8 +539,10 @@ class NativeApprovalMenuUiTest {
         content = { ProfileApprovalSettings(it) }, prepare = { _, fixture -> fixture.sessions.getValue("chat-a").getJSONObject("info").put("yolo", true) },
     ) { vm, fixture ->
         await { vm.data.value["profile:approvals"] != null }
-        // One line says what each segment does.
-        compose.onNodeWithTag("profile-approvals-caption").assertIsDisplayed().assert(hasText("Manual asks every time. Auto lets safe actions through."))
+        // The segments say what they do themselves, so the line that explained Manual and Auto is gone.
+        compose.onAllNodesWithTag("profile-approvals-caption").assertCountEquals(0)
+        assertTrue(compose.onAllNodesWithText("Always ask").fetchSemanticsNodes().isNotEmpty())
+        assertTrue(compose.onAllNodesWithText("Ask for risky ones").fetchSemanticsNodes().isNotEmpty())
         compose.onNodeWithTag("profile-approval-smart").performClick()
         await { fixture.approvalMode == "smart" && vm.data.value["profile:approvals"]?.string("value") == "smart" }
         compose.onNodeWithTag("profile-approval-smart").assert(isSelected())
@@ -531,6 +564,54 @@ class NativeApprovalMenuUiTest {
         await { fixture.approvalMode == "manual" && vm.data.value["profile:approvals"]?.string("value") == "manual" }
         compose.onNodeWithTag("profile-approval-manual").assert(isSelected())
         compose.onNodeWithTag("profile-approvals-off").assertDoesNotExist()
+    }
+
+    /** [text] is laid out whole: its last visible line ends at its last character and nothing is ellipsized (as UxaLayoutUiTest reads it). */
+    private fun assertWhole(text: String) {
+        val results = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        compose.onNodeWithText(text, useUnmergedTree = true).fetchSemanticsNode().config[androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult].action?.invoke(results)
+        val result = results.single(); val last = result.lineCount - 1
+        assertEquals("\"$text\" shows every character", text.length, result.getLineEnd(last, visibleEnd = true))
+        assertFalse("\"$text\" ends in an ellipsis", result.isLineEllipsized(last))
+    }
+
+    // UX re-check of F9, NEW-P1-1: at a large font the segment cut "Ask for risky ones"; the row now falls back to the dropdown when the words do not fit.
+    @Test fun theProfilesApprovalsNeverCutAskForRiskyOnesAtLargeText() {
+        var scale by mutableFloatStateOf(1f)
+        withFixture(
+            content = { vm -> val base = androidx.compose.ui.platform.LocalDensity.current
+                CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(base.density, scale)) { ProfileApprovalSettings(vm) } },
+            prepare = { _, fixture -> fixture.approvalMode = "smart" },
+        ) { vm, _ ->
+            await { vm.data.value["profile:approvals"]?.string("value") == "smart" }
+            for (size in listOf(1f, 1.3f, 2f)) {
+                compose.runOnIdle { scale = size }
+                compose.waitForIdle()
+                assertWhole("Ask for risky ones")
+            }
+            // At the largest font the two words cannot sit side by side: it is the dropdown row, whose option tags appear only when it opens.
+            compose.onNodeWithTag("profile-approval-smart").assertDoesNotExist()
+        }
+    }
+
+    // The F9 G3 crash: under this v1 rule a composition scope's coroutine resumes on the thread that woke it, so state written after a network call
+    // could be written off the main thread. The approval scopes use the app's own UI dispatcher, which brings them back to the main thread.
+    @Test fun theApprovalScopesResumeOnTheMainThreadAfterANetworkHop() {
+        val fixed = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        val plain = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        fun onMain() = android.os.Looper.myLooper() == android.os.Looper.getMainLooper()
+        compose.setContent {
+            val appScope = rememberCoroutineScope { MainUiDispatcher }
+            val defaultScope = rememberCoroutineScope()
+            LaunchedEffect(Unit) {
+                appScope.launch { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { Thread.sleep(50) }; fixed.set(onMain()) }
+                defaultScope.launch { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { Thread.sleep(50) }; plain.set(onMain()) }
+            }
+        }
+        compose.waitUntil(5_000) { fixed.get() != null && plain.get() != null }
+        assertEquals("the approval scope resumes on the main thread", true, fixed.get())
+        // The control (not asserted): the rule's own scope resumes where the IO call ended.
+        println("R28F_DISPATCHER_CONTROL defaultScopeResumedOnMain=${plain.get()}")
     }
 
     @Test fun modelLoadingHidesTheCustomEntryAction() = withFixture(
@@ -590,7 +671,7 @@ class NativeApprovalMenuUiTest {
     ) { _, _ ->
         compose.onNodeWithText("Extra high", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("Spend more time on difficult problems").assertIsDisplayed()
-        compose.onNodeWithText("Use the model's maximum reasoning budget").assertIsDisplayed()
+        compose.onNodeWithText("Thinks as long as it needs").assertIsDisplayed()
     }
 
     // 2026-10-26: the chat's Toolsets sheet carries the same Tools and MCP servers controls as Settings, not a read-only list.
@@ -650,18 +731,41 @@ class NativeApprovalMenuUiTest {
         fixture.releaseHistoryList.countDown()
     }
 
-    @Test fun archivedSnackbarOffersUndoForTheOriginalConversation() = withFixture(content = { vm ->
+    private val archiveSnackbar: @Composable (BeaconViewModel) -> Unit = { vm ->
         val ui by vm.ui.collectAsState()
         val undo by vm.archiveUndo.collectAsState()
         val snackbar = remember { SnackbarHostState() }
         NativeFeedbackEffect(ui.error, ui.notice, false, snackbar, actionLabel = "Undo".takeIf { undo != null && ui.notice == "Archived" }, onAction = vm::undoArchive, clearMessage = vm::clearMessage)
         Column { SnackbarHost(snackbar) }
-    }) { vm, fixture ->
+    }
+
+    /**
+     * Hermes turns the row visible and the Undo offer is gone at the tap, yet the app has not been answered: its notice is still
+     * "Updating archive…" until the answer arrives. The undo is over only at "Unarchived"; a wait on the row and the offer alone
+     * is satisfied in this state (this case holds Hermes' answer to keep it open; the case below waits on the notice).
+     */
+    @Test fun anUndoIsOverWhenTheNoticeSaysUnarchivedNotWhenHermesHasTheRowBack() = withFixture(content = archiveSnackbar) { vm, fixture ->
+        compose.runOnIdle { vm.conversationAction("chat-a", "/api/session/archive", json("archived" to true), "Archived") }
+        await { vm.archiveUndo.value != null }
+        fixture.holdHiddenAcknowledgement = true
+        compose.onNodeWithText("Undo").performClick()
+        await { !fixture.sessions.getValue("chat-a").getJSONObject("info").optBoolean("hidden") }
+        assertNull(vm.archiveUndo.value)
+        assertEquals("Updating archive…", vm.ui.value.notice)
+        fixture.releaseCreateAcknowledgement()
+        await { vm.ui.value.notice == "Unarchived" }
+    }
+
+    @Test fun archivedSnackbarOffersUndoForTheOriginalConversation() = withFixture(content = archiveSnackbar) { vm, fixture ->
         compose.runOnIdle { vm.conversationAction("chat-a", "/api/session/archive", json("archived" to true), "Archived") }
         await { vm.archiveUndo.value != null }
         compose.onNodeWithText("Archived").assertIsDisplayed()
         compose.onNodeWithText("Undo").performClick()
-        await { !fixture.sessions.getValue("chat-a").getJSONObject("info").optBoolean("hidden") && vm.archiveUndo.value == null }
+        // The undo is over when the view model says "Unarchived" (BeaconViewModel.conversationAction). Hermes' row turns visible, and the Undo
+        // offer is cleared at the tap, before that: waiting on those two alone could read the "Updating archive…" notice still on screen.
+        await { vm.ui.value.notice == "Unarchived" }
+        assertFalse(fixture.sessions.getValue("chat-a").getJSONObject("info").optBoolean("hidden"))
+        assertNull(vm.archiveUndo.value)
         assertEquals("Unarchived", vm.ui.value.notice)
     }
 

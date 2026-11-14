@@ -24,27 +24,33 @@ import dev.hermes.android.tasks.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 /** Every state [scheduleState] names; the card shows it through uiText. */
-internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Failed", "Waiting", "Execution unconfirmed")
+internal val ScheduleStateStrings = listOf("Paused", "Completed", "Running", "Failed", "Waiting", "Not confirmed")
 
 /** The phone's clock and language, with the app's own schedule words translated and carrying the assistant's name. */
 @Composable internal fun rememberScheduleFormat(): ScheduleFormat {
     val is24Hour = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
+    val locale = uiLocale()
     val words = ScheduleBuilderStrings.associateWith { assistantText(it) }
-    return remember(is24Hour, words) { ScheduleFormat(is24Hour, text = { words[it] ?: it }) }
+    return remember(is24Hour, locale, words) { ScheduleFormat(is24Hour, locale, text = { words[it] ?: it }) }
 }
 
 /** The schedule the form would save, in words, under the "When" fields; nothing while it is incomplete. */
 @Composable fun ScheduleSummary(values: Map<String, String>, timezone: String) {
     val format = rememberScheduleFormat()
+    val zoneName = rememberScheduleZoneNamer()
     val state = scheduleStateFrom { values[it].orEmpty() }
     val built = buildScheduleString(state).takeIf { it.isNotBlank() && (state.mode != ScheduleMode.Weekly || state.weekdays.isNotEmpty()) } ?: return
     // Typed text that is no schedule shape comes back as typed; that tells the owner nothing.
     // A typed cron code the pickers cannot hold is still described, so the owner sees what it means before saving.
     val text = (if (looksLikeCron(built)) describeCron(built, format) else null)
         ?: describeSchedule(scheduleObject(built), built, timezone, format).takeIf { it != built } ?: return
-    Text(if (timezone.isNotBlank() && state.mode != ScheduleMode.Every) "$text · $timezone" else text, Modifier.semantics { liveRegion = LiveRegionMode.Polite },
+    Text(if (state.mode != ScheduleMode.Every) scheduleSummaryWithZone(text, timezone, zoneName) else text, Modifier.semantics { liveRegion = LiveRegionMode.Polite },
         style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.primary)
 }
+
+/** The form's summary with the schedule's zone in plain words ("· Lisbon"), never its zone id ("Europe/Lisbon"); the text alone without a zone. */
+internal fun scheduleSummaryWithZone(text: String, timezone: String, zoneName: (String) -> String): String =
+    if (timezone.isBlank()) text else "$text · ${zoneName(timezone)}"
 
 @Composable fun TasksScreen(vm: BeaconViewModel) {
     Column(Modifier.fillMaxSize()) {
@@ -243,7 +249,7 @@ internal fun scheduleCardClock(schedule: JSONObject?, display: String, hermesZon
         ScheduleChip.Failed -> "Failed"
         ScheduleChip.Running -> "Running"
         ScheduleChip.Completed -> "Completed"
-        ScheduleChip.Unconfirmed -> "Execution unconfirmed"
+        ScheduleChip.Unconfirmed -> "Not confirmed"
     })
     val reason = if (chip == ScheduleChip.Failed) scheduleFailureReason(job) else ""
     if (reason.isBlank()) SettingsStatusPill(status, word, modifier.testTag("schedule-status:${job.string("id")}"))
@@ -288,11 +294,23 @@ internal fun scheduleFailureReason(job: JSONObject): String {
     }
 }
 
+/** What a card is doing now: nothing, a run, a pause or a resume. */
+internal enum class ScheduleBusy { None, Run, Pause, Resume }
+/** The Run now button's words: Run now at rest, otherwise the action in flight on that card. */
+internal fun scheduleRunLabel(busy: ScheduleBusy): String = when (busy) {
+    ScheduleBusy.None -> "Run now"
+    ScheduleBusy.Run -> "Running…"
+    ScheduleBusy.Pause -> "Pausing…"
+    ScheduleBusy.Resume -> "Resuming…"
+}
+/** The fixed words [scheduleRunLabel] can return; each must be translated. */
+internal val ScheduleRunStrings = listOf("Run now", "Running…", "Pausing…", "Resuming…")
+
 /** One labeled Run now: it opens the same confirmation the lightning-bolt icon did. */
-/** Run now, or, while [running], the same place saying so (the card's progress bar shows it too). */
-@Composable internal fun ScheduleRunNow(id: String, enabled: Boolean, running: Boolean = false, onClick: () -> Unit) {
-    TextButton(onClick, Modifier.heightIn(min = 48.dp).testTag("schedule-run:$id"), enabled = enabled && !running) {
-        Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp)); Text(uiText(if (running) "Running..." else "Run now"), Modifier.padding(start = 6.dp))
+/** Run now, or, while [busy], the same place saying which action is in flight (the card's progress bar shows it too). */
+@Composable internal fun ScheduleRunNow(id: String, enabled: Boolean, busy: ScheduleBusy = ScheduleBusy.None, onClick: () -> Unit) {
+    TextButton(onClick, Modifier.heightIn(min = 48.dp).testTag("schedule-run:$id"), enabled = enabled && busy == ScheduleBusy.None) {
+        Icon(Icons.Rounded.Bolt, null, Modifier.size(18.dp)); Text(uiText(scheduleRunLabel(busy)), Modifier.padding(start = 6.dp))
     }
 }
 
@@ -316,6 +334,7 @@ internal fun scheduleFailureReason(job: JSONObject): String {
     var showCompleted by rememberSaveable(ui.profile) { mutableStateOf(false) }
     val actionScope = rememberCoroutineScope()
     var pending by remember(ui.profile) { mutableStateOf("") }
+    var busy by remember(ui.profile) { mutableStateOf(ScheduleBusy.None) }
     val crons = data["crons"]
     val gatewayNeedsAttention = crons?.rows("jobs").orEmpty().any { !schedulePaused(it) && scheduleGatewayNeedsAttention(it) }
     val (active, completed) = splitSchedules(crons?.rows("jobs").orEmpty())
@@ -333,7 +352,7 @@ internal fun scheduleFailureReason(job: JSONObject): String {
     val deliveries = data["cron-delivery"]?.rows("targets").orEmpty()
     val deliveryWords = DeliveryNameStrings.associateWith { uiText(it) }
     val deleteTitle = uiText("Delete schedule")
-    val deleteExplanation = uiText("This schedule will be removed.")
+    val deleteExplanation = ""
     val deleteAction = uiText("Delete")
     val delete: (String) -> Unit = { id -> vm.openForm(ActionForm(deleteTitle, "/api/crons/delete", emptyList(), json("job_id" to id), explanation = deleteExplanation, actionLabel = deleteAction, onResult = { refresh() }, destructive = true)) }
     val nextTemplate = uiText("Next: {0}")
@@ -358,11 +377,11 @@ internal fun scheduleFailureReason(job: JSONObject): String {
             Glass(Modifier.testTag("schedule-card:$id")) { Column(Modifier.padding(start = 16.dp, top = 16.dp, end = 4.dp, bottom = 4.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(Modifier.padding(end = 0.dp), verticalAlignment = androidx.compose.ui.Alignment.Top, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Column(Modifier.weight(1f).padding(top = 4.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(scheduleTitle(job, uiText("Untitled schedule"), format.text("Callback")), style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                        Text(scheduleTitle(job, uiText("Untitled schedule"), format.text("Call back"), format.text), style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         ScheduleStatusChip(job)
                     }
                     ScheduleMenu(id, paused, scheduleEnded(job), !callback, idle,
-                        onPause = { pending = id; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = "" } },
+                        onPause = { pending = id; busy = if (paused) ScheduleBusy.Resume else ScheduleBusy.Pause; actionScope.launch { pauseSchedule(vm, job, refresh).join(); pending = ""; busy = ScheduleBusy.None } },
                         onEdit = { cronForm(vm, job, deliveries, timezone, refresh, format = format) },
                         onHistory = { selected = if (selected == id) "" else id },
                         onDelete = { delete(id) })
@@ -374,16 +393,16 @@ internal fun scheduleFailureReason(job: JSONObject): String {
                     scheduleBody(job, callbackReason(capabilities, id), format.text).takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodyMedium.contentDirection(), maxLines = 2, overflow = TextOverflow.Ellipsis) }
                     clock.description.takeIf(String::isNotBlank)?.let { Text(named(it), Modifier.testTag("schedule-description:$id"), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary, maxLines = 2, overflow = TextOverflow.Ellipsis) }
                     clock.inHermesClock?.let { Text(scheduleZoneNamed(it, clock.zoneLabel, inZoneTemplate), Modifier.testTag("schedule-hermes-clock:$id"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis) }
-                    val nextText = scheduleNextRun(job.string("next_run_at"), notScheduled, whenWords, now, clock.zone, format.is24Hour)
+                    val nextText = scheduleNextRun(job.string("next_run_at"), notScheduled, whenWords, now, clock.zone, format.is24Hour, format.locale)
                     Text(nextTemplate.replace("{0}", if (scheduleNextIsRelative(job.string("next_run_at"), now)) nextText else named(nextText)), Modifier.testTag("schedule-next:$id"), style = MaterialTheme.typography.bodyMedium)
-                    Text(job.string("last_run_at").takeIf(String::isNotBlank)?.let { lastTemplate.replace("{0}", named(scheduleTime(it, clock.zone.id, noRun, format.is24Hour))) } ?: noRun, Modifier.testTag("schedule-last:$id"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(job.string("last_run_at").takeIf(String::isNotBlank)?.let { lastTemplate.replace("{0}", named(scheduleTime(it, clock.zone.id, noRun, format.is24Hour, format.locale))) } ?: noRun, Modifier.testTag("schedule-last:$id"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     // A callback saves its result nowhere the owner picks, so its target is not worth a word.
                     listOfNotNull(profileDisplayLabel(job.string("profile", ui.profile), profileRows, profileLoading), deliveryLabel(job.string("deliver", "local"), deliveryNames(deliveries), deliveryWords).takeUnless { callback }).joinToString(" · ")
                         .takeIf(String::isNotBlank)?.let { Text(it, style = MaterialTheme.typography.bodySmall.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis) }
                     scheduleDeliveryError(job).takeIf { it.isNotBlank() }?.let { ScheduleDeliveryError(it) }
                     if (pending == id) LinearProgressIndicator(Modifier.fillMaxWidth())
                 }
-                ScheduleRunNow(id, idle, running = pending == id) { pending = id; actionScope.launch { runSchedule(vm, job, refresh).join(); pending = "" } }
+                ScheduleRunNow(id, idle, busy = if (pending == id) busy else ScheduleBusy.None) { pending = id; busy = ScheduleBusy.Run; actionScope.launch { runSchedule(vm, job, refresh).join(); pending = ""; busy = ScheduleBusy.None } }
                 if (selected == id) Column(Modifier.padding(end = 12.dp, bottom = 8.dp)) { RunHistory(vm, job, data["cron-history:$id"]) }
             } }
         }
@@ -391,12 +410,12 @@ internal fun scheduleFailureReason(job: JSONObject): String {
             item(key = "completed-schedules") { CompletedHeader(completed.size, showCompleted, format.text("Completed schedules")) { showCompleted = !showCompleted } }
             if (showCompleted) items(completed, key = { it.string("id") }) { job ->
                 val id = job.string("id")
-                CompletedScheduleRow(id, scheduleTitle(job, uiText("Untitled schedule"), format.text("Callback")), if (scheduleIsCallback(job)) callbackReason(capabilities, id) else "",
-                    job.string("last_run_at").takeIf(String::isNotBlank)?.let { ranTemplate.replace("{0}", scheduleTime(it, phoneZone.id, "", format.is24Hour)) } ?: noRun,
+                CompletedScheduleRow(id, scheduleTitle(job, uiText("Untitled schedule"), format.text("Call back"), format.text), if (scheduleIsCallback(job)) callbackReason(capabilities, id) else "",
+                    job.string("last_run_at").takeIf(String::isNotBlank)?.let { ranTemplate.replace("{0}", scheduleTime(it, phoneZone.id, "", format.is24Hour, format.locale)) } ?: noRun,
                     onHistory = { selected = if (selected == id) "" else id }, historyOpen = selected == id, onDelete = { delete(id) }) { RunHistory(vm, job, data["cron-history:$id"]) }
             }
         }
-        if (crons != null && !crons.has("_error") && crons.rows("jobs").isEmpty() && !crons.optBoolean("cron_unavailable")) item { EmptyState(uiText("Nothing scheduled yet"), assistantText("Choose what Beacon should do and when."), Icons.Rounded.EventNote) }
+        if (crons != null && !crons.has("_error") && crons.rows("jobs").isEmpty() && !crons.optBoolean("cron_unavailable")) item { EmptyState(uiText("Nothing scheduled yet"), "", Icons.Rounded.EventNote) }
     }
     // A background refresh over rows already shown: a thin bar, never a blank page.
     if (crons != null && "crons" in refreshing) LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp).align(androidx.compose.ui.Alignment.TopCenter).testTag("schedules-refreshing"))
@@ -409,9 +428,8 @@ internal fun scheduleFailureReason(job: JSONObject): String {
     else if (history.rows("runs").isEmpty()) Text(uiText("No recorded runs yet."))
     else history.rows("runs").forEach { run ->
         val session = run.string("session_id", run.string("id"))
-        TextButton(enabled = session.isNotBlank(), onClick = { vm.tab("Chat"); vm.selectSession(session) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(run.string("title", uiText("Open result conversation")) + if (run.optBoolean("is_active")) " · ${uiText("Running")}" else "") }
+        TextButton(enabled = session.isNotBlank(), onClick = { vm.tab("Chat"); vm.selectSession(session) }, modifier = Modifier.heightIn(min = 48.dp)) { Text(run.string("title", uiText("Open result chat")) + if (run.optBoolean("is_active")) " · ${uiText("Running")}" else "") }
     }
-    if (job.optBoolean("no_agent")) Text(uiText("Script schedules don't create a chat per run."), style = MaterialTheme.typography.bodySmall)
 }
 /** "Completed schedules (3)": closed until opened. */
 @Composable internal fun CompletedHeader(count: Int, expanded: Boolean, title: String, onToggle: () -> Unit) {
@@ -457,9 +475,9 @@ internal fun cronForm(vm: BeaconViewModel, job: JSONObject?, targets: List<JSONO
     val choices = targets.filter { it.string("id") == "local" || it.optBoolean("home_target_set") }.map { it.string("id") }.ifEmpty { listOf("local") }.toMutableList()
     seed.string("deliver").takeIf { it.isNotBlank() && it !in choices }?.let { choices.add(it) }
     // A target saved on the job but no longer listed (a deleted thread, an unset platform) keeps its place under a plain name.
-    val labels = names + targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.associate { it.string("id") to names.getValue(it.string("id")) + " (not configured)" } +
+    val labels = names + targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.associate { it.string("id") to names.getValue(it.string("id")) + " (not set up)" } +
         choices.filter { it !in names }.associateWith { deliveryLabel(it, names) }
-    val missing = targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.joinToString { it.string("name") + ": configure " + it.string("home_env_var") }
+    val missing = targets.filter { it.string("id") != "local" && !it.optBoolean("home_target_set") }.joinToString { it.string("name") + ": set up " + it.string("home_env_var") }
     // The next 90 days, and the saved day when it falls outside them.
     val days = ((0L..90L).map { today.plusDays(it).toString() } + state.onceDate).filter { runCatching { java.time.LocalDate.parse(it) }.isSuccess }.distinct().sorted()
     val dayLabels = days.associateWith { format.fullDay(java.time.LocalDate.parse(it)) }

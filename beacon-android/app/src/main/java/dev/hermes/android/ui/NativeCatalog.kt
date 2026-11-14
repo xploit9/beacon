@@ -1,6 +1,7 @@
 @file:OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class, androidx.compose.material3.ExperimentalMaterial3Api::class)
 package dev.hermes.android.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
@@ -106,7 +107,8 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
                         val options = value?.optJSONArray("options")?.strings().orEmpty()
                         var level by remember(value?.toString()) { mutableStateOf(value?.string("value").orEmpty().takeIf { it in options }.orEmpty()) }
                         Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                            if (value == null || "picker:reasoning" in refreshing) ReasoningSkeleton()
+                            // The options read before stay on screen while Hermes is asked again; only a first read shows the skeleton.
+                            if (value == null) ReasoningSkeleton()
                             else if (recordError(value).isNotBlank()) SettingsSection { SettingsErrorRow(uiText("Couldn't load reasoning"), { vm.openCatalog("Reasoning") }, uiText("Retry")) }
                             else if (options.isNotEmpty()) {
                                 if (reasoningPending) SettingsStatusPill(SettingsStatus.Working, uiText("Applying…"))
@@ -162,13 +164,13 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
     val options = reasoning?.optJSONArray("options")?.strings().orEmpty()
     val effort = chat.sessionReasoningEffort.ifBlank { chat.raw.string("reasoning_effort", chat.raw.string("reasoning")) }.ifBlank { reasoning?.string("value").orEmpty() }
     val currentGroup = catalogGroups.firstOrNull { it.string("provider_id") == currentProvider }
-    val currentTitle = currentGroup?.let { g -> (g.rows("models") + g.rows("extra_models")).firstOrNull { it.string("id") == chatModel }?.string("label") }?.takeIf { it.isNotBlank() } ?: chatModel
+    val currentTitle = modelTitle(currentGroup?.let { g -> (g.rows("models") + g.rows("extra_models")).firstOrNull { it.string("id") == chatModel }?.string("label") }.orEmpty(), chatModel)
     val currentProviderLabel = currentGroup?.let { shortProviderLabel(it.string("provider", it.string("label", it.string("provider_id")))) } ?: chatProvider
     SettingsSearchField(query, { query = it }, uiText("Search model or provider"), Modifier.padding(start = 16.dp, top = 4.dp, end = 16.dp), testTag = "models-search")
     SettingsList(Modifier.weight(1f), refreshing = (modelPending && modelSaving.isBlank()) || (!loading && "picker:models" in refreshing)) {
         if (query.isBlank()) item(key = "current") {
             CurrentModelCard(
-                model = currentTitle, provider = currentProviderLabel, applying = modelPending && modelSaving.isBlank(),
+                model = currentTitle, modelId = chatModel, provider = currentProviderLabel, applying = modelPending && modelSaving.isBlank(),
                 options = options, effort = effort, reasoningLoading = (reasoning == null && chat.sessionId.isNotBlank()) || ("picker:reasoning" in refreshing && options.isEmpty()),
                 reasoningFailed = reasoning != null && recordError(reasoning).isNotBlank(), automatic = reasoning != null && options.isEmpty() && reasoning.optBoolean("known"),
                 reasoningPending = reasoningPending, onEffort = vm::setReasoning, onRetry = { vm.openCatalog("Model & provider") },
@@ -183,7 +185,7 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
                 SettingsSection(title = label) {
                     models.forEachIndexed { index, model ->
                         val id = model.string("id")
-                        val title = model.string("label", id)
+                        val title = modelTitle(model.string("label"), id)
                         if (index > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = .45f))
                         ModelRow(title, modelSubtitle(title, id), selected = chatModel == id && currentProvider == provider, applying = modelSaving == "$provider:$id",
                             enabled = !loading && !modelPending, tag = "model:$provider:$id") { vm.pickModel(id, provider) }
@@ -221,12 +223,18 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
 
 /** The chips a loading reasoning control draws: as many as the usual levels, each as wide and tall as a loaded chip. */
 internal const val ReasoningSkeletonChips = 4
+/** The cards a loading Reasoning sheet draws: the usual set of levels a model offers, so the sheet does not change height when they arrive. */
+internal const val ReasoningSkeletonRows = 5
+
+/** Reopening the sheet keeps the options already read for this chat's model (same request), so they show at once while Hermes is asked again; any other answer is dropped. */
+internal fun reasoningKeptOnOpen(loaded: JSONObject?, requestId: String): Boolean =
+    loaded != null && !loaded.has("_error") && requestId.isNotBlank() && loaded.optString("_request_key") == requestId
 internal val ReasoningSkeletonWidth = 72.dp
 internal val ReasoningSkeletonHeight = 32.dp
 
 /** The chat's model with its provider, and the reasoning level as segments that apply on tap. Spoken as one line; the segments stay separate controls. */
 @Composable private fun CurrentModelCard(
-    model: String, provider: String, applying: Boolean, options: List<String>, effort: String, reasoningLoading: Boolean, reasoningFailed: Boolean,
+    model: String, modelId: String = "", provider: String, applying: Boolean, options: List<String>, effort: String, reasoningLoading: Boolean, reasoningFailed: Boolean,
     automatic: Boolean, reasoningPending: Boolean, onEffort: (String) -> Unit, onRetry: () -> Unit,
 ) {
     val title = model.ifBlank { uiText("Profile default") }
@@ -236,6 +244,8 @@ internal val ReasoningSkeletonHeight = 32.dp
             SettingsIconTile(Icons.Rounded.Memory)
             Column(Modifier.weight(1f).clearAndSetSemantics { contentDescription = spoken }, verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                // The id stays visible under the readable name, so the exact model is never hidden.
+                if (modelId.isNotBlank() && modelId != model) Text(modelId, Modifier.testTag("model-current-id"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 if (provider.isNotBlank()) Text(provider, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
             if (applying) SettingsStatusPill(SettingsStatus.Working, uiText("Applying model…"))
@@ -255,7 +265,9 @@ internal val ReasoningSkeletonHeight = 32.dp
                 Column(Modifier.fillMaxWidth().padding(16.dp).testTag("reasoning-loading"), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text(uiText("Reasoning"), style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        repeat(ReasoningSkeletonChips) { Box(Modifier.size(width = ReasoningSkeletonWidth, height = ReasoningSkeletonHeight).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .06f))) }
+                        // The chat's own level shows at once; the blank chips hold the rest of the row until the list arrives.
+                        if (effort.isNotBlank()) FilterChip(selected = true, onClick = {}, enabled = false, label = { Text(uiText(reasoningLevelLabel(effort))) }, modifier = Modifier.testTag("reasoning-current"))
+                        repeat(reasoningSkeletonChipCount(effort)) { Box(Modifier.size(width = ReasoningSkeletonWidth, height = ReasoningSkeletonHeight).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .06f))) }
                     }
                 }
             }
@@ -279,16 +291,51 @@ internal val ReasoningSkeletonHeight = 32.dp
 }
 
 internal fun modelSubtitle(title: String, id: String): String = id.takeUnless { it == title }.orEmpty()
+
+/** A model's name for people: a label Hermes sent, else the id read as words ("claude-cli/claude-opus-5-5" is "Claude Opus 5.5"). */
+internal fun modelTitle(label: String, id: String): String = label.takeIf { it.isNotBlank() && it != id } ?: readableModelName(id)
+
+/**
+ * An id read as a name: the part after the provider's slash, split at hyphens; short numbers beside each other read as one version
+ * ("5-5" is 5.5), a word repeated by the provider is shown once, and "gpt" stays capitals. Only the title changes; the id stays visible.
+ */
+internal fun readableModelName(id: String): String {
+    val parts = id.substringAfterLast('/').split('-', '_').filter(String::isNotBlank)
+    fun short(part: String) = part.length in 1..2 && part.all(Char::isDigit)
+    val words = mutableListOf<String>()
+    var index = 0
+    while (index < parts.size) {
+        val part = parts[index]
+        val next = parts.getOrNull(index + 1)
+        if (short(part) && next != null && short(next)) {
+            words += "$part.$next"
+            index += 2
+            continue
+        }
+        if (words.lastOrNull()?.lowercase() != part.lowercase()) words += part
+        index++
+    }
+    return words.joinToString(" ") { word ->
+        when {
+            word.lowercase() == "gpt" -> "GPT"
+            word.first().isLetter() -> word.replaceFirstChar(Char::titlecase)
+            else -> word
+        }
+    }.ifBlank { id }
+}
+
+/** The reasoning row's blank chips while the list loads: the chat's own level takes one of the slots, so the row keeps its width. */
+internal fun reasoningSkeletonChipCount(effort: String): Int = ReasoningSkeletonChips - if (effort.isNotBlank()) 1 else 0
 internal fun reasoningLevelLabel(level: String): String = if (level == "xhigh") "Extra high" else level.replaceFirstChar(Char::uppercase)
 internal fun reasoningLevelDescription(level: String): String = when (level.lowercase()) {
-    "none" -> "Respond without a separate reasoning step"
+    "none" -> "No thinking step"
     "minimal" -> "Use the least reasoning for quick replies"
     "low" -> "Faster, lighter responses"
     "medium" -> "Balanced detail"
     "high" -> "More detailed reasoning"
     "xhigh" -> "Spend more time on difficult problems"
-    "max" -> "Use the model's maximum reasoning budget"
-    "ultra" -> "Use extended reasoning when the provider supports it"
+    "max" -> "Thinks as long as it needs"
+    "ultra" -> "Longest thinking"
     else -> "Use the model's default reasoning"
 }
 
@@ -298,14 +345,24 @@ internal val reasoningLevels = listOf("none", "minimal", "low", "medium", "high"
 /** The reasoning words and sentences reach uiText through variables, so the translation test reads them from here. */
 internal val ReasoningStrings = (reasoningLevels.map(::reasoningLevelLabel) + reasoningLevels.map(::reasoningLevelDescription) + reasoningLevelDescription("")).distinct()
 
+/**
+ * The loaded sheet's shape: one pane, [ReasoningSkeletonRows] option cards of the same height, so nothing moves when the real options arrive.
+ * The working dust core sits in the first card where a chosen level's check would be, so it adds no height.
+ */
 @Composable internal fun ReasoningSkeleton() {
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth().testTag("reasoning-skeleton")) {
-        BeaconDustCore(28.dp)
-        repeat(3) { index ->
-            Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().heightIn(min = 64.dp)) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
-                    Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = .08f), modifier = Modifier.fillMaxWidth(if (index == 1) .48f else .62f).height(12.dp)) {}
-                    Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.onSurface.copy(alpha = .05f), modifier = Modifier.fillMaxWidth(.82f).height(9.dp)) {}
+    val bar = MaterialTheme.colorScheme.onSurface
+    SettingsSection(testTag = "reasoning-skeleton") {
+        Column(Modifier.fillMaxWidth().padding(12.dp).clearAndSetSemantics {}, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            repeat(ReasoningSkeletonRows) { index ->
+                Surface(shape = RoundedCornerShape(16.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = .6f), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+                    modifier = Modifier.fillMaxWidth().heightIn(min = SettingsKit.RowMinHeightTwoLine)) {
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                        Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+                            Box(Modifier.fillMaxWidth(if (index % 2 == 1) .34f else .46f).height(12.dp).clip(RoundedCornerShape(8.dp)).background(bar.copy(alpha = .08f)))
+                            Box(Modifier.fillMaxWidth(.78f).height(9.dp).clip(RoundedCornerShape(8.dp)).background(bar.copy(alpha = .05f)))
+                        }
+                        if (index == 0) BeaconDustCore(28.dp)
+                    }
                 }
             }
         }
@@ -430,7 +487,7 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
         SettingsIconTile(Icons.Rounded.Terminal)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text("/$name", style = MaterialTheme.typography.bodyLarge.copy(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium).contentDirection(), maxLines = 1, overflow = TextOverflow.Ellipsis)
-            if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyMedium.contentDirection(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
         }
         Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, Modifier.size(20.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
     }
@@ -453,7 +510,7 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
             else -> {
                 val figures = sessionUsageFigures(usage)
                 val line = listOf(chat.raw.string("model_provider"), chat.raw.string("model").ifBlank { usage.string("model") }).filter { it.isNotBlank() }.joinToString(" · ")
-                item { SettingsStatusHero(null, chat.title.ifBlank { uiText("Session usage") }, line = line, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
+                item { SettingsStatusHero(null, chat.title.ifBlank { uiText("Chat usage") }, line = line, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
                 // "0 in, 0 out" under a chat full of replies is Hermes not counting, not the chat using nothing.
                 val unreported = sessionUsageUnreported(figures, chat.messages.any { it.role == "assistant" })
                 if (unreported || figures.input != null || figures.output != null || figures.window != null || figures.percent != null) item { SettingsSection(testTag = "usage-figures") {

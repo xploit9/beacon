@@ -115,7 +115,8 @@ internal fun setupPluginActions(install: PluginInstallUi): SetupPluginActions = 
     PluginInstallStage.Done -> SetupPluginActions(SetupPluginAction.Continue)
     PluginInstallStage.Failed -> when (install.failure) {
         PluginInstallFailure.Unsupported -> SetupPluginActions(SetupPluginAction.Computer, listOf(SetupPluginAction.Skip))
-        PluginInstallFailure.Denied -> SetupPluginActions(SetupPluginAction.Skip, listOf(SetupPluginAction.Computer))
+        // Hermes' scan said no, and trying again asks the same question: leave it for the computer.
+        PluginInstallFailure.Denied, PluginInstallFailure.Blocked -> SetupPluginActions(SetupPluginAction.Skip, listOf(SetupPluginAction.Computer))
         PluginInstallFailure.SignIn -> SetupPluginActions(SetupPluginAction.SignInAgain, listOf(SetupPluginAction.Skip, SetupPluginAction.Computer))
         // The plugin answers and only the restarted gateway is late: the owner can move on, as in the install card.
         PluginInstallFailure.GatewayDown -> SetupPluginActions(SetupPluginAction.TryAgain, listOf(SetupPluginAction.ContinueAnyway))
@@ -127,18 +128,21 @@ internal fun setupPluginCanRetry(install: PluginInstallUi): Boolean = setupPlugi
 
 @Composable private fun setupPluginFailureText(failure: PluginInstallFailure?): String = when (failure) {
     PluginInstallFailure.SignIn -> uiText("Hermes needs you to sign in again.")
-    PluginInstallFailure.Denied -> uiText("Only the owner of this Hermes can add the Beacon plugin.")
+    PluginInstallFailure.Denied -> uiText("Only the owner of this Hermes can add Beacon.")
     PluginInstallFailure.Offline -> uiText("Can't reach Hermes. Check your connection, then try again.")
     PluginInstallFailure.Unsupported -> uiText("This Hermes can't add plugins from the app.")
     PluginInstallFailure.Busy -> uiText("Hermes is busy. Wait a moment and try again.")
     PluginInstallFailure.NotYet, PluginInstallFailure.GatewayDown -> uiText("Hermes isn't answering yet. Try again in a moment.")
+    PluginInstallFailure.NoRelease -> uiText("Couldn't find the latest Beacon release.")
+    PluginInstallFailure.GitHubBusy -> uiText("GitHub is busy. Try again later.")
+    PluginInstallFailure.Blocked -> uiText("Hermes' security scan blocked it.")
     PluginInstallFailure.Error, null -> uiText("Hermes couldn't do that. Try again.")
 }
 
 @Composable private fun SetupPluginRowLine(row: SetupPluginRow, state: SetupPluginRowState) {
     val label = when (row) {
-        SetupPluginRow.Install -> uiText("Install the Beacon plugin")
-        SetupPluginRow.Answers -> uiText("Check that it answers")
+        SetupPluginRow.Install -> uiText("Install Beacon")
+        SetupPluginRow.Answers -> uiText("Check it works")
         SetupPluginRow.Restart -> uiText("Restart Hermes")
     }
     val word = when (state) {
@@ -191,11 +195,11 @@ internal fun SetupPluginStepPage(
     CompositionLocalProvider(LocalSetupClose provides SetupClose(enabled = !install.working, onClose = onCancel)) {
         when {
             install.stage == PluginInstallStage.Idle && phase == SetupPluginPhase.Checking -> SetupShell(
-                step, uiText("Checking for the Beacon plugin…"), modifier,
+                step, uiText("Checking for Beacon on Hermes…"), modifier,
                 content = { Box(Modifier.fillMaxWidth().testTag("setup-plugin-checking"), contentAlignment = Alignment.Center) { BeaconDustCore(40.dp) } },
             )
             install.stage == PluginInstallStage.Idle -> SetupShell(
-                step, uiText("Add the Beacon plugin to Hermes"), modifier, uiText("Hermes downloads the Beacon plugin from GitHub and turns it on."),
+                step, uiText("Add Beacon to Hermes"), modifier, uiText("Adds Beacon's calls and phone tools to Hermes."),
                 content = {},
                 actions = { SetupPluginButtons(install, buttons) },
             )
@@ -203,13 +207,13 @@ internal fun SetupPluginStepPage(
                 val rows = setupPluginRows(install, restartSeen)
                 val offer = install.stage == PluginInstallStage.NeedsRestart
                 val title = when {
-                    install.stage == PluginInstallStage.Done -> uiText("The Beacon plugin is on your Hermes")
+                    install.stage == PluginInstallStage.Done -> uiText("Beacon is on your Hermes")
                     offer -> uiText("Restart Hermes to finish")
-                    else -> uiText("Add the Beacon plugin to Hermes")
+                    else -> uiText("Add Beacon to Hermes")
                 }
                 // The checklist already says what happened, so Done needs no body.
                 val body = if (offer) {
-                    uiText(if (install.busy) "The Beacon plugin is installed. Hermes is working right now; restarting stops that work." else "The Beacon plugin is installed. Restart Hermes to finish turning it on. Anything Hermes is doing right now will stop.")
+                    uiText(setupRestartLine(install.busy))
                 } else ""
                 SetupShell(
                     step, title, modifier, body,
@@ -226,6 +230,10 @@ internal fun SetupPluginStepPage(
         }
     }
 }
+
+/** The line under the restart offer's title ("Restart Hermes to finish"): what a restart stops, in the words the install card uses, never the title again. */
+internal fun setupRestartLine(busy: Boolean): String =
+    if (busy) "Hermes is busy. Restarting stops what it's doing." else "Restarting stops any reply or scheduled task that is running."
 
 /** What each button does; Restart later and Continue anyway both leave the restart for later. */
 private class SetupPluginClicks(
@@ -250,7 +258,7 @@ private fun SetupPluginLabel(action: SetupPluginAction): String = when (action) 
     SetupPluginAction.TryAgain -> uiText("Try again")
     SetupPluginAction.SignInAgain -> uiText("Sign in again")
     SetupPluginAction.Skip -> uiText("Skip for now")
-    SetupPluginAction.Computer -> uiText("Set up from a computer")
+    SetupPluginAction.Computer -> uiText("Set up from a computer (steps)")
     SetupPluginAction.Restart -> uiText("Restart Hermes")
     SetupPluginAction.RestartLater -> uiText("Restart later")
     SetupPluginAction.ContinueAnyway -> uiText("Continue anyway")

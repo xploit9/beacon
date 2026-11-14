@@ -47,12 +47,13 @@ internal enum class UpdatePhase { Idle, Checking, Available, Downloading, Verify
 /** Each failure is one short sentence; [retriesCheck] says whether "Try again" asks GitHub again or repeats the update. */
 internal enum class UpdateFailure(val text: String, val retriesCheck: Boolean = false) {
     Check("Couldn't check for updates. Check your connection.", true),
-    CheckVerification("The update didn't pass verification.", true),
+    CheckBusy("GitHub is busy. Try again later.", true),
+    CheckVerification("The download didn't check out. Nothing was installed.", true),
     Download("Couldn't download the update. Check your connection."),
-    Verification("The update didn't pass verification."),
+    Verification("The download didn't check out. Nothing was installed."),
     Install("Android couldn't install the update. Try again."),
     Call("End your call before updating Beacon."),
-    Plugin("The Beacon plugin didn't update, so the app didn't either."),
+    Plugin("Beacon on Hermes didn't update, so the app didn't either."),
 }
 
 /** Every failure text the update screen shows through uiText. */
@@ -250,8 +251,9 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         synchronized(lock) { prefs.edit().putLong("last_attempt", now).commit() }
         val installed = updater.installedVersion()
         // A 304 is only useful while the release it vouches for is still stored.
+        // A release kept by an earlier build has no commit for the plugin to pin: it is read again, not vouched for by a 304.
         val stored = Release.decode(prefs.getString("release", null))
-        val found = releases.latest(prefs.getString("etag", null)?.takeIf { stored != null })
+        val found = releases.latest(prefs.getString("etag", null)?.takeIf { stored != null && stored.commit.isNotEmpty() })
         val latest = when (found) {
             is LatestRelease.NotModified -> stored
             is LatestRelease.Found -> found.release
@@ -273,6 +275,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     private fun checkFailure(error: Exception): UpdateFailure {
+        if (error is UpdateException && error.kind == UpdateException.Kind.Busy) return UpdateFailure.CheckBusy
         val network = error is UpdateException && error.kind == UpdateException.Kind.Network
         return if (error is UpdateException && !network || error is IllegalArgumentException || error is IllegalStateException) UpdateFailure.CheckVerification else UpdateFailure.Check
     }
@@ -416,7 +419,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     private suspend fun runWaitingRestart(client: BeaconClient) {
         // Owner, 3 Nov: the restart belongs to an update the owner asked for, so it goes ahead whatever Hermes is doing.
         if (callActive()) return
-        pluginStep(client, accept = false)
+        pluginStep(client)
     }
 
     /**
@@ -458,12 +461,6 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
         } else checkIfDue(onUpdateScreen)
     }
 
-    /** "Review changes" accepted: runs the plugin update once more with the owner's consent. */
-    internal fun reviewPlugin(client: BeaconClient?) {
-        val detached = client?.detached() ?: return
-        scope.launch { try { pluginStep(detached, accept = true) } finally { detached.closeNative() } }
-    }
-
     internal fun dismissUpdated() {
         synchronized(lock) { prefs.edit().remove("updated_name").remove("updated_notes").commit() }
         publish { copy(updated = null) }
@@ -490,7 +487,7 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
                 probe = probePlugin(HermesPluginUpdater(client))
                 publish { this }
                 if (restartPending(client) || _state.value.plugin.status in setOf(PluginStatus.Available, PluginStatus.Restart, PluginStatus.Waiting, PluginStatus.RestartFailed,
-                        PluginStatus.DashboardFailed)) pluginStep(client, accept = false)
+                        PluginStatus.DashboardFailed)) pluginStep(client)
                 // One release is one version: the app installs only once the plugin runs the release's version; the plugin row says why not.
                 if (release != null && !pluginAllowsApp(_state.value.plugin)) { appSteps.clear(); return fail(UpdateFailure.Plugin) }
             }
@@ -514,23 +511,29 @@ class UpdateManager internal constructor(private val app: BeaconApplication, pri
     }
 
     /** Hermes' own updater; whatever it answers lands on the plugin row, and the app goes on only when that row matches the release. Hermes carries on if the phone stops watching. */
-    private suspend fun pluginStep(client: BeaconClient, accept: Boolean) {
+    private suspend fun pluginStep(client: BeaconClient) {
         val target = _state.value.latest?.pluginVersion.orEmpty()
-        val restartOnly = restartPending(client)
-        // Keep the recovery step before either native mutation, including cancellation or process death.
-        check(prefs.edit().putBoolean(restartKey(client), true).commit()) { "Plugin restart state could not be saved" }
-        pluginResult = PluginRow(PluginStatus.Updating, _state.value.plugin.installed, target)
-        publish { this }
-        val row = try {
-            runPluginUpdate(HermesPluginUpdater(client), target, accept, restartOnly = restartOnly,
-                memo = restartMemo(client), remember = { saveMemo(client, it) }, steps = pluginSteps)
-        } catch (error: CancellationException) { pluginResult = null; throw error }
-        check(prefs.edit().putBoolean(restartKey(client), row.status in RESTART_KEPT).putBoolean(waitKey(client), row.status == PluginStatus.Waiting).commit()) { "Plugin restart state could not be saved" }
-        saveDashboardFailed(client, row.status == PluginStatus.DashboardFailed)
-        restartMemoSeen = restartMemo(client)
-        pluginResult = row.takeIf { it.status != PluginStatus.Hidden }
-        if (row.status == PluginStatus.Hidden) probe = PluginProbe.None
-        publish { this }
+        // Repair and the missing-plugin install post the same forced install: one plugin change at a time, and this one says it must wait.
+        if (!PluginChange.begin()) { pluginResult = PluginRow(PluginStatus.Busy, _state.value.plugin.installed, target); publish { this }; return }
+        try {
+            val restartOnly = restartPending(client)
+            // The commit the last check found with this release: the tap asks GitHub for nothing. Without one (a release kept by an earlier build) it is looked up.
+            val known = _state.value.latest?.takeIf { it.pluginVersion == target }?.commit?.takeIf { COMMIT_SHA.matches(it) }
+            // Keep the recovery step before either native mutation, including cancellation or process death.
+            check(prefs.edit().putBoolean(restartKey(client), true).commit()) { "Plugin restart state could not be saved" }
+            pluginResult = PluginRow(PluginStatus.Updating, _state.value.plugin.installed, target)
+            publish { this }
+            val row = try {
+                runPluginUpdate(HermesPluginUpdater(client, commitFor = { known ?: releases.latestCommit(target).commit }), target, restartOnly = restartOnly,
+                    memo = restartMemo(client), remember = { saveMemo(client, it) }, steps = pluginSteps)
+            } catch (error: CancellationException) { pluginResult = null; throw error }
+            check(prefs.edit().putBoolean(restartKey(client), row.status in RESTART_KEPT).putBoolean(waitKey(client), row.status == PluginStatus.Waiting).commit()) { "Plugin restart state could not be saved" }
+            saveDashboardFailed(client, row.status == PluginStatus.DashboardFailed)
+            restartMemoSeen = restartMemo(client)
+            pluginResult = row.takeIf { it.status != PluginStatus.Hidden }
+            if (row.status == PluginStatus.Hidden) probe = PluginProbe.None
+            publish { this }
+        } finally { PluginChange.finish() }
     }
 
     private fun pendingFile(name: String): File {

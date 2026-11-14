@@ -52,7 +52,7 @@ class MixedTimelineJourneyTest {
         assertEquals("", after.streamId)
         val reopened = JSONObject(after.raw.toString())
         assertEquals("Already visible reply", reopened.rows("_unconfirmed_replies").single().string("text"))
-        assertEquals("Turn status unknown", after.status)
+        assertEquals("Reply status unknown", after.status)
     }
 
     @Test fun completedCallArchiveUnavailableThenAvailableDoesNotEraseTheEarlierCall() {

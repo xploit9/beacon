@@ -89,6 +89,8 @@ class UpdateMigrationDeviceTest {
                 .body(body.toResponseBody("application/octet-stream".toMediaType())).build()
             return when {
                 path.endsWith("/releases/latest") -> if (request.header("If-None-Match") == etag) answer(304) else answer(200, announcement().toString().toByteArray())
+                // The check also asks which commit the release's tag names (the plugin install pins it).
+                path.contains("/commits/") -> answer(200, "0123456789abcdef0123456789abcdef01234567".toByteArray())
                 path.endsWith(".json") -> answer(200, metadata().toString().toByteArray())
                 path.endsWith(".apk") -> answer(200, apk)
                 else -> answer(404)
@@ -105,6 +107,23 @@ class UpdateMigrationDeviceTest {
         it.createNotificationChannel(NotificationChannel(UpdateManager.CHANNEL, "Beacon app updates", dev.hermes.android.updates.updateChannelImportance(null)))
     }
     private fun posted(manager: NotificationManager) = manager.activeNotifications.any { it.id == 4202 && it.tag == null }
+    /**
+     * The system applies a cancel after the call has returned, so for a moment (longer on a loaded emulator) the card can still be listed.
+     * Every cancel inside a test waits until the card is gone, so what the next step finds posted is what that step posted.
+     */
+    private suspend fun cancelCard(manager: NotificationManager) {
+        manager.cancel(4202)
+        withTimeout(5_000) { while (posted(manager)) kotlinx.coroutines.delay(25) }
+    }
+    /** The post is applied by the system after notify() returns, so a card the app has just posted is listed a moment later (longer on a loaded emulator): wait for it, up to 5 s. */
+    private suspend fun postedSoon(manager: NotificationManager): Boolean {
+        val until = SystemClock.elapsedRealtime() + 5_000
+        while (!posted(manager) && SystemClock.elapsedRealtime() < until) kotlinx.coroutines.delay(25)
+        return posted(manager)
+    }
+    /** The update-id cards that are listed, for a failure message: a card the app posted and one the test left read differently. */
+    private fun cards(manager: NotificationManager) = manager.activeNotifications.filter { it.id == 4202 && it.tag == null }
+        .joinToString { "'${it.notification.extras.getString(android.app.Notification.EXTRA_TITLE)}' on ${it.notification.channelId}, posted ${System.currentTimeMillis() - it.postTime} ms ago" }.ifEmpty { "none" }
 
     private fun retainHermesStagedUpdate(): File {
         val file = File(File(directory, "updates").apply { mkdirs() }, "legacy.apk").apply { writeBytes(apk) }
@@ -159,11 +178,11 @@ class UpdateMigrationDeviceTest {
             assertEquals("99.0.0", offered.release?.pluginVersion)
             assertTrue(offered.checkedAt > 0)
             assertEquals(installedCode + 1, prefs.getLong("notified_version", 0))
-            assertTrue(posted(system))
+            assertTrue(postedSoon(system))
             // A background check's notice goes to the update category that pops up, not to the quiet one it replaced.
             assertEquals(UpdateManager.CHANNEL, system.activeNotifications.single { it.id == 4202 && it.tag == null }.notification.channelId)
             // The same release again: GitHub says 304, nothing more is posted, and nothing was downloaded.
-            system.cancel(4202)
+            cancelCard(system)
             dueAgain()
             manager.backgroundCheck()
             assertEquals(2, github.requests("/releases/latest"))
@@ -191,7 +210,7 @@ class UpdateMigrationDeviceTest {
             assertEquals(1, github.requests(".json"))
             assertEquals(0, github.requests(".apk"))
             assertEquals(installedCode + 1, manager.state.value.release?.version)
-            assertTrue(posted(system))
+            assertTrue(postedSoon(system))
             assertEquals(UpdateManager.CHANNEL, system.activeNotifications.single { it.id == 4202 && it.tag == null }.notification.channelId)
         } finally { system.cancel(4202) }
     }
@@ -205,8 +224,8 @@ class UpdateMigrationDeviceTest {
             // A Hermes too old to relay the release, or a document that does not verify: the phone's own check runs now, not in hours.
             manager.releaseAnnounced(null)
             assertEquals(1, github.requests("/releases/latest"))
-            assertTrue(posted(system))
-            system.cancel(4202)
+            assertTrue(postedSoon(system))
+            cancelCard(system)
             manager.releaseAnnounced(JSONObject().put("tag_name", "v99.0.0"))
             assertEquals(2, github.requests("/releases/latest"))
         } finally { system.cancel(4202) }
@@ -220,14 +239,14 @@ class UpdateMigrationDeviceTest {
         val sessions = sessionsBefore
         try {
             manager.backgroundCheck()
-            assertTrue(posted(system))
+            assertTrue(postedSoon(system))
             val requests = github.paths.size
-            system.cancel(4202)
+            cancelCard(system)
             // This is the state left when the fetch succeeds but permission or the channel blocks posting.
             assertTrue(prefs.edit().remove("notified_version").remove("notification_token").remove("notification_version").commit())
             val restored = manager(github)
             restored.backgroundCheck()
-            assertTrue("A permitted pending update must not wait six hours for another fetch", posted(system))
+            assertTrue("A permitted pending update must not wait six hours for another fetch", postedSoon(system))
             assertEquals(requests, github.paths.size)
             val firstPost = system.activeNotifications.single { it.id == 4202 && it.tag == null }.postTime
             restored.backgroundCheck()
@@ -245,7 +264,7 @@ class UpdateMigrationDeviceTest {
         val manager = manager(github)
         try {
             manager.backgroundCheck()
-            system.cancel(4202)
+            cancelCard(system)
             assertTrue(prefs.edit().remove("notified_version").putInt("pending_session_id", 12345).commit())
             val prompt = NotificationCompat.Builder(app, UpdateManager.CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("Synthetic installer confirmation").build()
             system.notify(4202, prompt)
@@ -259,11 +278,13 @@ class UpdateMigrationDeviceTest {
             assertEquals("A due release check must not replace an installer confirmation", 0L, prefs.getLong("notified_version", 0))
             assertEquals("Synthetic installer confirmation", system.activeNotifications.single { it.id == 4202 }.notification.extras.getString(android.app.Notification.EXTRA_TITLE))
             val afterDue = github.paths.size
-            system.cancel(4202)
+            cancelCard(system)
             val cached = requireNotNull(dev.hermes.android.core.Release.decode(prefs.getString("release", null)))
             assertTrue(prefs.edit().remove("pending_session_id").putString("release", cached.copy(sha = "d".repeat(64)).encode()).commit())
             manager(github).backgroundCheck()
-            assertFalse("A replaced cached version must never be announced", posted(system))
+            // The system lists a card a moment after notify() returns (postedSoon waits for the positive checks): look for a wrong one only after that moment, so it cannot slip past by being early.
+            kotlinx.coroutines.delay(1_000)
+            assertFalse("A replaced cached version must never be announced; update cards listed: ${cards(system)}", posted(system))
             assertEquals(afterDue, github.paths.size)
         } finally { system.cancel(4202) }
     }

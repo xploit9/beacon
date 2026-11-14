@@ -265,7 +265,9 @@ class Ux2TextShotsTest {
         shoot("commands") { current ->
             val prompt = if (current.arabic) arabic("Write a prompt in your editor") else "Write a prompt in your editor"
             val handoff = if (current.arabic) arabic("Hand off to a messaging app") else "Hand off to a messaging app"
-            expect(shown(prompt), { "\"$prompt\" is not shown" })
+            // /prompt and /worktree run only at a computer, so a phone does not list them (slop list, Root's finding 5).
+            expect(!shown(prompt) && !shown("/prompt") && !shown("/worktree"), { "a computer-only command is listed" })
+            expect(shown("/handoff") && shown("/standup"), { "a command that works on a phone is not listed" })
             expect(shown(handoff), { "\"$handoff\" is not shown" })
             // Hermes' own words for a built-in never reach the row; a custom command keeps its own.
             expect(!shown("Hand off this session to a messaging platform (Telegram, Discord, etc.)") && compose.onAllNodes(hasText("\$EDITOR", substring = true), useUnmergedTree = true).fetchSemanticsNodes().isEmpty(), { "a built-in still shows Hermes' words" })

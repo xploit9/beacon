@@ -48,7 +48,7 @@ private fun availableActions(state: AppUpdateUi): HeroActions {
         PluginStatus.RestartFailed, PluginStatus.Failed -> HeroActions(primary = HeroPrimary.TryAgain)
         PluginStatus.DashboardFailed -> HeroActions(primary = HeroPrimary.RestartDashboard)
         PluginStatus.Busy -> HeroActions(primary = HeroPrimary.Update)
-        PluginStatus.Waiting, PluginStatus.Newer, PluginStatus.NeedsReview -> HeroActions()
+        PluginStatus.Waiting, PluginStatus.Newer -> HeroActions()
         PluginStatus.DashboardRestart -> HeroActions(secondary = HeroSecondary.How)
         else -> HeroActions(primary = HeroPrimary.Update)
     }

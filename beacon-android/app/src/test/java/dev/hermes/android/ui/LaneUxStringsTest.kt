@@ -24,7 +24,7 @@ class LaneUxStringsTest {
 
     @Test fun everyChangedOrNewTextIsInEveryLanguage() {
         val texts = listOf(
-            "Hermes wants to use your phone", "Call saved contacts after 3 seconds", "Write message drafts", "Only what you turned on above",
+            "Hermes wants to use your phone", "Call saved contacts. 3 seconds to cancel.", "Write message drafts", "Only what you turned on above",
             "Beacon asks before it changes anything", "Voice call", "Mark as important", "Mark as not important", "Clear earlier ratings",
             "Couldn't clear earlier ratings. Try again.", "Starting screen share…",
         )
@@ -43,7 +43,8 @@ class LaneUxStringsTest {
         val arabic = catalog.getJSONObject("ar")
         assertEquals("بعد {0} د", arabic.getString("in {0} min"))
         assertEquals("كانبان", arabic.getString("kanban"))
-        assertEquals("اتصل بجهات الاتصال المحفوظة بعد 3 ثوانٍ", arabic.getString(normalized("Call saved contacts after 3 seconds")))
+        // The line now says you can cancel (slop list, UX P2-8), in Arabic too.
+        assertEquals("الاتصال بجهات الاتصال المحفوظة. لديك 3 ثوانٍ للإلغاء.", arabic.getString(normalized("Call saved contacts. 3 seconds to cancel.")))
         // The sentence that names the board reads the same word as the tile.
         assertFalse(arabic.getString("create a kanban board in your hermes dashboard, then refresh it here.").contains("Kanban"))
         // The short minute is the same word everywhere Arabic shows minutes.

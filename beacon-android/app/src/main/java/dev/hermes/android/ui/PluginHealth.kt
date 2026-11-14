@@ -1,12 +1,18 @@
 package dev.hermes.android.ui
 
 import android.os.SystemClock
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.relocation.BringIntoViewRequester
 import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -15,6 +21,12 @@ import dev.hermes.android.core.PLUGIN_VERSION_PATTERN
 import dev.hermes.android.data.ApiFailure
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.push.KeepConnectedService
+import dev.hermes.android.updates.HermesPluginInstaller
+import dev.hermes.android.updates.NEWER_THAN_RELEASE
+import dev.hermes.android.updates.RepairFinding
+import dev.hermes.android.updates.RepairUi
+import dev.hermes.android.updates.RepairStage
+import dev.hermes.android.updates.readRepairFinding
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -57,7 +69,7 @@ internal val PluginHealthStrings = listOf(
     "Beacon plugin", "Health", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "Checking…", "Retry", "Can't reach Hermes",
     "Healthy", "Needs attention", "Not working", "Up to date", "Needs restart", "Running", "Working", "Stopped", "Ready", "Add key",
     "Slow to start", "Hermes is updating", "Hermes is busy", "Hermes took too long", "Not ready", "Keep connected is on", "Keep connected is off", "Not set up",
-    "The Beacon plugin isn't installed", "Update Beacon on your Hermes", "Hermes answered in {0} ms",
+    "Beacon isn't installed on this Hermes", "Update Beacon on your Hermes", "Hermes answered in {0} ms",
 )
 
 private fun JSONObject.flag(name: String): Boolean? = opt(name) as? Boolean
@@ -138,6 +150,51 @@ internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKe
         busy = checking, busyLabel = uiText("Checking…"), testTag = "plugin-health-check")
 }
 
+/** The line beside the Repair button for what Hermes says is wrong with Beacon; null when nothing is. */
+private fun RepairFinding.line(): String? = when (this) {
+    RepairFinding.NotInstalled -> "Beacon isn't installed on this Hermes"
+    RepairFinding.TurnedOff -> "Beacon is turned off on Hermes."
+    RepairFinding.NotRunning -> "Beacon is on Hermes but isn't running."
+    RepairFinding.OutOfDate -> "Update Beacon on your Hermes"
+    RepairFinding.StillOld -> "Needs restart"
+    RepairFinding.Healthy, RepairFinding.Newer -> null
+}
+
+/**
+ * Repair Beacon: one row, one confirm sheet, one result line. It puts the published plugin back through Hermes' own routes and never runs by
+ * itself. The sheet says only what will really happen: the plugin is reinstalled and Beacon then restarts the Hermes dashboard on its own.
+ * No state of its own besides the sheet, so a screenshot or test can show any stage; [onRepair] runs once, after the owner confirms.
+ */
+@Composable internal fun PluginRepairContent(repair: RepairUi, onRepair: () -> Unit, finding: RepairFinding? = null) {
+    var confirming by rememberSaveable { mutableStateOf(false) }
+    when (repair.stage) {
+        RepairStage.Failed -> SettingsErrorRow(uiText(repair.problem?.text.orEmpty()), { confirming = true }, uiText("Retry"), retryTestTag = "plugin-repair-retry")
+        // A Beacon past the latest release is left as it is: saying "repaired" would claim a change that did not happen.
+        RepairStage.Done -> SettingsValueRow(uiText(if (repair.finding == RepairFinding.Newer) NEWER_THAN_RELEASE else "Beacon is repaired."), icon = Icons.Rounded.Build, status = SettingsStatus.Ok, testTag = "plugin-repair-done")
+        else -> SettingsActionRow(uiText("Repair Beacon"), { confirming = true }, icon = Icons.Rounded.Build, value = finding?.line()?.let { uiText(it) }.orEmpty(),
+            busy = repair.working, busyLabel = uiText(when (repair.stage) {
+                RepairStage.Repairing -> "Repairing Beacon…"
+                RepairStage.Waiting -> "Reconnecting…"
+                else -> "Checking…"
+            }), testTag = "plugin-repair")
+    }
+    if (confirming) AlertDialog(
+        onDismissRequest = { confirming = false },
+        title = { Text(uiText("Repair Beacon")) },
+        text = { Text(uiText("Reinstalls the latest Beacon. The Hermes dashboard restarts briefly.")) },
+        confirmButton = { TextButton(onClick = { confirming = false; onRepair() }, modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("plugin-repair-confirm")) { Text(uiText("Repair")) } },
+        dismissButton = { TextButton(onClick = { confirming = false }, modifier = Modifier.heightIn(min = SettingsKit.TouchMin).testTag("plugin-repair-cancel")) { Text(uiText("Cancel")) } },
+    )
+}
+
+/** The Repair row wired to the signed-in Hermes: the controller's stage in, one repair out. */
+@Composable internal fun PluginRepairRow(vm: BeaconViewModel, finding: RepairFinding? = null) {
+    val repair by vm.pluginRepair.state.collectAsStateWithLifecycle()
+    // A finished repair is shown once; the next time the section opens it starts fresh.
+    DisposableEffect(vm) { onDispose { if (vm.pluginRepair.state.value.stage == RepairStage.Done) vm.pluginRepair.reset() } }
+    PluginRepairContent(repair, { vm.pluginRepair.repair() }, finding)
+}
+
 /** Settings › Connection › Beacon plugin: opens from the last answer kept for this account and profile, then reads again in the background. */
 @Composable internal fun PluginHealthSection(vm: BeaconViewModel, pluginAbsent: Boolean) {
     val data by vm.data.collectAsStateWithLifecycle()
@@ -206,19 +263,43 @@ internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKe
         }
     }
     val health = remember(data[PLUGIN_HEALTH_KEY], keepConnected, voiceKeySaved) { pluginHealthOf(data[PLUGIN_HEALTH_KEY], keepConnected, voiceKeySaved) }
+    val repair by vm.pluginRepair.state.collectAsStateWithLifecycle()
+    // A finished repair changed what the plugin says about itself (its version, the dashboard's start), so the rows read it again instead of keeping the old answer.
+    LaunchedEffect(repair.stage) { if (repair.stage == RepairStage.Done && !pluginAbsent) read(false) }
+    // When Beacon's routes do not answer, Hermes' own list tells "not installed" from "installed but off or not running".
+    val found by produceState<RepairFinding?>(null, scopeKey, pluginAbsent, repair.working) {
+        value = null
+        val active = vm.client
+        if (!pluginAbsent || active == null || repair.working) return@produceState
+        val detached = active.detached()
+        value = try { withContext(Dispatchers.IO) { readRepairFinding(HermesPluginInstaller(detached)) } } finally { detached.closeNative() }
+    }
     // The route answers the owner only; to anyone else the plugin has nothing to say here.
     if (notOwner && !pluginAbsent) return
     SettingsSection(uiText("Beacon plugin"), testTag = "settings-section:Plugin") {
         when {
+            pluginAbsent && (found == RepairFinding.TurnedOff || found == RepairFinding.NotRunning || repair.stage != RepairStage.Idle) -> {
+                SettingsValueRow(uiText(found?.line() ?: "Beacon isn't installed on this Hermes"), icon = Icons.Rounded.Extension, testTag = "plugin-health-absent")
+                SettingsDivider()
+                PluginRepairRow(vm)
+            }
             pluginAbsent -> {
-                SettingsValueRow(uiText("The Beacon plugin isn't installed"), icon = Icons.Rounded.Extension, testTag = "plugin-health-absent")
+                SettingsValueRow(uiText("Beacon isn't installed on this Hermes"), icon = Icons.Rounded.Extension, testTag = "plugin-health-absent")
                 SettingsDivider()
                 MissingBeaconPluginState(compact = true, illustration = false)
             }
-            oldPlugin -> MissingBeaconPluginState(compact = true, update = true, illustration = false)
+            oldPlugin -> {
+                MissingBeaconPluginState(compact = true, update = true, illustration = false)
+                SettingsDivider()
+                PluginRepairRow(vm)
+            }
             // A failed read shows no verdicts at all: the last answer may be out of date, and it is not shown as if it were current.
             failed -> SettingsErrorRow(uiText("Can't reach Hermes"), { read(false) }, uiText("Retry"), retryTestTag = "plugin-health-retry")
-            health != null -> PluginHealthRows(health, roundTrip, checking && asked, open, finishedChecks) { read(true) }
+            health != null -> {
+                PluginHealthRows(health, roundTrip, checking && asked, open, finishedChecks) { read(true) }
+                SettingsDivider()
+                PluginRepairRow(vm)
+            }
             else -> SettingsSkeletonRows(2)
         }
     }

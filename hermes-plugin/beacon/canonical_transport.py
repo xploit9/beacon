@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import http.client
+import importlib.util
 import ipaddress
 import json
 import logging
@@ -384,6 +385,66 @@ def _ready(raw):
         return False
 
 
+def _approval_prompts(frame):
+    """Every approval prompt in a frame Hermes sent: a live event's payload, the snapshot's prompts and a replay's events."""
+    params, result, found = frame.get('params'), frame.get('result'), []
+    if isinstance(params, dict) and params.get('type') == 'approval.request' and isinstance(params.get('payload'), dict):
+        found.append(params['payload'])
+    if isinstance(result, dict):
+        prompts, events = result.get('prompts'), result.get('events')
+        for prompt in prompts if isinstance(prompts, list) else ():
+            if isinstance(prompt, dict) and prompt.get('kind') == 'approval':
+                found.append(prompt)
+        for event in events if isinstance(events, list) else ():
+            if isinstance(event, dict) and event.get('type') == 'approval.request' and isinstance(event.get('payload'), dict):
+                found.append(event['payload'])
+    return found
+
+
+def _card_markers():
+    """The saved-card tool's marker reader. The agent that marks a prompt and this relay are different processes, and this one may never
+    have registered the tool, so the module is loaded here (under the name the plugin gives it) when it is not loaded yet."""
+    module = sys.modules.get('beacon_any_site_card')
+    if module is None:
+        path = Path(__file__).with_name('any_site_card.py')
+        spec = importlib.util.spec_from_file_location('beacon_any_site_card', path)
+        module = importlib.util.module_from_spec(spec)
+        module._beacon_mtime = path.stat().st_mtime_ns
+        sys.modules['beacon_any_site_card'] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop('beacon_any_site_card', None)
+            raise
+    return module
+
+
+def annotate(raw):
+    """Add the plugin's own `surface` to the approval prompts that are Hermes' card consent.
+
+    Hermes' canonical prompts carry no surface, so the phone cannot tell a card payment from any other approval. The plugin records which
+    prompt ids are Hermes' card consent (any_site_card.surface_for, from the pre_approval_request hook); only those get `surface`, and any
+    `surface` already on another approval prompt is removed, so the phone can trust the field. Anything else is forwarded untouched."""
+    try:
+        if '"prompt_id"' not in raw:
+            return raw  # the common frame (a token, a tool step) costs one search
+        card = _card_markers()
+        if not card.has_surfaces():
+            return raw
+        frame = json.loads(raw, object_pairs_hook=_pairs, parse_constant=lambda _: (_ for _ in ()).throw(ValueError()))
+        changed = False
+        for prompt in _approval_prompts(frame) if isinstance(frame, dict) else ():
+            surface = card.surface_for(prompt.get('prompt_id'))
+            if surface and prompt.get('surface') != surface:
+                prompt['surface'], changed = surface, True
+            elif not surface and 'surface' in prompt:
+                del prompt['surface']
+                changed = True
+        return json.dumps(frame, ensure_ascii=False, separators=(',', ':')) if changed else raw
+    except Exception:  # health: allow BLE001 -- a lookup or parse failure must never cost the phone a frame; it gets Hermes' frame as sent
+        return raw
+
+
 def no_redirect_connect(url, **kwargs):
     from websockets.asyncio.client import connect
     class RefuseRedirect(connect):
@@ -491,6 +552,7 @@ async def relay_sockets(client, upstream, profile, mobile=None, binding=None, ru
             raw = await upstream.recv()
             if not isinstance(raw, str) or len(raw.encode('utf-8')) > MAX_FRAME:
                 raise ValueError('Invalid frame')
+            raw = annotate(raw)
             await confirmation(raw)
             await client.send_text(raw)
 

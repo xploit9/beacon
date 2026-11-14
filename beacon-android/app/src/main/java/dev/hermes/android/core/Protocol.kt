@@ -65,9 +65,11 @@ data class QueuedMessage(
     val id: String = UUID.randomUUID().toString(), val createdAt: Long = System.currentTimeMillis(),
     val state: String = "queued", val kind: String = "queue", val rowId: String = "", val admissionId: String = "", val outcome: String = "", val submissionId: String = id,
     val afterRowId: String? = null,
+    /** What Hermes said about this copy's admission when it accepted it: "queued" (it waits behind another turn), "started" (it is running), or "" (not told, e.g. a legacy gateway). */
+    val admissionStatus: String = "",
 ) {
     fun encode(): JSONObject = json("text" to text, "attachments" to JSONArray(attachments), "model" to model, "provider" to provider,
-        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId, "after_row_id" to afterRowId)
+        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId, "after_row_id" to afterRowId, "admission_status" to admissionStatus)
     companion object {
         fun decode(item: Any?): QueuedMessage {
             if (item !is JSONObject) return QueuedMessage(item?.toString().orEmpty(), createdAt = 0L)
@@ -76,7 +78,8 @@ data class QueuedMessage(
             val id = item.string("id").ifBlank { UUID.randomUUID().toString() }
             return QueuedMessage(item.string("text"), item.rows("attachments"), item.string("model"), item.string("provider"),
                 id, item.optLong("created_at").coerceAtLeast(0), state, item.string("kind").takeIf { it in setOf("queue", "steer") } ?: "queue",
-                item.string("row_id"), item.string("admission_id"), item.string("outcome"), item.string("submission_id").ifBlank { id }, item.opt("after_row_id") as? String)
+                item.string("row_id"), item.string("admission_id"), item.string("outcome"), item.string("submission_id").ifBlank { id }, item.opt("after_row_id") as? String,
+                item.string("admission_status").takeIf { it == "queued" || it == "started" }.orEmpty())
         }
     }
 }
@@ -123,7 +126,7 @@ const val MAX_UPDATE_APK_BYTES = 256L * 1024 * 1024
 val PLUGIN_VERSION_PATTERN = Regex("(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})\\.(0|[1-9][0-9]{0,8})")
 
 /** One public GitHub release: this app version and the Hermes plugin version it ships with. [url] is the APK asset's download address. */
-data class Release(val version: Long, val name: String, val packageName: String, val url: String, val sha: String, val size: Long, val signer: String, val pluginVersion: String, val notes: String = "", val published: String = "") {
+data class Release(val version: Long, val name: String, val packageName: String, val url: String, val sha: String, val size: Long, val signer: String, val pluginVersion: String, val notes: String = "", val published: String = "", val commit: String = "") {
     fun validate(installedPackage: String, installedVersion: Long, installedSigner: String) {
         require(url.isNotBlank()) { "Invalid release manifest" }
         require(packageName == installedPackage) { "Update belongs to another app" }
@@ -134,10 +137,12 @@ data class Release(val version: Long, val name: String, val packageName: String,
     }
     /** Phone-local copy, so a 304 from GitHub can still show the release. */
     fun encode(): String = json("version_code" to version, "version_name" to name, "package_name" to packageName, "download_url" to url, "sha256" to sha,
-        "size_bytes" to size, "certificate_sha256" to signer, "plugin_version" to pluginVersion, "notes" to notes, "published_at" to published).toString()
+        "size_bytes" to size, "certificate_sha256" to signer, "plugin_version" to pluginVersion, "notes" to notes, "published_at" to published, "commit" to commit).toString()
     companion object {
-        fun from(metadata: JSONObject, url: String, notes: String, published: String) = Release(metadata.getLong("version_code"), metadata.getString("version_name"), metadata.getString("package_name"), url,
-            metadata.getString("sha256"), metadata.getLong("size_bytes"), metadata.getString("certificate_sha256"), metadata.getString("plugin_version"), notes, published)
-        fun decode(raw: String?): Release? = runCatching { JSONObject(raw!!).let { from(it, it.getString("download_url"), it.string("notes"), it.string("published_at")) } }.getOrNull()
+        /** [commit] is the commit the release's tag names (the plugin install pins it); blank when it was not resolved. */
+        fun from(metadata: JSONObject, url: String, notes: String, published: String, commit: String = "") = Release(metadata.getLong("version_code"), metadata.getString("version_name"), metadata.getString("package_name"), url,
+            metadata.getString("sha256"), metadata.getLong("size_bytes"), metadata.getString("certificate_sha256"), metadata.getString("plugin_version"), notes, published, commit)
+        /** A release kept from an earlier build has no commit; one that is not a full lowercase SHA is read as none, so it is looked up again. */
+        fun decode(raw: String?): Release? = runCatching { JSONObject(raw!!).let { from(it, it.getString("download_url"), it.string("notes"), it.string("published_at"), it.string("commit").takeIf { c -> c.matches(Regex("[0-9a-f]{40}")) }.orEmpty()) } }.getOrNull()
     }
 }

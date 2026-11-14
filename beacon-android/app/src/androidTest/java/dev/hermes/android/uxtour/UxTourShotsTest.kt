@@ -311,7 +311,7 @@ class UxTourShotsTest {
     }
 
     @Test fun profileHero() {
-        val one = NativeBotsState(profiles = listOf(NativeBotSummary("work", "Work", "")), selected = NativeBot("work", "Work", "", "", "openai", "gpt", "r1"))
+        val one = NativeBotsState(profiles = listOf(NativeBotSummary("work", "Work", "")), selected = NativeBot("work", "Work", "", "", "openai", "gpt"))
         setScreen { NativeBotSettings(one, {}, {}, {}, { _, _ -> }, {}, {}, { _, _ -> }, {}, activeProfile = "default") }
         shoot("profile-without-description")
     }

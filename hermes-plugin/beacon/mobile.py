@@ -168,6 +168,26 @@ def register_assistant_conversation(owner,provider,profile,session_id,native_ver
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_claim',?)",(value,))
     return session_id
 
+def clear_scheduled_callback_conversation(owner,provider,profile,stored):
+    # Compare-and-clear: forget the saved check-up chat only while it is still this owner's stored one. The chat itself is kept.
+    if not _valid_owner_identity(owner,provider) or not isinstance(profile,str) or not isinstance(stored,str): return False
+    with LOCK,connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        row=conn.execute("SELECT value FROM meta WHERE key='owner_claim'").fetchone()
+        try: claim=json.loads(row['value']) if row else None
+        except (TypeError,ValueError): return False
+        if not isinstance(claim,dict) or claim.get('owner_id')!=owner or claim.get('owner_provider')!=provider: return False
+        conversations=claim.get('scheduled_callback_conversations')
+        if not isinstance(conversations,dict) or conversations.get(profile)!=stored: return False
+        del conversations[profile]
+        drafts=claim.get('provisional_conversations')
+        if isinstance(drafts,dict) and drafts.get(profile)==stored:
+            del drafts[profile]
+            if not drafts: claim.pop('provisional_conversations',None)
+        value=json.dumps(claim,separators=(',',':'))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('owner_claim',?)",(value,))
+    return True
+
 _LAUNCH_HOME=None
 
 def home():

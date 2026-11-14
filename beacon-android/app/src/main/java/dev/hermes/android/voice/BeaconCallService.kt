@@ -59,7 +59,7 @@ internal fun CallState.transcriptLabel(): String = when (transcriptStatus) {
     else -> ""
 }
 internal fun CallState.afterCleanupFailure(error: Throwable): CallState =
-    if (error is ApiFailure && error.status == 404) this else copy(hostCleanupPending=true,error=listOf(this.error, "Call ended locally; PC call cleanup is unconfirmed").filter(String::isNotBlank).distinct().joinToString(" "))
+    if (error is ApiFailure && error.status == 404) this else copy(hostCleanupPending=true,error=listOf(this.error, "Call ended.").filter(String::isNotBlank).distinct().joinToString(" "))
 internal fun finishCallOnce(closed: AtomicBoolean, fence: () -> Unit = {}, finish: (Throwable?) -> Unit): Boolean {
     if (!synchronized(closed) { closed.compareAndSet(false, true) }) return false
     val fenceFailure = runCatching(fence).exceptionOrNull()
@@ -88,7 +88,7 @@ internal fun CallState.afterOwnedCleanupFailure(error: Throwable, ownsCall: Bool
 internal fun CallState.afterTerminalControls(fenceFailure: Throwable?): CallState = copy(
     held=false,muted=false,userSpeaking=false,remoteSpeaking=false,localAudioLevel=null,remoteAudioLevel=null,
     routes=emptyList(),route="",cameraRear=false,cameraCanFlip=false,overlayPermissionMissing=false,contextNotice="",toolApprovals=emptyList(),toolReceipts=emptyList(),
-    error=listOf(error,if(fenceFailure!=null) "Call stop fence failed; capture or transcript finalization was unconfirmed" else "")
+    error=listOf(error,if(fenceFailure!=null) "Call ended. Some of it may not be saved." else "")
         .filter(String::isNotBlank).distinct().joinToString(" "))
 internal fun cameraMayShare(requested: Boolean, visible: Boolean, held: Boolean, closed: Boolean): Boolean =
     requested && visible && !held && !closed
@@ -137,6 +137,41 @@ internal val CallFailureStrings = listOf(CALL_START_FAILED, CALL_ALREADY_ON, CAL
     CALL_HERMES_NO_ANSWER, CALL_VOICE_NO_ANSWER, CALL_SIGN_IN_EXPIRED, CALL_MIC_FAILED, CALL_DROPPED, CALL_VOICE_STOPPED)
 /** A call the phone refused to start; its message is the owner's line, already translated. */
 internal class CallStartRefused(text: String) : IllegalStateException(text)
+/** The line a call start that failed shows: a refusal's own line as it is, a known call line in the phone's language, else a generic one. */
+internal fun callStartFailureLine(error: Throwable, translate: (String) -> String): String =
+    if (error is CallStartRefused) error.message.orEmpty() else translate(error.message?.takeIf { it in CallStrings || it in CallFailureStrings } ?: "Call ended unexpectedly")
+
+/**
+ * The line a call leaves on [CallState.error] once it is not live (a refused start, an ended call) belongs to a call nobody can answer when its ring
+ * window is over. The controller outlives every screen, so without an end each screen that opened later showed the same line again, over the chat.
+ */
+internal object CallLine {
+    @Volatile private var lifetimeOverride: Long? = null
+    /** How long the line of a call that is not live stays: a call's ring window. */
+    fun lifetimeMs(): Long = if (dev.hermes.android.BuildConfig.DEBUG) lifetimeOverride ?: RelayCallback.RING_WINDOW_MS else RelayCallback.RING_WINDOW_MS
+    /** Debug builds only: a device test shortens the life to watch the line go. Null restores the ring window. */
+    fun lifetimeForTest(millis: Long?) { check(dev.hermes.android.BuildConfig.DEBUG); lifetimeOverride = millis }
+}
+/** The line of a call that is not live. A failed call keeps its reason on its own panel until the owner closes it; that is not a line. */
+internal fun CallState.idleLine(): String = if (active || failureReason.isNotBlank()) "" else error
+/** Clears each line of a call that is not live once [lifetimeMs] has passed; a call starting, or a newer line, is left alone. Runs until cancelled. */
+internal suspend fun fadeIdleLines(state: MutableStateFlow<CallState>, lifetimeMs: () -> Long = CallLine::lifetimeMs) {
+    state.map { it.idleLine() }.distinctUntilChanged().collectLatest { line ->
+        if (line.isBlank()) return@collectLatest
+        delay(lifetimeMs())
+        state.update { if (it.idleLine() == line) it.copy(error = "") else it }
+    }
+}
+/** Tells a screen whether a line is new to the owner: each line is shown once, wherever and however many times a screen opens, and again after it cleared. */
+internal class LineOnce {
+    private var shown = ""
+    @Synchronized fun isNew(line: String): Boolean {
+        if (line.isBlank()) { shown = ""; return false }
+        if (line == shown) return false
+        shown = line
+        return true
+    }
+}
 
 /** What the owner reads when Hermes refuses or never answers a call's admission. */
 internal fun grantFailureText(error: Throwable): String = when {
@@ -213,13 +248,21 @@ class CallController(private val app: BeaconApplication) {
     internal val stageLog = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
     @Volatile internal var tappedAt = 0L
         private set
+    /** Which call line a screen has been told about ([lineIsNew]); declared before the collectors in init that reset it. */
+    private val shownLines = LineOnce()
     init {
         VoicePrewarm.engine = prewarm
         // A new key or voice changes the live session's setup.
         background.launch { VoiceKeyStore.changes.drop(1).collect { prewarm.changed() } }
         // 1.1.22 kept synthesized greetings on the phone; calls no longer play them, so they are removed once.
         background.launch { runCatching { java.io.File(app.noBackupFilesDir, "voice-greetings").takeIf { it.exists() }?.deleteRecursively() } }
+        // The line a refused or ended call leaves here (state is the app's, not a screen's) goes with its ring window, so no later screen shows it.
+        background.launch { fadeIdleLines(_state) }
+        // Whoever cleared a line, the next one with the same words is a new line again, even if no chat was open to see it clear.
+        background.launch { _state.map { it.error }.distinctUntilChanged().collect { if (it.isBlank()) shownLines.isNew("") } }
     }
+    /** True the first time a screen asks about [line]: the chat shows a call's line once, however many times it is opened. */
+    fun lineIsNew(line: String): Boolean = shownLines.isNew(line)
     private suspend fun readOwnerName(): String = try { app.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).ownerName }
         catch(error:CancellationException) { throw error } catch(_:Exception) { "" }
     /** A stage reported before the service took the call: kept with the call and uploaded once it has an id. */
@@ -529,7 +572,8 @@ class BeaconCallService : Service() {
                     previousAudioMode=audioManager.mode;audioManager.mode=AudioManager.MODE_IN_COMMUNICATION
                 }
                 if(closed.get()) return@launch
-                check(ContextCompat.checkSelfPermission(this@BeaconCallService, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) { "Microphone permission was revoked" }
+                if (ContextCompat.checkSelfPermission(this@BeaconCallService, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                    throw CallStartRefused(callText(this@BeaconCallService, CALL_ALLOW_MIC))
                 val manager = CallsManager(this@BeaconCallService)
                 manager.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
                 currentCoroutineContext().ensureActive()
@@ -546,7 +590,7 @@ class BeaconCallService : Service() {
                         try {
                             if (!closed.get()) {
                                 val result = if (pending.incoming) answer(CallAttributesCompat.CALL_TYPE_AUDIO_CALL) else setActive()
-                                if (result is CallControlResult.Error) failure("Android could not activate the call: $result")
+                                if (result is CallControlResult.Error) failure("Android couldn't start the call. Try again.")
                                 else if (!closed.get() && app.calls.service === this@BeaconCallService) { startRoute(startingRoute.active()); openTransport(pending) }
                             }
                             ended.await()
@@ -556,7 +600,7 @@ class BeaconCallService : Service() {
                         }
                     }
                 }
-            } catch (e: Throwable) { if (e !is CancellationException) failure(e.message ?: "Call ended unexpectedly") else hangup() }
+            } catch (e: Throwable) { if (e !is CancellationException) endCall(callStartFailureLine(e) { dev.hermes.android.push.serviceText(this@BeaconCallService, it) }, failedConnection = true) else hangup() }
             finally { control = null }
         }
         return START_NOT_STICKY
@@ -609,19 +653,19 @@ class BeaconCallService : Service() {
                     },onDropped={ bitmap?.recycle() })!=true) bitmap?.recycle()
                 },{ reason ->
                     val source=if(screenRequested) "screen" else "camera"
-                    app.calls.updateFrom(this@BeaconCallService) { it.copy(error=reason) };camera(false);stopScreen()
+                    app.calls.updateFrom(this@BeaconCallService) { it.copy(error=dev.hermes.android.push.serviceText(this@BeaconCallService, if(source=="screen") "Screen sharing stopped." else "Camera stopped.")) };camera(false);stopScreen()
                     directVoice?.setVisualState(source,"failed",reason)
                 },{ stopScreen() })
                 spec.trust.watch(applicationContext)
                 val direct=DirectVoice(spec.client,spec.grant.optString("call_id"),spec.conversation.ifBlank { spec.grant.getString("conversation_id") },scope,{bytes ->
-                    if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Playback queue overflow; current speech was interrupted") } } }
+                    if(!held&&!closed.get()) { if(!audio.enqueue(bytes)&&!closed.get()) { audio.interrupt();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="The call audio stalled. Call again.") } } }
                 },::directEvent,::failure,voiceSettings,ownerName=ownerName,ownerFence=closed,ownerActive={ !closed.get() },
                     clock=android.os.SystemClock::elapsedRealtime,tappedAt=spec.tappedAt,warm=spec.warm,prefetched=spec.context,earlyContext=spec.earlyContext,earlyContextAt=spec.earlyContextAt,admission=spec.admission,callback=spec.incoming,streamsMicrophone=true,
                     recentSpeech={ app.calls.state.value.transcripts.takeLast(10).joinToString("\n") { "${it.role}: ${it.text}" }.takeLast(6000) },
                     phone=PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust),trust=spec.trust,
                     microphoneMuted={ microphoneGate.snapshot().muted })
                 directVoice=direct;direct.start()
-            } catch(e:Exception) { if(!closed.get()) failure("Native audio initialization failed") }
+            } catch(e:Exception) { if(!closed.get()) failure("Call audio didn't start. Try again.") }
             }
         }
         connectionJob?.start()
@@ -724,7 +768,7 @@ class BeaconCallService : Service() {
                 checkNotNull(directVoice).decideTool(requestId,proposalId,decision)
             }
             catch(error:CancellationException) { throw error }
-            catch(error:Exception) { app.calls.updateFrom(this@BeaconCallService) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=false,error=callToolApprovalErrorMessage(error.message.orEmpty()).ifBlank { "Could not confirm the response. Retry checks the same request." }) else p }) };updateToolNotification() }
+            catch(error:Exception) { app.calls.updateFrom(this@BeaconCallService) { it.copy(toolApprovals=it.toolApprovals.map { p -> if(p.requestId==requestId) p.copy(busy=false,error=callToolApprovalErrorMessage(error.message.orEmpty()).ifBlank { "Couldn't confirm. Tap Retry to check." }) else p }) };updateToolNotification() }
         }
     }
     private fun finishDirectTurn(interrupted:Boolean=false,deliver:(JSONObject)->Unit=::handleControl) {
@@ -757,7 +801,7 @@ class BeaconCallService : Service() {
                 visual?.stop();cameraCaptureAttempted=false
                 if(operation.enabled) { val capture=checkNotNull(visual);foreground(true);cameraCaptureAttempted=true;capture.camera(rear) }
                 app.calls.updateFrom(this@BeaconCallService) { it.copy(cameraRear=rear,cameraCanFlip=operation.enabled,cameraStopPending=false,cameraBusy=operation.enabled) }
-                if(operation.enabled) scope.launch { delay(10000);if(cameraGate.current(operation)&&app.calls.state.value.cameraBusy&&!closed.get()) { app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Camera frame delivery did not start") };camera(false) } }
+                if(operation.enabled) scope.launch { delay(10000);if(cameraGate.current(operation)&&app.calls.state.value.cameraBusy&&!closed.get()) { app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Camera didn't start.") };camera(false) } }
                 if(!operation.enabled) foreground(false)
             } catch(e:Exception) { cameraRequested=false;val stopped=runCatching { visual?.stop() }.isSuccess;cameraCaptureAttempted=!stopped;app.calls.updateFrom(this@BeaconCallService) { it.afterCameraFailure(stopped) };directVoice?.setVisualState("camera","failed","Camera capture unavailable");foreground(!stopped) }
         } }
@@ -776,9 +820,9 @@ class BeaconCallService : Service() {
         scope.launch(mediaDispatcher) { mediaLock.withLock {
             if(!screenGate.permits(token,expectedId,app.calls.state.value,closed.get(),app.calls.service===this@BeaconCallService)||!screenRequested) return@withLock
             try { check(!cameraCaptureAttempted);foreground(false,true);screenCaptureAttempted=true;checkNotNull(visual).screen(consent)
-                scope.launch { delay(10000);if(screenGate.current(token)&&screenRequested&&app.calls.state.value.screenBusy&&!closed.get()) { app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Screen frame delivery did not start") };stopScreen() } }
+                scope.launch { delay(10000);if(screenGate.current(token)&&screenRequested&&app.calls.state.value.screenBusy&&!closed.get()) { app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Screen sharing didn't start.") };stopScreen() } }
             }
-            catch(e:Exception) { stopScreen();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Screen capture unavailable") } }
+            catch(e:Exception) { stopScreen();app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Screen sharing isn't available.") } }
         } }
     }
     internal fun stopScreen() {
@@ -887,7 +931,7 @@ class BeaconCallService : Service() {
         if(!intent.enabled) directVoice?.send(GeminiWire.endAudio())
         app.calls.updateFrom(this) { it.copy(muted=intent.muted,held=intent.held,userSpeaking=false) }
     }
-    fun route(id: String) { val endpoint = endpoints.find { it.identifier.toString() == id } ?: return; startingRoute.chosenByOwner(); scope.launch { val result = control?.requestEndpointChange(endpoint); if (result is CallControlResult.Error) app.calls.updateFrom(this@BeaconCallService) { it.copy(error = "Audio route could not change: $result") } } }
+    fun route(id: String) { val endpoint = endpoints.find { it.identifier.toString() == id } ?: return; startingRoute.chosenByOwner(); scope.launch { val result = control?.requestEndpointChange(endpoint); if (result is CallControlResult.Error) app.calls.updateFrom(this@BeaconCallService) { it.copy(error = dev.hermes.android.push.serviceText(this@BeaconCallService, "Couldn't switch the audio.")) } } }
     // Services have no Compose strings: the reason comes from the same catalog, in the phone's language.
     private fun failure(message: String) { endCall(dev.hermes.android.push.serviceText(this, message), failedConnection = true) }
     fun hangup() { endCall(null) }
@@ -950,7 +994,7 @@ class BeaconCallService : Service() {
                 // The next call is prepared again while its entry is on screen.
                 app.calls.prewarm.changed()
                 val telecomReleased=withTimeoutOrNull(6_000) { telecomJob?.join();true }==true
-                if(!telecomReleased) app.calls.updateFrom(this@BeaconCallService) { it.copy(error="Android call shutdown is unconfirmed. Use Android’s Stop app control before another call.") }
+                if(!telecomReleased) app.calls.updateFrom(this@BeaconCallService) { it.copy(error="The call may still be open. Stop Beacon in Android before calling again.") }
                 if(captureReleased&&audioReleased&&telecomReleased) {
                     runCatching { if(app.calls.service===this@BeaconCallService) {
                         val audioManager=getSystemService(AudioManager::class.java)
@@ -977,12 +1021,12 @@ class BeaconCallService : Service() {
             return PendingIntent.getService(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
         val builder = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_beacon_voice)
-            .setContentTitle(if (retainedCameraWarning) "Beacon call cleanup warning" else "${dev.hermes.android.data.currentAssistantName} call")
-            .setContentText(if (starting) { if(app.calls.state.value.active) "Connecting to ${dev.hermes.android.data.currentAssistantName}" else "Call cancelled" } else if (retainedCameraWarning) "Call or capture shutdown unconfirmed; media delivery blocked. Use Android’s Stop app control."
+            .setContentTitle(if (retainedCameraWarning) "The call may still be open" else "${dev.hermes.android.data.currentAssistantName} call")
+            .setContentText(if (starting) { if(app.calls.state.value.active) "Connecting to ${dev.hermes.android.data.currentAssistantName}" else "Call cancelled" } else if (retainedCameraWarning) "Stop Beacon in Android to close it."
                 else if (app.calls.state.value.toolApprovals.isNotEmpty()) "Action needs approval. Open Beacon to review."
-                else if (app.calls.state.value.screenStopPending) "Screen stop unconfirmed; visual delivery blocked. Tap to retry."
+                else if (app.calls.state.value.screenStopPending) "Screen may still be shared. Tap to stop."
                 else if (app.calls.state.value.screenSharing) "Screen sharing with ${dev.hermes.android.data.currentAssistantName}"
-                else if (app.calls.state.value.cameraStopPending) "Camera stop unconfirmed; video blocked. Tap to retry."
+                else if (app.calls.state.value.cameraStopPending) "Camera may still be on. Tap to stop."
                 else if (muted) "Microphone muted" else if (state.state == "connecting" || state.state == "reconnecting") "Connecting to ${dev.hermes.android.data.currentAssistantName}"
                 else if (state.remoteSpeaking || state.state == "speaking") "${dev.hermes.android.data.currentAssistantName} is speaking" else "Listening to you")
             .setContentIntent(open).setOngoing(true).setCategory(if (retainedCameraWarning) NotificationCompat.CATEGORY_ERROR else NotificationCompat.CATEGORY_CALL)

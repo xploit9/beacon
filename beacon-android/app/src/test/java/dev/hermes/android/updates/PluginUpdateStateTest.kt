@@ -20,10 +20,10 @@ class PluginUpdateStateTest {
         var restarts = 0
         var memos = emptyList<RestartMemo>()
         override suspend fun restart(last: RestartMemo, remember: (RestartMemo) -> Unit): RestartResult { restarts++; memos += last; return restartResult }
-        var accepted = emptyList<Boolean>()
+        var updates = 0
         override suspend fun version(): PluginVersions = reads[minOf(read++, reads.lastIndex)]
-        override suspend fun update(acceptCapabilities: Boolean): JSONObject {
-            accepted += acceptCapabilities
+        override suspend fun update(): JSONObject {
+            updates++
             failure?.let { throw it }
             return answer()
         }
@@ -74,22 +74,22 @@ class PluginUpdateStateTest {
 
     @Test fun aSavedRestartCanRetryAfterTheDashboardAlreadyReloaded() = runBlocking {
         val endpoint = Fake(listOf(versions("1.1.3")), restartResult = RestartResult.Completed)
-        assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {}.status)
-        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", restartOnly = true) {}.status)
+        assertEquals(0, endpoint.updates)
         assertEquals(1, endpoint.restarts)
     }
 
     @Test fun anInterruptedUpdateStillInstallsTheTargetBeforeRestarting() = runBlocking {
         val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.3")), restartResult = RestartResult.Completed)
-        assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {}.status)
-        assertEquals(listOf(false), endpoint.accepted)
+        assertEquals(PluginStatus.Updated, runPluginUpdate(endpoint, "1.1.3", restartOnly = true) {}.status)
+        assertEquals(1, endpoint.updates)
         assertEquals(0, endpoint.restarts)
     }
 
     @Test fun finishingAnOlderPendingRestartLeavesTheNewReleaseAvailable() {
         val endpoint = Fake(listOf(versions("1.1.0", "1.1.1"), versions("1.1.1")), restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Available, updateWith(endpoint).status)
-        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(0, endpoint.updates)
         assertEquals(1, endpoint.restarts)
     }
 
@@ -98,13 +98,13 @@ class PluginUpdateStateTest {
             { JSONObject().put("ok", true).put("restart_required", true) }, restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Updated, updateWith(endpoint).status)
         assertEquals(1, endpoint.restarts)
-        assertEquals(listOf(false), endpoint.accepted)
+        assertEquals(1, endpoint.updates)
     }
 
     @Test fun pendingRestartRetriesDoNotInstallThePluginAgain() {
         val endpoint = Fake(listOf(versions("1.1.1", "1.1.3"), versions("1.1.3")), restartResult = RestartResult.Completed)
         assertEquals(PluginStatus.Updated, updateWith(endpoint).status)
-        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(0, endpoint.updates)
         assertEquals(1, endpoint.restarts)
     }
 
@@ -112,7 +112,7 @@ class PluginUpdateStateTest {
         val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")), restartResult = RestartResult.Pending)
         assertEquals(PluginStatus.Restart, updateWith(endpoint).status)
         assertEquals(1, endpoint.restarts)
-        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(0, endpoint.updates)
     }
 
     @Test fun eachRefusalLandsOnItsOwnRowAndNeverClaimsUpdated() {
@@ -153,28 +153,28 @@ class PluginUpdateStateTest {
         val dashboardOnly = Fake(listOf(versions("1.1.1", "1.1.3").copy(gateway = "1.1.3")))
         assertEquals(PluginRow(PluginStatus.DashboardRestart, "1.1.3", "1.1.3"), updateWith(dashboardOnly))
         assertEquals(0, dashboardOnly.restarts)
-        assertTrue(dashboardOnly.accepted.isEmpty())
+        assertEquals(0, dashboardOnly.updates)
         // The phone's memory of a finished restart does the same when the gateway cannot be read.
         val remembered = Fake(listOf(versions("1.1.1", "1.1.3")))
-        assertEquals(PluginStatus.DashboardRestart, runBlocking { runPluginUpdate(remembered, "1.1.3", false, memo = RestartMemo(7, 1, completed = true)) {} }.status)
+        assertEquals(PluginStatus.DashboardRestart, runBlocking { runPluginUpdate(remembered, "1.1.3", memo = RestartMemo(7, 1, completed = true)) {} }.status)
         assertEquals(0, remembered.restarts)
     }
 
     @Test fun aGatewayThatReportsTheNewPluginNeedsNoRestartEvenWithOneLeftPending() {
         val endpoint = Fake(listOf(versions("1.1.3").copy(gateway = "1.1.3")))
-        assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), runBlocking { runPluginUpdate(endpoint, "1.1.3", false, restartOnly = true) {} })
+        assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), runBlocking { runPluginUpdate(endpoint, "1.1.3", restartOnly = true) {} })
         assertEquals(0, endpoint.restarts)
     }
 
     @Test fun theRestartAlreadyAskedForTravelsWithTheNextTapAndIsClearedByANewInstall() {
         val memo = RestartMemo(123, 5_000)
         val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")), restartResult = RestartResult.Completed)
-        runBlocking { runPluginUpdate(endpoint, "1.1.3", false, memo = memo) {} }
+        runBlocking { runPluginUpdate(endpoint, "1.1.3", memo = memo) {} }
         assertEquals(listOf(memo), endpoint.memos)
         // New files on disk make the earlier restart history irrelevant.
         val remembered = mutableListOf<RestartMemo>()
         val install = Fake(listOf(versions("1.1.1"), versions("1.1.3")))
-        runBlocking { runPluginUpdate(install, "1.1.3", false, memo = memo, remember = { remembered += it }) {} }
+        runBlocking { runPluginUpdate(install, "1.1.3", memo = memo, remember = { remembered += it }) {} }
         assertEquals(listOf(RestartMemo()), remembered)
     }
 
@@ -214,8 +214,8 @@ class PluginUpdateStateTest {
         assertFalse(hermesIdle(GatewayStatus(running = false, busy = false)))
     }
 
-    private fun updateWith(endpoint: Fake, target: String = "1.1.3", accept: Boolean = false, pauses: MutableList<Long> = mutableListOf()) =
-        runBlocking { runPluginUpdate(endpoint, target, accept) { pauses += it } }
+    private fun updateWith(endpoint: Fake, target: String = "1.1.3", pauses: MutableList<Long> = mutableListOf()) =
+        runBlocking { runPluginUpdate(endpoint, target) { pauses += it } }
 
     @Test fun theRowComparesWhatHermesRunsWithWhatTheReleaseShips() {
         assertEquals(PluginStatus.Available, pluginStatusFor(versions("1.1.1"), "1.1.3"))
@@ -241,14 +241,14 @@ class PluginUpdateStateTest {
         assertEquals(PluginProbe.Read(versions("1.1.1")), probePlugin(Fake(listOf(versions("1.1.1")))))
         val failing = { status: Int -> object : PluginEndpoint {
             override suspend fun version(): PluginVersions = throw ApiFailure(status, "no", plugin = true)
-            override suspend fun update(acceptCapabilities: Boolean): JSONObject = JSONObject()
+            override suspend fun update(): JSONObject = JSONObject()
         } }
         assertEquals(PluginProbe.None, probePlugin(failing(403)))
         assertEquals(PluginProbe.Unreadable, probePlugin(failing(404)))
         assertEquals(PluginProbe.Failed, probePlugin(failing(500)))
         assertEquals(PluginProbe.Failed, probePlugin(object : PluginEndpoint {
             override suspend fun version(): PluginVersions = throw IOException("offline")
-            override suspend fun update(acceptCapabilities: Boolean): JSONObject = JSONObject()
+            override suspend fun update(): JSONObject = JSONObject()
         }))
     }
 
@@ -257,7 +257,7 @@ class PluginUpdateStateTest {
         val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.1"), versions("1.1.3")))
         assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), updateWith(endpoint, pauses = pauses))
         assertEquals(listOf(1000L), pauses)
-        assertEquals(listOf(false), endpoint.accepted)
+        assertEquals(1, endpoint.updates)
     }
 
     @Test fun anUnchangedPluginDoesNotWait() {
@@ -267,21 +267,30 @@ class PluginUpdateStateTest {
         assertTrue(pauses.isEmpty())
     }
 
-    @Test fun capabilityChangesNeedTheOwnersReviewAndNothingIsInstalledBlind() {
-        val answer = { JSONObject().put("ok", false).put("consent_required", true).put("delta_lines", JSONArray(listOf("Reads files", "", "null", "Sends push"))) }
-        val row = updateWith(Fake(listOf(versions("1.1.1")), answer))
-        assertEquals(PluginRow(PluginStatus.NeedsReview, "1.1.1", "1.1.3", listOf("Reads files", "Sends push")), row)
-        // The owner's "Allow and update" resends with consent.
-        val consented = Fake(listOf(versions("1.1.1"), versions("1.1.3")))
-        updateWith(consented, accept = true)
-        assertEquals(listOf(true), consented.accepted)
-        assertEquals(PluginStatus.NeedsReview, updateWith(Fake(listOf(versions("1.1.1")), { JSONObject().put("scan_blocked", true) })).status)
+    @Test fun aScanBlockIsAFailedUpdateWithItsOwnLineAndNothingToReview() {
+        // Hermes answers a dangerous scan verdict with HTTP 400 whose text starts "Security scan blocked"; --force never overrides it.
+        val blocked = ApiFailure(400, "Security scan blocked plugin install: dangerous verdict (2 findings)")
+        for (failure in listOf(blocked, ApiFailure(400, "Install failed."))) {
+            val steps = StepTracker()
+            val row = runBlocking { runPluginUpdate(Fake(listOf(versions("1.1.1")), failure = failure), "1.1.3", steps = steps) {} }
+            assertEquals(PluginRow(PluginStatus.Failed, "1.1.1", "1.1.3"), row)
+            assertEquals(if (failure === blocked) StepNote.PluginBlocked else StepNote.PluginFailed, steps.rows.failed?.note)
+        }
+        assertTrue(scanBlocked(blocked)); assertFalse(scanBlocked(ApiFailure(400, "Install failed."))); assertFalse(scanBlocked(ApiFailure(500, "Security scan blocked")))
+        assertFalse(scanBlocked(IOException("Security scan blocked")))
+    }
+
+    @Test fun anAnswerThatAsksForConsentOrFlagsAScanBlockIsJustNotOk() {
+        // Hermes' install route never sends these (only its update route does); if it ever did, the update fails and nothing is offered for review.
+        for (answer in listOf(JSONObject().put("ok", false).put("consent_required", true), JSONObject().put("ok", false).put("scan_blocked", true), JSONObject().put("consent_required", true))) {
+            assertEquals(PluginRow(PluginStatus.Failed, "1.1.1", "1.1.3"), updateWith(Fake(listOf(versions("1.1.1")), { answer })))
+        }
     }
 
     @Test fun aRestartPendingPluginIsNotUpdatedAgain() {
         val endpoint = Fake(listOf(versions("1.1.1", "1.1.3")))
         assertEquals(PluginRow(PluginStatus.Restart, "1.1.3", "1.1.3"), updateWith(endpoint))
-        assertTrue(endpoint.accepted.isEmpty())
+        assertEquals(0, endpoint.updates)
         assertEquals(PluginStatus.Restart, updateWith(Fake(listOf(versions("1.1.1"), versions("1.1.1", "1.1.3")), { JSONObject().put("ok", true).put("restart_required", true) })).status)
     }
 
@@ -295,22 +304,52 @@ class PluginUpdateStateTest {
         listOf(403, 404).forEach { assertEquals(PluginRow(), updateWith(Fake(listOf(versions("1.1.1")), failure = ApiFailure(it, "no")))) }
     }
 
+    @Test fun aReplyLostAfterTheRequestLeftGoesOnToReadingTheVersionInsteadOfFailing() {
+        // A slow install: the phone's read timed out while Hermes carried on, so the new files arrive a little later.
+        for (lost in listOf(java.net.SocketTimeoutException("timeout"), java.net.SocketException("Connection reset"), IOException("unexpected end of stream"))) {
+            val pauses = mutableListOf<Long>()
+            val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.1"), versions("1.1.3")), failure = lost)
+            assertEquals(lost.toString(), PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), updateWith(endpoint, pauses = pauses))
+            assertEquals("It asked once and then only looked", 1, endpoint.updates)
+            assertEquals(listOf(1000L), pauses)
+        }
+    }
+
+    @Test fun aSlowInstallThatNeverShowsUpStillEndsOnTheRowNotOnAWrongError() {
+        val old = Fake(listOf(versions("1.1.1")), failure = java.net.SocketTimeoutException("timeout"))
+        val pauses = mutableListOf<Long>()
+        assertEquals(PluginRow(PluginStatus.Failed, "1.1.1", "1.1.3"), updateWith(old, pauses = pauses))
+        assertTrue("it waited longer than an install that answered", pauses.size > 10)
+        // The files arrive but the gateway still runs the old plugin: that is the restart, found from the versions alone.
+        val restart = Fake(listOf(versions("1.1.1"), versions("1.1.1", "1.1.3"), versions("1.1.3")), failure = IOException("Connection reset"), restartResult = RestartResult.Completed)
+        assertEquals(PluginStatus.Updated, updateWith(restart).status)
+        assertEquals(1, restart.restarts)
+    }
+
+    @Test fun aRequestThatNeverLeftTheMachineFailsAtOnceWithoutWaiting() {
+        for (never in listOf(java.net.UnknownHostException("no host"), java.net.ConnectException("refused"), java.net.SocketTimeoutException("connect timed out"))) {
+            val pauses = mutableListOf<Long>()
+            assertEquals(never.toString(), PluginStatus.Failed, updateWith(Fake(listOf(versions("1.1.1")), failure = never), pauses = pauses).status)
+            assertTrue(pauses.isEmpty())
+        }
+    }
+
     @Test fun anOlderPluginWithoutAVersionRouteCanStillBeUpdated() {
         val endpoint = object : PluginEndpoint {
             var reads = 0
             override suspend fun version(): PluginVersions = if (reads++ < 2) throw ApiFailure(404, "unknown route", plugin = true) else versions("1.1.3")
-            override suspend fun update(acceptCapabilities: Boolean): JSONObject = JSONObject().put("ok", true)
+            override suspend fun update(): JSONObject = JSONObject().put("ok", true)
         }
-        assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), runBlocking { runPluginUpdate(endpoint, "1.1.3", false) {} })
+        assertEquals(PluginRow(PluginStatus.Updated, "1.1.3", "1.1.3"), runBlocking { runPluginUpdate(endpoint, "1.1.3") {} })
     }
 
     @Test fun rowWordsAreShortAndActionsAreOnlyOfferedWhereTheyHelp() {
         PluginStatus.entries.forEach { assertTrue(PluginRow(it).text.length <= 60) }
-        assertEquals("Hermes is busy — restarts when it's idle", PluginRow(PluginStatus.Waiting).text)
+        assertEquals("Hermes is busy. It restarts when idle.", PluginRow(PluginStatus.Waiting).text)
         assertEquals("Restart the Hermes dashboard on your computer.", PluginRow(PluginStatus.DashboardRestart).text)
-        assertEquals("The Beacon plugin is newer than this app. Update the app.", PluginRow(PluginStatus.Newer).text)
-        assertEquals("The plugin is updated. The Hermes dashboard didn't restart.", PluginRow(PluginStatus.DashboardFailed).text)
-        assertEquals("Hermes gateway didn't restart", PluginRow(PluginStatus.RestartFailed).text)
+        assertEquals("Beacon on Hermes is newer than this app. Update the app.", PluginRow(PluginStatus.Newer).text)
+        assertEquals("Beacon is updated. The Hermes dashboard didn't restart.", PluginRow(PluginStatus.DashboardFailed).text)
+        assertEquals("Hermes didn't restart", PluginRow(PluginStatus.RestartFailed).text)
         // The button beside a failure says Try again, so the sentence does not.
         PluginStatus.entries.forEach { assertFalse(it.name, PluginRow(it).text.contains("Try again") && it != PluginStatus.Busy) }
         assertTrue(PluginRow(PluginStatus.Waiting).actionable)
@@ -320,7 +359,6 @@ class PluginUpdateStateTest {
         assertTrue(PluginRow(PluginStatus.Waiting).restartPending)
         assertFalse(PluginRow(PluginStatus.Available).restartPending)
         assertTrue(PluginRow(PluginStatus.Available).actionable)
-        assertTrue(PluginRow(PluginStatus.NeedsReview).actionable)
         assertFalse(PluginRow(PluginStatus.UpToDate).actionable)
         assertFalse(PluginRow(PluginStatus.Updated).actionable)
         assertFalse(PluginRow(PluginStatus.Hidden).actionable)

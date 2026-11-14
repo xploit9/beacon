@@ -18,6 +18,7 @@ import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.performScrollTo
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
@@ -85,8 +86,123 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicInteger
 
+/** The ring window the Answer step of the two incoming-call cases is given (debug seam, see exerciseIncoming): above the invitation's own 45 s, so that limit is the one that applies. */
+private const val ANSWER_RING_WINDOW_MS = 60_000L
+
 class KeepConnectedUiTest {
     @get:Rule val compose = createAndroidComposeRule<androidx.activity.ComponentActivity>()
+
+    /** The idle checks put the screen to sleep. However a test ends (passed, failed or skipped), the next one needs it on: a sleeping display fails every later UI test with "No compose hierarchies found". */
+    @org.junit.After fun leaveTheDisplayOn() {
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        fun shell(command: String) = automation.executeShellCommand(command).use { descriptor -> java.io.FileInputStream(descriptor.fileDescriptor).bufferedReader().readText() }
+        val context = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val power = context.getSystemService(android.os.PowerManager::class.java)
+        val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+        // Waking is not enough: the lock screen comes back with the screen and puts it to sleep again within seconds, so wait until it is really gone.
+        val deadline = System.currentTimeMillis() + 15_000
+        while ((!power.isInteractive || keyguard.isKeyguardLocked) && System.currentTimeMillis() < deadline) { shell("input keyevent KEYCODE_WAKEUP"); shell("wm dismiss-keyguard"); Thread.sleep(500) }
+    }
+
+    private fun shellOut(command: String): String = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(command).use { descriptor ->
+        java.io.FileInputStream(descriptor.fileDescriptor).bufferedReader().readText().trim()
+    }
+
+    private fun defaultDisplay(): android.view.Display =
+        ApplicationProvider.getApplicationContext<BeaconApplication>().getSystemService(android.hardware.display.DisplayManager::class.java).getDisplay(android.view.Display.DEFAULT_DISPLAY)
+
+    /** What the screen, the lock screen and this test's activity are doing right now, in one line: the run log and every failure text below use it. */
+    private fun uiSignals(): String {
+        val context = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val power = context.getSystemService(android.os.PowerManager::class.java)
+        val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+        val lifecycle = runCatching { compose.activity.lifecycle.currentState }.getOrNull()
+        val focus = runCatching { compose.activity.window.decorView.hasWindowFocus() }.getOrNull()
+        return "interactive=${power.isInteractive} display=${defaultDisplay().state} keyguardLocked=${keyguard.isKeyguardLocked} lifecycle=$lifecycle windowFocus=$focus deviceIdle=${power.isDeviceIdleMode}"
+    }
+
+    /**
+     * A sleep is finished only when the lock screen is up. The power manager says "not interactive" at once, but the display takes a second or two to go dark and the lock screen is put up after
+     * that (G3 run F5, #170: the card arrived 26 ms before the display finished going dark and 109 ms before the lock screen came up, and the wake in the finally block followed at once).
+     * A wake asked before the lock screen exists is answered by the lock screen a moment later, which stops the activity under a test that has already gone on. Wait for what the system shows,
+     * not for the request. A device with no lock screen never shows one: the wait is bounded and says so.
+     */
+    private fun awaitSleepSettled(): Boolean {
+        val keyguard = ApplicationProvider.getApplicationContext<BeaconApplication>().getSystemService(android.app.KeyguardManager::class.java)
+        val started = android.os.SystemClock.elapsedRealtime()
+        val settled = try { compose.waitUntil(8_000) { keyguard.isKeyguardLocked }; true } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) { false }
+        sleepAsked = false
+        println("KEEP_CONNECTED_FIXTURE_SLEEP lock_screen_up=$settled after_ms=${android.os.SystemClock.elapsedRealtime() - started} ${uiSignals()}")
+        return settled
+    }
+
+    /**
+     * A sleep this test asked for and has not yet seen through. The system answers a sleep with a lock screen a moment later, even when a wake follows at once (G3 run F6, #168: sleep, then
+     * wake and dismiss, asked back to back; the screen went off and on in the same millisecond, the lock screen came up 0.38 s after that, 0.3 s after every signal read "up", and stopped
+     * the activity). A single look at the signals cannot see a lock screen that does not exist yet, so the gate is told about the sleep and waits for the lock screen it brings
+     * ([awaitSleepSettled]) before it asks for the UI.
+     */
+    private var sleepAsked = false
+
+    /** Puts the screen to sleep and remembers that its lock screen is still to come. */
+    private fun askSleep(command: (String) -> Unit = { shellOut(it) }) { sleepAsked = true; command("input keyevent KEYCODE_SLEEP") }
+
+    /**
+     * The UI is up: the screen is on, the lock screen is gone, this test's activity is resumed and has window focus, and Compose has a resumed root to act on. Each is read from the system
+     * and from Compose (the root registry only holds the roots of RESUMED activities, which is what "No compose hierarchies found" means), asking again for whichever has not come, until all of
+     * them hold together. A single look at the screen and the lock screen is not enough: right after a wake they can both read fine just before the lock screen is put up.
+     */
+    private fun awaitUiUp(label: String, limitMs: Long = 20_000, activityHasFocus: Boolean = true): Long {
+        val context = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val power = context.getSystemService(android.os.PowerManager::class.java)
+        val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+        val started = android.os.SystemClock.elapsedRealtime()
+        var wakes = 0; var dismisses = 0; var recoveries = 0; var stuckSince = -1L
+        // What changed, and when, so a failure (or a slow wake) shows the order the system took.
+        val trail = mutableListOf<String>()
+        var last = ""
+        fun note() {
+            val now = uiSignals()
+            if (now != last) { trail += "+${android.os.SystemClock.elapsedRealtime() - started}ms $now"; last = now }
+        }
+        fun resumed() = compose.activity.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)
+        fun up() = power.isInteractive && !keyguard.isKeyguardLocked && resumed() && (!activityHasFocus || compose.activity.window.decorView.hasWindowFocus())
+        // Every root, not onRoot(): the incoming-call sheet is a second window with a root of its own, and onRoot() refuses two.
+        fun rootThere() = try { compose.onAllNodes(androidx.compose.ui.test.isRoot()).fetchSemanticsNodes().isNotEmpty() } catch (none: IllegalStateException) { false }
+        // The scenario is not asked to resume the activity: its moveToState(RESUMED) only checks the stage and waits (it starts nothing), which is what failed with "never becomes requested state
+        // RESUMED" in G3 run 3. The system resumes the activity itself the moment the lock screen is gone.
+        // A sleep asked for and not yet seen through brings a lock screen after it: wait for that one first (it is the one the signals below cannot see coming).
+        if (sleepAsked) awaitSleepSettled()
+        note()
+        while (!(up() && rootThere() && up())) {
+            note()
+            if (android.os.SystemClock.elapsedRealtime() - started > limitMs) {
+                val windows = shellOut("dumpsys window").lineSequence().map { it.trim() }.filter { it.startsWith("mCurrentFocus") || it.startsWith("mFocusedApp") || it.startsWith("isKeyguardShowing") }.toList()
+                throw AssertionError("The screen did not come back ($label): ${uiSignals()} wakes=$wakes dismisses=$dismisses recoveries=$recoveries windows=$windows trail=$trail")
+            }
+            if (!power.isInteractive) { shellOut("input keyevent KEYCODE_WAKEUP"); wakes++; stuckSince = -1 }
+            else if (keyguard.isKeyguardLocked) { shellOut("wm dismiss-keyguard"); dismisses++; stuckSince = -1 }
+            else if (!resumed()) {
+                // The screen is on and the lock screen reports gone, yet the activity is not back: the window manager still holds it under a lock screen that was dismissed before it was put up
+                // (G3 run F5: stopped for 16 s, back only after the display timed out and was woken again). One full sleep and wake puts the two in step again.
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (stuckSince < 0) stuckSince = now
+                else if (now - stuckSince > 3_000 && recoveries == 0) {
+                    recoveries++
+                    askSleep()
+                    try { compose.waitUntil(5_000) { !power.isInteractive } } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) { }
+                    awaitSleepSettled()
+                    shellOut("input keyevent KEYCODE_WAKEUP"); shellOut("wm dismiss-keyguard")
+                    stuckSince = -1
+                }
+            } else stuckSince = -1
+            try { compose.waitUntil(500) { up() } } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) { }
+        }
+        note()
+        val took = android.os.SystemClock.elapsedRealtime() - started
+        println("KEEP_CONNECTED_FIXTURE_UI label='$label' took_ms=$took wakes=$wakes dismisses=$dismisses recoveries=$recoveries ${uiSignals()} trail=$trail")
+        return took
+    }
 
     private class LifecycleGate {
         val entered = CountDownLatch(1)
@@ -220,7 +336,11 @@ class KeepConnectedUiTest {
         fun await(label: String = "SETUP_LIFECYCLE_BOUNDARY", condition: () -> Boolean) {
             val end = android.os.SystemClock.elapsedRealtime() + 8_000
             while (!condition() && android.os.SystemClock.elapsedRealtime() < end) Thread.sleep(10)
-            check(condition()) { label }
+            // The same 8 s and the same check; a failure says which wait it was and what the fixture held at that moment.
+            if (!condition()) {
+                val line = Throwable().stackTrace.firstOrNull { it.fileName == "KeepConnectedUiTest.kt" && it.methodName != "await" }?.lineNumber
+                throw IllegalStateException("$label at KeepConnectedUiTest.kt:$line active=${active() != null} pollAlive=${pollAlive()} services=${services.size} startReads=${startReads.get()} retirementReads=${retirementReads.get()} actualStarts=${actualStarts.get()} holdStart=$holdStart queuedStart=${queuedStart != null}")
+            }
         }
         fun vm(): BeaconViewModel {
             priorDataStore = dataStoreField.get(dataStoreDelegate)
@@ -448,20 +568,38 @@ class KeepConnectedUiTest {
         check(edit.commit())
     }
 
-    @Test fun setupDefaultsKeepConnectedOnAndPassesTheOwnerChoice() {
-        var selected: Boolean? = null
-        compose.setContent {
-            NativeLocalization("en") { BeaconTheme(dark = true) {
-                SetupWizardScreen(
-                    state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false),
-                    onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = { selected = it }, onReopen = {}, onCancel = {},
-                )
-            } }
-        }
+    @Test fun setupStartsKeepConnectedOnlyWhenNotificationsAreAllowedAndPassesWhatTheSwitchShows() {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val keepPrefs = app.getSharedPreferences(KeepConnectedService.PREFS, Context.MODE_PRIVATE)
+        val keepBefore = keepPrefs.all.toMap()
+        try {
+            // A first setup shows what is stored (off after a sign-out), and starts on only when the owner allowed notifications.
+            check(keepPrefs.edit().putBoolean(KeepConnectedService.KEY_ENABLED, false).commit())
+            val allowed = android.os.Build.VERSION.SDK_INT < 33 ||
+                androidx.core.content.ContextCompat.checkSelfPermission(app, Manifest.permission.POST_NOTIFICATIONS) == android.content.pm.PackageManager.PERMISSION_GRANTED
+            var selected: Boolean? = null
+            compose.setContent {
+                NativeLocalization("en") { BeaconTheme(dark = true) {
+                    SetupWizardScreen(
+                        state = AppState(origin = "https://hermes.example", authenticated = true, setupWizard = true, setupStep = "done", restoringSession = false),
+                        onProbe = {}, onSignIn = {}, onAdvancePermission = {}, onFinish = { selected = it }, onReopen = {}, onCancel = {},
+                    )
+                } }
+            }
 
-        compose.onNodeWithTag("setup-keep-connected").assertIsOn().performClick().assertIsOff()
-        compose.onNodeWithTag("setup-finish").performClick()
-        assertEquals(false, selected)
+            val keepSwitch = compose.onNodeWithTag("setup-keep-connected")
+            if (allowed) keepSwitch.assertIsOn() else keepSwitch.assertIsOff()
+            compose.onNodeWithTag("setup-finish").performClick()
+            assertEquals("Open chat passes exactly what the switch shows", allowed, selected)
+            // The owner's own move wins; only the move that needs no permission is made here (turning it on without one opens the system dialog).
+            if (allowed) {
+                keepSwitch.performClick().assertIsOff()
+                compose.onNodeWithTag("setup-finish").performClick()
+                assertEquals("A switch the owner turned off passes off", false, selected)
+            }
+        } finally {
+            restoreSharedPreferences(keepPrefs, keepBefore)
+        }
     }
 
     @Test fun disabledStartStopsWithoutCrashingTheApp() {
@@ -505,6 +643,29 @@ class KeepConnectedUiTest {
     @Test fun enablingPollsFixtureTaskResultsAndCallsThroughTheirNativePaths() = exerciseIncoming("default")
 
     @Test fun anIncomingCallKeepsItsOwnProfileWhenTheAssistantUsesAnotherProfile() = exerciseIncoming("coder")
+
+    /**
+     * G3G (#170). A wake asked while the display is still going dark is answered a moment later by the lock screen, which stops the activity under whoever went on (G3 run F5: the card
+     * arrived as the display finished going dark, the wake followed before the lock screen existed, and the incoming-call steps ran against a stopped activity). This asks for the sleep and
+     * the wake back to back, before the display is dark. The gate must end with the UI up (screen on, lock screen gone, activity resumed with window focus, a Compose root), and the activity
+     * must then stay resumed.
+     * G3 run F6 (#168, and alone on the same device): the system puts the lock screen up after a sleep even though the wake came at once, 0.3 s after every signal read "up". Android does
+     * not promise a settled state right after a wake that follows a sleep, so the gate is told about the sleep ([askSleep]) and waits for its lock screen before it asks for the UI;
+     * what this asserts afterwards is unchanged.
+     */
+    @Test fun aWakeAskedWhileTheDisplayIsGoingDarkEndsWithTheUiUpAndItStaysUp() {
+        compose.setContent { androidx.compose.material3.Text("wake probe", androidx.compose.ui.Modifier.testTag("wake-probe")) }
+        awaitUiUp("probe start")
+        askSleep()
+        shellOut("input keyevent KEYCODE_WAKEUP"); shellOut("wm dismiss-keyguard")
+        println("KEEP_CONNECTED_PROBE wake_asked ${uiSignals()}")
+        awaitUiUp("probe after the wake")
+        // Stays up: a lock screen that is still to come must not take the activity away. The system's own answer is awaited (up to four seconds), not a fixed time.
+        val left = try { compose.waitUntil(4_000) { !compose.activity.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) }; true } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) { false }
+        println("KEEP_CONNECTED_PROBE left_resumed=$left ${uiSignals()}")
+        assertFalse("The activity left RESUMED after the gate said the UI was up: ${uiSignals()}", left)
+        compose.onNodeWithTag("wake-probe").assertIsDisplayed()
+    }
 
     private fun exerciseIncoming(assistantProfile: String) = runBlocking {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
@@ -570,7 +731,9 @@ class KeepConnectedUiTest {
             showSignInPrompt()
             KeepConnectedService.setEnabled(app, null, false)
             compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
-            assertTrue(keepPrefs.edit().putString(KeepConnectedService.KEY_ORIGIN, scope.origin).commit())
+            // 8a344aec: a sign-out stops Keep connected and clears its prompt only for the account it was enabled for (origin, owner and provider), so seed all three as enabling does.
+            assertTrue(keepPrefs.edit().putString(KeepConnectedService.KEY_ORIGIN, scope.origin).putString(KeepConnectedService.KEY_OWNER, scope.owner)
+                .putString(KeepConnectedService.KEY_NATIVE_PROVIDER, scope.nativeProvider).commit())
             showSignInPrompt()
             KeepConnectedService.onUserSignedOut(app, requireNotNull(app.auth.deviceRemovalAuthority(scope)))
             compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
@@ -653,39 +816,75 @@ class KeepConnectedUiTest {
             val wasExempt = power.isIgnoringBatteryOptimizations(app.packageName)
             try {
                 if (!wasExempt) shell("dumpsys deviceidle whitelist +${app.packageName}")
-                shell("input keyevent KEYCODE_SLEEP")
+                askSleep { shell(it) }
                 compose.waitUntil(5_000) { !power.isInteractive }
-                shell("dumpsys deviceidle force-idle")
-                assertTrue("Fixture must enter actual Android idle mode", power.isDeviceIdleMode)
+                val forcedIdle = shell("dumpsys deviceidle force-idle")
+                // DeviceIdleController reports idle to PowerManager from a handler message once it reaches IDLE, after the shell command has returned:
+                // the flag is waited for, not read at once.
+                val forcedAt = android.os.SystemClock.elapsedRealtime()
+                val flagAtOnce = power.isDeviceIdleMode
+                val reachedIdle = try { compose.waitUntil(10_000) { power.isDeviceIdleMode }; true } catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) { false }
+                println("KEEP_CONNECTED_FIXTURE_IDLE forced='$forcedIdle' flag_at_once=$flagAtOnce flag_after_ms=${android.os.SystemClock.elapsedRealtime() - forcedAt} reached=$reachedIdle")
+                if (!reachedIdle) {
+                    val controller = shell("dumpsys deviceidle").lineSequence().map { it.trim() }.filter { Regex("(mDeepEnabled|mForceIdle|mState|mScreenOn|mCharging|mNotMoving)=.*").matches(it) }.toList()
+                    val detail = "force-idle said '$forcedIdle'; deep=${shell("cmd deviceidle get deep")} flag=${power.isDeviceIdleMode} controller=$controller"
+                    // Only Android's own refusal to enter Doze is a skip (the alert-during-idle step cannot be proven there); a controller that went idle while the flag never turned on is a failure.
+                    org.junit.Assume.assumeFalse("This device cannot enter Android idle mode: $detail", forcedIdle.startsWith("Unable to go deep idle"))
+                    throw AssertionError("Fixture must enter actual Android idle mode: $detail")
+                }
                 val taskResultEvent = fixture.emitTaskResult()
                 testEvents += taskResultEvent
                 val taskResultKey = notificationKey(taskResultEvent)
-                compose.waitUntil(15_000) { manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1 }
+                // Root ruling (msg_0ccbf1b46ebe): was 15_000. The poll schedule this wait used to bound is pinned by KeepConnectedScheduleTest (JVM). On a loaded emulator the card took longer after forced deep idle (fl6-base-1: idle flag after 3776 ms, no card in 15 s); a card that never comes still fails.
+                compose.waitUntil(45_000) { manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 } == 1 }
                 assertEquals("An alert must arrive during idle without reopening Beacon", 1, manager.activeNotifications.count { it.tag == taskResultKey && it.id == 1 })
                 assertTrue(deliveryCpuHeld())
+                // The wake in the finally below must come after the sleep is over (see awaitSleepSettled), not while the display is still going dark.
+                awaitSleepSettled()
             } finally {
                 shell("dumpsys deviceidle unforce")
                 if (!wasExempt) shell("dumpsys deviceidle whitelist -${app.packageName}")
-                if (wasInteractive) { shell("input keyevent KEYCODE_WAKEUP"); shell("wm dismiss-keyguard") }
+                // The screen is woken even when it was already asleep before the probe: a sleeping display fails every later UI test with "No compose hierarchies found".
+                shell("input keyevent KEYCODE_WAKEUP"); shell("wm dismiss-keyguard")
             }
             val interactiveBeforeUi = power.isInteractive
             // The fixture's next step uses the screen even if it had already slept before the idle probe.
-            shell("input keyevent KEYCODE_WAKEUP"); shell("wm dismiss-keyguard")
-            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
-            compose.waitUntil(10_000) {
-                power.isInteractive && compose.activity.lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED) &&
-                    compose.activity.window.decorView.hasWindowFocus()
-            }
+            // KEYCODE_WAKEUP and `wm dismiss-keyguard` return before the display is on and before the lock screen (put back when the display wakes) is down, and Android resumes the stopped
+            // activity only after both (G3 run 3, #166: waited ~45 s for a screen that was off; G3 run F5, #170: the screen and the lock screen read fine once, the lock screen came a moment
+            // later and the incoming-call steps ran against a stopped activity). So: wait until the screen, the lock screen, the activity and Compose's root all hold together.
+            awaitUiUp("after the idle probe")
             println("KEEP_CONNECTED_FIXTURE_WAKE before=$interactiveBeforeUi entered_idle_awake=$wasInteractive after=${power.isInteractive}")
             assertTrue(manager.activeNotifications.none { it.tag == notificationKey(olderEvent) })
 
+            // Everything the Answer tap needs that does not depend on the call is done before the call exists: it rings for only RelayCallback.RING_WINDOW_MS from its arrival.
+            val autoAdvance = compose.mainClock.autoAdvance
+            compose.mainClock.autoAdvance = false
+            compose.runOnUiThread { showIncomingCall.value = true }
+            compose.mainClock.advanceTimeByFrame()
+            compose.waitForIdle()
+            val answerOriginGeneration = BeaconViewModel::class.java.getDeclaredField("originGeneration").apply { isAccessible = true }.getInt(vm)
+            assertNotNull("The fixture's selected voice key must be readable", voiceStore.session())
+            // The product rings a call for 20 s from its arrival (RelayCallback.RING_WINDOW_MS; the JVM suite pins that value and its expiry). On a loaded emulator the sheet, the tap
+            // and the product's own opening of the chat before it asks Hermes took more than that (INT r16: 37-41 s), so for the Answer step only this debug-only seam gives the
+            // call more time; the invitation's own 45 s limit still applies. It is put back right after the Answer request is asserted, and in the finally.
+            dev.hermes.android.voice.RelayCallback.ringWindowForTest(ANSWER_RING_WINDOW_MS)
             val answerEvent = fixture.emitIncomingCall(conversationId = "chat-b")
             testEvents += answerEvent
+            val emittedAt = android.os.SystemClock.elapsedRealtime()
+            // A call rings for RelayCallback.RING_WINDOW_MS from its arrival: Answer is refused ("This call has already ended") after that, so the steps up to the tap are timed and a failure says where the window went.
+            val steps = mutableListOf<String>()
+            fun ringClock() = "since the call was emitted ${android.os.SystemClock.elapsedRealtime() - emittedAt} ms (it rings ${dev.hermes.android.voice.RelayCallback.ringWindowMs()} ms from arrival; the product's value is ${dev.hermes.android.voice.RelayCallback.RING_WINDOW_MS}); steps $steps"
+            fun timed(label: String, ms: Long, condition: () -> Boolean) {
+                val begun = android.os.SystemClock.elapsedRealtime()
+                try { compose.waitUntil(ms, condition) }
+                catch (timeout: androidx.compose.ui.test.ComposeTimeoutException) { compose.mainClock.autoAdvance = autoAdvance; throw AssertionError("$label: not within $ms ms; ${ringClock()}", timeout) }
+                steps += "$label ${android.os.SystemClock.elapsedRealtime() - begun}ms"
+            }
             val answerSource = answerEvent.getString("source_ref")
             seedExistingFcmBinding(answerSource)
-            compose.waitUntil(15_000) { app.push.ringingInvitation(answerSource, answerEvent.getString("event_id")) != null }
+            timed("invite rings", 15_000) { app.push.ringingInvitation(answerSource, answerEvent.getString("event_id")) != null }
             // The system applies notification cancels asynchronously.
-            compose.waitUntil(5_000) { manager.activeNotifications.none { it.id == 4083 } }
+            timed("older card cancelled", 5_000) { manager.activeNotifications.none { it.id == 4083 } }
             assertTrue(fixture.notificationWaits.contains(25L))
             val answerInvite = app.push.ringingInvitation(answerSource, answerEvent.getString("event_id"))!!
             val answerEventId = answerEvent.getString("event_id")
@@ -704,22 +903,24 @@ class KeepConnectedUiTest {
             }
             fun isRingingSlot(card: android.service.notification.StatusBarNotification) =
                 (card.tag == answerInvite.key && card.id == 2) || (card.tag == null && card.id == 42)
-            compose.waitUntil(10_000) { ringingCards().let { it.size == 1 && isRingingSlot(it.single()) } }
+            timed("one ringing card", 10_000) { ringingCards().let { it.size == 1 && isRingingSlot(it.single()) } }
             val cards = ringingCards()
             assertEquals("Expected one active call card for this invite; found ${cards.map { "${it.tag}:${it.id}" }}", 1, cards.size)
             assertTrue("The invite card must use its notification or ringtone foreground slot", isRingingSlot(cards.single()))
 
-            val autoAdvance = compose.mainClock.autoAdvance
-            compose.mainClock.autoAdvance = false
-            compose.runOnUiThread { showIncomingCall.value = true }
+            val sheetFrom = android.os.SystemClock.elapsedRealtime()
             compose.mainClock.advanceTimeByFrame()
             compose.waitForIdle()
-            compose.mainClock.advanceTimeBy(1000)
+            // One jump of a second, not sixty drawn frames: the sheet only has to reach its resting place.
+            compose.mainClock.advanceTimeBy(1000, ignoreFrameDuration = true)
+            steps += "sheet shown ${android.os.SystemClock.elapsedRealtime() - sheetFrom}ms"
+            // The tap needs the UI up now, not only when the step began: a stopped activity has no Compose root to find the control in.
+            // The incoming-call sheet is a window of its own and holds the focus while it is up (the F5-based ordered run's coder twin failed here when this asked the activity for it): the root check is what counts.
+            steps += "ui up ${awaitUiUp("before the Answer tap", activityHasFocus = false)}ms"
             val answerRequestStart = fixture.requests.size
-            val answerOriginGeneration = BeaconViewModel::class.java.getDeclaredField("originGeneration").apply { isAccessible = true }.getInt(vm)
             try {
-                assertTrue("The displayed invite must still authorize Answer", app.push.authorizeKeepConnectedAction(answerSource, answerEventId, "answer"))
-                assertNotNull("The fixture's selected voice key must be readable", voiceStore.session())
+                assertTrue("The displayed invite must still authorize Answer; ${ringClock()}", app.push.authorizeKeepConnectedAction(answerSource, answerEventId, "answer"))
+                steps += "before the tap ${android.os.SystemClock.elapsedRealtime() - emittedAt}ms"
                 compose.onNodeWithTag("beacon-incoming-answer").performScrollTo().assertIsDisplayed().assertIsEnabled().performClick()
                 assertEquals("The actual Answer control must dispatch once", 1, answerActions)
             } catch (failure: Throwable) {
@@ -738,6 +939,7 @@ class KeepConnectedUiTest {
                     "notice=${vm.ui.value.notice} callError=${app.calls.state.value.error} invite=${app.push.ringingInvitation(answerSource, answerEventId) != null} " +
                     "requests=${fixture.requests.takeLast(8).map { it.string("method") + " " + it.string("path") }}", timeout)
             }
+            steps += "chat opened ${android.os.SystemClock.elapsedRealtime() - emittedAt}ms"
             assertEquals("chat-b", vm.chat.value.sessionId)
             val answerPath = "/api/plugins/beacon/mobile/callbacks/${answerEvent.getString("event_id")}/answer"
             // This fixture host is hidden; the service posts the explicit receipt before refusing to start a live call.
@@ -746,10 +948,11 @@ class KeepConnectedUiTest {
                 println("KEEP_CONNECTED_FIXTURE_ANSWER generation_delta=${BeaconViewModel::class.java.getDeclaredField("originGeneration").apply { isAccessible = true }.getInt(vm) - answerOriginGeneration} assistant_matches_fixture=${AppPreferences.read(app.preferences.data.first()).assistantProfile == scope.profile} profile_matches_fixture=${vm.client?.scope?.profile == scope.profile} permits=${app.push.permitsIncoming(answerSource)} authorized=${app.push.authorizeKeepConnectedAction(answerSource, answerEventId, "answer")} invite=${app.push.invitation(answerSource, answerEventId) != null} phone_provider=${voiceStore.settings().provider} fixture_provider=${fixture.voiceProvider}")
                 println("KEEP_CONNECTED_FIXTURE_REJECTIONS ${fixture.rejectedRequests.map { it.string("method") + " " + it.string("path") + " " + it.optInt("status") }}")
                 println("KEEP_CONNECTED_FIXTURE_ANSWER_REQUESTS ${fixture.requests.drop(answerRequestStart).filter { it.string("path") != "/api/plugins/beacon/mobile/notifications/events" }.map { it.string("method") + " " + it.string("path") }}")
-                throw AssertionError("Answer callback: posted=${fixture.requests.any { it.string("method") == "POST" && it.string("path") == answerPath }} active=${app.calls.state.value.active} stage=${app.calls.state.value.state} error=${app.calls.state.value.error} uiError=${vm.ui.value.error} page=${vm.ui.value.morePage} requests=${fixture.requests.filter { it.string("path") != "/api/plugins/beacon/mobile/notifications/events" }.takeLast(12).map { it.string("method") + " " + it.string("path") }}", timeout)
+                throw AssertionError("Answer callback: posted=${fixture.requests.any { it.string("method") == "POST" && it.string("path") == answerPath }} active=${app.calls.state.value.active} stage=${app.calls.state.value.state} error=${app.calls.state.value.error} uiError=${vm.ui.value.error} page=${vm.ui.value.morePage} invite=${app.push.deadlineInvitation(answerSource, answerEventId)} now=${System.currentTimeMillis()} ${ringClock()} permits=${app.push.permitsIncoming(answerSource)} requests=${fixture.requests.filter { it.string("path") != "/api/plugins/beacon/mobile/notifications/events" }.takeLast(12).map { it.string("method") + " " + it.string("path") }}", timeout)
             }
             assertFalse(app.calls.state.value.active)
             assertTrue(fixture.requests.any { it.string("method") == "POST" && it.string("path") == answerPath })
+            dev.hermes.android.voice.RelayCallback.ringWindowForTest(null)
 
             val declineEvent = fixture.emitIncomingCall(conversationId = "chat-a")
             testEvents += declineEvent
@@ -813,6 +1016,7 @@ class KeepConnectedUiTest {
             )))
             assertFalse(app.push.authorizeKeepConnectedAction(receiptlessSource, receiptlessEventId, "answer"))
         } finally {
+            dev.hermes.android.voice.RelayCallback.ringWindowForTest(null)
             if (priorBeacon == null) app.cache.delete(scope, "beacon-session") else app.cache.write(scope, "beacon-session", priorBeacon, protected = true)
             KeepConnectedService.setEnabled(app, null, false)
             if (previousSignInNotification == null) manager.cancel(4083)
