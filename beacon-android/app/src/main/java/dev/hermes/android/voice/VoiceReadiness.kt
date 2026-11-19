@@ -37,9 +37,20 @@ internal fun callbackDefinitelyRejected(status:Int,message:String)=status in set
 
 internal class VoiceProviderRejected(message:String):IllegalStateException(message)
 
-/** A provider refused the call setup (close 1007/1008 before the greeting): say which part to fix. */
+/**
+ * Backlog 81 (CHAT-121 follow-up 11): the provider refuses for money. Its own reason names credits, billing or a prepaid plan, whatever the close
+ * code (Gemini Live closes 1011 "Your prepayment credits are depleted…" and "…please check your plan and billing details"), so trying again
+ * cannot help until the owner adds credits. A rate limit ("Resource has been exhausted", "quota" alone) passes by itself and is not this.
+ */
+internal fun providerMoneyRefusal(reason:String):Boolean = PROVIDER_MONEY_WORDS.containsMatchIn(reason)
+private val PROVIDER_MONEY_WORDS = Regex("""(?i)\b(credits?|billing|prepay(ment|ed)?|payment required|insufficient (funds|balance))\b""")
+/** [providerRejectionMessage]'s reason for a refusal for money. */
+internal const val PROVIDER_MONEY_REFUSAL = "credits"
+
+/** A provider refused the call setup (close 1007/1008 before the greeting), or for money at any time: say which part to fix. */
 internal fun providerRejectionMessage(provider:String,reason:String):String {
     val name=when(provider) { "grok" -> "Grok";"openai" -> "OpenAI";else -> "Gemini" }
+    if(reason==PROVIDER_MONEY_REFUSAL) return "Your $name credits ran out."
     return if(reason.contains("key",ignoreCase=true)) "$name didn't accept the API key. Check it in Settings › Voice & calls."
     else "$name couldn't start the call. Choose another model in Settings › Voice & calls."
 }

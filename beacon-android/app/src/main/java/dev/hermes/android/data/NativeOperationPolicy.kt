@@ -53,8 +53,10 @@ internal object NativeOperationPolicy {
      * commit. Any other key, value or source is refused here, before a request exists. Every other path has no body rule.
      */
     fun installBodyAllowed(path: String, body: org.json.JSONObject?): Boolean {
-        // The turn-on route takes exactly {profile: <a Hermes profile id>}; the client further requires it to be the profile the app is signed in to.
-        if (path == PROFILE_PLUGIN_ENABLE_PATH) return body != null && body.length() == 1 && (body.opt("profile") as? String)?.matches(profileIdOnly) == true
+        // The turn-on route takes exactly {profile: <a Hermes profile id>}, plus auto: true when the phone asks by itself; the client further requires it to be the profile the
+        // app is signed in to.
+        if (path == PROFILE_PLUGIN_ENABLE_PATH) return body != null && (body.length() == 1 || body.length() == 2 && body.opt("auto") == true) &&
+            (body.opt("profile") as? String)?.matches(profileIdOnly) == true
         if (path != beaconPluginInstallPath) return true
         return body != null && body.length() == 4 && body.opt("identifier") == dev.hermes.android.updates.BEACON_PLUGIN_SOURCE &&
             body.opt("enable") == true && body.opt("force") == true && (body.opt("ref") as? String)?.let(dev.hermes.android.updates.COMMIT_SHA::matches) == true
@@ -180,7 +182,7 @@ internal fun profileDefaultsAfterFailure(previous: JSONObject?, scopeKey: String
     val usable = previous != null && !previous.has("_error") && previous.string("scope_key") == scopeKey && previous.string("profile") == profile &&
         previous.opt("model") is String && previous.string("model").isNotBlank() && previous.opt("reasoning_effort") is String && previous.string("reasoning_effort").isNotBlank()
     return if (usable) previous!!.let { JSONObject(it.toString()) }.put("session_id", session).put("_stale", true)
-    else JSONObject().put("_error", if (error != null && beaconOffForProfile(error)) PROFILE_PLUGIN_OFF_ERROR else "Couldn't load models").put("profile", profile).put("scope_key", scopeKey).put("session_id", session)
+    else JSONObject().put("_error", if (error != null && beaconOffForProfile(error)) beaconOffLine(error) else "Couldn't load models").put("profile", profile).put("scope_key", scopeKey).put("session_id", session)
 }
 
 /** A failed read puts the app-wide error on screen only for a read the owner asked for and not for the chat defaults, which fall back to what was last good. */

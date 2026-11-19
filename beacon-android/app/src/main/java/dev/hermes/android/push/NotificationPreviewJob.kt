@@ -72,9 +72,11 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
             else app.push.conversationPosts.tryEmit(scope.session(it))
         }
         val preview = route.optJSONObject("preview") ?: return@withTimeout
-        // The Beacon chat's own replies carry the assistant's name, never that chat's auto title (owner, 4 Nov).
-        val assistant = if (route.optBoolean("assistant_chat")) context.applicationContext.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).assistantName else ""
-        val title = boundedNotificationText(replyNotificationTitle(route, preview.opt("title") as? String ?: "", assistant), 120)
+        // The Beacon chat's own notices carry the assistant's name, never that chat's auto title (owner, 4 and 17 Nov). Hermes says which chat that is
+        // (and keeps saying so after it moved the chat to a new session id); this phone also knows its own, which Hermes may not have been told yet.
+        val beaconChat = app.cache.beaconChat(scope)
+        val assistant = if (beaconChatNotice(route, beaconChat)) context.applicationContext.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).assistantName else ""
+        val title = boundedNotificationText(replyNotificationTitle(route, preview.opt("title") as? String ?: "", assistant, beaconChat), 120)
         val body = boundedNotificationText(preview.opt("body") as? String ?: "", 640)
         if (title.isBlank() || body.isBlank() || !authorized()) return@withTimeout
         // Recover the posted notification to retain tap/call actions and never re-ring a preview.
@@ -91,9 +93,13 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
     }
 }
 
-/** A reply notice's title: the assistant's name for the Beacon chat's own replies, otherwise the chat's title. */
-internal fun replyNotificationTitle(route: JSONObject, chatTitle: String, assistantName: String): String =
-    if (route.optBoolean("assistant_chat") && assistantName.isNotBlank()) assistantName else chatTitle
+/** Whether a notice is the Beacon chat's own: Hermes says so, or the chat it names is the one this phone keeps for this account and profile ([beaconChat]). */
+internal fun beaconChatNotice(route: JSONObject, beaconChat: String?): Boolean =
+    route.optBoolean("assistant_chat") || !beaconChat.isNullOrBlank() && route.string("session_id") == beaconChat
+
+/** A notice's title: the assistant's name for the Beacon chat's own, otherwise the chat's title. */
+internal fun replyNotificationTitle(route: JSONObject, chatTitle: String, assistantName: String, beaconChat: String? = null): String =
+    if (beaconChatNotice(route, beaconChat) && assistantName.isNotBlank()) assistantName else chatTitle
 
 /** How long the FCM thread waits for the real text before the job takes over. */
 internal const val INLINE_PREVIEW_MILLIS = 8_000L

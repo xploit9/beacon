@@ -1,0 +1,19 @@
+{
+  "request_id": "req-synthetic-0002",
+  "tool_id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+  "tool": "t_hermes_notes_create",
+  "tool_name": "t_hermes_notes_create",
+  "read_only": false,
+  "approved_by": null,
+  "status": "needs_approval",
+  "ran_on_hermes": false,
+  "server_ms": {},
+  "proposal": {
+    "id": "proposal-synthetic-0000000000000000000000000000",
+    "tool_name": "t_hermes_notes_create",
+    "arguments": {
+      "title": "Synthetic note"
+    }
+  },
+  "expires_at": 1794651339.5
+}

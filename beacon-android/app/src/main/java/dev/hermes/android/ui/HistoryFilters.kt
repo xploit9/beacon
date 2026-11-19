@@ -76,12 +76,20 @@ internal fun historySources(rows: List<JSONObject>, hidden: Set<String>): List<S
 internal fun historyProfileKey(profile: String): String = profile.trim().lowercase(Locale.ROOT)
 
 /**
+ * Whether a listed row is the chat saved as [chatId]. Hermes lists a chat it compressed under the id of its newest session and names the first one
+ * in `_lineage_root_id` and every one in `_lineage_ids`, so the Beacon chat is found by any of them and never shows up as a second chat.
+ */
+internal fun rowIsChat(row: JSONObject, chatId: String): Boolean =
+    chatId.isNotBlank() && (sessionRowId(row) == chatId || row.string("_lineage_root_id") == chatId ||
+        row.optJSONArray("_lineage_ids")?.let { ids -> (0 until ids.length()).any { ids.optString(it) == chatId } } == true)
+
+/**
  * The assistant's own session: the row whose session id is [assistantSessionId] inside the assistant's profile. A row with no
  * profile belongs to the profile the list is loaded for ([currentProfile]), and ids differing only in case or spacing are one
  * profile, so the session never shows as an ordinary chat next to Beacon's card.
  */
 internal fun isAssistantSessionRow(row: JSONObject, currentProfile: String, assistantProfile: String, assistantSessionId: String): Boolean {
-    if (assistantSessionId.isBlank() || sessionRowId(row) != assistantSessionId) return false
+    if (assistantSessionId.isBlank() || !rowIsChat(row, assistantSessionId)) return false
     val rowProfile = historyProfileKey(row.string("profile").ifBlank { currentProfile })
     return rowProfile == historyProfileKey(assistantProfile.ifBlank { currentProfile })
 }
@@ -94,7 +102,8 @@ internal fun historyRows(rows: List<JSONObject>, view: HistoryView, order: Histo
         HistoryView.Threads -> visible.filter { isThreadSource(it.string("source")) }
         HistoryView.Pinned -> visible.filter { it.optBoolean("pinned") }
     }
-    return if (order == HistoryOrder.Title) shown.sortedWith(compareByDescending<JSONObject> { it.optBoolean("pinned") }.thenBy { it.string("title").lowercase(Locale.ROOT) }) else shown
+    // Pinned chats stay on top in every order (as in Telegram); the sort is stable, so the rest keep Hermes' order.
+    return if (order == HistoryOrder.Title) shown.sortedWith(compareByDescending<JSONObject> { it.optBoolean("pinned") }.thenBy { it.string("title").lowercase(Locale.ROOT) }) else shown.sortedByDescending { it.optBoolean("pinned") }
 }
 
 /** Hermes rejects a duplicate title (the first-turn title is then dropped), so a repeated thread name gets a number. */
@@ -242,8 +251,6 @@ private val markdownBlockMarker = Regex("(?m)^\\s{0,3}(?:#{1,6}|>|[-*+])\\s+")
 private val markdownInlineMarker = Regex("[*`~]")
 private val whitespaceRuns = Regex("\\s+")
 
-// Hermes' MEDIA tag in any case, quoted or not; an unquoted one must look like a path, so "social media: news" stays words.
-private val mediaReference = Regex("MEDIA:\\s*(?:`([^`\\n]+)`|\"([^\"\\n]+)\"|'([^'\\n]+)'|(\\S*[/\\\\]\\S*))", RegexOption.IGNORE_CASE)
 
 /** What the chat list keeps for a chat's newest message: the line its bubble shows and who it is from. A scheduled post is
  *  the thread's message (not "You"), and an interrupted turn reads "Stopped" rather than Hermes' error text. */
@@ -258,14 +265,28 @@ internal fun chatListLine(latest: dev.hermes.android.Message?): Pair<String, Str
 // directly or after a bullet. The bubble keeps its stricter pattern (cronDeliveryLabel), which needs the line break.
 private val previewCronLabel = Regex("^\\[Cron delivery: [^\\]\\n]{1,200}]\\s*(?:[-–—:•]\\s*)?")
 
+/**
+ * Hermes' list preview is the first message on one line, cut at 60 characters (hermes_state_common._shape_preview), so the footer Hermes stores
+ * below a sent file's words (agent/context_references.py: "--- Attached Context ---", "--- Context Warnings ---") arrives flattened, " --- Attached
+ * Context --- …", or cut short, " --- Attached Co...". The line keeps only what comes before it.
+ */
+internal fun withoutFlattenedContextFooter(line: String): String {
+    for (match in Regex(" ---").findAll(line)) {
+        val rest = line.substring(match.range.last + 1).trimStart().removeSuffix("...")
+        if (listOf("Attached Context ---", "Context Warnings ---").any { header -> rest.startsWith(header) || header.startsWith(rest) }) return line.substring(0, match.range.first)
+    }
+    return line
+}
+
 /** One line of a message for a list: Markdown marks and line breaks gone, bounded. */
 internal fun chatPreviewText(source: String): String {
     // A stored first message carries Hermes' note and the file's path in front of the owner's words: a preview shows the words only, wherever it is built.
-    val raw = if (mentionsHermesNote(source)) splitAttachedMedia(source).text else source
+    val raw = withoutFlattenedContextFooter(if (mentionsHermesNote(source)) splitAttachedMedia(source).text else source)
     // Hermes labels a scheduled post "[Cron delivery: <job>]"; the list shows the post itself.
     val unlabelled = raw.trimStart().let { trimmed -> previewCronLabel.find(trimmed)?.let { trimmed.substring(it.range.last + 1) } ?: raw }
     // Like the bubble: an attached or generated file shows as its safe name, never its path on the computer.
-    val named = mediaReference.replace(unlabelled) { match -> match.groupValues.drop(1).first { it.isNotEmpty() }.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\') }
+    // Hermes' own MEDIA: grammar (spaces, quotes, a sentence's full stop); a message that only delivers files reads "📎 report.pdf".
+    val named = dev.hermes.android.core.withFileNames(unlabelled, dev.hermes.android.core.FILES_MARK)
     val text = historyAttachmentPresentation(named).let { shown -> shown.text.ifBlank { shown.attachments.firstOrNull()?.name.orEmpty() } }
     val plain = whitespaceRuns.replace(markdownInlineMarker.replace(markdownBlockMarker.replace(markdownLink.replace(text) { it.groupValues[1] }, ""), ""), " ").trim()
     val cut = plain.take(GLANCE_PREVIEW_MAX)

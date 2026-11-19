@@ -88,6 +88,16 @@ internal fun persistPushBindings(prefs:android.content.SharedPreferences,values:
         error("Could not save notification bindings")
     }
 }
+/**
+ * What this phone forgets when Hermes removes it (a sign-out from Hermes' side), besides the account's push state: the removed account's saved [screens], and
+ * the large files kept on this phone for sends (ChatAttachmentStore), as at the owner's own sign-out (BeaconViewModel.logout), and the account's [chats] and
+ * received files (REVIEW-JOIN-121 P3-6). Each is launched on its own with [launch], so one that fails or waits never holds back the others.
+ */
+internal fun forgetAfterDeviceRemoval(launch: (suspend () -> Unit) -> Unit, chats: suspend () -> Unit = {}, screens: suspend () -> Unit) {
+    launch { runCatching { screens() } }
+    launch { runCatching { chats() } }
+    launch { runCatching { dev.hermes.android.data.ChatAttachmentStore.clear() } }
+}
 class PushManager(private val app: BeaconApplication) {
     private val privatePrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
     private val lock = Any()
@@ -137,8 +147,8 @@ class PushManager(private val app: BeaconApplication) {
         if (!applied) return
         revokeLocalWhere({ bindingScope(it).sameAccount(scope) || unstampedBindingOfAccount(it, scope) }, removal)
         KeepConnectedService.onUserSignedOut(app, removal)
-        // The screen cache's own hook exists only while a ViewModel is alive; the saved screens of a removed phone go either way.
-        cleanup.launch { runCatching { app.cache.deleteIfCurrent(scope.copy(profile = "", session = ""), "screens", removal) } }
+        // The screen cache's own hook exists only while a ViewModel is alive; the saved screens of a removed phone go either way, and so do the kept files.
+        forgetAfterDeviceRemoval({ step -> cleanup.launch { step() } }, { dev.hermes.android.forgetRemovedAccountData(app, scope, removal) }) { app.cache.deleteIfCurrent(scope.copy(profile = "", session = ""), "screens", removal) }
         cleanup.launch { runCatching { deleteUnusedFirebaseToken() }.onFailure { android.util.Log.w("BeaconPush", "Firebase token cleanup could not be confirmed") } }
     }
     private suspend fun deleteUnusedFirebaseToken() = registration.withLock { deleteUnusedFirebaseTokenLocked() }
@@ -734,6 +744,11 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
         val nativeKind = data["kind"].orEmpty()
         // Hermes is asking to use this phone's calendar, alarms, contacts, calls or messages: the phone reads the request and asks its owner.
         if (nativeKind == "phone_request") { dev.hermes.android.phone.HermesPhoneRequests.onPush(context, source); return null }
+        // The agent's own phone asks its owner, or tells of a payment or send it made (approvals-v1 §6, §6b): the push carries no
+        // content, so the phone reads the record or the activity row over Hermes and asks in its secure dialog.
+        if (dev.hermes.android.agentphone.isAgentPhoneNotice(nativeKind)) {
+            dev.hermes.android.agentphone.AgentApprovals.onPush(context, source, data["event_id"].orEmpty(), data["conversation_ref"].orEmpty(), nativeKind); return null
+        }
         val activity = data["activity_ref"].orEmpty()
         fun fetchPreview(kind: String): PreviewRequest? {
             if (deferPreview) return PreviewRequest(source, event, data["conversation_ref"].orEmpty(), kind)

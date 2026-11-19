@@ -255,11 +255,19 @@ def _initialize_schema(conn):
     CREATE TABLE IF NOT EXISTS phone_requests(id TEXT PRIMARY KEY,owner TEXT NOT NULL,profile TEXT NOT NULL,session TEXT NOT NULL DEFAULT '',tool TEXT NOT NULL,args TEXT NOT NULL,created REAL NOT NULL,expires REAL NOT NULL,status TEXT NOT NULL DEFAULT 'pending',result TEXT NOT NULL DEFAULT '',device TEXT NOT NULL DEFAULT '');
     CREATE INDEX IF NOT EXISTS phone_requests_owner ON phone_requests(owner,profile,status,expires);
     CREATE TABLE IF NOT EXISTS phone_state(owner TEXT NOT NULL,device TEXT NOT NULL,updated REAL NOT NULL,state TEXT NOT NULL,PRIMARY KEY(owner,device));
+    CREATE TABLE IF NOT EXISTS agent_phone_approvals(id TEXT PRIMARY KEY,owner TEXT NOT NULL,profile TEXT NOT NULL,session TEXT NOT NULL DEFAULT '',kind TEXT NOT NULL,payload TEXT NOT NULL,bind TEXT NOT NULL DEFAULT '{}',holder TEXT NOT NULL DEFAULT '',created REAL NOT NULL,expires REAL NOT NULL,decided REAL,status TEXT NOT NULL DEFAULT 'pending',device TEXT NOT NULL DEFAULT '',answer TEXT NOT NULL DEFAULT '');
+    CREATE INDEX IF NOT EXISTS agent_phone_approvals_owner ON agent_phone_approvals(owner,status,expires);
+    CREATE TABLE IF NOT EXISTS agent_phone_activity(seq INTEGER PRIMARY KEY AUTOINCREMENT,owner TEXT NOT NULL,profile TEXT NOT NULL,at REAL NOT NULL,app TEXT NOT NULL DEFAULT '',action TEXT NOT NULL DEFAULT '',label TEXT NOT NULL DEFAULT '',approved INTEGER NOT NULL DEFAULT 0,outcome TEXT NOT NULL DEFAULT '');
+    CREATE INDEX IF NOT EXISTS agent_phone_activity_owner ON agent_phone_activity(owner,seq);
+    CREATE TABLE IF NOT EXISTS call_updates(call_id TEXT NOT NULL,seq INTEGER NOT NULL,type TEXT NOT NULL,key TEXT NOT NULL,payload TEXT NOT NULL,at REAL NOT NULL,state TEXT NOT NULL DEFAULT '',PRIMARY KEY(call_id,seq));
+    CREATE TABLE IF NOT EXISTS call_diagnostics(owner TEXT NOT NULL,client_event_id TEXT NOT NULL,device TEXT NOT NULL DEFAULT '',received REAL NOT NULL,payload TEXT NOT NULL,PRIMARY KEY(owner,client_event_id));
     CREATE TRIGGER IF NOT EXISTS close_call_tool_allowances AFTER UPDATE OF closed,status ON calls
       WHEN NEW.closed=1 OR NEW.status IN ('saved','partial','failed')
       BEGIN DELETE FROM call_tool_allowances WHERE call_id=NEW.id AND owner=NEW.owner AND profile=NEW.profile; END;
     CREATE TRIGGER IF NOT EXISTS delete_call_tool_allowances AFTER DELETE ON calls
       BEGIN DELETE FROM call_tool_allowances WHERE call_id=OLD.id AND owner=OLD.owner AND profile=OLD.profile; END;
+    CREATE TRIGGER IF NOT EXISTS delete_call_updates AFTER DELETE ON calls
+      BEGIN DELETE FROM call_updates WHERE call_id=OLD.id; END;
     ''')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_voice_calls ON calls(owner,profile,conversation,created DESC)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_call_log ON call_log(owner,profile,created DESC)')
@@ -272,6 +280,9 @@ def _initialize_schema(conn):
     conn.execute('CREATE INDEX IF NOT EXISTS call_log_call_id ON call_log(call_id)')
     conn.execute('CREATE INDEX IF NOT EXISTS owned_beacon_devices ON beacon_devices(owner,profile,removed,last_seen DESC)')
     conn.execute("CREATE INDEX IF NOT EXISTS transcript_versions ON timeline(call_id,json_extract(payload,'$.type'),json_extract(payload,'$.role'),json_extract(payload,'$.turn_id'),json_extract(payload,'$.final'),json_extract(payload,'$.at_ms'))")
+    # The app version each phone reports (X-Beacon-App-Version); '' for an app that reports none.
+    if 'app_version' not in {r[1] for r in conn.execute('PRAGMA table_info(beacon_devices)')}:
+        conn.execute("ALTER TABLE beacon_devices ADD COLUMN app_version TEXT NOT NULL DEFAULT ''")
     call_columns={r[1] for r in conn.execute('PRAGMA table_info(calls)')}
     if 'voice_config' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN voice_config TEXT NOT NULL DEFAULT '{}'")
     if 'callback_context' not in call_columns: conn.execute("ALTER TABLE calls ADD COLUMN callback_context TEXT NOT NULL DEFAULT '{}'")
@@ -293,6 +304,7 @@ def _initialize_schema(conn):
     if 'tool_request' not in columns: conn.execute("ALTER TABLE jobs ADD COLUMN tool_request TEXT NOT NULL DEFAULT ''")
     if 'transfer' not in columns: conn.execute('ALTER TABLE jobs ADD COLUMN transfer INTEGER NOT NULL DEFAULT 0')
     if 'callback_consent' not in columns: conn.execute("ALTER TABLE jobs ADD COLUMN callback_consent TEXT NOT NULL DEFAULT ''")
+    if 'work_mode' not in columns: conn.execute("ALTER TABLE jobs ADD COLUMN work_mode TEXT NOT NULL DEFAULT ''")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS voice_tool_follow ON jobs(owner,provider,profile,call_id,tool_request) WHERE tool_request<>''")
     if 'history_updated' not in columns:
         conn.execute('ALTER TABLE jobs ADD COLUMN history_updated REAL NOT NULL DEFAULT 0')
@@ -567,7 +579,7 @@ def remove_device(owner, device_id):
     return True
 
 
-def touch_device(owner, provider, profile, device_id, update_seen=True, require=False):
+def touch_device(owner, provider, profile, device_id, update_seen=True, require=False, app_version=None):
     """Marks the owner's phone as seen and refuses a phone the owner removed. The Hermes sign-in authorizes the
     request; the device ID is not a credential, so an unknown ID (or another owner's) changes nothing, except where
     `require` is set (push registration): there only a linked phone of the owner passes, else `device_required`."""
@@ -576,7 +588,7 @@ def touch_device(owner, provider, profile, device_id, update_seen=True, require=
         return
     now = time.time()
     with LOCK, connect() as conn:
-        row = conn.execute('SELECT owner,provider,removed,last_seen FROM beacon_devices WHERE id=?', (device_id,)).fetchone()
+        row = conn.execute('SELECT owner,provider,removed,last_seen,app_version FROM beacon_devices WHERE id=?', (device_id,)).fetchone()
         if not row or row['owner'] != owner or row['provider'] != provider:
             if require: raise LookupError('device_required')
             return
@@ -585,6 +597,19 @@ def touch_device(owner, provider, profile, device_id, update_seen=True, require=
         # "Last seen" shows minutes, so a phone polling every second writes it once a minute, not on every request.
         if update_seen and not 0 <= now - row['last_seen'] < DEVICE_SEEN_SECONDS:
             conn.execute('UPDATE beacon_devices SET last_seen=? WHERE id=? AND removed=0', (now, device_id))
+        # The version this phone's app reports, kept when it changes (an update), not only once a minute.
+        if isinstance(app_version, str) and APP_VERSION.fullmatch(app_version) and app_version != row['app_version']:
+            conn.execute('UPDATE beacon_devices SET app_version=? WHERE id=? AND removed=0', (app_version, device_id))
+
+APP_VERSION = re.compile(r'[0-9A-Za-z.+-]{1,32}')
+
+def newest_app_version(owner, provider):
+    """The app version the owner's most recently seen phone reports; '' when it reports none (an app from before file cards, which never
+    sent one) or when the owner has no linked phone."""
+    with connect() as conn:
+        row = conn.execute('SELECT app_version FROM beacon_devices WHERE owner=? AND provider=? AND removed=0 ORDER BY last_seen DESC LIMIT 1',
+                           (owner, provider)).fetchone()
+    return row['app_version'] if row else ''
 
 HELD_POST_SECONDS=86400
 MAX_HELD_POSTS=200
@@ -606,6 +631,57 @@ def held_posts(owner,profile,limit=10):
 
 def drop_held_post(owner,profile,key):
     with LOCK,connect() as conn: conn.execute('DELETE FROM held_posts WHERE owner=? AND profile=? AND key=?',(owner,profile,key))
+
+# Hermes' MEDIA: delivery tag, read with Hermes' own grammar (gateway/platforms/base.py MEDIA_TAG_CLEANUP_RE: quoted, or an anchored path that
+# may hold spaces and ends in a deliverable extension) plus the desktop's bare-word fallback (apps/desktop parts.ts), which needs the tag in
+# capitals. The phone's chat reads the same grammar (core/ReceivedFiles.kt). Text the owner reads or hears outside the chat names the file.
+_MEDIA_EXTS=('png','jpg','jpeg','gif','webp','bmp','tiff','svg','mp4','mov','avi','mkv','webm','3gp','mp3','m2a','wav','ogg','opus','m4a',
+    'flac','pdf','docx','doc','odt','rtf','txt','md','epub','xlsx','xls','ods','csv','tsv','json','xml','yaml','yml','kmz','kml','geojson',
+    'gpx','pptx','ppt','odp','key','zip','tar','gz','tgz','bz2','xz','7z','rar','apk','ipa','html','htm')
+_MEDIA_CJK='（）〈〉《》：，。；！？、“”‘’【】'
+_MEDIA_TAG=re.compile(r'''[`"'*_]{0,3}(MEDIA:)[ \t]*(?:`([^`\n]+?)`|"([^"\n]+?)"|'([^'\n]+?)'|'''
+    r'''((?:~/|/|[A-Za-z]:[/\\])\S+?(?:[^\S\n]+\S+?)*?\.(?:'''+'|'.join(sorted(_MEDIA_EXTS,key=len,reverse=True))+r'''))'''
+    r'''(?=[\s`"'*_,;:)\]}\['''+_MEDIA_CJK+r''']|MEDIA:|\.(?:\s|$)|$)|((?:(?!MEDIA:)[^\s`"])+))[`"'*_]{0,3}''',re.IGNORECASE)
+FILES_MARK='📎 '
+# What a call's model reads after a file's name in a hand-over's answer: the file itself is in the chat.
+CALL_FILE_NOTE=' (sent to the chat)'
+_FILES_ONLY=' \t\r\n.,;:!?-–—`"\'*_()[]#>'
+
+def _plausible_path(value):
+    return '/' in value or '\\' in value or re.search(r'\.[^.]',value) is not None
+
+def media_tags(text):
+    """Every MEDIA: tag in text as (path, start, end), in order. Code included: what the plugin writes from a reply is a summary (a
+    notification, the call's hand-over answer), where a path on the computer must never show; models often put the tag in inline code."""
+    if not isinstance(text,str) or 'media:' not in text.lower(): return []
+    found=[]
+    for match in _MEDIA_TAG.finditer(text):
+        quoted=next((g for g in match.group(2,3,4,5) if g is not None),None)
+        if quoted is not None:
+            if _plausible_path(quoted.strip()): found.append((quoted.strip(),match.start(),match.end()))
+            continue
+        if match.group(6) is None or match.group(1)!='MEDIA:': continue
+        path=match.group(6)
+        while path and path[-1] in '.,;:!?' and _plausible_path(path[:-1]): path=path[:-1]
+        path=path.rstrip('`"')
+        if _plausible_path(path): found.append((path,match.start(),match.start(6)+len(path)))
+    return found
+
+def file_name(path):
+    name=''.join(c for c in re.split(r'[\\/]',path.rstrip('/\\'))[-1] if ord(c)>=32 and c!='\x7f').strip()[:200]
+    return name or 'File'
+
+def named_files(text,clean=lambda words:words,mark=None,after=''):
+    """text with each MEDIA: tag as its file's name (+ after). clean runs on the words between tags only, so a name keeps its _ and *.
+    With mark, a text that only delivers files reads as the mark and the names ("📎 report.pdf, data.csv")."""
+    tags=media_tags(text)
+    if not tags: return clean(text)
+    words=[];at=0
+    for _,start,end in tags: words.append(clean(text[at:start]));at=end
+    words.append(clean(text[at:]))
+    names=[file_name(path) for path,_,_ in tags]
+    if mark is not None and not any(w.strip(_FILES_ONLY) for w in words): return mark+', '.join(names)
+    return ''.join(w+(names[i]+after if i<len(names) else '') for i,w in enumerate(words))
 
 def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
     if (not isinstance(owner,str) or not owner or len(owner)>256 or any(ord(c)<32 for c in owner)
@@ -726,6 +802,9 @@ def call_lock(call_id):
         return lock
 
 STALE_CALL_SECONDS=300
+# A call's update events (CALLS-CONTRACT.md section 3) stay this long after the call closed; the watch pass removes them.
+CALL_UPDATES_KEEP_SECONDS=900
+_call_updates_pruned=[0.0]
 
 def active_calls(conn,owner):
     return conn.execute('SELECT COUNT(*) FROM calls WHERE owner=? AND closed=0 AND COALESCE(seen,created)>=?',(owner,time.time()-STALE_CALL_SECONDS)).fetchone()[0]
@@ -742,6 +821,11 @@ def prune_notices(conn):
         (SELECT 1 FROM calls c WHERE c.id=call_id AND c.owner=call_tool_allowances.owner
          AND c.profile=call_tool_allowances.profile AND c.closed=0 AND c.created>?)''',(now-4*3600,))
     prune_call_history(conn)
+    if now>=_call_updates_pruned[0]:
+        # Every watch pass, whether or not a phone reads the channel: events of calls closed 15 minutes ago, or with no call row.
+        _call_updates_pruned[0]=now+60
+        conn.execute('DELETE FROM call_updates WHERE call_id NOT IN (SELECT id FROM calls WHERE closed=0 OR COALESCE(ended,created)>=?)',
+                     (now-CALL_UPDATES_KEEP_SECONDS,))
     # Move legacy answered invitation metadata into its owned call before pruning
     # the delivery outbox; call, timeline and job history use separate retention.
     rows=conn.execute("SELECT n.* FROM notices n JOIN calls c ON c.id=n.call_id AND c.owner=n.owner AND c.profile=n.profile WHERE n.state='answered' AND n.expires<? AND c.callback_context='{}'",(now,)).fetchall()
@@ -924,12 +1008,15 @@ def events(call_id,owner,body):
         if not isinstance(item,dict) or item.get('type') not in EVENT_TYPES: raise ValueError('Unsupported event')
         row={k:item[k] for k in ('event_id','display_event_id','turn_id','type','role','text','final','interrupted','at_ms','stream','sequence','state','stage','elapsed_ms','count','total_corrected_ms','source','frames_sent','request_id','tool_name','status','error_code','provider','attempt','close_code','cause_class','failed_stage','warm') if k in item}
         ident(row.get('event_id')); ident(row.get('turn_id','none')); finite(row.get('at_ms'))
-        if any(k in row for k in ('provider','attempt','close_code','cause_class','failed_stage','warm')):
-            if row['type']!='media_diagnostic': raise ValueError('Unexpected transport diagnostic')
+        transport={'provider','attempt','close_code','cause_class','failed_stage','warm'}&set(row)
+        if transport:
+            # A tool receipt may name what lost the call's link (LINK-121); the other transport fields stay a media diagnostic's.
+            if row['type']!='media_diagnostic' and not (row['type']=='tool_receipt' and transport=={'cause_class'}):
+                raise ValueError('Unexpected transport diagnostic')
             if 'provider' in row and row['provider'] not in ('gemini','grok','openai'): raise ValueError('Invalid diagnostic provider')
             if 'attempt' in row and (type(row['attempt']) is not int or not 0<=row['attempt']<=10): raise ValueError('Invalid diagnostic attempt')
             if 'close_code' in row and (type(row['close_code']) is not int or not 0<=row['close_code']<=4999): raise ValueError('Invalid diagnostic close code')
-            if 'cause_class' in row and row['cause_class'] not in ('ssl_handshake','ssl_peer','ssl_protocol','ssl_transport','socket_timeout','dns','connect','eof','io','other'): raise ValueError('Invalid diagnostic cause')
+            if 'cause_class' in row and row['cause_class'] not in CAUSE_CLASSES: raise ValueError('Invalid diagnostic cause')
             if 'failed_stage' in row and row['failed_stage'] not in CALL_STAGES: raise ValueError('Invalid diagnostic stage')
             if 'warm' in row and type(row['warm']) is not bool: raise ValueError('Invalid diagnostic flag')
         if 'role' in row and row['role'] not in ('user','assistant'): raise ValueError('Invalid role')
@@ -956,8 +1043,8 @@ def events(call_id,owner,body):
         elif any(k in row for k in ('request_id','tool_name','status')): raise ValueError('Unexpected tool evidence')
         if 'stage' in row and row['stage'] not in DIAGNOSTIC_STAGES: raise ValueError('Invalid stage')
         if 'error_code' in row:
-            codes=r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response'
-            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating'
+            codes=DIAGNOSTIC_CODES
+            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating|tool_unknown|tool_changed|invalid_arguments|tool_error|capacity|not_started|outcome_unknown|deadline'
             if row['type'] not in ('tool_receipt','media_diagnostic') or not isinstance(row['error_code'],str) or not re.fullmatch(codes,row['error_code']): raise ValueError('Invalid diagnostic code')
         if 'elapsed_ms' in row: finite(row['elapsed_ms'])
         for field,limit in (('count',1000000),('total_corrected_ms',9007199254740991)):
@@ -974,6 +1061,54 @@ def events(call_id,owner,body):
             if known.setdefault(eid,digest)!=digest: raise ValueError('Conflicting duplicate event')
         conn.executemany('INSERT OR IGNORE INTO timeline VALUES(?,?,?,?)',[(call_id,eid,digest,raw) for eid,digest,raw in clean])
     return {'stored':True,'count':len(clean),'recording_status':'disabled','transcript_status':'syncing'}
+
+# Call-start diagnostics (CALLS-CONTRACT.md section 5): the stages of a start the phone could not report through a call,
+# sent later in one batch. Only these fields exist; text, audio, tool data, Hermes addresses and tokens have no field to travel in.
+CALL_START_STAGES = DIAGNOSTIC_STAGES+('reach_failed',)
+CALL_START_SHOWN = ('hermes_unreachable','hermes_no_answer','voice_no_answer','mic_failed','sign_in_expired','start_failed')
+CALL_START_TRIGGERS = ('tap','side_button','callback_answer','overlay')
+CAUSE_CLASSES = ('ssl_handshake','ssl_peer','ssl_protocol','ssl_transport','socket_timeout','dns','connect','eof','io','other')
+DIAGNOSTIC_CODES = r'http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response'
+CALL_DIAGNOSTICS_PER_OWNER = 500
+CALL_DIAGNOSTICS_SECONDS = 14*86400
+
+def _start_row(item):
+    fields={'client_event_id','call_id','tapped_at','provider','trigger','app_version','call_contract','outcome','failed_stage','shown','stages'}
+    if not isinstance(item,dict) or set(item)-fields or not {'client_event_id','tapped_at','provider','trigger','outcome','stages'}<=set(item):
+        raise ValueError('Invalid diagnostics row')
+    if not isinstance(item['client_event_id'],str) or not re.fullmatch(r'[0-9A-Fa-f-]{8,64}',item['client_event_id']): raise ValueError('Invalid diagnostics id')
+    if item.get('call_id') is not None: ident(item['call_id'])
+    if type(item['tapped_at']) is not int or not 0<item['tapped_at']<10**13: raise ValueError('Invalid tap time')
+    if item['provider'] not in ('gemini','grok','openai'): raise ValueError('Invalid diagnostics provider')
+    if item['trigger'] not in CALL_START_TRIGGERS: raise ValueError('Invalid diagnostics trigger')
+    if item['outcome'] not in ('connected','failed','cancelled'): raise ValueError('Invalid diagnostics outcome')
+    if 'app_version' in item and (not isinstance(item['app_version'],str) or not re.fullmatch(r'[0-9A-Za-z.+-]{1,32}',item['app_version'])): raise ValueError('Invalid app version')
+    if 'call_contract' in item and (type(item['call_contract']) is not int or not 0<=item['call_contract']<=99): raise ValueError('Invalid call contract')
+    if item.get('failed_stage') is not None and item['failed_stage'] not in CALL_START_STAGES: raise ValueError('Invalid failed stage')
+    if item.get('shown') is not None and item['shown'] not in CALL_START_SHOWN: raise ValueError('Invalid failure line')
+    stages=item['stages']
+    if not isinstance(stages,list) or len(stages)>32: raise ValueError('Invalid diagnostics stages')
+    for stage in stages:
+        if not isinstance(stage,dict) or set(stage)-{'stage','elapsed_ms','error_code','cause_class'} or not {'stage','elapsed_ms'}<=set(stage):
+            raise ValueError('Invalid diagnostics stage')
+        if stage['stage'] not in CALL_START_STAGES: raise ValueError('Invalid diagnostics stage')
+        finite(stage['elapsed_ms'])
+        if 'error_code' in stage and (not isinstance(stage['error_code'],str) or not re.fullmatch(DIAGNOSTIC_CODES,stage['error_code'])): raise ValueError('Invalid diagnostic code')
+        if 'cause_class' in stage and stage['cause_class'] not in CAUSE_CLASSES: raise ValueError('Invalid diagnostic cause')
+    return item
+
+def store_call_diagnostics(owner,device,body):
+    """Stores each row once (by its client_event_id); keeps the newest CALL_DIAGNOSTICS_PER_OWNER for 14 days."""
+    rows=body.get('diagnostics') if isinstance(body,dict) and set(body)=={'diagnostics'} else None
+    if not isinstance(rows,list) or not 1<=len(rows)<=20: raise ValueError('Send 1 to 20 diagnostics rows')
+    clean=[_start_row(item) for item in rows]
+    now=time.time()
+    with LOCK,connect() as conn:
+        conn.executemany('INSERT OR IGNORE INTO call_diagnostics(owner,client_event_id,device,received,payload) VALUES(?,?,?,?,?)',
+                         [(owner,row['client_event_id'],device or '',now,json.dumps(row,ensure_ascii=False,sort_keys=True,separators=(',',':'))) for row in clean])
+        conn.execute('DELETE FROM call_diagnostics WHERE owner=? AND (received<? OR rowid NOT IN (SELECT rowid FROM call_diagnostics WHERE owner=? ORDER BY received DESC,rowid DESC LIMIT ?))',
+                     (owner,now-CALL_DIAGNOSTICS_SECONDS,owner,CALL_DIAGNOSTICS_PER_OWNER))
+    return {'stored':len(clean)}
 
 def finalize(call_id,owner,body):
     incomplete=body.get('incomplete',False)

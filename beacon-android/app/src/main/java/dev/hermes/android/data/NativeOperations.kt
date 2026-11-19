@@ -219,6 +219,37 @@ private const val HISTORY_WINDOW = 500
 private const val MAX_COMPRESSION_CHAIN = 512
 private const val OPTIONAL_VOICE_HISTORY_TIMEOUT_MS = 1_500L
 
+/** The images a chat with session authority stages as images (image.attach_bytes); every other file goes through file.attach. */
+internal val CANONICAL_IMAGE_TYPES = setOf("image/png", "image/jpeg", "image/gif", "image/webp")
+/** The Beacon plugin relay's frame cap (canonical_transport.MAX_FRAME, 1.2.0 and later): a larger frame from the phone ends the socket. */
+internal const val CANONICAL_RELAY_FRAME_BYTES = 8 * 1024 * 1024
+/**
+ * Whether one staging frame for this file fits the relay's cap, as Android's JSON writes it: base64 escapes each "/" as "\/", a name may take up to 6
+ * bytes a character once escaped, and the envelope (method, ids, session, profile, the data URL's prefix) stays well under 1 KiB.
+ */
+/**
+ * The phone's own cap on one file it sends in pieces (CHAT-121 follow-up 4). A file is read from its kept copy as it is sent, so the phone's heap holds
+ * only a piece and OkHttp's queue whatever the size (measured on the emulator: see CHAT-121.md, follow-up 4); this caps the copy kept on the phone.
+ */
+internal const val PHONE_ATTACHMENT_MAX_BYTES = 256L * 1024 * 1024
+/** The largest file one text frame of 8 MiB carries (a 1.2.0 plugin, or no pieces): its base64 with each "/" escaped, the envelope and the name. */
+internal fun textFrameFileBytes(name: String, mime: String): Long = rawBytesForFrame(CANONICAL_RELAY_FRAME_BYTES.toLong() * 64 / 65, name, mime)
+/** The largest file of [mime] a chat with session authority sends on a connection with [limits]: the phone's cap, Hermes' own cap, one frame. */
+internal fun attachmentLimitBytes(limits: AttachmentLimits, name: String, mime: String): Long =
+    if (!limits.pieces) textFrameFileBytes(name, mime)
+    else minOf(PHONE_ATTACHMENT_MAX_BYTES, (if (mime in CANONICAL_IMAGE_TYPES) limits.imageBytes else limits.fileBytes) ?: Long.MAX_VALUE,
+        rawBytesForFrame(limits.frameBytes, name, mime))
+internal fun fitsCanonicalFrame(base64: String, name: String, mime: String): Boolean =
+    base64.length.toLong() + base64.count { it == '/' } + name.length * 6L + mime.length * 2L + 1024 <= CANONICAL_RELAY_FRAME_BYTES
+/**
+ * Hermes' answer to file.attach that means it cannot take this file, from its source: no such method on the chat's authority (-32601), the owner's
+ * file.attach refusing the file itself (4001 invalid_params: bytes it cannot read, past its size limit), or a Hermes before 5551a2c342, whose authority
+ * passed file.attach to the legacy sidecar, which never holds such a chat (4001 "session not found"). Anything else (permission, storage, a dropped
+ * connection) is not about the file.
+ */
+internal fun hermesRefusesFile(error: ApiFailure): Boolean =
+    error.status == -32601 || error.status == 4001 && error.message in setOf("invalid_params", "session not found")
+
 /**
  * The create parameters for a new conversation, from the request body. Every other key of the body stays on the phone (the profile rides in the envelope, a `worktree`
  * flag or a previous chat means nothing to Hermes). `request_id` is the create's retry identity: Hermes derives the session from it and returns the session an earlier
@@ -234,8 +265,65 @@ internal fun nativeCreateParams(d: JSONObject): JSONObject {
     return params
 }
 
-/** One lazy resume of [id]: the runtime Hermes holds for it (the stream id) and that runtime's turn status; null when the answer is not about this conversation. */
-internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<String, String?>? {
+/**
+ * When Beacon may close a turn Hermes lost across its restart. Hermes holds what waits behind such a turn until a person decides
+ * (gateway-internals "neither replays the input nor lets the queued turns behind it run"; Desktop's Discard, /discard, the last viewer's close).
+ * [WhenAlone]: only when nothing waits behind it, so closing starts nothing. [Never]: the phone holds a waiting message, so a read never closes.
+ * [Decided]: the owner's own act (the Send of the restart line, Send on a waiting message, Delete).
+ */
+internal enum class LostTurnClose { WhenAlone, Never, Decided }
+
+/** Hermes' lost turn holds this chat and something waits behind it: in Hermes' queue, or (said by the caller) on the phone. */
+internal fun lostTurnWithWaiting(snapshot: JSONObject): Boolean =
+    snapshot.rows("pending").any { it.string("status") == "unknown" } && snapshot.rows("pending").any { it.string("status") != "unknown" }
+
+/**
+ * Hermes keeps a turn its previous run lost (it restarted or crashed mid-reply) as `unknown` and runs nothing queued behind it until the person
+ * discards it (hermes_state_runtime.recover_session_inputs, claim_session_input). Its own clients ask the person: Desktop shows "Turn lost during
+ * restart" with Discard, the dashboard chat Ctrl+X; both call prompt.resolve_unknown with the generation Hermes stamped on that row. Beacon closes
+ * the turn the same way, as [mode] allows: Hermes ends it as interrupted with its "did not complete" note (or keeps the answer if the turn had
+ * finished), never runs the lost message again, and starts the next queued one. Returns how many lost turns are closed now; one another client
+ * closed first (stale_generation) counts too, so the caller reads the chat again.
+ */
+internal suspend fun BeaconClient.closeLostTurns(lease: NativeTurnLease, snapshot: JSONObject, mode: LostTurnClose = LostTurnClose.WhenAlone): Int {
+    if (!lease.authority || mode == LostTurnClose.Never || mode == LostTurnClose.WhenAlone && lostTurnWithWaiting(snapshot)) return 0
+    var closed = 0
+    for (row in snapshot.rows("pending").filter { it.string("status") == "unknown" }) {
+        val admission = row.string("admission_id")
+        val generation = nativeReplayNumber(row.opt("execution_generation"))?.takeIf { it >= 0 }
+        require(admission.isNotBlank() && generation != null) { LOST_REPLY_ERROR }
+        val result = try {
+            nativeTurnRpc(lease, "prompt.resolve_unknown", json("session_id" to lease.binding.runtimeSessionId, "admission_id" to admission, "execution_generation" to generation))
+        } catch (e: ApiFailure) { if (e.detail == "stale_generation") { closed++; continue }; throw e }
+        require(result.string("admission_id") == admission && result.string("status") == "terminal") { LOST_REPLY_ERROR }
+        closed++
+    }
+    return closed
+}
+
+/**
+ * Lets [sessionId]'s lost replies go the way Hermes' own Discard does, with no session resumed and no agent built (WEDGE-121 follow-up 4):
+ * prompt.resolve_unknown with the admission and the generation Hermes stamped, on the profile's connection. Hermes ends each one interrupted
+ * with its "did not complete" note and never requeues it; only a message already queued behind it would run
+ * (gateway/session_authority.resolve_unknown). One another client let go first (stale_generation) counts as gone. True when every one is gone.
+ */
+internal suspend fun BeaconClient.discardLostTurns(sessionId: String, lost: List<LostAdmission>): Boolean {
+    if (lost.isEmpty()) return false
+    for (turn in lost) {
+        val result = try {
+            nativeRpc("prompt.resolve_unknown", json("session_id" to sessionId, "admission_id" to turn.admissionId, "execution_generation" to turn.generation))
+        } catch (e: ApiFailure) { if (e.detail == "stale_generation") continue; throw e }
+        require(result.string("admission_id") == turn.admissionId && result.string("status") == "terminal") { LOST_REPLY_ERROR }
+    }
+    return true
+}
+
+/**
+ * One lazy resume of [id]: the runtime Hermes holds for it (the stream id) and that runtime's turn status; null when the answer is not about this conversation.
+ * A turn Hermes lost across its restart is closed first as [close] allows ([closeLostTurns]), so the status is the chat's real one: idle, or the next
+ * queued message running; "lost" while it still holds the chat (something waits behind it for the owner's decision).
+ */
+internal suspend fun BeaconClient.recoveredNativeSession(id: String, close: LostTurnClose = LostTurnClose.WhenAlone, onClosed: (() -> Unit)? = null): Pair<String, String?>? {
     if (!id.matches(storedSessionId)) return null
     // A resumed socket may bind a different runtime id than the stale ChatState stream id.
     // Lazy: a stored conversation resumes as usual; one Hermes no longer holds answers 4007 (legacy) or 4001 not_found (canonical) instead of a new ownerless row.
@@ -244,12 +332,14 @@ internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<Strin
     val lease = nativeTurnLease(id, binding.runtimeSessionId)
     val status = if (!lease.authority) nativeSessionStatus(id, binding.runtimeSessionId) else {
         // Canonical active_list omits internal task sources; the attached conversation's own snapshot is authoritative.
-        val fresh = nativeTurnRpc(lease, "session.resume", json("session_id" to binding.runtimeSessionId, "omit_messages" to true))
-        require(nativeSessionBinding(scope, fresh) == binding) { "Conversation identity changed during recovery" }
-        val profile = fresh.optJSONObject("info")?.opt("profile_name")
-        require(profile == null || profile == JSONObject.NULL || profile == scope.profile) { "Conversation scope changed during recovery" }
+        suspend fun snapshot() = nativeTurnRpc(lease, "session.resume", json("session_id" to binding.runtimeSessionId, "omit_messages" to true)).also { fresh ->
+            require(nativeSessionBinding(scope, fresh) == binding) { "Conversation identity changed during recovery" }
+            val profile = fresh.optJSONObject("info")?.opt("profile_name")
+            require(profile == null || profile == JSONObject.NULL || profile == scope.profile) { "Conversation scope changed during recovery" }
+        }
+        val fresh = snapshot().let { first -> if (closeLostTurns(lease, first, close) > 0) { onClosed?.invoke(); snapshot() } else first }
         when {
-            fresh.rows("pending").any { it.string("status") == "unknown" } -> null
+            fresh.rows("pending").any { it.string("status") == "unknown" } -> "lost"
             fresh.opt("running") == true -> if (fresh.rows("prompts").isEmpty()) "working" else "waiting"
             fresh.opt("running") == false && fresh.rows("pending").none { it.string("status") in setOf("queued", "started") } -> "idle"
             else -> null
@@ -258,7 +348,13 @@ internal suspend fun BeaconClient.recoveredNativeSession(id: String): Pair<Strin
     return binding.runtimeSessionId to status
 }
 
-internal suspend fun BeaconClient.recoveredNativeSessionStatus(id: String): String? = recoveredNativeSession(id)?.second
+internal suspend fun BeaconClient.recoveredNativeSessionStatus(id: String, close: LostTurnClose = LostTurnClose.WhenAlone): String? = recoveredNativeSession(id, close)?.second
+
+/**
+ * Delete withdrew the messages waiting behind a lost turn (so none could start), then could not finish. Their words go back to the phone's queue
+ * ([withdrawn]: admission id and text), and the owner is told in one line.
+ */
+internal class DeleteKeptWaiting(val withdrawn: List<Pair<String, String>>) : ApiFailure(409, DELETE_KEPT_WAITING_ERROR)
 
 private const val THREAD_MARK_READ_MS = 60_000L
 private const val MARKED_THREAD_FETCH_LIMIT = 40
@@ -268,9 +364,17 @@ internal val threadMarkReads = HashMap<String, Long>()
 internal class NativeOperations(private val c: BeaconClient) {
     suspend fun call(path: String, q: Map<String, String>, method: String, body: JSONObject?, maxBytes: Int): JSONObject {
         var keepCreatedSessionLive = false
+        var failedSend = false
         return try {
             dispatch(path, q, method, body, maxBytes).also { keepCreatedSessionLive = path == "/api/session/new" || path == "/api/beacon/open" }
-        } finally { if (!keepCreatedSessionLive && path != "/api/chat/steer") c.closeNative() }
+        } catch (e: Throwable) {
+            failedSend = path == "/api/chat/start"
+            throw e
+        } finally {
+            // CHAT-121 follow-up 11: a send that failed on the chat's own client (not a detached one) leaves its connection as it is: it carries the
+            // chat's other work, and a first prompt sent again needs the socket that created the chat (follow-up 10's cut lost the chat's socket here).
+            if (!keepCreatedSessionLive && path != "/api/chat/steer" && !(failedSend && c.ownsChatConnection)) c.closeNative()
+        }
     }
     /**
      * The chat's saved YOLO flag. Hermes persists it in the conversation's model_config (`yolo_mode`) and restores it on
@@ -470,17 +574,59 @@ internal class NativeOperations(private val c: BeaconClient) {
                     if (model != d.string("model") || d.string("model_provider").isNotBlank() && provider != d.string("model_provider"))
                         throw NativeTurnNotSent("The model changed. Pick this message's model to send it.")
                 }
-                for (attachment in d.rows("attachments")) {
+                // Every staging frame of a chat with session authority passes the Beacon plugin's relay (Hermes serves its staged upload route to its own
+                // webapp only, hermes_cli/web_server_surface.py: browser_files). A large file was kept as a file on this phone and goes in pieces up to what
+                // this connection takes (CHAT-121 follow-up 4); through a plugin that acknowledges them, a small one kept as base64 goes in pieces too, so a
+                // slow link sends it a piece at a time and the socket keeps answering Hermes' pings (follow-up 8); otherwise it goes in one text frame. A
+                // file that cannot go, or whose kept copy is gone, is named before anything of the message is sent.
+                // CHATQA-121 follow-up 5: asked again under the same identity, the payload is the first one's: its staged attachments, never staged again.
+                val resubmit = !steer && d.optBoolean("resubmit")
+                if (resubmit) {
+                    if (!lease.authority) throw NativeTurnNotSent("This Hermes is not asked again.")
+                    val staged = d.optJSONArray("staged_attachments") ?: JSONArray()
+                    if (staged.length() != d.rows("attachments").size) throw NativeTurnNotSent("This send's attachments are not saved.")
+                    for (index in 0 until staged.length()) canonicalAttachments.put(staged.getJSONObject(index))
+                }
+                // Chat join: a resubmit stages nothing, so there is no file to check either.
+                val files = if (resubmit) emptyList() else d.rows("attachments")
+                for (item in files) {
+                    val name = item.string("name").ifBlank { "Attachment" }
+                    val mime = item.string("mime")
+                    val kept = ChatAttachmentStore.file(item)
+                    if (item.optBoolean("staged_file") && kept?.isFile != true) throw NativeTurnNotSent("The attached file is no longer on this phone")
+                    val fits = if (kept != null) lease.authority && lease.attachLimits.pieces && kept.length() <= attachmentLimitBytes(lease.attachLimits, name, mime)
+                        else !lease.authority || fitsCanonicalFrame(item.string("staged_base64"), name, mime)
+                    if (!fits) throw AttachmentRefused(name, ATTACHMENT_TOO_LARGE_LINE,
+                        limitMb = megabytes(if (lease.authority) attachmentLimitBytes(lease.attachLimits, name, mime) else textFrameFileBytes(name, mime)))
+                }
+                for (attachment in files) {
                     require(attachment.string("scope_key") == c.scope.session(bound.storedSessionId).key) { "Attachment belongs to another conversation" }
-                    val data = attachment.getString("staged_base64")
+                    val data = attachment.string("staged_base64")
                     val mime = attachment.string("mime")
-                    val receipt = if (lease.authority) {
-                        if (mime !in setOf("image/png", "image/jpeg", "image/gif", "image/webp"))
-                            throw NativeTurnNotSent("This Hermes can't take this attachment. The message stays on this phone.")
-                        val staged = c.nativeTurnRpc(lease, "image.attach_bytes", json("session_id" to bound.runtimeSessionId,
+                    val kept = ChatAttachmentStore.file(attachment)
+                    val pieces = lease.authority && lease.attachLimits.pieces
+                    val receipt = if (lease.authority && mime in CANONICAL_IMAGE_TYPES) {
+                        val staged = if (kept != null || pieces) c.nativeTurnRpc(lease, "image.attach_bytes", json("session_id" to bound.runtimeSessionId,
+                            "filename" to attachment.string("name")), InlineFile(kept, "content_base64", "", if (kept == null) data else null))
+                        else c.nativeTurnRpc(lease, "image.attach_bytes", json("session_id" to bound.runtimeSessionId,
                             "content_base64" to data, "filename" to attachment.string("name")))
                         require(staged.optBoolean("attached") && staged.string("path").isNotBlank() && staged.string("mime") == mime) { "Native image staging was not confirmed" }
                         canonicalAttachments.put(json("path" to staged.string("path"), "mime" to staged.string("mime")))
+                        staged
+                    } else if (lease.authority) {
+                        // Any other file is staged as Hermes' own Desktop does (gateway/session_ancillary.attach_file, since 5551a2c342): file.attach with
+                        // the bytes, and its @file: reference travels in the text of the submit, as on a chat without session authority.
+                        val name = attachment.string("name").ifBlank { "Attachment" }
+                        val type = mime.ifBlank { "application/octet-stream" }
+                        val staged = try {
+                            if (kept != null || pieces) c.nativeTurnRpc(lease, "file.attach", json("session_id" to bound.runtimeSessionId, "name" to name),
+                                InlineFile(kept, "data_url", "data:$type;base64,", if (kept == null) data else null))
+                            else c.nativeTurnRpc(lease, "file.attach", json("session_id" to bound.runtimeSessionId, "data_url" to "data:$type;base64,$data", "name" to name))
+                        }
+                        catch (e: ApiFailure) { if (hermesRefusesFile(e)) throw AttachmentRefused(name, ATTACHMENT_REFUSED_LINE, e) else throw e }
+                        val ref = staged.string("ref_text")
+                        require(staged.optBoolean("attached") && ref.startsWith("@file:") && ref.length <= 2048 && ref.none { it == '\n' || it == '\r' || it == '\u0000' }) { "Native file staging was not confirmed" }
+                        refs.add(ref)
                         staged
                     } else if (mime.startsWith("image/")) {
                         require(attachment.getString("id").matches(Regex("[a-fA-F0-9-]{36}")) && validUploadName(attachment.getString("name"))) { "This staged attachment has an invalid filename or identity. Rename it without quotes, slashes, dollar signs, percent signs or control characters, then attach it again." }
@@ -526,6 +672,9 @@ internal class NativeOperations(private val c: BeaconClient) {
                     if (steer && error is ApiFailure && ((!lease.authority && error.status == 4010) ||
                             (lease.authority && error.detail in setOf("unsupported_control", "execution_not_ready", "stale_generation"))))
                         throw NativeTurnNotSent("Couldn't change the reply. Your message is kept.", error)
+                    // Follow-up 5: the answer was lost (the prompt may have reached Hermes): its staged attachments go with it, so asking again re-sends them unchanged.
+                    if (!steer && lease.authority && promptAttempted && generateSequence(error) { it.cause }.take(8).any { it.message == NATIVE_OUTCOME_UNKNOWN })
+                        throw NativeSubmitUnknown(canonicalAttachments, error)
                     throw error
                 }
             }
@@ -536,6 +685,12 @@ internal class NativeOperations(private val c: BeaconClient) {
                 val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
                 require(b.runtimeSessionId == runtime) { "The active reply changed. Refresh before stopping." }
                 val snapshot = canonicalSnapshot(lease)
+                // Stop on a reply Hermes lost in a restart: nothing runs to interrupt. Alone, it is closed. With messages waiting behind it (in Hermes' queue,
+                // or on the phone: `waiting`), Stop never starts the next one; the owner gets the restart line's choice instead.
+                if (snapshot.opt("running") != true && snapshot.rows("pending").any { it.string("status") == "unknown" }) {
+                    if (d.string("waiting") == "1" || lostTurnWithWaiting(snapshot)) return json("stopped" to "lost_waiting", "session_id" to b.storedSessionId)
+                    if (c.closeLostTurns(lease, snapshot) > 0) return json("stopped" to "lost_turn", "session_id" to b.storedSessionId)
+                }
                 val generation = nativeReplayNumber(snapshot.opt("execution_generation"))?.takeIf { it >= 0 }
                 require(snapshot.opt("running") == true && generation != null) { "The active reply could not be confirmed." }
                 val result = c.nativeTurnRpc(lease, "session.interrupt", json("session_id" to runtime, "execution_generation" to generation))
@@ -736,11 +891,43 @@ internal class NativeOperations(private val c: BeaconClient) {
             "/api/session/delete" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
                 if (lease.authority) {
-                    val snapshot = canonicalSnapshot(lease)
-                    require(snapshot.opt("running") == false && snapshot.opt("pending") is JSONArray && snapshot.rows("pending").isEmpty()) { "Stop the reply before deleting this chat." }
-                    val result = canonicalMutation(lease, snapshot, "delete", JSONObject())
-                    require(result.optJSONArray("deleted_ids")?.strings()?.contains(b.storedSessionId) == true) { "Deletion was not confirmed. Refresh before trying again." }
-                    return result.put("deleted", b.storedSessionId)
+                    var snapshot = canonicalSnapshot(lease)
+                    val held = snapshot.rows("pending")
+                    // Messages wait while nothing runs: a task Hermes lost in its restart holds them. A lost reply can be closed; a lost background task
+                    // only goes with Hermes' own reset, and Hermes refuses Delete until then (unknown_execution), so nothing is withdrawn for nothing.
+                    if (snapshot.opt("running") == false) require(held.isEmpty() || held.any { it.string("status") == "unknown" }) { LOST_TASK_ERROR }
+                    // A lost reply holds the chat, and Hermes refuses to delete it (unknown_execution). Nothing queued behind it can start while it is
+                    // held, so withdraw those messages first (they go with the chat), then close the lost turn and read the chat again. If Delete then
+                    // cannot finish, the withdrawn words go back to the phone's queue ([DeleteKeptWaiting]): a waiting message is never lost silently.
+                    val withdrawn = mutableListOf<Pair<String, String>>()
+                    try {
+                        if (snapshot.opt("running") == false && held.any { it.string("status") == "unknown" }) {
+                            for (row in held.filter { it.string("status") == "queued" }) {
+                                val admission = row.string("admission_id")
+                                val result = try { c.nativeTurnRpc(lease, "prompt.cancel", json("session_id" to b.runtimeSessionId, "admission_id" to admission)) }
+                                catch (e: Throwable) {
+                                    if (e is CancellationException) throw e
+                                    // The answer was lost or refused: Hermes may still hold the message (then it stays there, and is not handed back
+                                    // to be sent twice), or may have withdrawn it before the answer was lost (then it is handed back).
+                                    val kept = try { canonicalSnapshot(lease).rows("pending").any { it.string("admission_id") == admission } }
+                                        catch (r: Throwable) { if (r is CancellationException) throw r; false }
+                                    if (!kept) withdrawn += admission to row.string("text")
+                                    throw e
+                                }
+                                require(result.string("admission_id") == admission && result.string("status") == "terminal") { LOST_REPLY_ERROR }
+                                withdrawn += admission to row.string("text")
+                            }
+                            if (c.closeLostTurns(lease, snapshot, LostTurnClose.Decided) > 0) snapshot = canonicalSnapshot(lease)
+                        }
+                        require(snapshot.opt("running") == false && snapshot.opt("pending") is JSONArray && snapshot.rows("pending").isEmpty()) { "Stop the reply before deleting this chat." }
+                        val result = try { canonicalMutation(lease, snapshot, "delete", JSONObject()) }
+                        catch (e: ApiFailure) { if (e.detail == "unknown_execution") throw ApiFailure(e.status, LOST_TASK_ERROR, e.plugin); throw e }
+                        require(result.optJSONArray("deleted_ids")?.strings()?.contains(b.storedSessionId) == true) { "Deletion was not confirmed. Refresh before trying again." }
+                        return result.put("deleted", b.storedSessionId)
+                    } catch (e: Throwable) {
+                        if (e is CancellationException || withdrawn.isEmpty()) throw e
+                        throw DeleteKeptWaiting(withdrawn)
+                    }
                 }
                 val fresh = c.nativeRpc("session.resume", json("session_id" to sid(), "omit_messages" to true, "close_on_disconnect" to false))
                 val target = nativeSessionBinding(c.scope, fresh)
@@ -969,6 +1156,8 @@ internal class NativeOperations(private val c: BeaconClient) {
                     if (proof.opt("complete") == true) receipt.put("_confirmed_persisted_turn", proof)
                 }
         }
+        // A reply Hermes lost in a restart holds this message (or is it): the chat closes that turn ([closeLostTurns]) instead of waiting forever.
+        if (receipt.string("status") == "unknown" || snapshot.rows("pending").any { it.string("status") == "unknown" }) receipt.put("lost_turn", true)
         return receipt.put("session_id", stored).put("stream_id", b.runtimeSessionId)
     }
 
@@ -1174,11 +1363,17 @@ internal class NativeOperations(private val c: BeaconClient) {
         // Hermes searches the stored text, which includes the notes it writes into a user row (a photo's description and file path). Only words the owner can see count.
         return coroutineScope {
             val permits = Semaphore(4)
-            hits.map { hit -> async { permits.withPermit { hit.takeIf { visibleContentHit(it.first, it.second, query) } } } }.awaitAll().filterNotNull()
+            hits.map { hit -> async { permits.withPermit { hit.takeIf { visibleContentHit(it.first, it.second, query) }?.let { (id, row) -> id to row.copy().put("hidden", contentHitHidden(id)) } } } }.awaitAll().filterNotNull()
         }
     }
 
     /** True when the words of [query] are in what the owner sees of the chat. Only a stored user row can hold Hermes' own note, so every other hit stands; a user-row hit is read against the chat's newest rows, cleaned as the chat cleans them. A check that cannot be made leaves the hit out. */
+    /** Whether Hermes keeps the chat [id] hidden (archived from a sidebar); unreadable reads as not hidden. */
+    private suspend fun contentHitHidden(id: String): Boolean = try { nativeSessionFlag(c.nativeGet("/api/sessions/$id", mapOf("profile" to c.auth.profile)), "hidden") }
+        catch (e: Exception) {
+            if (e is CancellationException || e is NativeAuthExpiredException || e is LoopbackSessionRefreshFailed || e is CachedIdentityMismatch || e is ApiFailure && e.status == 401) throw e
+            false
+        }
     private suspend fun visibleContentHit(id: String, hit: JSONObject, query: String): Boolean {
         if (hit.string("role") != "user") return true
         val page = try { c.nativeGet("/api/sessions/$id/messages", mapOf("profile" to c.auth.profile, "order" to "latest", "limit" to "$HISTORY_WINDOW", "offset" to "0", "inline_images" to "false")) }
@@ -1303,10 +1498,12 @@ internal class NativeOperations(private val c: BeaconClient) {
         if (result.optBoolean("running") || result.has("inflight") && !result.isNull("inflight") || result.string("status") in setOf("streaming", "running", "working", "waiting")) o.put("active_stream_id", b.runtimeSessionId)
         return o
     }
-    suspend fun stream(path: String, q: Map<String, String>, lastId: String, callback: suspend (SseEvent) -> Unit) {
+    suspend fun stream(path: String, q: Map<String, String>, lastId: String, onOpen: (suspend () -> Unit)? = null, callback: suspend (SseEvent) -> Unit) {
         try {
         val b = c.nativeSession(q["session_id"])
         if (path == "/api/chat/stream") c.nativeReplay(lastId) else c.nativeReplay(beforePrompt = true)
+        // The subscription is live (rules27): the caller learns the link works before any event comes, and a turn waiting on a card sends none.
+        onOpen?.invoke()
         c.nativeEvents { raw ->
             val params = raw.optJSONObject("params") ?: JSONObject()
             if (params.string("type") == "gateway.ready") return@nativeEvents
@@ -1317,7 +1514,9 @@ internal class NativeOperations(private val c: BeaconClient) {
             params.string("admission_id").takeIf(String::isNotBlank)?.let { payload.put("turn_admission_id", it) }
             val type = if (raw.optString("method") == "reconciliation.required") { params.optJSONObject("history")?.let { payload.put("session", sessionProjection(it, b)) }; if (path == "/api/session/stream") "session_updated" else "state_saved" } else when (params.string("type", raw.string("method"))) {
                 "message.delta" -> "token"
-                "reasoning.delta", "reasoning.available", "thinking.delta" -> "reasoning"
+                "reasoning.delta", "reasoning.available" -> "reasoning"
+                // Hermes' thinking_callback: a spinner face, an empty clear or an explained wait, each replacing the last (gateway/local_viewer_events.py). A status line, not reasoning.
+                "thinking.delta" -> "thinking"
                 "message.interim" -> "interim_assistant"
                 "error" -> "error"
                 "message.start" -> "server_turn_started"

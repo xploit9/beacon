@@ -1,0 +1,11 @@
+{
+  "package": "dev.hermes.agentphone.helper",
+  "version_code": 121,
+  "version_name": "1.2.1",
+  "file": "BeaconAgentPhoneHelper-release.apk",
+  "bytes": 112364,
+  "sha256": "3345c5c1007745ee7442d2c6493f080652092512ea05734576bc367b2571a98f",
+  "signer_sha256": "034a424397622cb8cf9784ef19a3855930cb637abd844a0dfbf4f5a84b3b94ac",
+  "signed_by": "stable",
+  "url": "https://github.com/xploit9/beacon/releases/download/v1.2.1/beacon-agent-phone-helper-1.2.1.apk"
+}

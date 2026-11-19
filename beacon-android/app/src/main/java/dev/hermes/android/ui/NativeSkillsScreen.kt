@@ -86,14 +86,16 @@ internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<N
     state: NativeSkillsState, onSearch: (String) -> Unit, onOpen: (NativeSkill) -> Unit,
     onBack: () -> Unit, onToggle: (NativeSkill, Boolean) -> Unit,
     onEdit: (Boolean) -> Unit, onDraft: (String) -> Unit, onSave: () -> Unit,
-    onRetry: () -> Unit, renderInstructions: @Composable (String) -> Unit = { SelectionContainer { Text(it) } },
+    onRetry: () -> Unit, renderInstructions: @Composable (String) -> Unit = { SelectionContainer { Text(it) } }, readOnly: Boolean = false,
 ) {
-    val busy = state.loading || state.saving
+    // Read-only (saved copy, Hermes not reached): every control waits like it does for a save, with no progress bar.
+    val working = state.loading || state.saving
+    val busy = working || readOnly
     val enableLabel = uiText("Enable")
     var filter by rememberSaveable(state.profile) { mutableStateOf("all") }
     val selected = state.selected
     // Cached skills stay on screen while a refresh or save runs; the thin bar is the only sign of it.
-    SettingsList(refreshing = busy && (state.skills.isNotEmpty() || selected != null), testTag = "skills-page") {
+    SettingsList(refreshing = working && (state.skills.isNotEmpty() || selected != null), testTag = "skills-page") {
         state.notice?.takeIf { it.isNotBlank() }?.let { notice -> item(key = "notice") {
             if (skillNoticeIsSuccess(notice)) SettingsStatusPill(SettingsStatus.Ok, uiText(notice))
             else SettingsSection { SettingsValueRow(uiText(notice), icon = Icons.Rounded.ErrorOutline) }

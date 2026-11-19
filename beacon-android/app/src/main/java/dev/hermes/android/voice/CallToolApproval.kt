@@ -80,13 +80,27 @@ internal fun callApprovalMode(choice: dev.hermes.android.phone.ApprovalChoice, h
 internal fun approvesItself(choice: dev.hermes.android.phone.ApprovalChoice, locked: Boolean, approval: CallToolApproval): Boolean =
     choice == dev.hermes.android.phone.ApprovalChoice.Never && !locked && approval.phone == null && approval.toolName !in PhoneTools.names
 
+/** What the approval card and the tool chip say while the phone cannot reach Hermes (contract v3 section 6: hermes_unreachable, lost_result). */
+internal const val HERMES_UNREACHABLE_LINE = "Can't reach Hermes"
+/** The states only the phone tells (contract v3 section 6); none of them is Hermes' answer, so none closes an approval card. */
+private val PHONE_LINK_STATES = setOf("still_running", "hermes_unreachable", "lost_result")
+
 internal fun pendingCallToolApprovals(current: List<CallToolApproval>, event: JSONObject): List<CallToolApproval> = when (event.optString("type")) {
     "tool_approval" -> CallToolApproval.from(event).let { approval ->
         if (current.any { it.requestId == approval.requestId }) current.map { if (it.requestId == approval.requestId) approval else it } else current + approval
     }
-    "tool_receipt" -> if (callProposalNeedingOwnerApproval(event) == null) current.filterNot { it.requestId == event.optString("request_id") } else current
+    "tool_receipt" -> if (event.optString("status") in PHONE_LINK_STATES || callProposalNeedingOwnerApproval(event) != null) current
+        else current.filterNot { it.requestId == event.optString("request_id") }
     else -> current
 }
+
+/** The approval card's line: while Hermes can't be reached it says so instead of a progress bar; the card itself stays until Hermes decides. */
+internal fun CallToolApproval.line(unreachable: Boolean): String? = when {
+    unreachable -> HERMES_UNREACHABLE_LINE
+    error.isNotBlank() -> callToolApprovalErrorMessage(error)
+    else -> null
+}
+internal fun CallToolApproval.showsProgress(unreachable: Boolean): Boolean = busy && !unreachable
 
 internal data class CallApprovalSummary(
     val action: String,
@@ -185,8 +199,12 @@ data class CallToolReceipt(
         fun from(value: JSONObject): CallToolReceipt? {
             val requestId = value.optString("request_id")
             val toolName = value.optString("tool_name")
-            val status = value.optString("status")
+            // The phone's own states of a request still waiting (Hermes out of reach, a result not arrived) show it as running: while
+            // Hermes can't be reached its chip says so (device round 1: a read asked during an outage had no chip at all).
+            val status = value.optString("status").let { if (it in PHONE_LINK_STATES) "running" else it }
             if (!requestId.matches(Regex("[A-Za-z0-9_-]{1,160}")) || toolName.isBlank() || toolName.length > 200 || status !in statuses) return null
+            // A hand-over runs in the chat, not as a tool on the call screen (as in 1.2.0); the call timeline still records it.
+            if (toolName in setOf("hermes_work", "hermes_follow")) return null
             val approvedBy = if (value.has("approved_by") && !value.isNull("approved_by")) value.optString("approved_by").takeIf(decisions::contains) else null
             // Fixed reads omit private contents; gateway receipts still require their actual result.
             val fixedReadResult = status == "completed" && !value.has("tool_id") && value.opt("result_present") == true &&
@@ -228,8 +246,12 @@ internal fun CallToolReceipt.statusLabel(): String? = statusTemplate()?.replace(
 /** The receipt texts that reach uiText whole or as templates; the tool chip's "<tool> complete" forms are built from the tool's own name. */
 internal val CallToolStrings = listOf(
     "Using {0}…", "Writing a file…", "Updating a file…", "Reading files…",
-    "Needs approval", "Not confirmed", "Action denied", "Approval expired", "Action cancelled",
+    "Needs approval", "Not confirmed", "Action denied", "Approval expired", "Action cancelled", HERMES_UNREACHABLE_LINE,
 )
+
+/** The tool chip's line: while Hermes can't be reached, a tool still waiting says so instead of spinning. */
+internal fun CallToolReceipt.chipText(unreachable: Boolean): String? =
+    if (unreachable && status in setOf("ready", "running", "needs_approval")) HERMES_UNREACHABLE_LINE else chipLabel()
 
 internal fun CallToolReceipt.chipLabel(): String? {
     activityLabel()?.let { return it }

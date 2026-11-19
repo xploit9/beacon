@@ -70,20 +70,22 @@
                 <data android:scheme="${applicationId}" android:host="auth" android:path="/complete" />
             </intent-filter>
         </activity>
-        <!-- Beacon in Android's share sheet for text, links and images. It draws a small chooser over the sharing app and opens BeaconActivity with the choice;
+        <!-- Beacon in Android's share sheet for text, links, images and documents (what a chat can send: Hermes stages any document with file.attach). It draws a small chooser over the sharing app and opens BeaconActivity with the choice;
              any app may send to it, so everything it receives is treated as untrusted data and nothing is sent without the owner's tap. -->
         <activity android:name=".share.ShareActivity" android:exported="true" android:excludeFromRecents="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar">
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/*" />
                 <data android:mimeType="image/*" />
+                <data android:mimeType="application/*" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.SEND_MULTIPLE" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:mimeType="image/*" />
-                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/*" />
+                <data android:mimeType="application/*" />
             </intent-filter>
         </activity>
         <!-- The phone's assist gesture. An exported ASSIST activity is what lists Beacon under Settings > Default digital assistant app; it draws nothing and hands off to BeaconActivity. -->
@@ -110,10 +112,18 @@
         </service>
         <!-- Asks the lock screen to unlock before the overlay opens anything private; draws nothing; only the overlay starts it. -->
         <activity android:name=".assist.AssistUnlockActivity" android:exported="false" android:excludeFromRecents="true" android:taskAffinity="" android:showWhenLocked="true" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <!-- The agent phone's setup view (L5): secure, full screen; opened from Settings by class name. configChanges keeps the live
+             view and its socket through a turn, a fold or a theme change. -->
+        <activity android:name=".agentphone.AgentPhoneActivity" android:exported="false" android:resizeableActivity="true" android:windowSoftInputMode="adjustResize" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode" />
         <!-- Installed launcher component remains a technical compatibility alias. -->
         <activity-alias android:name=".MainActivity" android:targetActivity=".BeaconActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
         </activity-alias>
+        <!-- The agent phone's questions to its owner (L6): a secure dialog over whatever is on screen, its own task, opened only by
+             Beacon (a notification or the open app); not over the lock screen, so a payment asks for the unlock first. -->
+        <activity android:name=".agentphone.AgentApprovalActivity" android:exported="false" android:taskAffinity="" android:launchMode="singleTop" android:autoRemoveFromRecents="true" android:theme="@style/Theme.Beacon.Assist" android:windowSoftInputMode="adjustResize" />
+        <!-- "What {name} did on its phone" (L6): a done notification opens it at its row; the phone page can open it by class name. -->
+        <activity android:name=".agentphone.AgentPhoneLogActivity" android:exported="false" android:resizeableActivity="true" />
         <service android:name=".voice.BeaconCallService" android:exported="false" android:foregroundServiceType="microphone|phoneCall|camera|mediaProjection" />
         <service android:name=".voice.IncomingRingtoneService" android:exported="false" android:foregroundServiceType="phoneCall" />
         <service android:name=".push.KeepConnectedService" android:exported="false" android:foregroundServiceType="specialUse">

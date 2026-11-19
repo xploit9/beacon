@@ -1,0 +1,9 @@
+{
+  "request_id": "req-synthetic-0001",
+  "tool": "notes_search",
+  "arguments": {
+    "query": "synthetic groceries"
+  },
+  "approval": "changes",
+  "wait_ms": 8000
+}

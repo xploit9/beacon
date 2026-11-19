@@ -8,6 +8,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
 import java.io.InterruptedIOException
+import java.net.ConnectException
+import java.net.NoRouteToHostException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
 class KeepConnectedReasonTextTest {
     // Every reason goes through the real keepConnectedFailureReason, so rewording one there fails here.
@@ -16,8 +20,17 @@ class KeepConnectedReasonTextTest {
     @Test fun eachStoredReasonReadsInShortUserWords() {
         assertEquals("Sign in again", say(NativeAuthExpiredException()))
         assertEquals("Sign in again", say(ApiFailure(401, "")))
-        assertEquals("Hermes didn't answer. Retrying…", say(InterruptedIOException()))
-        assertEquals("Can't reach Hermes. Retrying…", say(IOException()))
+        // A timeout or a dropped connection does not blame Hermes: the stall is usually the phone's path (KEEP-E, 14 Nov 2026).
+        assertEquals("Lost the connection to Hermes. Retrying…", say(InterruptedIOException("timeout")))
+        assertEquals("Lost the connection to Hermes. Retrying…", say(SocketTimeoutException("timeout")))
+        assertEquals("Lost the connection to Hermes. Retrying…", say(IOException("unexpected end of stream")))
+        // A request that never left the phone keeps 1.2.0's line: it is also what the phone sees while Hermes' computer is off.
+        for (offline in listOf(ConnectException("Failed to connect"), SocketTimeoutException("connect timed out"),
+                UnknownHostException("hermes.example.ts.net"), NoRouteToHostException("No route to host"))) {
+            assertEquals(offline.toString(), "Can't reach Hermes. Retrying…", say(offline))
+        }
+        // 1.2.0's stored timeout reason reads the same until the first cycle after the update replaces it.
+        assertEquals("Lost the connection to Hermes. Retrying…", keepConnectedReasonText("Hermes did not answer in time"))
         assertEquals("Hermes refused the connection. Retrying…", say(ApiFailure(403, "")))
         assertEquals("Hermes refused the connection. Retrying…", say(ApiFailure(409, "")))
         assertEquals("Check Beacon on Hermes.", say(ApiFailure(404, "")))
@@ -37,7 +50,7 @@ class KeepConnectedReasonTextTest {
     }
 
     @Test fun reconnectingWithANetworkSaysWhyAndWithoutOneKeepsTheGenericLine() {
-        val reason = keepConnectedFailureReason("default", IOException())
+        val reason = keepConnectedFailureReason("default", ConnectException("Failed to connect"))
         assertEquals("Reconnecting…" to "Can't reach Hermes. Retrying…",
             keepConnectedNotificationText(KeepConnectedService.STATUS_RECONNECTING, "Cypher", reason, online = true))
         assertEquals("Reconnecting…" to "Cypher can call you again once you're back online.",

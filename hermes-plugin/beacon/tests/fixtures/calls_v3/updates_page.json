@@ -1,0 +1,89 @@
+{
+  "call_id": "call-synthetic-0001",
+  "events": [
+    {
+      "seq": 1,
+      "type": "receipt",
+      "at": 1794651219.84,
+      "request_id": "req-synthetic-0001",
+      "tool_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "tool": "notes_search",
+      "tool_name": "notes_search",
+      "read_only": true,
+      "approved_by": null,
+      "status": "running",
+      "ran_on_hermes": true,
+      "server_ms": {}
+    },
+    {
+      "seq": 2,
+      "type": "approval",
+      "at": 1794651220.12,
+      "request_id": "req-synthetic-0002",
+      "tool": "t_hermes_notes_create",
+      "tool_name": "t_hermes_notes_create",
+      "proposal": {
+        "id": "proposal-synthetic-0000000000000000000000000000",
+        "tool_name": "t_hermes_notes_create",
+        "arguments": {
+          "title": "Synthetic note"
+        }
+      },
+      "expires_at": 1794651339.5
+    },
+    {
+      "seq": 3,
+      "type": "receipt",
+      "at": 1794651220.31,
+      "request_id": "req-synthetic-0001",
+      "tool_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+      "tool": "notes_search",
+      "tool_name": "notes_search",
+      "read_only": true,
+      "approved_by": null,
+      "status": "completed",
+      "ran_on_hermes": true,
+      "server_ms": {
+        "queue": 0.412,
+        "authority": 12.104,
+        "catalogue": 3.215,
+        "profile": 1.702,
+        "execute": 420.551,
+        "total": 438.031
+      },
+      "result": {
+        "notes": [
+          {
+            "title": "Synthetic groceries",
+            "tag": "open"
+          }
+        ]
+      },
+      "truncated": false
+    },
+    {
+      "seq": 4,
+      "type": "job",
+      "at": 1794651260.02,
+      "job_id": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+      "request_id": "handover-synthetic-0001",
+      "stored_session_id": "stored-synthetic-0001",
+      "runtime_session_id": "stored-synthetic-0001",
+      "user_row_id": null,
+      "status": "done",
+      "callback_consent": "requested",
+      "admission_id": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+      "will_continue": false,
+      "result": "Synthetic summary: three items found and listed in the chat."
+    },
+    {
+      "seq": 5,
+      "type": "call",
+      "at": 1794651300.5,
+      "status": "closed"
+    }
+  ],
+  "next_after": 5,
+  "reset": false,
+  "closed": true
+}

@@ -25,9 +25,7 @@ class CallEndReportTest {
     @Test fun callEndAndHandOffTextIsPlain() {
         assertEquals("1 request wasn't sent before the call ended.", callEndNotSentText(1))
         assertEquals("$currentAssistantName couldn't confirm 2 requests. Check the chat before asking again.", callEndUnknownText(2))
-        assertTrue(handoffWithoutRowMessage("queued").startsWith("$currentAssistantName queued this"))
-        assertTrue(handoffWithoutRowMessage("streaming").startsWith("$currentAssistantName accepted this"))
-        for (text in listOf(callEndNotSentText(3), callEndUnknownText(1), handoffWithoutRowMessage("queued")))
+        for (text in listOf(callEndNotSentText(3), callEndUnknownText(1)))
             assertFalse(text, Regex("native|linkage|receipt|resubmit", RegexOption.IGNORE_CASE).containsMatchIn(text))
     }
 }

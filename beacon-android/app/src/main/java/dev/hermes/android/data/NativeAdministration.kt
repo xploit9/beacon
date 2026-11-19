@@ -29,6 +29,10 @@ data class NativeServerState(
     val checkpoints: List<NativeCheckpoint> = emptyList(), val checkpointBytes: Long = 0,
     /** The first sentence of an ERROR or FATAL line Hermes logged as recently as its latest log activity; blank when there is none (see [recentServerError]). */
     val recentError: String = "",
+    /** True once this page has asked Hermes (or been given a saved answer): before that the empty state is not an answer, and the page says it is checking. */
+    val asked: Boolean = false,
+    /** The pages Hermes has answered at least once, even with nothing in the answer (no log lines, no backups): an empty answer is still the answer, so it never draws a skeleton again. */
+    val answered: Set<String> = emptySet(),
 ) {
     val canApply get() = updateStatusFresh && !hostBusy && error.isBlank() && update?.optBoolean("can_apply") == true && update.optBoolean("update_available") && !loading && !applying && (requestedAt.isBlank() || outcome in terminalUpdateOutcomes)
     val outcome: String get() {

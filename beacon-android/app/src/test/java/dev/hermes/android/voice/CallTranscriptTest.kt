@@ -175,7 +175,111 @@ class CallTranscriptTest {
 
         assertEquals("Could you check my calendar?", deriveCallEndTitle("New conversation", transcript, "Beacon"))
         assertEquals("Call with Beacon", deriveCallEndTitle("", emptyList(), "Beacon"))
+        // (From the second call on, the same words repeat: aCallWithNoSpokenRequestGetsATitleNoListedChatHolds.)
         assertNull(deriveCallEndTitle("Owner's title", transcript, "Beacon"))
+    }
+
+    /** 47/66: Hermes refuses a repeat title (its rename raises and the gateway logs a dispatch crash), so a call's title never repeats one the phone lists. */
+    @Test fun aCallWithNoSpokenRequestGetsATitleNoListedChatHolds() {
+        val zone = java.time.ZoneId.of("UTC"); val locale = java.util.Locale.ENGLISH
+        val first = requireNotNull(deriveCallEndTitle("New conversation", emptyList(), "Beacon", startedAt = 1_794_936_720_000, zone = zone, locale = locale))
+        assertEquals("Call with Beacon, 17 Nov, 17:32", first)
+        // The second voice-only call, a minute later or the very same minute, is told apart from the first.
+        val later = requireNotNull(deriveCallEndTitle("New conversation", emptyList(), "Beacon", listOf(first), startedAt = 1_794_936_780_000, zone = zone, locale = locale))
+        assertEquals("Call with Beacon, 17 Nov, 17:33", later)
+        val sameMinute = requireNotNull(deriveCallEndTitle("New conversation", emptyList(), "Beacon", listOf(first), startedAt = 1_794_936_730_000, zone = zone, locale = locale))
+        assertEquals("$first #2", sameMinute)
+        // Without a start time the plain name still never repeats.
+        assertEquals("Call with Beacon #2", deriveCallEndTitle("", emptyList(), "Beacon", listOf("Call with Beacon")))
+    }
+
+    @Test fun aFirstSpokenRequestThatAChatAlreadyHoldsIsNumberedTheWayHermesNumbersItsOwnTitles() {
+        val transcript = listOf(CallTranscript("call:user:1", "user", "What is the weather", turnId = "1"))
+        assertEquals("What is the weather #2", deriveCallEndTitle("New conversation", transcript, "Beacon", listOf("what is the weather")))
+        assertEquals("What is the weather #3", deriveCallEndTitle("New conversation", transcript, "Beacon", listOf("What is the weather", "What is the weather #2")))
+        assertEquals("What is the weather", deriveCallEndTitle("New conversation", transcript, "Beacon", listOf("Another chat")))
+    }
+
+    /** Root, 17 Nov: the title is in the phone's language with the assistant's current name, then the call's start in the phone's own date and clock style. */
+    @Test fun theCallTitleCarriesTheAssistantsCurrentNameInThePhonesLanguage() {
+        val german = dev.hermes.android.ui.assistantName("Anruf mit Beacon", "Mira")
+        assertEquals("Anruf mit Mira", german)
+        val label: (Long) -> String = { "17. Nov., 17:32" }
+        assertEquals("Anruf mit Mira, 17. Nov., 17:32", deriveCallEndTitle("New conversation", emptyList(), "Mira", startedAt = 1_794_936_720_000, callWith = german, startedLabel = label))
+        // Renamed again later: the next call's title uses the new name, the older chat keeps its own.
+        val later = dev.hermes.android.ui.assistantName("Anruf mit Beacon", "Nova")
+        assertEquals("Anruf mit Nova, 17. Nov., 17:32", deriveCallEndTitle("", emptyList(), "Nova", startedAt = 1_794_936_720_000, callWith = later, startedLabel = label))
+        // English with no phrase given still follows the name, and a blank stamp leaves no trailing comma.
+        assertEquals("Call with Mira", deriveCallEndTitle("", emptyList(), "Mira", startedAt = 1_794_936_720_000, startedLabel = { " " }))
+    }
+
+    @Test fun everyLanguageHasTheCallPhraseWithTheNamePlaceholderInIt() {
+        val module = requireNotNull(listOf(".", "app", "beacon-android/app").map { java.io.File(it) }.firstOrNull { java.io.File(it, "src/main/assets/native-locales.json").isFile })
+        val catalogs = org.json.JSONObject(java.io.File(module, "src/main/assets/native-locales.json").readText())
+        val languages = catalogs.keys().asSequence().toList()
+        assertEquals(16, languages.size)
+        for (language in languages) {
+            val phrase = catalogs.getJSONObject(language).optString("call with beacon")
+            assertTrue("$language has the phrase", phrase.isNotBlank())
+            assertTrue("$language keeps the name's place: $phrase", phrase.contains("Beacon"))
+            if (language != "en") assertNotEquals("$language is translated", "Call with Beacon", phrase)
+        }
+    }
+
+    /**
+     * Root, 17 Nov (live Gemini pending the owner's top-up): a call that ends with no spoken request, run twice against a Hermes that raises on a repeat title
+     * (hermes_state_titles.py `_resolve_title_conflict`), gives two titled chats, sends no refused title and loses no rename.
+     */
+    @Test fun twoVoiceOnlyCallsAgainstAHermesThatRefusesRepeatTitlesNeverSendOne() {
+        val hermes = mutableMapOf<String, String>()   // session id -> title
+        var refused = 0
+        val rename: (String, String) -> Unit = { session, title ->
+            if (hermes.any { (id, held) -> id != session && held == title }) { refused++; throw IllegalStateException("Title '$title' is already in use by session x") }
+            hermes[session] = title
+        }
+        val remembered = mutableSetOf<String>()
+        val zone = java.time.ZoneId.of("UTC"); val locale = java.util.Locale.ENGLISH
+        val startedAt = 1_794_936_720_000   // both calls start in the same minute
+        kotlinx.coroutines.runBlocking {
+            for (session in listOf("chat-1", "chat-2", "chat-3")) {
+                // The phone knows the earlier titles from its list, or (an empty chat not yet listed) from the ones it gave.
+                val listed = if (session == "chat-2") emptyList() else hermes.values.toList()
+                val title = deriveCallEndTitle("New conversation", emptyList(), "Beacon", takenTitles = listed + remembered, startedAt = startedAt, zone = zone, locale = locale)
+                assertTrue(renameCallChat(title) { rename(session, it) })
+                remembered += requireNotNull(title)
+            }
+        }
+        assertEquals("no title was refused", 0, refused)
+        assertEquals(3, hermes.values.toSet().size)
+        assertEquals(listOf("Call with Beacon, 17 Nov, 17:32", "Call with Beacon, 17 Nov, 17:32 #2", "Call with Beacon, 17 Nov, 17:32 #3"), listOf("chat-1", "chat-2", "chat-3").map { hermes.getValue(it) })
+    }
+
+    @Test fun aTitleStaysWithinHermesLimitOfOneHundredCharactersEvenNumbered() {
+        val long = "Call with " + "A".repeat(120)
+        val title = requireNotNull(deriveCallEndTitle("", emptyList(), "A".repeat(120)))
+        assertTrue(title.length <= 100)
+        val numbered = requireNotNull(deriveCallEndTitle("", emptyList(), "A".repeat(120), listOf(title)))
+        assertTrue("$numbered", numbered.length <= 100 && numbered.endsWith(" #2") && numbered != title)
+        assertTrue(long.length > 100)
+        // A surrogate pair is never cut in half.
+        assertFalse(uniqueCallTitle("a".repeat(91) + "😀", emptyList()).last().isHighSurrogate())
+    }
+
+    @Test fun aRenameThatFailsOrIsRefusedIsReportedNotThrown() {
+        kotlinx.coroutines.runBlocking {
+            assertFalse(renameCallChat(null) { throw AssertionError("nothing to send") })
+            assertFalse(renameCallChat("Call with Beacon") { throw IllegalStateException("Title 'Call with Beacon' is already in use by session x") })
+            var sent = ""
+            assertTrue(renameCallChat("Call with Beacon #2") { sent = it })
+            assertEquals("Call with Beacon #2", sent)
+        }
+    }
+
+    @Test fun aCancelledRenameStillCancels() {
+        kotlinx.coroutines.runBlocking {
+            val cancelled = runCatching { renameCallChat("x") { throw kotlinx.coroutines.CancellationException("left") } }.exceptionOrNull()
+            assertTrue(cancelled is kotlinx.coroutines.CancellationException)
+        }
     }
 
     @Test fun callTitleStopsAtFortyUnicodeCharactersWithoutSplittingASurrogatePair() {
@@ -207,5 +311,41 @@ class CallTranscriptTest {
 
         assertEquals(listOf("call-a", "call-b"), groups.map { it.callId })
         assertEquals(listOf("First call", "Reply"), groups.first().lines.map { it.text })
+    }
+
+    // Device round 4, D2: a cut reply keeps only what played, cut at a word and marked.
+    @Test fun aCutReplyKeepsTheShareOfItsWordsThatPlayed() {
+        val words = (1..30).joinToString(" ") { "Tram twenty eight climbs through the old district on its route number $it." }.take(724).trimEnd()
+        val kept = playedCaption(words, 12_160, 39_920)
+        assertTrue(kept.length in 190..250);assertTrue(kept.endsWith("…"));assertTrue(words.startsWith(kept.removeSuffix("…")))
+        // r4-item7r-1: 0.34 s played while the words had run ahead of the audio received: the speech ceiling keeps the first words only.
+        val jump = "You have a call with Anna at 9:00. You have a call with Ben at 10:00. You have a call with Carla"
+        assertEquals("You have…", playedCaption(jump, 340, 1_000))
+        assertEquals("all of it played", words, playedCaption(words, 46_680, 46_680))
+        assertEquals("nothing played", "", playedCaption(words, 0, 46_680))
+        val captions = mutableMapOf("user" to "Tell me about tram 28.", "assistant" to words)
+        cutCaptions(captions, org.json.JSONObject().put("type", "interrupted").put("played_ms", 0).put("received_ms", 46_680))
+        val written = mutableListOf<org.json.JSONObject>()
+        finishDirectTranscriptTurn("call", "chat", 3L, captions, 0L, interruptsReply(true, captions)) { written += it }
+        assertEquals("nothing played: no assistant line", listOf("user"), written.filter { it.getBoolean("final") }.map { it.getString("role") })
+        assertTrue("its live caption is withdrawn (REVIEW-E7 P2-2)", written.single { it.getString("role") == "assistant" }.getBoolean("withdrawn"))
+        val untouched = mutableMapOf("assistant" to words)
+        cutCaptions(untouched, org.json.JSONObject().put("type", "interrupted"))
+        assertEquals("no audio figures: as it came", words, untouched["assistant"])
+    }
+
+    // Device round 4, D2 (the final check): a reply in a script without spaces keeps the share that played, cut at the character.
+    @Test fun aCutReplyWithoutSpacesKeepsItsPlayedShare() {
+        val words = "東京の路面電車は百年以上の歴史があり、今も多くの人に愛されています。毎日たくさんの観光客が乗っています。"
+        val kept = playedCaption(words, 2_000, 4_000)
+        assertEquals(words.substring(0, words.length / 2) + "…", kept)
+        assertEquals("a surrogate pair is never split", "ab…", playedCaption("ab\uD83D\uDE00cd", 1_000, 2_000))
+    }
+
+    // Device round 4, D2: on screen the cut turn's final, shorter than its live caption, replaces it.
+    @Test fun aCutTurnsShorterFinalReplacesItsLiveCaption() {
+        val live = CallTranscript("call:assistant:3", "assistant", "Tram 28 climbs through Alfama, past the cathedral and on to Graca.", false, interrupted = true)
+        val final = live.copy(text = "Tram 28 climbs through…", final = true)
+        assertEquals(listOf("Tram 28 climbs through…"), listOf(live).acceptTranscript(final).map { it.text })
     }
 }

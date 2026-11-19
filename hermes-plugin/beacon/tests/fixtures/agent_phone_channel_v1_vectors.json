@@ -1,0 +1,681 @@
+{
+ "contract": "docs/agent-phone/channel-v1.md",
+ "protocol": 1,
+ "revision": 5,
+ "about": "Inputs are fixed test bytes, not secrets. Names follow the contract: T, Nc, Ns, Ka, CH, SH0, Ps, SH, Pc, K_h2c, K_c2h. Byte strings are lowercase hex. In notification texts, {at} stands for the at sign; replace it before use.",
+ "handshake": {
+  "T": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "T_b64url": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  "Nc": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "Ns": "404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+  "Ka": "8d2a003e228b419ec14308ea5bfeefd19b347c7206fceba7d308c2fe6c5ea2ea",
+  "CH": "4241504301202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+  "SH0": "4241504301404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+  "Ps": "ac4bb15f77a342d5461ad217f661840cd315c5aa4e0963365ba28c4d8933de51",
+  "SH": "4241504301404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fac4bb15f77a342d5461ad217f661840cd315c5aa4e0963365ba28c4d8933de51",
+  "Pc": "d906a5989ddb340745756370dfa9085777267212f30774891a6cd08a5dc17d28",
+  "CP": "d906a5989ddb340745756370dfa9085777267212f30774891a6cd08a5dc17d28",
+  "salt": "202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f",
+  "K_h2c": "2894b2e2fa1148409ef442c1fbba5558d6cd632198034d539cd098438c95c8c3",
+  "K_c2h": "bf0a26a5150b01d91d8168325c36f09cb4e3a5dc6e7fcea00e7d9d58c0d16ed4",
+  "frames": {
+   "CH": "000000254241504301202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f",
+   "SH": "000000454241504301404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5fac4bb15f77a342d5461ad217f661840cd315c5aa4e0963365ba28c4d8933de51",
+   "CP": "00000020d906a5989ddb340745756370dfa9085777267212f30774891a6cd08a5dc17d28"
+  },
+  "start_command": [
+   "am",
+   "start-foreground-service",
+   "-n",
+   "dev.hermes.agentphone.helper/.ChannelService",
+   "--ei",
+   "port",
+   "41234",
+   "--es",
+   "token",
+   "{T_b64url}"
+  ],
+  "start_command_port": 41234
+ },
+ "sealed": [
+  {
+   "dir": "helper->host",
+   "seq": 0,
+   "plaintext_text": "{\"t\":\"hello\",\"proto_min\":1,\"proto_max\":1,\"helper_version\":\"1.2.1\",\"version_code\":121}",
+   "plaintext_hex": "7b2274223a2268656c6c6f222c2270726f746f5f6d696e223a312c2270726f746f5f6d6178223a312c2268656c7065725f76657273696f6e223a22312e322e31222c2276657273696f6e5f636f6465223a3132317d",
+   "nonce": "000000000000000000000000",
+   "aad": "4241504301020000000000000000",
+   "body": "00000000000000004e018d1a7303a1bfcc56560c1b628b2fa814d33cfcb6c714c1e85b023dec6b0e6a56f1f6e49dfad74934e156bcc3c9230f65d1657285bdc09e62d6a4d1f07ecf23190813e52b1f8133efd02ce8394c00f374a1ea48522e3b78c13c7b92de2e559a462c28d8",
+   "frame": "0000006d00000000000000004e018d1a7303a1bfcc56560c1b628b2fa814d33cfcb6c714c1e85b023dec6b0e6a56f1f6e49dfad74934e156bcc3c9230f65d1657285bdc09e62d6a4d1f07ecf23190813e52b1f8133efd02ce8394c00f374a1ea48522e3b78c13c7b92de2e559a462c28d8"
+  },
+  {
+   "dir": "host->helper",
+   "seq": 0,
+   "plaintext_text": "{\"t\":\"hello_ok\",\"proto\":1}",
+   "plaintext_hex": "7b2274223a2268656c6c6f5f6f6b222c2270726f746f223a317d",
+   "nonce": "000000000000000000000000",
+   "aad": "4241504301010000000000000000",
+   "body": "0000000000000000c4e99aed479f2b8362d3da10d21c76b01de156e15a079fa2e4dc2922c4ffb9ae089d686566b8d1db4505",
+   "frame": "000000320000000000000000c4e99aed479f2b8362d3da10d21c76b01de156e15a079fa2e4dc2922c4ffb9ae089d686566b8d1db4505"
+  },
+  {
+   "dir": "host->helper",
+   "seq": 1,
+   "plaintext_text": "{\"t\":\"arm\",\"id\":1,\"arm_id\":\"arm_AAAAAAAAAAAAAAAA\",\"kind\":\"login\",\"package\":\"dev.beacon.fixture.shop\",\"web_domain\":null,\"items\":[{\"item_id\":\"item_DDDDDDDDDDDDDDD\",\"label\":\"Kanto Foods · وكيل\",\"roles\":[\"username\",\"password\"]},{\"item_id\":\"item_EEEEEEEEEEEEEEE\",\"label\":\"Kanto Foods · second.account\",\"roles\":[\"username\",\"password\"]}],\"ttl_ms\":20000}",
+   "plaintext_hex": "7b2274223a2261726d222c226964223a312c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226b696e64223a226c6f67696e222c227061636b616765223a226465762e626561636f6e2e666978747572652e73686f70222c227765625f646f6d61696e223a6e756c6c2c226974656d73223a5b7b226974656d5f6964223a226974656d5f444444444444444444444444444444222c226c6162656c223a224b616e746f20466f6f647320c2b720d988d983d98ad984222c22726f6c6573223a5b22757365726e616d65222c2270617373776f7264225d7d2c7b226974656d5f6964223a226974656d5f454545454545454545454545454545222c226c6162656c223a224b616e746f20466f6f647320c2b7207365636f6e642e6163636f756e74222c22726f6c6573223a5b22757365726e616d65222c2270617373776f7264225d7d5d2c2274746c5f6d73223a32303030307d",
+   "nonce": "000000000000000000000001",
+   "aad": "4241504301010000000000000001",
+   "body": "00000000000000017e99b290a338ed545db57899cefe79660d3f7b638376eebeb33de2d1f24f8e2fff66954ca9a224ff8ca7f6f19c94937bd4cf17095c5b4bc0a25f55a9738e63a263bed60e0fe7210c5d2c0dad8e5c3df97b7fe8abfbc36446b17c1adba05a356dabc175b6269c8df7869962974383f32c342b74acbb3fd47c99d148d1014cfe7c2b4098a792f1ec64968a4c0f03e8e4bd46e7ca61aa5268c64f9aff562cedb3a1903becdc8ef2e8535d06ca7a1879751d4130c2948ff83cbbe455854d1efc2d6968ec70833e07f2bf673583e3f680954c06b5cdca02c22b376746bd055db37b87cf99ff11e5f4e4ff909fd5255b548f56cdc02b8725db5f108ac10eb5384fc9874c957bf6fbbc8cabbd97a9b4cb40e5f39d9064762bc2583a357ef76ec3e4223045c217ab38f79c37a539bffa2c617460f096371365596b9a19228b387054266ded0cf851a311aa8709433c26fdfe2e890aa5d6a7ad0bd570d79f38974258ae91effe41293687b2a56ef11f46618efc94",
+   "frame": "0000017800000000000000017e99b290a338ed545db57899cefe79660d3f7b638376eebeb33de2d1f24f8e2fff66954ca9a224ff8ca7f6f19c94937bd4cf17095c5b4bc0a25f55a9738e63a263bed60e0fe7210c5d2c0dad8e5c3df97b7fe8abfbc36446b17c1adba05a356dabc175b6269c8df7869962974383f32c342b74acbb3fd47c99d148d1014cfe7c2b4098a792f1ec64968a4c0f03e8e4bd46e7ca61aa5268c64f9aff562cedb3a1903becdc8ef2e8535d06ca7a1879751d4130c2948ff83cbbe455854d1efc2d6968ec70833e07f2bf673583e3f680954c06b5cdca02c22b376746bd055db37b87cf99ff11e5f4e4ff909fd5255b548f56cdc02b8725db5f108ac10eb5384fc9874c957bf6fbbc8cabbd97a9b4cb40e5f39d9064762bc2583a357ef76ec3e4223045c217ab38f79c37a539bffa2c617460f096371365596b9a19228b387054266ded0cf851a311aa8709433c26fdfe2e890aa5d6a7ad0bd570d79f38974258ae91effe41293687b2a56ef11f46618efc94"
+  },
+  {
+   "dir": "helper->host",
+   "seq": 1,
+   "plaintext_text": "{\"t\":\"ack\",\"re\":1}",
+   "plaintext_hex": "7b2274223a2261636b222c227265223a317d",
+   "nonce": "000000000000000000000001",
+   "aad": "4241504301020000000000000001",
+   "body": "000000000000000131081baaf5f6acba7ebbaffeb87dbc1645f357b02c8025941bc7e65ae7b7e30b3c14",
+   "frame": "0000002a000000000000000131081baaf5f6acba7ebbaffeb87dbc1645f357b02c8025941bc7e65ae7b7e30b3c14"
+  },
+  {
+   "dir": "helper->host",
+   "seq": 2,
+   "plaintext_text": "{\"t\":\"release_request\",\"req\":\"req_BBBBBBBBBBBBBBBB\",\"arm_id\":\"arm_AAAAAAAAAAAAAAAA\",\"item_id\":\"item_DDDDDDDDDDDDDDD\",\"roles\":[\"username\",\"password\"],\"context\":{\"package\":\"dev.beacon.fixture.shop\",\"certs\":[\"697a414200000000000000000000000000000000000000000000000000000000\"],\"web_domain\":null,\"web_scheme\":null,\"fields\":[{\"id\":\"af-1\",\"role\":\"username\",\"focused\":false},{\"id\":\"af-2\",\"role\":\"password\",\"focused\":true}],\"at_ms\":1800000000000,\"source\":\"play\"}}",
+   "plaintext_hex": "7b2274223a2272656c656173655f72657175657374222c22726571223a227265715f42424242424242424242424242424242222c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226974656d5f6964223a226974656d5f444444444444444444444444444444222c22726f6c6573223a5b22757365726e616d65222c2270617373776f7264225d2c22636f6e74657874223a7b227061636b616765223a226465762e626561636f6e2e666978747572652e73686f70222c226365727473223a5b2236393761343134323030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030225d2c227765625f646f6d61696e223a6e756c6c2c227765625f736368656d65223a6e756c6c2c226669656c6473223a5b7b226964223a2261662d31222c22726f6c65223a22757365726e616d65222c22666f6375736564223a66616c73657d2c7b226964223a2261662d32222c22726f6c65223a2270617373776f7264222c22666f6375736564223a747275657d5d2c2261745f6d73223a313830303030303030303030302c22736f75726365223a22706c6179227d7d",
+   "nonce": "000000000000000000000002",
+   "aad": "4241504301020000000000000002",
+   "body": "0000000000000002005297e0b60aca0c4ae02ce78a8e547de29a31b355ffdfbeb03248a445f45f1adb540ec5adba3cb2977861d5f48005b6976b83c97b48948d7ee25c2dd5c9639fefa9cbbd8d13dda376e9c918cf4a22339c2273281161f837edaf1140c7d9bdc86155a5a6fb1ff25dcdb335cb9835feb3f542220c30e9ad19f5e985728856a702a3e1f18f9b72cc8aeac7d8d63c0bdd3a62dcf25b129f32545baa0c5f4d7597f78955149b2c551c7c805b29d35702fdc3222cf3e87a7926db94347f2de7531e0880f0810f0390867cb86afaa8c8cd56398230da7a085ee566d95a56b29b440de69ca685ec975f86ba93166f512744eff28a9e2e59c9a995f10da9ddd8fc85d7a2c53ef41c6e23fdc46a93aa7bdd747686b4db03f618993e8ad7ac4727edfb97ed331679e270671d4a3eee17e5ccc85ebb70de8053e1a3b80711d6c7b3ff37a9e0507fddb7b43fd3f59905830f81e2f5a99b1d9b2e20242e3fb7ccd6368973cebb368db1cd4a04b88d7c0e246bd0a5d52a5d3756594f30a12123950cebfe131677facfe9fecc8e32b9d33ce63cd1181b425b1e4a03ea8b75c79d5b1b9e992641cd18cdb48cfee646e87e5b045b9802d6686b52dbc2c8d31404a3de1e716d9c44ecc51634703ca3fa28bbf423df525243fd7940809dad21",
+   "frame": "000001de0000000000000002005297e0b60aca0c4ae02ce78a8e547de29a31b355ffdfbeb03248a445f45f1adb540ec5adba3cb2977861d5f48005b6976b83c97b48948d7ee25c2dd5c9639fefa9cbbd8d13dda376e9c918cf4a22339c2273281161f837edaf1140c7d9bdc86155a5a6fb1ff25dcdb335cb9835feb3f542220c30e9ad19f5e985728856a702a3e1f18f9b72cc8aeac7d8d63c0bdd3a62dcf25b129f32545baa0c5f4d7597f78955149b2c551c7c805b29d35702fdc3222cf3e87a7926db94347f2de7531e0880f0810f0390867cb86afaa8c8cd56398230da7a085ee566d95a56b29b440de69ca685ec975f86ba93166f512744eff28a9e2e59c9a995f10da9ddd8fc85d7a2c53ef41c6e23fdc46a93aa7bdd747686b4db03f618993e8ad7ac4727edfb97ed331679e270671d4a3eee17e5ccc85ebb70de8053e1a3b80711d6c7b3ff37a9e0507fddb7b43fd3f59905830f81e2f5a99b1d9b2e20242e3fb7ccd6368973cebb368db1cd4a04b88d7c0e246bd0a5d52a5d3756594f30a12123950cebfe131677facfe9fecc8e32b9d33ce63cd1181b425b1e4a03ea8b75c79d5b1b9e992641cd18cdb48cfee646e87e5b045b9802d6686b52dbc2c8d31404a3de1e716d9c44ecc51634703ca3fa28bbf423df525243fd7940809dad21"
+  },
+  {
+   "dir": "host->helper",
+   "seq": 2,
+   "plaintext_text": "{\"t\":\"release\",\"req\":\"req_BBBBBBBBBBBBBBBB\",\"values\":{\"username\":\"وكيل.تجريبي\",\"password\":\"Test-Pass-1111-كلمة\"}}",
+   "plaintext_hex": "7b2274223a2272656c65617365222c22726571223a227265715f42424242424242424242424242424242222c2276616c756573223a7b22757365726e616d65223a22d988d983d98ad9842ed8aad8acd8b1d98ad8a8d98a222c2270617373776f7264223a22546573742d506173732d313131312dd983d984d985d8a9227d7d",
+   "nonce": "000000000000000000000002",
+   "aad": "4241504301010000000000000002",
+   "body": "000000000000000282939f2d7dc5f5b8cf141b2e2229ad40bbcd594ab11e2516e0cae306c92c16ce6f1baf34835e7056cd500684d9d8956d35e76fce3ed05355d5c3e141faa399ec4189e613cc3a358c9f2fa8f26d0fd8d4035c68f637d25b8a85be31a87c52c1ba8163a257171f9857d9cfbffe176a4b8232c6f7742c3644cb74463648a34e95bf9cda5516e928768a9935f88e0ffd27",
+   "frame": "00000097000000000000000282939f2d7dc5f5b8cf141b2e2229ad40bbcd594ab11e2516e0cae306c92c16ce6f1baf34835e7056cd500684d9d8956d35e76fce3ed05355d5c3e141faa399ec4189e613cc3a358c9f2fa8f26d0fd8d4035c68f637d25b8a85be31a87c52c1ba8163a257171f9857d9cfbffe176a4b8232c6f7742c3644cb74463648a34e95bf9cda5516e928768a9935f88e0ffd27"
+  },
+  {
+   "dir": "helper->host",
+   "seq": 3,
+   "plaintext_text": "{\"t\":\"filled\",\"req\":\"req_BBBBBBBBBBBBBBBB\",\"arm_id\":\"arm_AAAAAAAAAAAAAAAA\",\"fields\":2}",
+   "plaintext_hex": "7b2274223a2266696c6c6564222c22726571223a227265715f42424242424242424242424242424242222c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226669656c6473223a327d",
+   "nonce": "000000000000000000000003",
+   "aad": "4241504301020000000000000003",
+   "body": "00000000000000034032bf9d61e0217953ec7de27e37a08df1ad1fcaeb4ff59356bcb3a575ab7e3b01e1601f2d8b4b0808e206366944c5fb372a5d84ee53dd66cb23fe4ed09b97fed6e87c7b8b679b9f5dad7c94354b054ba5b38c8cb5c83ee4ed5cc5366ab2956e028752e571b7",
+   "frame": "0000006e00000000000000034032bf9d61e0217953ec7de27e37a08df1ad1fcaeb4ff59356bcb3a575ab7e3b01e1601f2d8b4b0808e206366944c5fb372a5d84ee53dd66cb23fe4ed09b97fed6e87c7b8b679b9f5dad7c94354b054ba5b38c8cb5c83ee4ed5cc5366ab2956e028752e571b7"
+  },
+  {
+   "dir": "helper->host",
+   "seq": 4,
+   "plaintext_text": "{\"t\":\"save\",\"save_id\":\"save_CCCCCCCCCCCCCCC\",\"context\":{\"package\":\"dev.beacon.fixture.shop\",\"certs\":[\"697a414200000000000000000000000000000000000000000000000000000000\"],\"web_domain\":null,\"web_scheme\":null,\"fields\":[{\"id\":\"af-1\",\"role\":\"username\",\"focused\":false},{\"id\":\"af-2\",\"role\":\"password\",\"focused\":true}],\"at_ms\":1800000000000,\"source\":\"play\"},\"values\":{\"username\":\"agent\",\"password\":\"Test-Pass-2222\"}}",
+   "plaintext_hex": "7b2274223a2273617665222c22736176655f6964223a22736176655f434343434343434343434343434343222c22636f6e74657874223a7b227061636b616765223a226465762e626561636f6e2e666978747572652e73686f70222c226365727473223a5b2236393761343134323030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030225d2c227765625f646f6d61696e223a6e756c6c2c227765625f736368656d65223a6e756c6c2c226669656c6473223a5b7b226964223a2261662d31222c22726f6c65223a22757365726e616d65222c22666f6375736564223a66616c73657d2c7b226964223a2261662d32222c22726f6c65223a2270617373776f7264222c22666f6375736564223a747275657d5d2c2261745f6d73223a313830303030303030303030302c22736f75726365223a22706c6179227d2c2276616c756573223a7b22757365726e616d65223a226167656e74222c2270617373776f7264223a22546573742d506173732d32323232227d7d",
+   "nonce": "000000000000000000000004",
+   "aad": "4241504301020000000000000004",
+   "body": "00000000000000049fae3687909e07e9c96c0c46d284b3c677911c147eee5d828775c57d96e41cd3d95ca182f790b7e068baa4ec3038fbce165d07025d4d8659db009d59dfa0e4ee69e82e475c97dff771c0cd5901ef4b24bb198cf2cecb2a20a0d7108f07763adb4ca7f6cc342f92273e2663fc121d1df174512fff3e7d97316abae59f1b9c0d5d1032b361d7b07098b7682b37b58775bc2e6ff9a3d7e63c941a7e692dcff5d54cecd96a4f4a253ef9c85a03e948ed29b16aea266da1270414800e80c95a422ad6b3452c964081817b454d43723545351e7d72ae4a52941536771304270499ed073faec84010c28135375384c5a894979a28614a450cef473a0e5af4ae13a66e1b5cb099ce1659d4f9d69303f458fcac8750c5dcae8b8fb776ee7d6ac67fed0f321568da9f34a6d76df619bd28019a852a90cbae44b76a387447ad7d61740ff8e46dcb18ad8f0a2b68313876f632bebfcb610cff02080ab69570ec485d831bc925e40e70586bb29181e8cc6f5ff15abe982aff3debd17c818ba1654d4d5daaeb4cbd35fbcbb7bba8560365b61e03d6734b101d19f3ef7434feb0b4caf1fd5c67f4a52e1305af652ed6",
+   "frame": "000001b000000000000000049fae3687909e07e9c96c0c46d284b3c677911c147eee5d828775c57d96e41cd3d95ca182f790b7e068baa4ec3038fbce165d07025d4d8659db009d59dfa0e4ee69e82e475c97dff771c0cd5901ef4b24bb198cf2cecb2a20a0d7108f07763adb4ca7f6cc342f92273e2663fc121d1df174512fff3e7d97316abae59f1b9c0d5d1032b361d7b07098b7682b37b58775bc2e6ff9a3d7e63c941a7e692dcff5d54cecd96a4f4a253ef9c85a03e948ed29b16aea266da1270414800e80c95a422ad6b3452c964081817b454d43723545351e7d72ae4a52941536771304270499ed073faec84010c28135375384c5a894979a28614a450cef473a0e5af4ae13a66e1b5cb099ce1659d4f9d69303f458fcac8750c5dcae8b8fb776ee7d6ac67fed0f321568da9f34a6d76df619bd28019a852a90cbae44b76a387447ad7d61740ff8e46dcb18ad8f0a2b68313876f632bebfcb610cff02080ab69570ec485d831bc925e40e70586bb29181e8cc6f5ff15abe982aff3debd17c818ba1654d4d5daaeb4cbd35fbcbb7bba8560365b61e03d6734b101d19f3ef7434feb0b4caf1fd5c67f4a52e1305af652ed6"
+  },
+  {
+   "dir": "host->helper",
+   "seq": 3,
+   "plaintext_text": "{\"t\":\"clip_set\",\"id\":2,\"text\":\"café naïve مرحبا 👋\",\"ttl_ms\":5000}",
+   "plaintext_hex": "7b2274223a22636c69705f736574222c226964223a322c2274657874223a22636166c3a9206e61c3af766520d985d8b1d8add8a8d8a720f09f918b222c2274746c5f6d73223a353030307d",
+   "nonce": "000000000000000000000003",
+   "aad": "4241504301010000000000000003",
+   "body": "0000000000000003574b163def518a2890b327cccba89ff84ce5d6b260cd55a4a091ea4378e0187f20ddabb7014286a2d4343d692bc51162ef5ae8650775f5c09df2dbbcd612d4e65b73ec8e3edb1a5ecd21c8c71f02d55dc2757b0957106149d9c36e",
+   "frame": "000000630000000000000003574b163def518a2890b327cccba89ff84ce5d6b260cd55a4a091ea4378e0187f20ddabb7014286a2d4343d692bc51162ef5ae8650775f5c09df2dbbcd612d4e65b73ec8e3edb1a5ecd21c8c71f02d55dc2757b0957106149d9c36e"
+  },
+  {
+   "dir": "host->helper",
+   "seq": 4,
+   "plaintext_text": "{\"t\":\"bye\",\"reason\":\"done\"}",
+   "plaintext_hex": "7b2274223a22627965222c22726561736f6e223a22646f6e65227d",
+   "nonce": "000000000000000000000004",
+   "aad": "4241504301010000000000000004",
+   "body": "000000000000000405f377605094553864ec57b2e58bb27dcf5390034eb4265ec9587d69e7155167589d8eee339bab6e48e30d",
+   "frame": "00000033000000000000000405f377605094553864ec57b2e58bb27dcf5390034eb4265ec9587d69e7155167589d8eee339bab6e48e30d"
+  }
+ ],
+ "negative": [
+  {
+   "name": "host proof made with a wrong token",
+   "check": "helper_checks_SH",
+   "SH": "4241504301404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f6ee6d50dd7c90bb4e1295a1c512daaef7df4de27865c86f32bec4e76f468e199"
+  },
+  {
+   "name": "helper proof made with a wrong token",
+   "check": "host_checks_CP",
+   "CP": "4c944b04472883bbe14cc15b73632124b263c12cd4b36ecbb31a902d03286b39"
+  },
+  {
+   "name": "helper proof over another host nonce",
+   "check": "host_checks_CP",
+   "CP": "70369ec06da255cc8b638c4f23fb47197382301ddde1c5f15d09217dc10646da"
+  },
+  {
+   "name": "bad magic",
+   "check": "host_reads_CH",
+   "CH": "4241504401202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+  },
+  {
+   "name": "bad handshake version",
+   "check": "host_reads_CH",
+   "CH": "4241504302202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f"
+  },
+  {
+   "name": "CH length header not 37",
+   "check": "handshake_length",
+   "header": "00000026",
+   "expected": 37
+  },
+  {
+   "name": "replayed frame (seq 0 again)",
+   "check": "open",
+   "dir": "helper->host",
+   "expected_seq": 1,
+   "body": "00000000000000004e018d1a7303a1bfcc56560c1b628b2fa814d33cfcb6c714c1e85b023dec6b0e6a56f1f6e49dfad74934e156bcc3c9230f65d1657285bdc09e62d6a4d1f07ecf23190813e52b1f8133efd02ce8394c00f374a1ea48522e3b78c13c7b92de2e559a462c28d8"
+  },
+  {
+   "name": "skipped frame (seq 2 while 1 is next)",
+   "check": "open",
+   "dir": "helper->host",
+   "expected_seq": 1,
+   "body": "0000000000000002005297e0b60aca0c4ae02ce78a8e547de29a31b355ffdfbeb03248a445f45f1adb540ec5adba3cb2977861d5f48005b6976b83c97b48948d7ee25c2dd5c9639fefa9cbbd8d13dda376e9c918cf4a22339c2273281161f837edaf1140c7d9bdc86155a5a6fb1ff25dcdb335cb9835feb3f542220c30e9ad19f5e985728856a702a3e1f18f9b72cc8aeac7d8d63c0bdd3a62dcf25b129f32545baa0c5f4d7597f78955149b2c551c7c805b29d35702fdc3222cf3e87a7926db94347f2de7531e0880f0810f0390867cb86afaa8c8cd56398230da7a085ee566d95a56b29b440de69ca685ec975f86ba93166f512744eff28a9e2e59c9a995f10da9ddd8fc85d7a2c53ef41c6e23fdc46a93aa7bdd747686b4db03f618993e8ad7ac4727edfb97ed331679e270671d4a3eee17e5ccc85ebb70de8053e1a3b80711d6c7b3ff37a9e0507fddb7b43fd3f59905830f81e2f5a99b1d9b2e20242e3fb7ccd6368973cebb368db1cd4a04b88d7c0e246bd0a5d52a5d3756594f30a12123950cebfe131677facfe9fecc8e32b9d33ce63cd1181b425b1e4a03ea8b75c79d5b1b9e992641cd18cdb48cfee646e87e5b045b9802d6686b52dbc2c8d31404a3de1e716d9c44ecc51634703ca3fa28bbf423df525243fd7940809dad21"
+  },
+  {
+   "name": "sealed with the other direction key",
+   "check": "open",
+   "dir": "helper->host",
+   "expected_seq": 1,
+   "body": "00000000000000017e99b290a338ed455bb57899d5ff79660d6e49327be7b8f32dbe9ce56af86c65aed0"
+  },
+  {
+   "name": "other direction byte in the AAD",
+   "check": "open",
+   "dir": "helper->host",
+   "expected_seq": 1,
+   "body": "000000000000000131081baaf5f6acba7ebbaffeb87dbc1645f34fd75fb53448341c038fff7264f36e30"
+  },
+  {
+   "name": "flipped tag bit",
+   "check": "open",
+   "dir": "helper->host",
+   "expected_seq": 2,
+   "body": "0000000000000002005297e0b60aca0c4ae02ce78a8e547de29a31b355ffdfbeb03248a445f45f1adb540ec5adba3cb2977861d5f48005b6976b83c97b48948d7ee25c2dd5c9639fefa9cbbd8d13dda376e9c918cf4a22339c2273281161f837edaf1140c7d9bdc86155a5a6fb1ff25dcdb335cb9835feb3f542220c30e9ad19f5e985728856a702a3e1f18f9b72cc8aeac7d8d63c0bdd3a62dcf25b129f32545baa0c5f4d7597f78955149b2c551c7c805b29d35702fdc3222cf3e87a7926db94347f2de7531e0880f0810f0390867cb86afaa8c8cd56398230da7a085ee566d95a56b29b440de69ca685ec975f86ba93166f512744eff28a9e2e59c9a995f10da9ddd8fc85d7a2c53ef41c6e23fdc46a93aa7bdd747686b4db03f618993e8ad7ac4727edfb97ed331679e270671d4a3eee17e5ccc85ebb70de8053e1a3b80711d6c7b3ff37a9e0507fddb7b43fd3f59905830f81e2f5a99b1d9b2e20242e3fb7ccd6368973cebb368db1cd4a04b88d7c0e246bd0a5d52a5d3756594f30a12123950cebfe131677facfe9fecc8e32b9d33ce63cd1181b425b1e4a03ea8b75c79d5b1b9e992641cd18cdb48cfee646e87e5b045b9802d6686b52dbc2c8d31404a3de1e716d9c44ecc51634703ca3fa28bbf423df525243fd7940809dad20"
+  },
+  {
+   "name": "sealed length over 262144",
+   "check": "sealed_length",
+   "header": "00040001"
+  },
+  {
+   "name": "sealed length under 25",
+   "check": "sealed_length",
+   "header": "00000018"
+  },
+  {
+   "name": "message: unknown type",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a227375727072697365227d"
+  },
+  {
+   "name": "message: host type from the helper",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a2272656c65617365222c22726571223a227265715f42424242424242424242424242424242222c2276616c756573223a7b7d7d"
+  },
+  {
+   "name": "message: reply without re",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a2261636b227d"
+  },
+  {
+   "name": "message: request id as a string",
+   "check": "decode",
+   "dir": "host->helper",
+   "plaintext_hex": "7b2274223a2270696e67222c226964223a2231227d"
+  },
+  {
+   "name": "message: role outside the list",
+   "check": "decode",
+   "dir": "host->helper",
+   "plaintext_hex": "7b2274223a2261726d222c226964223a312c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226b696e64223a226c6f67696e222c227061636b616765223a2270222c227765625f646f6d61696e223a6e756c6c2c226974656d73223a5b7b226974656d5f6964223a226974656d5f444444444444444444444444444444222c226c6162656c223a2278222c22726f6c6573223a5b2270696e225d7d5d2c2274746c5f6d73223a3130307d"
+  },
+  {
+   "name": "message: ttl over 20 s",
+   "check": "decode",
+   "dir": "host->helper",
+   "plaintext_hex": "7b2274223a2261726d222c226964223a312c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226b696e64223a226c6f67696e222c227061636b616765223a2270222c227765625f646f6d61696e223a6e756c6c2c226974656d73223a5b7b226974656d5f6964223a226974656d5f444444444444444444444444444444222c226c6162656c223a2278222c22726f6c6573223a5b2270617373776f7264225d7d5d2c2274746c5f6d73223a32303030317d"
+  },
+  {
+   "name": "message: item role outside the arm kind",
+   "check": "decode",
+   "dir": "host->helper",
+   "plaintext_hex": "7b2274223a2261726d222c226964223a312c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226b696e64223a226c6f67696e222c227061636b616765223a2270222c227765625f646f6d61696e223a6e756c6c2c226974656d73223a5b7b226974656d5f6964223a226974656d5f444444444444444444444444444444222c226c6162656c223a2278222c22726f6c6573223a5b22636172645f6e756d626572225d7d5d2c2274746c5f6d73223a3130307d"
+  },
+  {
+   "name": "message: two items with one item_id",
+   "check": "decode",
+   "dir": "host->helper",
+   "plaintext_hex": "7b2274223a2261726d222c226964223a312c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226b696e64223a226c6f67696e222c227061636b616765223a2270222c227765625f646f6d61696e223a6e756c6c2c226974656d73223a5b7b226974656d5f6964223a226974656d5f444444444444444444444444444444222c226c6162656c223a2278222c22726f6c6573223a5b2270617373776f7264225d7d2c7b226974656d5f6964223a226974656d5f444444444444444444444444444444222c226c6162656c223a2279222c22726f6c6573223a5b2270617373776f7264225d7d5d2c2274746c5f6d73223a3130307d"
+  },
+  {
+   "name": "message: no items",
+   "check": "decode",
+   "dir": "host->helper",
+   "plaintext_hex": "7b2274223a2261726d222c226964223a312c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c226b696e64223a226c6f67696e222c227061636b616765223a2270222c227765625f646f6d61696e223a6e756c6c2c226974656d73223a5b5d2c2274746c5f6d73223a3130307d"
+  },
+  {
+   "name": "message: release request without item_id",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a2272656c656173655f72657175657374222c22726571223a227265715f42424242424242424242424242424242222c2261726d5f6964223a2261726d5f41414141414141414141414141414141222c22726f6c6573223a5b2270617373776f7264225d2c22636f6e74657874223a7b227061636b616765223a20226465762e626561636f6e2e666978747572652e73686f70222c20226365727473223a205b2236393761343134323030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030225d2c20227765625f646f6d61696e223a206e756c6c2c20227765625f736368656d65223a206e756c6c2c20226669656c6473223a205b7b226964223a202261662d31222c2022726f6c65223a2022757365726e616d65222c2022666f6375736564223a2066616c73657d2c207b226964223a202261662d32222c2022726f6c65223a202270617373776f7264222c2022666f6375736564223a20747275657d5d2c202261745f6d73223a20313830303030303030303030302c2022736f75726365223a2022706c6179227d7d"
+  },
+  {
+   "name": "message: context without source",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a2266696c6c5f636f6e74657874222c22636f6e74657874223a7b227061636b616765223a20226465762e626561636f6e2e666978747572652e73686f70222c20226365727473223a205b2236393761343134323030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030225d2c20227765625f646f6d61696e223a206e756c6c2c20227765625f736368656d65223a206e756c6c2c20226669656c6473223a205b7b226964223a202261662d31222c2022726f6c65223a2022757365726e616d65222c2022666f6375736564223a2066616c73657d2c207b226964223a202261662d32222c2022726f6c65223a202270617373776f7264222c2022666f6375736564223a20747275657d5d2c202261745f6d73223a20313830303030303030303030307d7d"
+  },
+  {
+   "name": "message: link result found without a url",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a226e6f74655f6c696e6b5f726573756c74222c227265223a312c22666f756e64223a747275657d"
+  },
+  {
+   "name": "message: link result with a plain http url",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a226e6f74655f6c696e6b5f726573756c74222c227265223a312c22666f756e64223a747275652c2275726c223a22687474703a2f2f6b616e746f2e6578616d706c652f6d61676963227d"
+  },
+  {
+   "name": "message: context with an unknown source",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a2266696c6c5f636f6e74657874222c22636f6e74657874223a7b227061636b616765223a20226465762e626561636f6e2e666978747572652e73686f70222c20226365727473223a205b2236393761343134323030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030225d2c20227765625f646f6d61696e223a206e756c6c2c20227765625f736368656d65223a206e756c6c2c20226669656c6473223a205b7b226964223a202261662d31222c2022726f6c65223a2022757365726e616d65222c2022666f6375736564223a2066616c73657d2c207b226964223a202261662d32222c2022726f6c65223a202270617373776f7264222c2022666f6375736564223a20747275657d5d2c202261745f6d73223a20313830303030303030303030302c2022736f75726365223a2022736964656c6f6164227d7d"
+  },
+  {
+   "name": "message: not an object",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "5b2268656c6c6f225d"
+  },
+  {
+   "name": "message: byte-order mark",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "efbbbf7b2274223a22706f6e67222c227265223a317d"
+  },
+  {
+   "name": "message: not UTF-8",
+   "check": "decode",
+   "dir": "helper->host",
+   "plaintext_hex": "7b2274223a22706f6e67222c227265223a312c2278223a22ff227d"
+  }
+ ],
+ "notifications": {
+  "now_ms": 1800000000000,
+  "senders": {
+   "packages": [
+    "dev.beacon.fixture.shop"
+   ],
+   "hosts": [
+    "www.kanto.example",
+    "kanto.example"
+   ],
+   "mail_packages": [
+    "dev.beacon.fixture.mail"
+   ]
+  },
+  "codes": [
+   {
+    "name": "the site app posts a code",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "Your code is 482913"
+     }
+    ],
+    "code": "482913"
+   },
+   {
+    "name": "another app posts the same text",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.probe",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "Your code is 482913"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "mail app, sender is the site",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "From: no-reply{at}kanto.example verification code 551204"
+     }
+    ],
+    "code": "551204"
+   },
+   {
+    "name": "mail app, sender is a subdomain",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "From: no-reply{at}mail.kanto.example code 551204"
+     }
+    ],
+    "code": "551204"
+   },
+   {
+    "name": "mail app, site name inside a longer domain",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: no-reply{at}kanto.example.evil.example code 551204"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "mail app, look-alike domain",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: no-reply{at}evil-kanto.example code 551204"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "mail app, Cyrillic letter in the domain",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: no-reply{at}kаnto.example code 551204"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "right sender text from an app not in mail_packages",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.probe",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: no-reply{at}kanto.example code 551204"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "too old",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999300000,
+      "title": "Kanto Foods",
+      "text": "Your code is 482913"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "no code word",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "Your order 482913 has shipped"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "nine digits is not a code",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "Your code is 123456789"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "first 4-8 digit run wins",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "Kanto Foods",
+      "text": "Order #12: code 7781"
+     }
+    ],
+    "code": "7781"
+   },
+   {
+    "name": "newest matching wins",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999700000,
+      "title": "Kanto Foods",
+      "text": "code 111111"
+     },
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999970000,
+      "title": "Kanto Foods",
+      "text": "code 222222"
+     }
+    ],
+    "code": "222222"
+   },
+   {
+    "name": "Arabic code word",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "كانتو",
+      "text": "رمز التحقق: 4471"
+     }
+    ],
+    "code": "4471"
+   },
+   {
+    "name": "first address is not the site",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: x{at}evil.example cc: y{at}kanto.example code 551204"
+     }
+    ],
+    "code": null
+   },
+   {
+    "name": "upper case and a trailing dot",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: NO-REPLY{at}KANTO.EXAMPLE. code 551204"
+     }
+    ],
+    "code": "551204"
+   }
+  ],
+  "passwords": [
+   {
+    "name": "colon form",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: accounts{at}kanto.example Your temporary password: Tmp-AAAA-1111"
+     }
+    ],
+    "value": "Tmp-AAAA-1111"
+   },
+   {
+    "name": "is form, trailing dot dropped",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: accounts{at}kanto.example The password is Tmp-BBBB-2222."
+     }
+    ],
+    "value": "Tmp-BBBB-2222"
+   },
+   {
+    "name": "Arabic word, site app",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "كانتو",
+      "text": "كلمة المرور: Tmp-CCCC-3333"
+     }
+    ],
+    "value": "Tmp-CCCC-3333"
+   },
+   {
+    "name": "another app",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.probe",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "Your temporary password: Tmp-AAAA-1111"
+     }
+    ],
+    "value": null
+   },
+   {
+    "name": "too short",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "password: abc"
+     }
+    ],
+    "value": null
+   },
+   {
+    "name": "no password word",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.shop",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "Welcome Tmp-AAAA-1111"
+     }
+    ],
+    "value": null
+   }
+  ],
+  "links": [
+   {
+    "name": "site link",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: accounts{at}kanto.example Sign in: https://kanto.example/magic?t=abc"
+     }
+    ],
+    "result": {
+     "found": true,
+     "url": "https://kanto.example/magic?t=abc"
+    }
+   },
+   {
+    "name": "only a look-alike link",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.mail",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "From: accounts{at}kanto.example Sign in: https://kanto.example.evil.example/x"
+     }
+    ],
+    "result": {
+     "found": false
+    }
+   },
+   {
+    "name": "another app",
+    "max_age_ms": 600000,
+    "notes": [
+     {
+      "package": "dev.beacon.fixture.probe",
+      "posted_ms": 1799999940000,
+      "title": "Kanto",
+      "text": "Sign in: https://kanto.example/magic"
+     }
+    ],
+    "result": {
+     "found": false
+    }
+   }
+  ]
+ }
+}

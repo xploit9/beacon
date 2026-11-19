@@ -2,8 +2,11 @@ package dev.hermes.android
 
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
+import dev.hermes.android.core.Draft
+import dev.hermes.android.core.QueuedMessage
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.digest
+import dev.hermes.android.core.json
 import dev.hermes.android.data.*
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.*
@@ -299,6 +302,47 @@ class NativeProjectionStorageTest {
             assertTrue(cache.delete(scope, "pending", "new receipt"))
             assertNull(cache.read(scope, "pending"))
             assertTrue(cache.delete(scope, "pending", "new receipt"))
+        } finally { db.close() }
+    }
+
+    /** A chat's saved draft as the app writes it: one message waiting for the network ("Not sent"), with one 3 MiB photo kept as base64 (BeaconClient.upload). */
+    private fun waitingPhotoDraft(chat: Int): Draft {
+        val photo = java.util.Base64.getEncoder().encodeToString(ByteArray(3 * 1024 * 1024) { (it * 31 + chat).toByte() })
+        val attachment = json("id" to "00000000-0000-4000-8000-0000000000%02d".format(chat), "state" to "ready", "scope_key" to "synthetic-scope-$chat",
+            "staged_base64" to photo, "name" to "IMG_$chat.jpg", "mime" to "image/jpeg")
+        return Draft(queued = listOf(QueuedMessage("Photo for chat $chat", listOf(attachment), state = "queued", outcome = OFFLINE_OUTCOME)))
+    }
+
+    /**
+     * JOINBFIX-121 (REVIEW-JOINB-121 P1-1): CACHEFIX-B's protected-row cap deleted older chats' saved drafts, waiting "Not sent" messages and their photos
+     * included, once the protected rows passed 48 MiB, whichever protected row was written next. Nothing the owner wrote is deleted silently: 13 chats each
+     * hold one waiting 3 MiB photo (about 4 MiB encrypted, over 50 MiB together, well under the 128 MiB limit), a small protected write follows (a
+     * selection handle), and every draft is still there with its message and photo, still the outbox's next send.
+     */
+    @Test fun aSavedDraftHoldingAWaitingMessageIsNeverEvictedByTheProtectedCap() = runBlocking {
+        val db = database()
+        try {
+            val cache = ProjectionCache(db, AppCipher())
+            val account = Scope("https://native.example", "fixture-owner", "default")
+            val chats = 13
+            val photoChars = java.util.Base64.getEncoder().encodeToString(ByteArray(3 * 1024 * 1024)).length
+            var written = 0L
+            for (chat in 1..chats) {
+                val encoded = waitingPhotoDraft(chat).encode()
+                written += encoded.toByteArray().size + APP_CIPHER_OVERHEAD
+                cache.write(account.copy(session = "chat-$chat"), "draft", encoded, protected = true)
+            }
+            cache.write(account, "selected-session", "chat-$chats", protected = true)
+            assertTrue("the drafts written together pass the old 48 MiB cap ($written bytes)", written > 48L * 1024 * 1024)
+            for (chat in 1..chats) {
+                val saved = cache.read(account.copy(session = "chat-$chat"), "draft")
+                assertNotNull("chat-$chat's saved draft is still there", saved)
+                val draft = Draft.decode(saved!!)
+                assertEquals("Photo for chat $chat", draft.queued.single().text)
+                assertEquals("its photo is whole", photoChars, draft.queued.single().attachments.single().getString("staged_base64").length)
+                assertNotNull("the outbox still sends it", nextOfflineToSend(draft))
+            }
+            assertEquals("chat-$chats", cache.read(account, "selected-session"))
         } finally { db.close() }
     }
 

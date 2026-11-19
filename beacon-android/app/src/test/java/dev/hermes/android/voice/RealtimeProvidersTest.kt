@@ -129,7 +129,7 @@ class RealtimeProvidersTest {
         assertEquals(24000, output.getJSONObject("format").getInt("rate"))
         assertEquals("marin", output.getString("voice"))
         assertEquals("auto", session.getString("tool_choice"))
-        assertTrue(session.getString("instructions").contains("You answer the owner yourself, in your own voice"))
+        assertTrue(session.getString("instructions").contains("Answer yourself as soon as the owner finishes"))
         assertFalse("OpenAI answers the owner on its own", input.getJSONObject("turn_detection").has("create_response"))
         assertTrue((0 until session.getJSONArray("tools").length()).any {
             session.getJSONArray("tools").getJSONObject(it).getString("name") == "discover_tools"
@@ -154,7 +154,6 @@ class RealtimeProvidersTest {
         assertEquals("function_call_output", reply.first().getJSONObject("item").getString("type"))
         assertEquals("call-1", reply.first().getJSONObject("item").getString("call_id"))
         assertEquals("response.create", reply.last().getString("type"))
-        assertTrue(wire.outbound(receipt).isEmpty())
     }
 
     @Test fun openAiStreamedFunctionArgumentsAreDeliveredOnlyOnce() {

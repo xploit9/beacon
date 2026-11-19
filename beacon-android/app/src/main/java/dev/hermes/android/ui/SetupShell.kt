@@ -179,11 +179,14 @@ internal fun SetupShell(
                     radius = maxOf(size.width, size.height) * .72f,
                 ))
             }
+            // A page that scrolls fades at its lower edge while there is more below, so a list cut by the buttons reads as "more" (visual only).
+            val scroll = rememberScrollState()
             BoxWithConstraints(modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+                // Wide (the unfolded phone): the header and title start at the top beside the card, never floating mid-height.
                 if (maxWidth >= 720.dp) Row(
                     Modifier.widthIn(max = 960.dp).fillMaxSize().padding(horizontal = 32.dp, vertical = 24.dp),
                     horizontalArrangement = Arrangement.spacedBy(48.dp),
-                    verticalAlignment = Alignment.CenterVertically,
+                    verticalAlignment = Alignment.Top,
                 ) {
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(32.dp)) {
                         SetupHeader(step, progress)
@@ -191,14 +194,14 @@ internal fun SetupShell(
                     }
                     Surface(Modifier.weight(1.2f), shape = MaterialTheme.shapes.extraLarge, color = MaterialTheme.colorScheme.surfaceContainerHigh) {
                         Column(Modifier.padding(24.dp)) {
-                            Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(24.dp), content = content)
+                            Column(Modifier.weight(1f, fill = false).verticalScrollFade(scroll).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(24.dp), content = content)
                             Column(Modifier.fillMaxWidth().padding(top = 16.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp), content = actions)
                         }
                     }
                 } else Column(Modifier.widthIn(max = 480.dp).fillMaxSize().padding(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 24.dp)) {
                     SetupHeader(step, progress)
                     Spacer(Modifier.height(32.dp))
-                    Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(24.dp)) {
+                    Column(Modifier.weight(1f, fill = false).verticalScrollFade(scroll).verticalScroll(scroll), verticalArrangement = Arrangement.spacedBy(24.dp)) {
                         SetupTitle(title, body)
                         content()
                     }

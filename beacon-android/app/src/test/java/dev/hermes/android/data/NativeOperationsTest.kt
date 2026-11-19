@@ -42,13 +42,28 @@ class NativeOperationsTest {
         var responseOverride: JSONObject? = null
         var steerResult = json("status" to "queued")
         var steerErrorCode: Int? = null
+        /** What Hermes answers to file.attach instead of staging the file: (code, message), as gateway/session_controls.py writes them. */
+        var fileAttachError: Pair<Int, String>? = null
+        /** A test's own Hermes for one method: its answer is the result, or `{"error": {...}}` for a refusal; null leaves the method to the fixture. */
+        var onRpc: ((String, JSONObject) -> JSONObject?)? = null
+        /** The Beacon plugin's relay that takes file frames in acknowledged pieces (form 3, CHAT-121 follow-up 8) is in front of Hermes; the bytes it took. */
+        var relayPieces = false
+        val pieceBytes = java.util.concurrent.atomic.AtomicLong()
+        /** The sockets of one file each (form 4) the phone opened: its file frames in pieces go on them, never on the chat's. */
+        val fileSockets = java.util.concurrent.atomic.AtomicInteger()
         private fun reply(id: String, result: JSONObject) = json("jsonrpc" to "2.0", "id" to id, "result" to result).toString()
         val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
             builder.addInterceptor { chain ->
                 httpRequests += chain.request()
                 val path = chain.request().url.encodedPath
-                val found = path != CANONICAL_TICKET_PATH && !path.endsWith("/voice-history")
+                val found = (path != CANONICAL_TICKET_PATH || relayPieces) && !path.endsWith("/voice-history")
+                // A file's own socket (form 4, follow-up 9) asks its ticket with {"purpose": "file"}, and the plugin's answer says so.
+                val file = path == CANONICAL_TICKET_PATH && chain.request().body?.let { okio.Buffer().also(it::writeTo).readUtf8() }.orEmpty().contains("\"purpose\":\"file\"")
+                if (file) fileSockets.incrementAndGet()
                 val body = when {
+                    path == CANONICAL_TICKET_PATH && relayPieces -> json("ticket" to "fixture-relay-ticket", "path" to "/api/plugins/beacon/gateway/ws", "profile" to "default",
+                        "canonical" to true, "expires_in" to 25, "attach_frame_limit" to 384L * 1024 * 1024, "attach_pieces" to ATTACHMENT_PIECES_FORM,
+                        "attach_file_limit" to 256L * 1024 * 1024, "attach_image_limit" to 25L * 1024 * 1024).apply { if (file) put("purpose", "file") }
                     path == "/api/auth/ws-ticket" -> json("ticket" to "fixture-ticket")
                     path == "/api/model/options" -> modelInventoryOverride?.copy() ?: json("model" to profileModel, "provider" to "fixture", "providers" to JSONArray())
                     path == "/api/sessions/stored-a" -> json("id" to "stored-a", "profile" to "default", "title" to "Fixture", "message_count" to 0)
@@ -67,7 +82,26 @@ class NativeOperationsTest {
                 override fun queueSize() = 0L
                 override fun cancel() = Unit
                 override fun close(code: Int, reason: String?) = true
-                override fun send(bytes: ByteString) = false
+                private val body = okio.Buffer()
+                private var header: JSONObject? = null
+                private var held = 0L
+                // As the plugin's relay (form 3): the frame is joined from a header and the base64, each piece acknowledged, and Hermes gets it whole as text.
+                override fun send(bytes: ByteString): Boolean {
+                    if (!relayPieces) return false
+                    pieceBytes.addAndGet(bytes.size.toLong())
+                    when (bytes[0]) {
+                        PIECE_HEAD -> { header = JSONObject(bytes.substring(1).utf8()); body.clear(); held = 0 }
+                        PIECE_MORE, PIECE_LAST -> {
+                            val head = header ?: return false
+                            body.write(bytes.substring(1)); held += bytes.size - 1
+                            val id = JSONObject(head.getString("head") + head.getString("tail")).getString("id")
+                            listener.onMessage(this, okio.Buffer().writeByte(PIECE_ACK.toInt()).writeLong(held).writeUtf8(id).readByteString())
+                            if (bytes[0] == PIECE_LAST) { header = null; return send(head.getString("head") + body.readUtf8() + head.getString("tail")) }
+                        }
+                        else -> return false
+                    }
+                    return true
+                }
                 override fun send(text: String): Boolean {
                     val frame = JSONObject(text)
                     calls += frame.copy()
@@ -94,8 +128,26 @@ class NativeOperationsTest {
                         listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to if (canonical) 4001 else 4007, "message" to if (canonical) "not_found" else "session not found")).toString())
                         return true
                     }
+                    if (method == "file.attach") {
+                        val refused = fileAttachError
+                        val answer = if (refused != null) json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to refused.first, "message" to refused.second))
+                        else {
+                            // gateway/session_ancillary.attach_file: the file is staged under attachments/ and its @file: reference comes back, quoted when the name has spaces.
+                            val name = params.string("name")
+                            val ref = "attachments/$name".let { if (it.any(Char::isWhitespace)) "\"$it\"" else it }
+                            json("jsonrpc" to "2.0", "id" to frame.getString("id"), "result" to json("attached" to true, "name" to name, "path" to "/synthetic/attachments/$name",
+                                "ref_path" to "attachments/$name", "ref_text" to "@file:$ref", "uploaded" to true))
+                        }
+                        listener.onMessage(this, answer.toString())
+                        return true
+                    }
                     if (method == "session.steer" && steerErrorCode != null) {
                         listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to steerErrorCode, "message" to "Synthetic steer refusal")).toString())
+                        return true
+                    }
+                    onRpc?.invoke(method, params)?.let { answer ->
+                        listener.onMessage(this, (if (answer.has("error")) json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to answer.getJSONObject("error")).toString()
+                            else reply(frame.getString("id"), answer)))
                         return true
                     }
                     val result = when (method) {
@@ -287,7 +339,125 @@ class NativeOperationsTest {
         } finally { fixture.client.closeNative() }
     }
 
-    @Test fun legacyModelMismatchAndUnsupportedCanonicalFileAreRefusedBeforePrompt() = runBlocking {
+    /**
+     * CHAT-121 follow-up 3: a chat with session authority refused every file that is not one of four image types ("This Hermes can't take this
+     * attachment"), before asking Hermes, although Hermes' own Desktop stages any file there with file.attach (gateway/session_ancillary.py, 5551a2c342).
+     * A PDF, an Office file and a file with a non-Latin name now go in one message, each as Hermes' own @file: reference in the text.
+     */
+    @Test fun aChatWithSessionAuthoritySendsDocumentsAsHermesFileReferences() = runBlocking {
+        // CHAT-121 follow-ups 8 and 9: through the Beacon plugin's relay (form 4), the same small files go in acknowledged pieces, each on a socket of its own,
+        // and Hermes gets the same frames.
+        for (relay in listOf(false, true)) {
+        val fixture = Fixture(canonical = true).apply { relayPieces = relay }
+        try {
+            val key = fixture.client.scope.session("stored-a").key
+            val docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            val files = listOf(
+                json("id" to "doc-1", "name" to "Synthetic summary 2026.pdf", "mime" to "application/pdf", "staged_base64" to "JVBERi0xLjQgc3ludGhldGlj", "scope_key" to key),
+                json("id" to "doc-2", "name" to "Team plan (draft).docx", "mime" to docx, "staged_base64" to "UEsDBHN5bnRoZXRpYw==", "scope_key" to key),
+                json("id" to "doc-3", "name" to "ملف تجريبي.txt", "mime" to "text/plain", "staged_base64" to "c3ludGhldGlj", "scope_key" to key),
+                json("id" to "img-1", "name" to "sample.png", "mime" to "image/png", "staged_base64" to "c2FtcGxl", "scope_key" to key))
+            val result = fixture.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Read these", "client_request_id" to "local-docs",
+                "attachments" to JSONArray(files)))
+            assertEquals("admission-a", result.string("admission_id"))
+            val staged = fixture.calls.filter { it.string("method") == "file.attach" }.map { it.getJSONObject("params") }
+            assertEquals(listOf("Synthetic summary 2026.pdf", "Team plan (draft).docx", "ملف تجريبي.txt"), staged.map { it.string("name") })
+            assertEquals(listOf("data:application/pdf;base64,JVBERi0xLjQgc3ludGhldGlj", "data:$docx;base64,UEsDBHN5bnRoZXRpYw==", "data:text/plain;base64,c3ludGhldGlj"),
+                staged.map { it.string("data_url") })
+            assertTrue(staged.all { it.string("session_id") == "stored-a" && it.string("profile") == "default" })
+            val sent = fixture.calls.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
+            assertEquals("Read these\n@file:\"attachments/Synthetic summary 2026.pdf\"\n@file:\"attachments/Team plan (draft).docx\"\n@file:\"attachments/ملف تجريبي.txt\"",
+                sent.string("text"))
+            // The image still goes as an image; only it is in attachments.
+            assertEquals(listOf("/synthetic/image.png"), (0 until sent.getJSONArray("attachments").length()).map { sent.getJSONArray("attachments").getJSONObject(it).string("path") })
+            assertEquals(4, result.getJSONArray("attachment_receipts").length())
+            assertEquals("$relay", relay, fixture.pieceBytes.get() > 0)
+            // Follow-up 9: each file in pieces goes on a socket of its own (the three documents and the image), never on the chat's.
+            assertEquals("$relay", if (relay) 4 else 0, fixture.fileSockets.get())
+        } finally { fixture.client.closeNative() }
+        }
+    }
+
+    /** Only a Hermes that really cannot take the file gets the refusal line, and it names the file; nothing is submitted and the draft stays (NativeTurnNotSent). */
+    @Test fun aFileThisHermesCannotTakeIsNamedAndNothingIsSent() = runBlocking {
+        val key = { fixture: Fixture -> fixture.client.scope.session("stored-a").key }
+        fun files(fixture: Fixture, big: Boolean = false) = JSONArray(listOf(
+            json("id" to "doc-1", "name" to "Synthetic summary 2026.pdf", "mime" to "application/pdf", "staged_base64" to "JVBERi0xLjQgc3ludGhldGlj", "scope_key" to key(fixture)),
+            json("id" to "doc-2", "name" to "ملف تجريبي.docx", "mime" to "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "staged_base64" to if (big) "A".repeat(CANONICAL_RELAY_FRAME_BYTES) else "UEsDBHN5bnRoZXRpYw==", "scope_key" to key(fixture))))
+        // A Hermes without file.attach on the chat's authority (-32601), its own refusal of the file (invalid_params), a Hermes before 5551a2c342 (session not found).
+        for (refusal in listOf(-32601 to "unknown method: file.attach", 4001 to "invalid_params", 4001 to "session not found")) {
+            val fixture = Fixture(canonical = true).apply { fileAttachError = refusal }
+            try {
+                val failure = runCatching { fixture.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Read these", "client_request_id" to "local-r",
+                    "attachments" to files(fixture))) }.exceptionOrNull()
+                assertTrue("$refusal: $failure", failure is AttachmentRefused && failure.file == "Synthetic summary 2026.pdf" && failure.line == ATTACHMENT_REFUSED_LINE)
+                assertEquals("This Hermes can't take “Synthetic summary 2026.pdf”. The message stays on this phone.", failure?.message)
+                assertTrue(fixture.calls.none { it.string("method") == "prompt.submit" })
+            } finally { fixture.client.closeNative() }
+        }
+        // Not about the file: no refusal line, the usual "not sent".
+        val denied = Fixture(canonical = true).apply { fileAttachError = 4001 to "permission_denied" }
+        try {
+            val failure = runCatching { denied.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Read these", "client_request_id" to "local-p",
+                "attachments" to files(denied))) }.exceptionOrNull()
+            assertTrue("$failure", failure is NativeTurnNotSent && failure !is AttachmentRefused)
+            assertTrue(denied.calls.none { it.string("method") == "prompt.submit" })
+        } finally { denied.client.closeNative() }
+        // Too large for one frame of the plugin relay (Hermes serves no staged upload to Beacon): named before anything is staged, even when it is not the
+        // first file, and a photo too.
+        val large = Fixture(canonical = true)
+        try {
+            val failure = runCatching { large.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Read these", "client_request_id" to "local-l",
+                "attachments" to files(large, big = true))) }.exceptionOrNull()
+            assertTrue("$failure", failure is AttachmentRefused && failure.file == "ملف تجريبي.docx" && failure.line == ATTACHMENT_TOO_LARGE_LINE)
+            assertTrue(large.calls.none { it.string("method") in setOf("file.attach", "image.attach_bytes", "prompt.submit") })
+        } finally { large.client.closeNative() }
+        val photo = Fixture(canonical = true)
+        try {
+            val failure = runCatching { photo.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Look", "client_request_id" to "local-i",
+                "attachments" to JSONArray(listOf(json("id" to "img-1", "name" to "large photo.jpg", "mime" to "image/jpeg", "staged_base64" to "A".repeat(CANONICAL_RELAY_FRAME_BYTES),
+                    "scope_key" to key(photo)))))) }.exceptionOrNull()
+            assertTrue("$failure", failure is AttachmentRefused && failure.file == "large photo.jpg" && failure.line == ATTACHMENT_TOO_LARGE_LINE)
+            assertTrue(photo.calls.none { it.string("method") in setOf("image.attach_bytes", "prompt.submit") })
+        } finally { photo.client.closeNative() }
+    }
+
+    /** The frame check counts what Android's JSON writes: each "/" of base64 escaped as "\/", and a name up to 6 bytes a character. */
+    @Test fun theFrameCheckLeavesRoomForEscapesAndTheEnvelope() {
+        val slashes = "/".repeat(4_000_000)
+        assertFalse("4 MB of slashes is 8 MB once escaped", fitsCanonicalFrame(slashes + "A".repeat(400_000), "a.pdf", "application/pdf"))
+        assertTrue(fitsCanonicalFrame("A".repeat(CANONICAL_RELAY_FRAME_BYTES - 2048), "a.pdf", "application/pdf"))
+        assertFalse(fitsCanonicalFrame("A".repeat(CANONICAL_RELAY_FRAME_BYTES - 2048), "ملف".repeat(200), "application/pdf"))
+    }
+
+    /**
+     * CHAT-121 follow-up 4: a file kept on the phone (past one text frame) goes only to a plugin that takes it in pieces. On a connection without
+     * them (a 1.2.0 plugin, or no plugin) it is named with that connection's real limit, before anything is sent; a kept copy that is gone is not sent.
+     */
+    @Test fun aKeptFileOnAConnectionWithoutPiecesIsNamedWithItsRealLimit() = runBlocking {
+        val dir = java.nio.file.Files.createTempDirectory("chat-attachments").toFile()
+        ChatAttachmentStore.dir = dir
+        val id = java.util.UUID.randomUUID().toString()
+        java.io.File(dir, id).writeBytes(ByteArray(7 * 1024 * 1024))
+        val fixture = Fixture(canonical = true)
+        try {
+            val item = json("id" to id, "state" to "ready", "name" to "Synthetic report 2026.pdf", "mime" to "application/pdf", "size" to 7 * 1024 * 1024,
+                "staged_file" to true, "scope_key" to fixture.client.scope.session("stored-a").key)
+            suspend fun send() = runCatching { fixture.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Read this", "client_request_id" to "local-k",
+                "attachments" to JSONArray().put(item))) }.exceptionOrNull()
+            val failure = send()
+            assertTrue("$failure", failure is AttachmentRefused && failure.line == ATTACHMENT_TOO_LARGE_LINE && failure.limitMb == "6")
+            assertEquals("“Synthetic report 2026.pdf” is too large to send to this Hermes (6 MB at most). The message stays on this phone.", failure?.message)
+            assertTrue(fixture.calls.none { it.string("method") in setOf("file.attach", "image.attach_bytes", "prompt.submit") })
+            java.io.File(dir, id).delete()
+            val gone = send()
+            assertTrue("$gone", gone is NativeTurnNotSent && gone !is AttachmentRefused)
+            assertTrue(fixture.calls.none { it.string("method") in setOf("file.attach", "prompt.submit") })
+        } finally { fixture.client.closeNative(); ChatAttachmentStore.dir = null; dir.deleteRecursively() }
+    }
+
+    @Test fun legacyModelMismatchAndAFileTheCanonicalHermesCannotTakeAreRefusedBeforePrompt() = runBlocking {
         val legacy = Fixture()
         try {
             val failure = runCatching { legacy.client.post("/api/chat/start", json("session_id" to "stored-a", "message" to "Queued text",
@@ -295,7 +465,8 @@ class NativeOperationsTest {
             assertTrue(failure is NativeTurnNotSent)
             assertTrue(legacy.calls.none { it.string("method") in setOf("prompt.submit", "config.set") })
         } finally { legacy.client.closeNative() }
-        val canonical = Fixture(canonical = true)
+        // A Hermes whose chat authority has no file.attach (before 5551a2c342 it answered from the legacy sidecar: "session not found").
+        val canonical = Fixture(canonical = true).apply { fileAttachError = 4001 to "session not found" }
         try {
             val file = json("id" to "file-a", "name" to "notes.txt", "mime" to "text/plain", "staged_base64" to "c2FtcGxl",
                 "scope_key" to canonical.client.scope.session("stored-a").key)

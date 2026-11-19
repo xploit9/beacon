@@ -50,12 +50,13 @@ internal fun memoryCounterVisible(length: Int, limit: Int): Boolean = limit > 0 
         val cut = LocalMarkdownCut.current
         SelectionContainer { Text(it, style = MaterialTheme.typography.bodyLarge.contentDirection(), maxLines = maxLines, overflow = if (maxLines == Int.MAX_VALUE) TextOverflow.Clip else TextOverflow.Ellipsis, onTextLayout = { layout -> if (layout.hasVisualOverflow) cut() }) }
     },
+    readOnly: Boolean = false,
 ) {
     var selected by rememberSaveable(state.scope) { mutableStateOf("memory") }
     var explanation by rememberSaveable(state.scope) { mutableStateOf(false) }
     val target = state.editing.ifBlank { selected }
     val current = state.documents.firstOrNull { it.target == target } ?: state.documents.firstOrNull()
-    val canEdit = state.editing.isBlank() && !state.loading && !state.saving
+    val canEdit = state.editing.isBlank() && !state.loading && !state.saving && !readOnly
     BackHandler(enabled = state.editing.isNotBlank() && !state.saving, onBack = onCancel)
     // Notes already loaded stay on screen while a refresh or save runs; the thin bar is the only sign of it.
     SettingsList(refreshing = (state.loading && state.documents.isNotEmpty()) || state.saving, testTag = "memory-page") {

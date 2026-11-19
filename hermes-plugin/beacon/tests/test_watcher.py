@@ -24,7 +24,9 @@ async def test_watcher_pushes_later_profiles_after_one_profile_raises(harness,mo
     api._jobs_warming.clear()
     await api.start_watcher()
     try:
-        assert await asyncio.to_thread(second_push.wait,1)
+        # Waits for the real condition: the later profile's push. One pass reads settings, the jobs version, watch and push for
+        # each profile on worker threads beside the start's own background work, so on a loaded machine it can take well over a second.
+        assert await asyncio.to_thread(second_push.wait,10)
     finally:
         await api.stop_watcher()
 

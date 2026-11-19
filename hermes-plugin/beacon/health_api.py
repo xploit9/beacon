@@ -168,7 +168,7 @@ def build_router(identity):
 
     @router.get('/mobile/health')
     async def health(request: Request, fresh: int = 0):
-        owner, _, _, cfg = identity(request, owner_only=True)
+        owner, _, _, cfg = await asyncio.to_thread(identity, request, owner_only=True)
         profiles = cfg['profiles']
         wanted = request.query_params.get('beacon_profile') or request.query_params.get('profile')
         if wanted is not None and wanted not in profiles:

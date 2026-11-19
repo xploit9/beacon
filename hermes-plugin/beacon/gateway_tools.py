@@ -127,6 +127,34 @@ QUERY_ALIASES = {
     'remember': {'remember', 'memory', 'save', 'note'},
 }
 logger = logging.getLogger(__name__)
+# Receipt writes in this process; a waiting answer reads the store only after this changes.
+RECEIPT_CHANGES = [0]
+
+
+def call_updates():
+    """The updates channel module (call_updates.py), loaded by path like every plugin sibling; None if it cannot load."""
+    module=sys.modules.get('beacon_call_updates')
+    if module is None:
+        try:
+            import importlib.util
+            path=Path(__file__).with_name('call_updates.py')
+            spec=importlib.util.spec_from_file_location('beacon_call_updates',path)
+            module=importlib.util.module_from_spec(spec);module._beacon_mtime=path.stat().st_mtime_ns
+            spec.loader.exec_module(module);sys.modules['beacon_call_updates']=module
+        except Exception:
+            return None
+    return module
+
+
+def record_receipt(conn, scope, value):
+    """The receipt's state as a call update, in the transaction that saved it; never fails the save itself."""
+    updates=call_updates()
+    if updates is None: return
+    try:
+        kind,payload,state=updates.receipt_event(receipt_v3(value))
+        updates.append(conn,scope[3],kind,value['request_id'],payload,state)
+    except Exception as error:
+        logger.debug('Beacon call update not recorded: %s',type(error).__name__)
 
 
 def worker_stack(thread):
@@ -631,6 +659,193 @@ def clipped_line(line, limit):
     return (cut.rstrip(' ,;:')+' …') if cut else ''
 
 
+# Call contract v3 (CALLS-CONTRACT.md section 1): the profile's tools declared to the live model by name.
+DECLARED_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_-]{0,63}\Z')
+# The app's own call functions and the phone tools; a Hermes tool never takes one of these names.
+RESERVED_NAMES = frozenset({'hermes_work', 'hermes_follow', 'hermes_callback', 'schedule_callback', 'hermes_cancel',
+                            'get_visual_state', 'discover_tools', 'invoke_tool', 'tool_status', 'hermes_search',
+                            'hermes_memory', 'hermes_skills', 'hermes_context'}) | PHONE_TOOLS
+RESERVED_PREFIXES = ('hermes_', 'phone_')
+DECLARATIONS_BUDGET = 49152
+DECLARATION_LIMIT = 4096
+DECLARATION_DEPTH = 6
+PORTABLE_TYPES = ('object', 'string', 'number', 'integer', 'boolean', 'array', 'null')
+# The string formats Google documents a meaning for in Gemini function schemas (an earlier Schema reference: "for STRING type:
+# enum, date-time"). The current reference allows any value but says most trigger nothing, and Live refuses a whole setup on a
+# shape it does not take (an array without items did), so any other format becomes words in the description.
+GEMINI_STRING_FORMATS = frozenset({'date-time', 'enum'})
+
+
+def _hash8(name):
+    return hashlib.sha256(name.encode('utf-8', 'surrogatepass')).hexdigest()[:8]
+
+
+def _base_name(name):
+    text = re.sub(r'[^A-Za-z0-9_-]', '_', name)
+    if not re.match(r'[A-Za-z_]', text): text = 't_' + text
+    if text.startswith(RESERVED_PREFIXES) or text in RESERVED_NAMES: text = 't_' + text
+    return text[:55] + '_' + _hash8(name) if len(text) > 64 else text
+
+
+def declared_names(rows):
+    """tool_id -> provider-safe name for every row, deterministic over the rows' Hermes names; names that collide all take
+    a hash suffix. Computed over the whole call catalogue, so a tool left out of the declarations keeps the same name."""
+    base = {row['tool_id']: (_base_name(row['name']), row['name']) for row in rows
+            if isinstance(row.get('name'), str) and row['name'] and isinstance(row.get('tool_id'), str)}
+    counts = {}
+    for text, _ in base.values(): counts[text] = counts.get(text, 0) + 1
+    return {tool_id: text if counts[text] == 1 else text[:55] + '_' + _hash8(name) for tool_id, (text, name) in base.items()}
+
+
+class _Unportable(Exception):
+    pass
+
+
+def _note(node, sentence):
+    text = (str(node.get('description') or '') + ' ' + sentence).strip()
+    node['description'] = display_line(text, 300)
+
+
+def portable_schema(schema):
+    """A tool's parameter schema in the portable subset every voice provider accepts, or None when it cannot be expressed
+    (a reference cycle, nesting deeper than six, an allOf that is not objects, a root that is not an object). Only a hint:
+    the model's arguments are still validated against the original schema."""
+    if not isinstance(schema, dict): return None
+    defs = {}
+    for key in ('definitions', '$defs'):
+        if isinstance(schema.get(key), dict): defs.update(schema[key])
+
+    def resolve(node, trail):
+        while isinstance(node, dict) and isinstance(node.get('$ref'), str):
+            ref = node['$ref']
+            match = re.fullmatch(r'#/(?:\$defs|definitions)/(.+)', ref)
+            if not match or match.group(1) not in defs or ref in trail: raise _Unportable()
+            trail = trail | {ref}
+            node = {**defs[match.group(1)], **{k: v for k, v in node.items() if k != '$ref'}}
+        return node, trail
+
+    def convert(node, depth, trail):
+        if depth > DECLARATION_DEPTH: raise _Unportable()
+        if node is True or node is None: node = {}
+        if not isinstance(node, dict): raise _Unportable()
+        node, trail = resolve(node, trail)
+        node = dict(node)
+        if isinstance(node.get('allOf'), list):
+            parts = [resolve(part, trail)[0] for part in node.pop('allOf')]
+            if not all(isinstance(part, dict) and (part.get('type') in (None, 'object')) and
+                       not part.get('anyOf') and not part.get('oneOf') for part in parts): raise _Unportable()
+            properties = dict(node.get('properties') or {})
+            required = list(node.get('required') or [])
+            for part in parts:
+                properties.update(part.get('properties') or {})
+                required += [name for name in part.get('required') or [] if name not in required]
+                if part.get('description') and not node.get('description'): node['description'] = part['description']
+            node.update(type='object', properties=properties, required=required)
+        out = {}
+        if isinstance(node.get('title'), str): out['title'] = display_line(node['title'], 100)
+        if isinstance(node.get('description'), str) and node['description'].strip(): out['description'] = display_line(node['description'], 300)
+        kind = node.get('type')
+        if node.get('nullable') is True and isinstance(kind, str): kind = [kind, 'null']
+        kinds = [kind] if isinstance(kind, str) else list(kind) if isinstance(kind, list) else []
+        kinds = [k for k in kinds if k in PORTABLE_TYPES]
+        unions = [member for key in ('anyOf', 'oneOf') if isinstance(node.get(key), list) for member in node[key]]
+        if not kinds and not unions:
+            kinds = ['object'] if isinstance(node.get('properties'), dict) else ['array'] if 'items' in node else []
+            if not kinds and isinstance(node.get('enum'), list) and all(isinstance(v, str) for v in node['enum']): kinds = ['string']
+        real = [k for k in kinds if k != 'null']
+        # A typed node's anyOf/oneOf only narrows it (the original schema still validates); an untyped one is a real union.
+        if len(real) == 1: unions = []
+        elif len(real) > 1:
+            unions = [{**{k: v for k, v in node.items() if k not in ('type', 'anyOf', 'oneOf', 'nullable', 'description', 'title')},
+                       'type': k} for k in real] + unions
+        if unions:
+            members = [convert(member, depth + 1, trail) for member in unions]
+            if 'null' in kinds: members.append({'type': 'null'})
+            others = [member for member in members if member != {'type': 'null'}]
+            if len(members) == 2 and len(others) == 1 and isinstance(others[0].get('type'), str):
+                # anyOf [T, null] is the common optional field: one nullable T.
+                merged = {**others[0], 'type': [others[0]['type'], 'null']}
+                return {**merged, **{k: out[k] for k in ('title', 'description') if k in out}}
+            out['anyOf'] = members
+            return out
+        if not real:
+            if kinds == ['null']:
+                out['type'] = 'null'
+                return out
+            real = kinds = ['string']
+        base = real[0]
+        out['type'] = [base, 'null'] if 'null' in kinds else base
+        if base == 'object':
+            properties = node.get('properties') if isinstance(node.get('properties'), dict) else {}
+            if len(properties) > 64: raise _Unportable()
+            out['properties'] = {str(name): convert(child, depth + 1, trail) for name, child in properties.items()}
+            required = [name for name in node.get('required') or [] if isinstance(name, str) and name in properties]
+            if required: out['required'] = required
+        elif base == 'array':
+            items = node.get('items')
+            if isinstance(items, list): items = {'anyOf': items} if items else {}
+            out['items'] = convert(items if items is not None else {}, depth + 1, trail)
+            for key in ('minItems', 'maxItems'):
+                if type(node.get(key)) is int and node[key] >= 0: out[key] = node[key]
+        elif base == 'string':
+            for key in ('minLength', 'maxLength'):
+                if type(node.get(key)) is int and node[key] >= 0: out[key] = node[key]
+            if isinstance(node.get('pattern'), str) and len(node['pattern']) <= 1000: out['pattern'] = node['pattern']
+            if node.get('format') in GEMINI_STRING_FORMATS: out['format'] = node['format']
+            elif isinstance(node.get('format'), str) and node['format'].strip(): _note(out, 'Format: ' + display_line(node['format'], 50) + '.')
+        elif base in ('number', 'integer'):
+            for key in ('minimum', 'maximum'):
+                value = node.get(key)
+                if type(value) in (int, float) and value == value and abs(value) != float('inf'): out[key] = value
+        if 'const' in node:
+            if base == 'string' and isinstance(node['const'], str): out['enum'] = [node['const']]
+            else: _note(out, 'Must be ' + json.dumps(node['const'], ensure_ascii=False)[:100] + '.')
+        if isinstance(node.get('enum'), list):
+            values = node['enum']
+            if base == 'string' and values and len(values) <= 64 and all(isinstance(v, str) and len(v) <= 100 for v in values):
+                out['enum'] = list(values)
+            elif values:
+                _note(out, 'Allowed values: ' + ', '.join(json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+                                                          for v in values[:64]) + '.')
+        if 'default' in node and (node['default'] is None or type(node['default']) in (str, int, float, bool)):
+            out['default'] = node['default']
+        return out
+
+    try:
+        root = convert(schema, 1, frozenset())
+    except (_Unportable, RecursionError, TypeError, ValueError):
+        return None
+    if root.get('type') != 'object': return None
+    root.setdefault('properties', {})
+    return root
+
+
+def tool_declarations(rows):
+    """The tool_declarations block of a v3 call context: native Hermes tools first, then MCP tools by server in config order,
+    read-only before the rest, within DECLARATIONS_BUDGET bytes. Nothing in the order depends on a tool or server name."""
+    names = declared_names(rows)
+    def order(row):
+        if row.get('_kind') == 'hermes':
+            return (0, not row.get('read_only'), str(row.get('_toolset') or ''), str(row.get('name')))
+        return (1, row.get('_server_order', 1 << 20), str(row.get('_server') or ''), not row.get('read_only'), str(row.get('_raw') or row.get('name')))
+    declared, size, omitted, full = [], 2, 0, False
+    for row in sorted((r for r in rows if r.get('tool_id') in names), key=order):
+        if full: omitted += 1; continue
+        name = names[row['tool_id']]
+        parameters = portable_schema(row.get('parameters') if isinstance(row.get('parameters'), dict) else {})
+        if parameters is None or not DECLARED_NAME.fullmatch(name): omitted += 1; continue
+        item = {'name': name, 'description': plain_line(row.get('description') or '', 600), 'parameters': parameters,
+                'read_only': bool(row.get('read_only')), 'tool_id': row['tool_id']}
+        cost = len(encoded(item).encode('utf-8'))
+        if cost > DECLARATION_LIMIT: omitted += 1; continue
+        if size + cost + (1 if declared else 0) > DECLARATIONS_BUDGET:
+            full = True; omitted += 1; continue
+        declared.append(item); size += cost + (1 if len(declared) > 1 else 0)
+    return {'tool_declarations': declared, 'tool_declarations_complete': omitted == 0,
+            'tool_declarations_omitted': omitted,
+            'tool_declarations_digest': hashlib.sha256(encoded(declared).encode('utf-8')).hexdigest()[:16]}
+
+
 def seconds(value, default):
     """A configured number of seconds; anything that is not a positive finite number is the default."""
     try: number=float(value)
@@ -976,6 +1191,7 @@ class NativeMcp:
                     state=self._register(config)
         self._seen.settled=state is not None and not state[0]
         output = []
+        server_order = {name: index for index, name in enumerate(config or {})}  # the profile's MCP config order
         served = {}  # server -> (its tool filter, whether it is not connected yet), or None when this process does not serve it as configured
         def mcp_row(entry):
             if not str(getattr(entry, 'toolset', '') or '').startswith('mcp-'):
@@ -1025,7 +1241,7 @@ class NativeMcp:
                  'description':plain_line(entry.schema.get('description', '') if isinstance(entry.schema.get('description', ''), str) else '', 1200),
                  'parameters':schema, 'read_only':readonly,
                  '_timeout':tool_timeout,
-                 '_server':server, '_raw':raw,
+                 '_server':server, '_raw':raw, '_server_order':server_order.get(server, len(server_order)),
                  '_trust':trust}
             # A server Hermes has not started yet connects inside the first call to one of its tools, within that call's deadline.
             if served[server][1]: row['_connect_timeout']=seconds(cfg.get('connect_timeout'),getattr(core,'_DEFAULT_CONNECT_TIMEOUT',60))
@@ -1134,6 +1350,56 @@ class NativeMcp:
 
 # The app's Ask for approval choices a tool request may carry (Manual, Auto, Full access).
 APPROVAL_CHOICES=('ask','changes','owner')
+# A v3 answer is final in these states; ready and running are still on their way.
+FINAL_STATES=frozenset({'completed','failed','denied','expired','cancelled','uncertain'})
+
+
+def receipt_v3(value):
+    """One receipt as call contract v3 shows it (CALLS-CONTRACT.md section 2), from the stored receipt with its private fields."""
+    status=value['status']
+    shown='running' if status=='ready' else status
+    out={'request_id':value['request_id'],'tool_id':value.get('tool_id'),'tool':value.get('_tool') or value.get('tool_name'),
+         'tool_name':value.get('tool_name'),'status':shown,'read_only':bool(value.get('_read_only')),
+         'approved_by':value.get('approved_by'),
+         'ran_on_hermes':shown in ('running','completed') or shown=='uncertain' or bool(value.get('_dispatched')) and shown=='failed',
+         'server_ms':dict(value.get('_timings_ms') or {})}
+    if shown=='completed':
+        out['result']=value.get('result')
+        out['truncated']=bool(value.get('truncated'))
+    elif shown=='needs_approval':
+        out['proposal']=value.get('proposal')
+        out['expires_at']=value.get('_expires')
+    elif shown in ('failed','uncertain'):
+        code=value.get('_error_code') or value.get('error_code')
+        out['error_code']=code or ('outcome_unknown' if shown=='uncertain' else 'not_started')
+        out['reason']=plain_line(value.get('reason') or '',200)
+    elif shown in ('denied','expired','cancelled','transferred'):
+        out['reason']=plain_line(value.get('reason') or '',200)
+    return out
+
+
+def refused_v3(request, tool, code, reason, row=None, tool_name=None):
+    """A v3 tool answer that was refused before any receipt existed (an unknown tool, arguments that do not fit)."""
+    return {'request_id':request,'tool_id':row['tool_id'] if row else None,'tool':tool,
+            'tool_name':tool_name or plain_line(tool,MAX_TOOL_NAME),'status':'failed',
+            'read_only':bool(row and row.get('read_only')),'approved_by':None,'ran_on_hermes':False,'server_ms':{},
+            'error_code':code,'reason':plain_line(reason,200)}
+
+
+def argument_problem(schema, arguments):
+    """One plain line naming the first argument that does not fit the tool's schema, for the live model to fix."""
+    if not isinstance(arguments, dict): return 'arguments: a JSON object is required.'
+    try:
+        if len(encoded(arguments).encode()) > MAX_ARGUMENTS: return 'arguments: larger than 16384 bytes.'
+        from jsonschema import validators
+        from jsonschema.exceptions import best_match
+        checker=validators.validator_for(schema)
+        error=best_match(checker(schema).iter_errors(arguments))
+        if error is None: return 'arguments: not accepted for this tool.'
+        field='.'.join(str(part) for part in error.absolute_path)
+        return (field+': ' if field else '')+display_line(error.message,180)
+    except Exception:
+        return 'arguments: not accepted for this tool.'
 
 
 class Gateway:
@@ -1144,17 +1410,23 @@ class Gateway:
         self.scoped = scoped
         self.execution_scoped = scoped
         self.sanitize = sanitizer
+        self._tables = False
 
     @contextmanager
     def db(self):
         with self.mobile.LOCK, self.mobile.connect() as conn:
-            conn.execute('''CREATE TABLE IF NOT EXISTS tool_receipts (
-                owner TEXT, provider TEXT, profile TEXT, call_id TEXT, request_id TEXT,
-                signature TEXT NOT NULL, payload TEXT NOT NULL, updated REAL NOT NULL,
-                PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
-            conn.execute('''CREATE TABLE IF NOT EXISTS call_tool_allowances (
-                owner TEXT, provider TEXT, profile TEXT, call_id TEXT, tool_id TEXT, tool_name TEXT,
-                created REAL NOT NULL, PRIMARY KEY(owner,provider,profile,call_id,tool_name))''')
+            if not self._tables:
+                # The plugin's own schema has these tables; a store that predates them gets them once per dispatcher.
+                conn.execute('''CREATE TABLE IF NOT EXISTS tool_receipts (
+                    owner TEXT, provider TEXT, profile TEXT, call_id TEXT, request_id TEXT,
+                    signature TEXT NOT NULL, payload TEXT NOT NULL, updated REAL NOT NULL,
+                    PRIMARY KEY(owner,provider,profile,call_id,request_id))''')
+                conn.execute('''CREATE TABLE IF NOT EXISTS call_tool_allowances (
+                    owner TEXT, provider TEXT, profile TEXT, call_id TEXT, tool_id TEXT, tool_name TEXT,
+                    created REAL NOT NULL, PRIMARY KEY(owner,provider,profile,call_id,tool_name))''')
+                updates=call_updates()
+                if updates is not None: conn.execute(updates.DDL)
+                self._tables = True
             yield conn
 
     def _catalog_key(self, profile):
@@ -1393,8 +1665,11 @@ class Gateway:
     def _save(self, conn, scope, request, value):
         conn.execute('UPDATE tool_receipts SET payload=?,updated=? WHERE owner=? AND provider=? AND profile=? AND call_id=? AND request_id=?',
                      (encoded(value),time.time(),*scope,request))
+        record_receipt(conn,scope,value)
+        RECEIPT_CHANGES[0] += 1
 
-    def status(self, scope, request):
+    def _stored(self, scope, request):
+        """The stored receipt with its private fields, after the time-based transitions every read applies."""
         try: self.mobile.ident(request)
         except ValueError: raise HTTPException(400,'Invalid tool request identity') from None
         with self.db() as conn:
@@ -1404,15 +1679,21 @@ class Gateway:
             value.setdefault('approved_by',None)
             if value['status']=='running' and (not producer_running(value) or
                     time.time()-value['_started']>value.get('_deadline_seconds',DEADLINE)):
-                value.update(status='uncertain', reason='Execution may have completed; do not retry automatically')
+                value.update(status='uncertain', reason='Execution may have completed; do not retry automatically',_error_code='deadline')
                 self._save(conn,scope,request,value)
             if value['status'] in ('needs_approval','transferred') and time.time()>value['_expires']:
                 value.update(status='expired', reason='Approval proposal expired')
                 self._save(conn,scope,request,value)
             if value['status']=='ready' and time.time()-row['updated']>DEADLINE:
-                value.update(status='failed',reason='Admission interrupted before execution; operation was not started')
+                value.update(status='failed',reason='Admission interrupted before execution; operation was not started',_error_code='not_started')
                 self._save(conn,scope,request,value)
-        return {k:v for k,v in value.items() if not k.startswith('_')}
+        return value
+
+    def status(self, scope, request):
+        return {k:v for k,v in self._stored(scope,request).items() if not k.startswith('_')}
+
+    def status_v3(self, scope, request):
+        return receipt_v3(self._stored(scope,request))
 
     def _approval_source(self, scope, tool, arguments, session_id,principal=None):
         # A call allowance never covers Hermes' own tools: it would also answer their dangerous-command prompts.
@@ -1431,30 +1712,57 @@ class Gateway:
         except Exception:
             return None  # Missing/malformed state or a failed guardian always asks the phone.
 
+    @staticmethod
+    def resolve(rows, handle):
+        """A v3 tool handle: the 64-hex tool_id, then the declared name, then the exact Hermes name."""
+        if not isinstance(handle,str) or not handle: return None
+        if re.fullmatch(r'[0-9a-f]{64}',handle):
+            found=next((t for t in rows if t['tool_id']==handle),None)
+            if found: return found
+        names=declared_names(rows)
+        return (next((t for t in rows if names.get(t['tool_id'])==handle),None) or
+                next((t for t in rows if t.get('name')==handle),None))
+
     def invoke(self, scope, value, session_id=None, principal=None):
         # approval is the owner's Ask for approval choice in the app: ask (Manual), changes (Auto) or owner (Full access).
-        if set(value)-{'approval'}!={'request_id','tool_id','arguments'}: raise HTTPException(400, 'Invalid tool request fields')
+        # v2 names the tool by tool_id and answers refusals as HTTP errors; v3 names it by `tool` and answers every tool-level
+        # outcome as a receipt (CALLS-CONTRACT.md section 2).
+        v3='tool' in value
+        if set(value)-{'approval'}!=({'request_id','tool','arguments'} if v3 else {'request_id','tool_id','arguments'}):
+            raise HTTPException(400, 'Invalid tool request fields')
         choice=value.get('approval','changes')
         if choice not in APPROVAL_CHOICES: raise HTTPException(400, 'Invalid approval choice')
         try: request=self.mobile.ident(value['request_id'])
         except ValueError: raise HTTPException(400,'Invalid tool request identity') from None
-        if not isinstance(value['tool_id'],str) or len(value['tool_id'])!=64: raise HTTPException(400, 'Invalid tool handle')
+        handle=value['tool'] if v3 else value['tool_id']
+        if not isinstance(handle,str) or (not 1<=len(handle)<=MAX_TOOL_NAME if v3 else len(handle)!=64):
+            raise HTTPException(400, 'Invalid tool handle')
         try: signature=digest(value)
         except (ValueError,TypeError): raise HTTPException(400,'Invalid tool request') from None
+        answer=self.status_v3 if v3 else self.status
         with self.db() as conn:
             previous=self._row(conn,scope,request)
             if previous:
                 if json.loads(previous['payload']).get('_principal')!=principal: raise HTTPException(409,'Original request principal mismatch')
                 if previous['signature']!=signature: raise HTTPException(409, 'Request identity conflicts with its original arguments')
-                return self.status(scope,request)
-        tools=self.catalog(scope[2],discover=False);tool=next((t for t in tools if t['tool_id']==value['tool_id']),None)
-        if not tool: raise HTTPException(409, 'Tool changed or is no longer configured; rediscover it')
-        arguments=coerce(tool['parameters'], value['arguments'])
-        validate(tool['parameters'], arguments)
-        methods=readonly_methods(tool['parameters'])
-        if 'method' not in arguments and methods:
-            arguments={**arguments,'method':'GET' if 'GET' in methods else 'HEAD'}
-            validate(tool['parameters'],arguments)
+                return answer(scope,request)
+        tools=self.catalog(scope[2],discover=False)
+        tool=self.resolve(tools,handle) if v3 else next((t for t in tools if t['tool_id']==handle),None)
+        if not tool:
+            if v3: return refused_v3(request,handle,'tool_unknown','No tool with this name is configured.')
+            raise HTTPException(409, 'Tool changed or is no longer configured; rediscover it')
+        declared=declared_names(tools).get(tool['tool_id']) or plain_line(tool['name'],MAX_TOOL_NAME)
+        try:
+            arguments=coerce(tool['parameters'], value['arguments'])
+            validate(tool['parameters'], arguments)
+            methods=readonly_methods(tool['parameters'])
+            if 'method' not in arguments and methods:
+                arguments={**arguments,'method':'GET' if 'GET' in methods else 'HEAD'}
+                validate(tool['parameters'],arguments)
+        except HTTPException:
+            if not v3: raise
+            return refused_v3(request,declared,'invalid_arguments',argument_problem(tool['parameters'],value['arguments']),
+                              tool,plain_line(tool['name'],MAX_TOOL_NAME))
         read_only=tool_read_only(tool,arguments)
         tool={**tool,'read_only':read_only}
         session_id=session_id or scope[3]
@@ -1468,7 +1776,7 @@ class Gateway:
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':shown_name,
                 'status':'needs_approval' if needs_approval else 'ready','approved_by':approved_by,
                 '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,'_principal':principal,
-                '_expires':time.time()+120}
+                '_expires':time.time()+120,'_tool':declared}
         if '_timeout' in tool:
             result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+float(tool.get('_connect_timeout') or 0)+30)
         if needs_approval:
@@ -1478,6 +1786,7 @@ class Gateway:
                 if encoded(displayed)!=serialized:
                     raise ValueError('Approval arguments were changed by redaction')
             except (ValueError,TypeError):
+                if v3: return refused_v3(request,declared,'invalid_arguments','These arguments cannot be shown accurately for approval; remove sensitive values.',tool,shown_name)
                 raise HTTPException(400,'These arguments cannot be shown accurately for approval; remove sensitive values') from None
             result['proposal']={'id':secrets.token_urlsafe(32),'tool_name':shown_name,'arguments':displayed,
                                 **({'allow_call':False} if tool.get('_kind')=='hermes' else {})}
@@ -1486,7 +1795,7 @@ class Gateway:
             if previous:
                 if json.loads(previous['payload']).get('_principal')!=principal: raise HTTPException(409,'Original request principal mismatch')
                 if previous['signature']!=signature: raise HTTPException(409,'Request identity conflicts')
-                return self.status(scope,request)
+                return answer(scope,request)
             if conn.execute('SELECT COUNT(*) FROM tool_receipts WHERE owner=? AND profile=? AND call_id=?', (scope[0],scope[2],scope[3])).fetchone()[0]>=128:
                 raise HTTPException(429,'Call tool request capacity reached')
             total=conn.execute('SELECT COUNT(*) FROM tool_receipts').fetchone()[0]
@@ -1503,8 +1812,14 @@ class Gateway:
                     if expired: conn.commit()
                     raise HTTPException(429,'Tool receipt capacity reached')
             conn.execute('INSERT INTO tool_receipts VALUES(?,?,?,?,?,?,?,?)',(*scope,request,signature,encoded(result),time.time()))
-        if not needs_approval: self._start(scope,request,tool,False)
-        return self.status(scope,request)
+            record_receipt(conn,scope,result)
+            RECEIPT_CHANGES[0] += 1
+        if not needs_approval:
+            try: self._start(scope,request,tool,False)
+            except HTTPException as error:
+                # A v3 tool that could not start is a failed receipt (capacity, not_started), not a request error.
+                if not v3 or error.status_code not in (429,503): raise
+        return answer(scope,request)
 
     def decide(self, scope, request, value):
         if set(value)!={'proposal_id','decision'} or value['decision'] not in ('approve','approve_call','deny'):
@@ -1524,7 +1839,7 @@ class Gateway:
             with self.db() as conn:
                 stored=json.loads(self._row(conn,scope,request)['payload'])
                 if stored['status']=='needs_approval':
-                    stored.update(status='failed',reason='Tool changed; rediscover before a new proposal');self._save(conn,scope,request,stored)
+                    stored.update(status='failed',reason='Tool changed; rediscover before a new proposal',_error_code='tool_changed');self._save(conn,scope,request,stored)
             return self.status(scope,request)
         if value['decision']=='approve_call' and tool.get('_kind')=='hermes':
             raise HTTPException(409,'This tool needs approval each time')
@@ -1549,7 +1864,7 @@ class Gateway:
             with self.db() as conn:
                 value=json.loads(self._row(conn,scope,request)['payload'])
                 if value['status']=='ready':
-                    value.update(status='failed',reason='Execution capacity reached; operation was not started')
+                    value.update(status='failed',reason='Execution capacity reached; operation was not started',_error_code='capacity')
                     self._save(conn,scope,request,value)
             raise HTTPException(429,'Tool execution capacity reached')
         submitted = False
@@ -1593,7 +1908,7 @@ class Gateway:
                     if row:
                         value=json.loads(row['payload'])
                         if value['status']=='running':
-                            value.update(status='failed',reason='Tool execution could not be started')
+                            value.update(status='failed',reason='Tool execution could not be started',_error_code='not_started')
                             self._save(conn,scope,request,value)
                 raise HTTPException(503,'Tool execution could not be started') from None
             submitted = True
@@ -1670,15 +1985,19 @@ class Gateway:
             oversized=len(encoded(result).encode())>MAX_RESULT
             if oversized: result={'text':text.encode()[:MAX_RESULT//8].decode('utf-8',errors='ignore'),'truncated':True}
             update={'status':state,'result':result,'truncated':len(raw)>MAX_RESULT or oversized}
+            if state!='completed': update['_error_code']='tool_error' if state=='failed' else 'outcome_unknown'
         except HTTPException as error:
+            changed=not dispatched and error.detail in ('Tool configuration changed','Tool access classification changed')
             update={'status':'uncertain' if dispatched and not tool['read_only'] else 'failed',
                     'reason':'Tool returned an HTTP failure after dispatch' if dispatched else 'Call authority or tool configuration changed before execution',
-                    'error_code':'tool_http_failure' if dispatched else 'admission_rejected','http_status':error.status_code}
+                    'error_code':'tool_http_failure' if dispatched else 'admission_rejected','http_status':error.status_code,
+                    '_error_code':('tool_http_failure' if tool['read_only'] else 'outcome_unknown') if dispatched else 'tool_changed' if changed else 'admission_rejected'}
         except Exception:
             uncertain=dispatched and not tool['read_only']
             update={'status':'uncertain' if uncertain else 'failed',
                     'reason':'Tool outcome unavailable; inspect external state before retrying' if uncertain else
-                            'Read-only tool failed' if dispatched else 'Tool failed before execution'}
+                            'Read-only tool failed' if dispatched else 'Tool failed before execution',
+                    '_error_code':'outcome_unknown' if uncertain else 'tool_error' if dispatched else 'not_started'}
         finally:
             timing['total']=(time.perf_counter()-queued_at)*1000
             timing={name:round(value,3) for name,value in timing.items()}
@@ -1689,5 +2008,5 @@ class Gateway:
                     value=json.loads(self._row(conn,scope,request)['payload'])
                     # A timeout is terminal: a late return cannot manufacture certainty.
                     if value['status']=='running' and value.get('_boot')==BOOT and producer_running(value):
-                        value.update(update,_timings_ms=timing);self._save(conn,scope,request,value)
+                        value.update(update,_timings_ms=timing,_dispatched=dispatched);self._save(conn,scope,request,value)
             finally: SLOTS.release()

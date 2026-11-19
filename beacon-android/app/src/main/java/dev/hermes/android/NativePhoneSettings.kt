@@ -9,6 +9,10 @@ import org.json.JSONObject
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 
+private const val SERVER_HEALTH_KEY = "settings:health"
+private const val SERVER_UPDATE_KEY = "settings:update-check"
+private const val SERVER_BACKUPS_KEY = "settings:backups"
+
 /** Shown when the model Hermes has is no longer the one a model draft was made from: the draft is kept, the new base is shown, nothing is saved. */
 internal const val MODEL_CHANGED_ELSEWHERE = "The model changed elsewhere. Review it and save again."
 /** Shown when the model was written but reading it back failed: the typed pair is shown as saved, not as an error. */
@@ -20,10 +24,13 @@ internal const val MODEL_SAVED_UNCONFIRMED = "Default model saved for new chats.
 internal fun modelSaveBase(unconfirmed: Triple<String, String, String>?, bot: NativeBot, now: Pair<String, String>): Pair<String, String> =
     if (unconfirmed == Triple(bot.profile, bot.provider, bot.model)) now else bot.provider to bot.model
 
+/** The profile list as the plugin sends it, and as the saved copy of it holds it. */
+internal fun parseBotSummaries(response: JSONObject) = response.rows("bots").map { NativeBotSummary(it.getString("profile"), it.string("title", it.getString("profile")), it.string("purpose")) }
+
 /** Profile editors outlive their page; late responses never replace another account's draft. */
 class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: SavedStateHandle, private val draftChanged: () -> Unit = {}, private val screens: ScreenCache? = null,
     private val globalClient: (() -> BeaconClient?)? = null, private val authorizeProfile: suspend (BeaconClient, String) -> Unit = { _, _ -> },
-    private val profileFailure: (Throwable) -> Unit = {}, private val client: () -> BeaconClient?) {
+    private val profileFailure: (Throwable) -> Unit = {}, private val cachedScope: () -> Scope? = { null }, private val client: () -> BeaconClient?) {
     private val _skills = MutableStateFlow(NativeSkillsState())
     val skills = _skills.asStateFlow()
     private val _memory = MutableStateFlow(NativeMemoryState(""))
@@ -36,6 +43,9 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     val botModels = _botModels.asStateFlow()
     var scopeKey: String = ""; private set
     private var scopeAccount = ""
+    private var boundLists = ""
+    private var boundHost = ""
+    private var updateCheckedAt = 0L
     private var boundClient: BeaconClient? = null
     private var bindingRevision = 0L
     private var skillJob: Job? = null
@@ -146,31 +156,85 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
     }
 
-    fun bind(force: Boolean = false) {
+    /** The profile whose lists these are: the account plus the profile, so a reconnect or a trip through Settings keeps them and any other account or profile starts clean. */
+    private fun listsOf(scope: Scope?): String = scope?.let { "${it.copy(profile = "", session = "").key}|${it.profile}" }.orEmpty()
+    private fun savedSkills(scope: Scope?): List<NativeSkill> = scope?.let { screens?.exact(it, "settings:skills")?.value }
+        ?.let { runCatching { parseNativeSkills(it.copy()) }.getOrNull() }.orEmpty()
+    private fun savedMemory(scope: Scope?): NativeMemoryState? = scope?.let { screens?.exact(it, "settings:memory")?.value }
+        ?.let { runCatching { val cached = it.copy(); NativeMemoryState.parse(scope.key, cached.getJSONObject("status"), cached.getJSONObject("notes")) }.getOrNull() }
+
+    /**
+     * Points the editors at the client's profile (or, before any client exists, at the account the phone restored). [keepLists] and a plain rebind to the same
+     * profile keep what the pages already show, the saved copy is the first thing a new profile shows, and only drafts and selections are dropped.
+     */
+    fun bind(force: Boolean = false, keepLists: Boolean = false) {
         val next = client()
-        val key = next?.scope?.key.orEmpty()
+        val scope = next?.scope ?: cachedScope()
+        val key = scope?.key.orEmpty()
         if (!force && scopeKey == key && boundClient === next) return
         ++bindingRevision
-        val account = next?.let(::updateKey).orEmpty()
+        val account = scope?.let { it.copy(profile = "", session = "").key }.orEmpty()
+        val lists = listsOf(scope)
+        val same = lists.isNotBlank() && lists == boundLists && (!force || keepLists)
         val priorBots = _bots.value
         val priorModels = _botModels.value
+        val priorSkills = _skills.value.skills
+        val priorMemory = _memory.value
         val sameAccount = account.isNotBlank() && account == scopeAccount
-        val carryBot = priorBots.takeIf { sameAccount && it.selected?.profile == next?.scope?.profile }
+        val carryBot = priorBots.takeIf { sameAccount && it.selected?.profile == scope?.profile }
         if (_skills.value.editing) skillDrafts[scopeKey] = _skills.value.copy(loading = false, saving = false)
         if (_memory.value.editing.isNotBlank()) memoryDrafts[scopeKey] = _memory.value.copy(loading = false, saving = false)
         if (_bots.value.editing && carryBot == null) botDrafts[scopeKey] = _bots.value.copy(loading = false, saving = false)
         skillJob?.cancel(); memoryJob?.cancel(); serverJob?.cancel(); botJob?.cancel(); updateJob?.cancel(); ++updateObservationRevision
-        scopeKey = key; scopeAccount = account; boundClient = next; skillsAt = 0L; memoryAt = 0L
-        _skills.value = skillDrafts.remove(key) ?: NativeSkillsState(profile = client()?.auth?.profile.orEmpty())
-        _memory.value = memoryDrafts.remove(key) ?: NativeMemoryState(key)
+        scopeKey = key; scopeAccount = account; boundClient = next; boundLists = lists
+        if (!same) { skillsAt = 0L; memoryAt = 0L }
+        // A job cancelled above never clears its own "loading", so a kept list starts quiet and the next load marks it again.
+        _skills.value = skillDrafts.remove(key) ?: NativeSkillsState(profile = next?.auth?.profile ?: scope?.profile.orEmpty(), skills = if (same) priorSkills else if (force) emptyList() else savedSkills(scope))
+        _memory.value = memoryDrafts.remove(key) ?: if (same) priorMemory.copy(scope = key, loading = false, saving = false, error = "", message = "", editing = "", draft = "") else (if (force) null else savedMemory(scope)) ?: NativeMemoryState(key)
         _bots.value = botDrafts.remove(key) ?: carryBot?.copy(loading = false, saving = false) ?: NativeBotsState(profiles = if (sameAccount) priorBots.profiles else emptyList())
         _botModels.value = if (carryBot != null && _bots.value.selected?.profile == carryBot.selected?.profile) priorModels else emptyList()
         val host = global()?.let(::updateKey).orEmpty()
-        _server.value = NativeServerState(requestedActionId = saved["server-update:$host:id"] ?: "", requestedAt = saved["server-update:$host:at"] ?: "")
+        val hostScope = global()?.scope ?: cachedScope()
+        val hostLists = listsOf(hostScope)
+        val sameHost = hostLists.isNotBlank() && hostLists == boundHost && (!force || keepLists)
+        val prior = _server.value
+        boundHost = hostLists
+        // What the pages last showed (not an update in flight, which the cancelled jobs above no longer track) stays until the new answer lands.
+        val base = NativeServerState(requestedActionId = saved["server-update:$host:id"] ?: "", requestedAt = saved["server-update:$host:at"] ?: "")
+        _server.value = when {
+            sameHost -> base.copy(version = prior.version, overall = prior.overall, gatewayState = prior.gatewayState, activeAgents = prior.activeAgents, components = prior.components,
+                recentError = prior.recentError, update = prior.update, checkpoints = prior.checkpoints, checkpointBytes = prior.checkpointBytes, logs = prior.logs, logFile = prior.logFile, logSearch = prior.logSearch, asked = prior.asked, answered = prior.answered)
+            force -> base
+            else -> savedServer(hostScope, base).also { updateCheckedAt = 0L }
+        }
+        if (!sameHost) updateCheckedAt = 0L
     }
 
+    /**
+     * The saved copy for what is bound now, for when the account's saved screens finished loading after the pages bound (a page opened in the first moments of a start).
+     * It only fills what is empty; anything already shown, edited or asked of Hermes stays.
+     */
+    fun seedSaved() {
+        val scope = client()?.scope ?: cachedScope() ?: return
+        if (scope.key != scopeKey) return
+        if (_skills.value.skills.isEmpty() && !_skills.value.editing) savedSkills(scope).takeIf { it.isNotEmpty() }?.let { cached -> _skills.update { if (it.skills.isEmpty()) it.copy(skills = cached) else it } }
+        if (_memory.value.documents.isEmpty() && _memory.value.editing.isBlank()) savedMemory(scope)?.let { cached -> if (cached.documents.isNotEmpty()) _memory.update { if (it.documents.isEmpty() && it.editing.isBlank()) cached else it } }
+        if (!_server.value.asked) (global()?.scope ?: cachedScope())?.let { host -> _server.update { if (it.asked) it else savedServer(host, it) } }
+    }
+
+    /** The last health, update check and backups of this account's profile, as the pages last showed them. Log lines are never saved. */
+    private fun savedServer(scope: Scope?, base: NativeServerState): NativeServerState {
+        if (scope == null) return base
+        var state = base
+        runCatching { screens?.exact(scope, SERVER_HEALTH_KEY)?.value?.copy()?.let { state = parseServerStatus(it.getJSONObject("status"), state).copy(asked = true, answered = state.answered + "Health") } }
+        runCatching { screens?.exact(scope, SERVER_UPDATE_KEY)?.value?.copy()?.let { state = state.copy(update = it, asked = true, answered = state.answered + "Server updates") } }
+        runCatching { screens?.exact(scope, SERVER_BACKUPS_KEY)?.value?.copy()?.let { state = parseCheckpoints(it, state).copy(asked = true, answered = state.answered + "Session checkpoints") } }
+        return state
+    }
+    private fun keepServer(scope: Scope, key: String, value: JSONObject) { jobs.launch(Dispatchers.Default) { cacheAttempt { screens?.open(scope); screens?.set(scope, key, value) } } }
+
     /** [optimistic] shows the expected result at once; [undo] puts the old state back if the request fails (the error text is shown either way). */
-    private fun skillsRequest(write: Boolean = false, optimistic: ((NativeSkillsState) -> NativeSkillsState)? = null, undo: ((NativeSkillsState) -> NativeSkillsState)? = null, toggling: String? = null, block: suspend (NativeSkills) -> NativeSkillsState) {
+    private fun skillsRequest(write: Boolean = false, optimistic: ((NativeSkillsState) -> NativeSkillsState)? = null, undo: ((NativeSkillsState) -> NativeSkillsState)? = null, toggling: String? = null, seed: (suspend () -> Unit)? = null, block: suspend (NativeSkills) -> NativeSkillsState) {
         val active = client() ?: return
         bind()
         val revision = bindingRevision
@@ -181,6 +245,8 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         skillJob = jobs.launch {
             val c = active.detached()
             try {
+                // The saved list comes first: authorizing asks Hermes for the profile list, and that waits for the network.
+                seed?.invoke()
                 authorizeProfile(active, c.scope.profile)
                 if (!current(active, revision)) return@launch
                 val result = block(NativeSkills(c))
@@ -195,14 +261,14 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         bind()
         val revision = bindingRevision
         if (_skills.value.editing || !force && (skillJob?.isActive == true || startupReadFresh(skillsAt, System.currentTimeMillis()))) return
-        skillsRequest { api ->
-            val c = active
+        skillsRequest(seed = {
             if (!force && _skills.value.skills.isEmpty()) cacheAttempt {
-                screens?.get(c.scope, "settings:skills")?.let { stored ->
-                    val cached = parseNativeSkills(stored.copy())
-                    if (current(active, revision)) _skills.update { it.copy(skills = cached) }
-                }
+                screens?.open(active.scope)
+                val cached = savedSkills(active.scope)
+                if (cached.isNotEmpty() && current(active, revision)) _skills.update { it.copy(skills = cached) }
             }
+        }) { api ->
+            val c = active
             val list = api.list()
             if (current(active, revision)) keepSkills(c.scope, api)
             if (current(active, revision)) skillsAt = System.currentTimeMillis()
@@ -253,15 +319,13 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         memoryJob = jobs.launch {
             val c = active.detached()
             try {
+                // The saved notes come first: authorizing asks Hermes for the profile list, and that waits for the network.
+                if (!force && _memory.value.documents.isEmpty()) cacheAttempt {
+                    screens?.open(c.scope)
+                    savedMemory(c.scope)?.let { value -> if (current(active, revision) && _memory.value.editing.isBlank()) _memory.value = value }
+                }
                 authorizeProfile(active, c.scope.profile)
                 if (!current(active, revision)) return@launch
-                if (!force && _memory.value.documents.isEmpty()) cacheAttempt {
-                    screens?.get(c.scope, "settings:memory")?.let { stored ->
-                        val cached = stored.copy()
-                        val value = NativeMemoryState.parse(c.scope.key, cached.getJSONObject("status"), cached.getJSONObject("notes"))
-                        if (current(active, revision) && _memory.value.editing.isBlank()) _memory.value = value
-                    }
-                }
                 val profile = mapOf("profile" to c.auth.profile)
                 val status = c.nativeGet("/api/memory", profile)
                 val notes = c.nativeGet("/api/plugins/beacon/memory/documents", profile)
@@ -277,7 +341,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
     }
     fun editMemory(target: String) {
-        if (_memory.value.saving || target.isNotBlank() && _memory.value.loading) return
+        if (_memory.value.saving || target.isNotBlank() && (_memory.value.loading || client() == null)) return
         val state = _memory.value
         val document = state.documents.firstOrNull { it.target == target }
         if (document != null) { memoryJob?.cancel(); memoryAt = 0L }
@@ -312,26 +376,39 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     }
 
     fun loadServer(page: String, force: Boolean = false) {
-        val active = global() ?: return
+        // No client yet (the sign-in is still reconnecting): the page is waiting for its answer, not reporting an empty one.
+        val active = global() ?: run { _server.update { it.copy(loading = true, error = "") }; return }
         bind(); serverJob?.cancel()
-        _server.update { it.copy(loading = true, error = "") }
+        _server.update { it.copy(loading = true, error = "", asked = true) }
         if (page == "Server updates") observeServerUpdate(active)
         serverJob = jobs.launch {
             val c = active.detached()
             try {
                 val q = mapOf("profile" to c.auth.profile)
                 if (page == "Server updates") {
-                    val check = if (force || _server.value.update == null) c.nativeGet("/api/hermes/update/check", q + ("force" to force.toString())) else _server.value.update
-                    if (global() === active) _server.update { it.copy(update = check, loading = false) }
+                    val reuse = !force && _server.value.update != null && startupReadFresh(updateCheckedAt, System.currentTimeMillis())
+                    val check = if (reuse) _server.value.update else c.nativeGet("/api/hermes/update/check", q + ("force" to force.toString()))
+                    if (global() === active) {
+                        _server.update { it.copy(update = check, loading = false, answered = it.answered + page) }
+                        if (!reuse && check != null) { updateCheckedAt = System.currentTimeMillis(); keepServer(c.scope, SERVER_UPDATE_KEY, check) }
+                    }
                     return@launch
                 }
                 val result = when (page) {
-                    "Health" -> parseServerStatus(c.nativeGet("/api/status", q), _server.value, recentHermesError(c, q))
+                    "Health" -> {
+                        val status = c.nativeGet("/api/status", q)
+                        val recent = recentHermesError(c, q)
+                        // The saved copy keeps the verdict (Needs attention when the log said so), never the log's sentence: log lines are not saved.
+                        parseServerStatus(status, _server.value, recent).also { if (global() === active) keepServer(c.scope, SERVER_HEALTH_KEY, json("status" to status.copy().put("overall", it.overall))) }
+                    }
                     "Logs" -> _server.value.copy(logs = c.nativeGet("/api/logs", q + mapOf("file" to _server.value.logFile, "search" to _server.value.logSearch, "lines" to "100")).optJSONArray("lines")?.strings().orEmpty())
-                    "Session checkpoints" -> parseCheckpoints(c.nativeGet("/api/ops/checkpoints", q), _server.value)
+                    "Session checkpoints" -> {
+                        val backups = c.nativeGet("/api/ops/checkpoints", q)
+                        parseCheckpoints(backups, _server.value).also { if (global() === active) keepServer(c.scope, SERVER_BACKUPS_KEY, backups) }
+                    }
                     else -> error("Unknown server page")
                 }
-                if (global() === active) _server.value = result.copy(loading = false)
+                if (global() === active) _server.value = result.copy(loading = false, answered = result.answered + page)
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (global() === active) _server.update { it.copy(loading = false, error = appErrorText(e)) } }
             finally { c.closeNative() }
@@ -429,7 +506,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
     }
 
-    private fun botSummaries(response: JSONObject) = response.rows("bots").map { NativeBotSummary(it.getString("profile"), it.string("title", it.getString("profile")), it.string("purpose")) }
+    private fun botSummaries(response: JSONObject) = parseBotSummaries(response)
     fun loadBots(): Job? {
         val editor = client() ?: return null
         val active = global() ?: return null

@@ -14,12 +14,14 @@ import dev.hermes.android.NativeExperienceFixture
 import dev.hermes.android.core.digest
 import dev.hermes.android.core.json
 import dev.hermes.android.core.string
+import dev.hermes.android.preferences
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.NativeBearerRecord
 import dev.hermes.android.push.KeepConnectedService
 import dev.hermes.android.push.persistPushBindings
 import dev.hermes.android.push.receivePush
 import dev.hermes.android.push.refreshNotificationPreview
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.json.JSONObject
 import org.junit.After
@@ -44,6 +46,7 @@ class ReplyFromNotificationDeviceTest {
     private val scope = fixture.scope
     private val pushPrefs = app.getSharedPreferences("push-binding", Context.MODE_PRIVATE)
     private val previousAuth = app.auth.read(scope.origin)
+    private val previousBeaconChat = runBlocking { app.cache.read(scope, "beacon-session") }
     private val bindingKeys = mutableListOf<String>()
     private val tags = mutableListOf<String>()
 
@@ -64,8 +67,20 @@ class ReplyFromNotificationDeviceTest {
     @After fun tearDown() {
         KeepConnectedService.clientFactoryForTest = null
         tags.forEach { manager.cancel(it, 1) }
+        settleShade()
         pushPrefs.edit().apply { bindingKeys.forEach { remove(it) } }.commit()
         app.auth.write(previousAuth)
+        runBlocking { if (previousBeaconChat == null) app.cache.delete(scope, "beacon-session") else app.cache.write(scope, "beacon-session", previousBeaconChat, protected = true) }
+    }
+
+    /**
+     * After cancelling, wait until Android has really dropped them (and the auto-group summary it makes for four or more): a notice posted
+     * while that clean-up is still running is lost, which failed the next case ("Timed out waiting for the Reply action").
+     */
+    private fun settleShade() {
+        val until = SystemClock.elapsedRealtime() + 5_000
+        while (manager.activeNotifications.any { it.packageName == app.packageName && it.id == 1 } && SystemClock.elapsedRealtime() < until) SystemClock.sleep(50)
+        SystemClock.sleep(1_500)
     }
 
     /** Keeps the fixture under Android's notification rate limit (above about five an update a second it drops updates, which a person never reaches). */
@@ -105,6 +120,11 @@ class ReplyFromNotificationDeviceTest {
         while (!ready() && SystemClock.elapsedRealtime() < until) SystemClock.sleep(25)
         assertTrue("Timed out waiting for $what", ready())
     }
+    /** What the shade holds when an expected action never came (a leftover of an earlier case shows here). */
+    private fun diagnose(event: JSONObject): String = "mine=${tagOf(event).take(6)} " + manager.activeNotifications.filter { it.packageName == app.packageName }.joinToString(";") {
+        val n = it.notification
+        "${(it.tag ?: "").take(6)}/${it.id} grp=${n.group} quiet=${n.extras.getBoolean("beacon_quiet")} actions=${n.actions?.size ?: 0} text=${n.extras.getCharSequence(Notification.EXTRA_TEXT)?.take(24)}"
+    } + " | route=${fixture.incomingNotification?.let { "kind=" + it.optString("kind") + " session=" + it.optString("session_id") }}"
     private fun promptSubmissions() = fixture.requests.filter { it.optString("method") == "prompt.submit" }.map { it.getJSONObject("params") }
 
     /**
@@ -112,7 +132,8 @@ class ReplyFromNotificationDeviceTest {
      * arrives with the preview's update, which a long run can delay (Android paces a package's notification updates), so it is waited for.
      */
     private fun typeReply(event: JSONObject, text: String) {
-        await("the Reply action") { shown(event)?.actions?.any { !it.remoteInputs.isNullOrEmpty() } == true }
+        try { await("the Reply action") { shown(event)?.actions?.any { !it.remoteInputs.isNullOrEmpty() } == true } }
+        catch (e: AssertionError) { throw AssertionError(e.message + " | " + diagnose(event), e) }
         pace()
         val action = shown(event)!!.actions.single { !it.remoteInputs.isNullOrEmpty() }
         val fill = Intent()
@@ -147,6 +168,41 @@ class ReplyFromNotificationDeviceTest {
         }
         val noChat = post("completion") { it.put("session_id", "") }
         assertTrue("a notice Hermes names no chat for takes no reply", shown(noChat)?.actions.isNullOrEmpty())
+    }
+
+    /** One notice at a time: four or more at once make Android group them, and its clean-up of that group is slow. */
+    private fun clearNotice(event: JSONObject) { manager.cancel(tagOf(event), 1); settleShade() }
+    private fun keepBeaconChat(id: String?) = runBlocking { if (id == null) app.cache.delete(scope, "beacon-session") else app.cache.write(scope, "beacon-session", id, protected = true) }
+    private fun titleOf(event: JSONObject) = shown(event)?.extras?.getCharSequence(Notification.EXTRA_TITLE)?.toString()
+    private fun assistantName() = runBlocking { app.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).assistantName }
+
+    // Owner, 17 Nov: the Beacon chat's reply showed the chat's own title ("hi") as if it were another chat. The preview Hermes sends carries that title.
+    @Test fun aBeaconChatNoticeIsTitledWithTheAssistantsNameAndOtherChatsKeepTheirTitle() {
+        keepBeaconChat("chat-a")
+        for (kind in listOf("completion", "task_result")) {
+            // Hermes' record of the Beacon chat is missing (it says nothing): this phone's own Beacon chat decides.
+            val own = post(kind)
+            await("$kind titled with the assistant's name") { lineOf(own) == "Dinner is booked for seven." }
+            assertEquals(kind, assistantName(), titleOf(own))
+            clearNotice(own)
+            // Hermes names the notice's session by a newer id (it continued the chat under it) and says it is the Beacon chat.
+            val moved = post(kind) { it.put("session_id", "chat-a-2").put("assistant_chat", true) }
+            await("$kind of the moved chat") { lineOf(moved) == "Dinner is booked for seven." }
+            assertEquals(kind, assistantName(), titleOf(moved))
+            clearNotice(moved)
+        }
+        // Another chat keeps its own title, also when it is not the one this phone keeps as the Beacon chat.
+        keepBeaconChat("chat-b")
+        val other = post("completion")
+        await("another chat's notice") { lineOf(other) == "Dinner is booked for seven." }
+        assertEquals("Weekend plan", titleOf(other))
+        clearNotice(other)
+        // No Beacon chat kept and Hermes silent: the chat's title, as before.
+        keepBeaconChat(null)
+        val unknown = post("completion")
+        await("a notice with no Beacon chat known") { lineOf(unknown) == "Dinner is booked for seven." }
+        assertEquals("Weekend plan", titleOf(unknown))
+        clearNotice(unknown)
     }
 
     @Test fun aReplyGoesToTheNoticesOwnChatReadsSentAndGivesWayToTheAnswer() {

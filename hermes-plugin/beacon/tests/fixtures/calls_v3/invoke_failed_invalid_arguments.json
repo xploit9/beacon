@@ -1,0 +1,13 @@
+{
+  "request_id": "req-synthetic-0004",
+  "tool_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "tool": "notes_search",
+  "tool_name": "notes_search",
+  "read_only": true,
+  "approved_by": null,
+  "status": "failed",
+  "ran_on_hermes": false,
+  "server_ms": {},
+  "error_code": "invalid_arguments",
+  "reason": "query: a string is required."
+}

@@ -37,7 +37,9 @@ class HistoryFiltersTest {
 
     @Test fun pinnedViewAndTitleOrderKeepPinnedFirst() {
         assertEquals(listOf("b"), historyRows(rows, HistoryView.Pinned, HistoryOrder.Recent).map { it.getString("id") })
-        assertEquals("Server order is kept for recent/created", rows, historyRows(rows, HistoryView.All, HistoryOrder.Created))
+        // Pinned chats stay on top in every order (Telegram); the rest keep the server order for recent/created.
+        assertEquals(listOf("b", "a", "c", "d", "e"), historyRows(rows, HistoryView.All, HistoryOrder.Created).map { it.getString("id") })
+        assertEquals(listOf("b", "a", "c", "d", "e"), historyRows(rows, HistoryView.All, HistoryOrder.Recent).map { it.getString("id") })
         assertEquals(listOf("b", "a", "d", "e", "c"), historyRows(rows, HistoryView.All, HistoryOrder.Title).map { it.getString("id") })
         assertEquals(HistoryOrder.Recent, HistoryOrder.of("unknown"))
     }
@@ -87,5 +89,20 @@ class HistoryFiltersTest {
         assertEquals("Trip planning 3", uniqueThreadTitle("Trip planning", listOf("Trip planning", "Trip planning 2")))
         assertEquals(100, uniqueThreadTitle("x".repeat(300), emptyList()).length)
         assertEquals("", uniqueThreadTitle("   ", emptyList()))
+    }
+
+    // Hermes lists a chat it compressed under its newest session's id; the Beacon chat is saved under its first, so it must still be recognised.
+    @Test fun theBeaconChatNeverShowsAsASecondChatAfterHermesMovedItToANewSession() {
+        val moved = json("id" to "beacon-chat-3", "_lineage_root_id" to "beacon-chat", "_lineage_ids" to org.json.JSONArray(listOf("beacon-chat", "beacon-chat-2", "beacon-chat-3")), "title" to "hi", "profile" to "default")
+        val midway = json("id" to "beacon-chat-2", "_lineage_ids" to org.json.JSONArray(listOf("beacon-chat", "beacon-chat-2")), "profile" to "default")
+        val other = json("id" to "chat-a", "_lineage_root_id" to "chat-a", "_lineage_ids" to org.json.JSONArray(listOf("chat-a", "chat-a-2")), "title" to "Weekend", "profile" to "default")
+        val shown = historyRows(listOf(moved, midway, other), HistoryView.All, HistoryOrder.Recent, currentProfile = "default", assistantProfile = "default", assistantSessionId = "beacon-chat")
+        assertEquals(listOf("chat-a"), shown.map { it.getString("id") })
+        assertTrue(rowIsChat(moved, "beacon-chat"))
+        assertFalse(rowIsChat(other, "beacon-chat"))
+        assertFalse(rowIsChat(moved, ""))
+        // Another profile's chat that happens to carry the same lineage id is not the Beacon chat of this one.
+        val foreign = json("id" to "beacon-chat-3", "_lineage_root_id" to "beacon-chat", "profile" to "coder")
+        assertEquals(1, historyRows(listOf(foreign), HistoryView.All, HistoryOrder.Recent, currentProfile = "default", assistantProfile = "default", assistantSessionId = "beacon-chat").size)
     }
 }

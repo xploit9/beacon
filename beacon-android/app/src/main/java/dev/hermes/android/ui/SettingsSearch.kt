@@ -10,6 +10,8 @@ internal fun settingsLabel(route: String): String = when (route) {
     "Session checkpoints" -> "File backups"
     "Devices" -> "Phones"
     "Session usage" -> "Chat usage"
+    // The row and its page carry the assistant's own name; the route stays the same whatever it is called.
+    AGENT_PHONE_ROUTE -> "{name}'s phone"
     else -> route
 }
 
@@ -29,6 +31,7 @@ private val settingsSearchKeywords = mapOf(
     "App updates" to "Install the latest Beacon version",
     "Profiles" to "Profile defaults and behavior",
     "File backups" to "Session checkpoints",
+    "{name}'s phone" to "Own phone apps sign-ins payments shopping Play Store Chrome logins virtual phone",
 )
 private fun searchTermsMatch(text: String, query: String): Boolean =
     query.splitToSequence(searchWhitespace).filter(String::isNotBlank).all { text.contains(it, ignoreCase = true) }
@@ -67,6 +70,7 @@ internal val settingsDescriptions = mapOf(
     "Voice & calls" to VoiceDescription,
     "Notifications & Keep connected" to NotificationsDescription,
     "Phone access" to "Calendar, contacts and calls",
+    AGENT_PHONE_ROUTE to "Apps, sign-ins and payments",
     "Appearance" to "Theme and colors",
     "Profiles & model" to "Profiles and models",
     "Tools & MCP" to "Tools and MCP servers",
@@ -87,7 +91,7 @@ internal val settingsDescriptions = mapOf(
 /** Hub sections in Relay's order (connection first, then Hermes, then the app), with the assistant's own section up front. */
 internal val settingsHubSections = linkedMapOf(
     "" to listOf("Connection"),
-    "Assistant" to listOf("Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected"),
+    "Assistant" to listOf("Assistant", "Voice & calls", "Phone access", AGENT_PHONE_ROUTE, "Notifications & Keep connected"),
     "Hermes" to listOf("Chat", "Profiles & model", "Skills", "Tools & MCP", "Server"),
     "App" to listOf("Appearance", "App updates", "About & licenses"),
 )
@@ -95,7 +99,7 @@ internal val settingsHubRoutes = settingsHubSections.values.flatten()
 /** Search includes both the hub and its focused destinations. */
 internal val settingsSearchRoutes = settingsHubRoutes + settingsCategories.values.flatten() + listOf("Devices", "Memory")
 // Skills, Memory and Server updates are native Hermes routes; only plugin-backed pages are gated.
-private val pluginSettingsRoutes = setOf("Notifications", "Bots")
+private val pluginSettingsRoutes = setOf("Notifications", "Bots", AGENT_PHONE_ROUTE)
 internal fun settingsNeedsBeaconPlugin(page: String, pluginStatus: String): Boolean = pluginStatus == "absent" && page in pluginSettingsRoutes
 
 /** The exact `BeaconViewModel.more` argument for a row; categories open their own list, everything else opens its page. */
@@ -121,7 +125,7 @@ internal val settingsThemeLabels = mapOf("system" to "System", "dark" to "Dark",
 
 /** The short pill words of the hub rows, which reach uiText through a summary part rather than a literal. */
 internal val settingsPillWords = listOf("Connected", "Offline", "Sign in", "Key saved", "Add key", "Keep connected is on", "Keep connected is off", "Update ready", "Update available",
-    "Update Beacon on Hermes", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles", "Off")
+    "Update Beacon on Hermes", "Restart Hermes", "Restart dashboard", "Healthy", "Needs attention", "Failed", "Reconnecting…", "{0} on", "{0} servers", "1 server", "{0} profiles", "Off", "On", "Starting…", "Not set up")
 
 /**
  * The fixed texts that reach uiText through variables and so are checked by the translation test: the hub's row names and descriptions, section and
@@ -155,6 +159,7 @@ internal data class SettingsSnapshot(
     val profileCount: Int? = null, val skillsOn: Int? = null, val toolsOn: Int? = null, val mcpServers: Int? = null,
     val serverHealthy: Boolean? = null, /** Hermes' own overall word ("ok", "degraded", …); wins over [serverHealthy] and maps like the Health page. */ val serverOverall: String = "", val serverUpdateAvailable: Boolean? = null, val checkpointSize: String = "",
     /** The Phone access switches that are on and usable, by their English names; empty is a known "none", null is unread. */ val phoneAccess: List<String>? = null,
+    /** {name}'s phone as its page last read it: "setup", "starting", "on" or "off"; null is unread ([agentPhoneHubState]). */ val agentPhone: String? = null,
 )
 /**
  * Mirrors the composer's key handling (`ChatScreen.kt` `onPreviewKeyEvent`): it recognises `ctrl_enter`/`ctrl+enter` and
@@ -237,6 +242,13 @@ internal fun settingsSummary(route: String, s: SettingsSnapshot): List<SettingsS
         }.orEmpty()
         // Nothing on is a state of its own (Off); otherwise the row names what is on, as its neighbours name their own state.
         "Phone access" -> s.phoneAccess?.let { on -> if (on.isEmpty()) listOf(SettingsSummaryPart("Off", status = SettingsStatus.Off)) else on.map { SettingsSummaryPart(it) } }.orEmpty()
+        AGENT_PHONE_ROUTE -> when (s.agentPhone) {
+            "on" -> listOf(SettingsSummaryPart("On", status = SettingsStatus.Ok))
+            "off" -> listOf(SettingsSummaryPart("Off", status = SettingsStatus.Off))
+            "starting" -> listOf(SettingsSummaryPart("Starting…", status = SettingsStatus.Working))
+            "setup" -> listOf(SettingsSummaryPart("Not set up"))
+            else -> emptyList()
+        }
         "Notifications & Keep connected" -> s.keepConnectedEnabled?.let {
             listOf(SettingsSummaryPart(if (it) "Keep connected is on" else "Keep connected is off", status = if (it) SettingsStatus.Ok else SettingsStatus.Off))
         }.orEmpty()

@@ -27,7 +27,7 @@ internal fun shareChatOpen(target: ShareTarget, chat: ChatState, ui: AppState, b
 
 /**
  * Takes the share the chooser handed over: opens the chosen chat, puts the shared text in its composer under whatever is already
- * typed there, and attaches the images the way the attach button does. It sends nothing; the owner reviews, adds a line and sends.
+ * typed there, and attaches the images and documents the way the attach button does. It sends nothing; the owner reviews, adds a line and sends.
  */
 internal fun openShared(model: BeaconViewModel, share: PendingShare): Job? {
     if (!SharedIntake.claim(share, System.currentTimeMillis())) return null
@@ -39,8 +39,8 @@ internal fun openShared(model: BeaconViewModel, share: PendingShare): Job? {
             is ShareTarget.Chat -> { model.tab("Chat"); if (model.chat.value.sessionId != target.id) { model.selectSession(target.id); model.awaitSelection() } }
         }
         if (withTimeoutOrNull(SHARE_OPEN_MILLIS) { model.chat.first { shareChatOpen(share.target, it, model.ui.value, model.isBeaconConversation()) } } == null) { model.notice(ShareStrings.NOT_OPENED); return@launch }
-        val merged = mergeSharedDraft(model.composer.value.text, share.content.text)
+        val merged = mergeSharedDraft(model.composerBase(), share.content.text)
         if (share.content.text.isNotBlank()) model.composer(TextFieldValue(merged, TextRange(merged.length)))
-        share.content.images.forEach { model.upload(Uri.parse(it)) }
+        share.content.files.forEach { model.upload(Uri.parse(it)) }
     }
 }

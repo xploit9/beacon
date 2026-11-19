@@ -55,14 +55,14 @@ class LockedStartCallTest {
 
     private fun credentials() = VoiceSessionCredentials("gemini", "fixture-provider-key", defaultVoiceModel("gemini"), defaultVoiceName("gemini"), "balanced")
 
-    private fun client(paths: MutableList<String>, tickets: AtomicInteger): BeaconClient =
+    private fun client(paths: MutableList<String>, tickets: AtomicInteger, context: () -> JSONObject = ::pluginContext): BeaconClient =
         BeaconClient(AuthContext("https://voice-fixture.invalid", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain ->
                 val path = chain.request().url.encodedPath
                 paths += path
                 if (path.endsWith("/ws-ticket") || path == "/api/plugins/beacon/mobile/gateway-ticket") tickets.incrementAndGet()
                 val body = when {
-                    path.endsWith("/context") -> pluginContext()
+                    path.endsWith("/context") -> context()
                     path.endsWith("/tools") -> json("tools" to JSONArray().put(json("name" to "get_weather", "tool_id" to "a".repeat(64), "description" to "Weather")))
                     else -> json("jobs" to JSONArray())
                 }
@@ -95,12 +95,12 @@ class LockedStartCallTest {
         fun call(id: String, name: String, args: JSONObject = json()) = latest.get().let { (socket, listener) ->
             listener.onMessage(socket, json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to id, "name" to name, "args" to args)))).toString())
         }
-        fun responses() = frames.filter { it.has("toolResponse") }.map { it.getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0) }
+        fun responses() = frames.flatMap { f -> f.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } }.orEmpty() }
         fun response(id: String) = responses().first { it.getString("id") == id }.getJSONObject("response")
         fun close() { voice.close(); scope.cancel(); client.closeNative() }
     }
 
-    private fun openCall(trust: CallTrust): Call = runBlocking {
+    private fun openCall(trust: CallTrust, context: () -> JSONObject = ::pluginContext): Call = runBlocking {
         val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val started = CompletableDeferred<Pair<WebSocket, WebSocketListener>>()
         val latest = java.util.concurrent.atomic.AtomicReference<Pair<WebSocket, WebSocketListener>>()
@@ -108,7 +108,7 @@ class LockedStartCallTest {
         val frames = CopyOnWriteArrayList<JSONObject>()
         val paths = CopyOnWriteArrayList<String>()
         val tickets = AtomicInteger()
-        val client = client(paths, tickets)
+        val client = client(paths, tickets, context)
         val voice = DirectVoice(client, "call", "stored", scope, {}, { events += it }, {}, credentials = credentials(),
             providerSocketFactory = providerFactory({ frames += it }, { socket, listener -> latest.set(socket to listener); started.complete(socket to listener) }), trust = trust)
         voice.start()
@@ -137,6 +137,29 @@ class LockedStartCallTest {
                 assertTrue(name, answer.getString("message").startsWith("Unlock your phone first."))
             }
             assertEquals("nothing was read from Hermes and no work was opened", emptyList<String>(), call.paths.drop(read).filter { !it.endsWith("/context") })
+            assertEquals(0, call.tickets.get())
+        } finally { call.close() }
+    }
+
+    // REVIEW-INT-121 finding 14: a 1.2.1 context declares the owner's tools; on a locked phone a declared name, and invoke_tool by that
+    // name, are refused like every other Hermes tool, before anything is read or run.
+    @Test(timeout = 15000) fun aLockedStartRefusesTheToolsAV3ContextDeclares() {
+        val v3 = JSONObject(checkNotNull(javaClass.getResourceAsStream("/calls_v3/context_v3.json")).bufferedReader().use { it.readText() })
+        val declared = v3.getJSONArray("tool_declarations").getJSONObject(0).getString("name")
+        val call = openCall(CallTrust { true }) { JSONObject(v3.toString()).put("profile", "default").put("selected_session_id", "stored") }
+        try {
+            val read = call.paths.size
+            call.call("id-declared", declared, json("query" to "invoices"))
+            call.call("id-by-name", "invoke_tool", json("tool_id" to declared, "arguments" to "{\"query\":\"invoices\"}"))
+            runBlocking { withTimeout(5000) { while (call.responses().size < 2) delay(5) } }
+            for (id in listOf("id-declared", "id-by-name")) {
+                assertEquals(id, "unavailable", call.response(id).getString("status"))
+                assertEquals(id, "locked", call.response(id).getString("error_code"))
+            }
+            // The call's own context and updates channel are the call's bookkeeping; no tool, lookup or hand-over was sent.
+            assertEquals("nothing was read from Hermes and nothing ran", emptyList<String>(),
+                call.paths.drop(read).filter { !it.endsWith("/context") && !it.endsWith("/calls/call/updates") })
+            assertFalse("the locked setup declares none of the owner's tools", call.frames.first { it.has("setup") }.toString().contains("\"$declared\""))
             assertEquals(0, call.tickets.get())
         } finally { call.close() }
     }
@@ -248,14 +271,17 @@ class LockedStartCallTest {
         assertTrue(service.contains("PhoneVoiceBridge(applicationContext,spec.phoneOrigin,trust=spec.trust)"))
         // A locked start never takes the warm session or the context read before the tap: both carry the owner's memory.
         assertTrue(service.contains("val prefetched = if (trust.trusted()) target?.let"))
-        assertTrue(service.contains("warm = if (target != null && prefetched != null) prewarm.claim(target, voiceSettings) else null"))
+        // Without that context the claim takes nothing and closes the warm session (VoiceConnectTest: one provider session per call).
+        assertTrue(service.contains("warm = prewarm.claim(target?.takeIf { prefetched != null }, voiceSettings)"))
     }
 
     @Test fun theDispatchRefusesBeforeAnythingRunsAndTheBriefIsWithheldWhereItIsApplied() {
         val direct = source("voice/DirectVoice.kt")
-        assertTrue(direct.contains("if(!trust.trusted()&&name in DIRECT_CALL_TOOLS) { if(name!=\"get_visual_state\") trust.refused();toolResponse(id,name,lockedToolResult());return }"))
+        // Calls contract v3: every Hermes function is refused while locked, declared tools included (lane B).
+        assertTrue(direct.contains("if(!trust.trusted()&&!phoneTool) { if(name!=\"get_visual_state\") trust.refused();if(opened(id,name,\"\",false,true)) link.final(id,lockedToolResult());return }"))
         // The setup remembers whether its brief was whole, so the unlock knows whether the session has to be replaced.
-        assertTrue(direct.contains("liveSetup(credentials,callBrief(context,briefTrust()),resumption,recentSpeech())"))
+        assertTrue(direct.contains("liveSetup(credentials,brief,resumption,recentSpeech())"))
+        assertTrue(direct.contains("private fun setupBrief():JSONObject = callBrief(context,briefTrust())"))
         assertTrue(direct.contains("private fun briefTrust():Boolean=trust.trusted().also { briefedTrusted=it }"))
         assertTrue(direct.contains("trust.whenTrusted(::upgrade)"))
         assertTrue(direct.contains("warm?.takeIf { !warmUsed&&!greeted&&!it.dead&&trust.trusted() }"))

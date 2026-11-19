@@ -25,6 +25,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.BeaconViewModel
+import dev.hermes.android.botCutOff
 import dev.hermes.android.data.BotModeBot
 import dev.hermes.android.data.BotModeSpace
 import dev.hermes.android.data.NativeBotModeState
@@ -70,6 +71,8 @@ internal const val BOT_MODE_ROSTER_KEY = "bot-mode:roster"
     val you = uiText("You")
     LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(vm.botMode) { vm.botMode.refresh(silent = true) }
+    // Each bot's Bot Chat that holds a reply Hermes lost in a restart gets "Reply cut off" on its row (the plugin finds the chat; nothing is opened).
+    LaunchedEffect(state.bots.map { it.profile }, ui.connected) { if (ui.connected) vm.refreshLostBots(state.bots.map { it.profile }) }
     val cachedRoster = data[BOT_MODE_ROSTER_KEY]
     LaunchedEffect(cachedRoster, ui.connected, state.loaded) { if (!ui.connected && !state.loaded) vm.botMode.showCached(cachedRoster, ui.origin, ui.owner, ui.profile) }
     BotModeDialogs(vm, dialog)
@@ -91,7 +94,7 @@ internal const val BOT_MODE_ROSTER_KEY = "bot-mode:roster"
             items(state.bots, key = { "bot:${it.profile}" }) { bot ->
                 TeammateRow(botName(bot, profileRows), bot.profile, botRole(bot, profileRows), state.activeBot?.profile == bot.profile,
                     botActions(vm, bot, vm.canDeleteProfile(bot.profile), dialog), "bot-row-${bot.profile}",
-                    status = statusOf(bot.profile)) { vm.openBot(bot) }
+                    status = statusOf(bot.profile), cutOff = botCutOff(ui, bot.profile)) { vm.openBot(bot) }
             }
             // Not before the first read, and not blinking out while a refresh runs over bots already shown.
             if (starters.isNotEmpty() && (state.bots.isNotEmpty() || botModeEmptyKnown(state))) item("suggested-roles") { SuggestedRolesRow(starters) { dialog.value = "newBot:$it" } }

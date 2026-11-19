@@ -27,6 +27,9 @@ class BeaconApplication : Application() {
     var firebaseConfigured = false; private set
     override fun onCreate() {
         super.onCreate()
+        // Large picked chat files kept until they are sent (CHAT-121 follow-up 4); old ones go in the background.
+        dev.hermes.android.data.ChatAttachmentStore.dir = java.io.File(filesDir, "chat-attachments")
+        Thread { runCatching { dev.hermes.android.data.ChatAttachmentStore.sweep() } }.start()
         // Test builds log main-thread disk and network IO to logcat while developing; it is never fatal.
         if (BuildConfig.DEBUG) android.os.StrictMode.setThreadPolicy(android.os.StrictMode.ThreadPolicy.Builder().detectDiskReads().detectDiskWrites().detectNetwork().penaltyLog().build())
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

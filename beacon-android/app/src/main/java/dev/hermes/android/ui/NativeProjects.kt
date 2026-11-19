@@ -258,6 +258,9 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                     val rows = (tree?.rows("repos").orEmpty().flatMap { it.rows("groups").flatMap { group -> group.rows("sessions") } } + tree?.rows("previewSessions").orEmpty())
                         .filter { nativeProjectSessionAllowed(it.string("id", it.string("session_id")), it.string("profile"), ui.profile, allowed, it.optBoolean("archived")) }.distinctBy { it.string("id", it.string("session_id")) }
                     item { SettingsSection(uiText("Chats"), testTag = "project-conversations") {
+                        // A project's chat whose reply Hermes lost in a restart gets "Reply cut off", from the same read as the chat list.
+                        val ids = rows.map { it.string("id", it.string("session_id")) }
+                        LaunchedEffect(ids) { vm.refreshLostChats(ids) }
                         if (rows.isEmpty()) SettingsEmpty(uiText("No chats yet"), Icons.Rounded.ChatBubbleOutline)
                         rows.forEach { row ->
                             val sessionId = row.string("id", row.string("session_id"))
@@ -269,7 +272,7 @@ private data class ProjectEditDraft(val id: String, val originalName: String, va
                             // The same row as the drawer's chat list, with the project's own menu beside it.
                             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                                 ChatListRow(sessionId, row.string("title").ifBlank { uiText("Untitled chat") }, preview = preview, time = time,
-                                    modifier = Modifier.weight(1f).clickable { vm.tab("Chat"); vm.selectSession(sessionId) })
+                                    cutOff = "${ui.profile}:$sessionId" in ui.lostChats, modifier = Modifier.weight(1f).clickable { vm.tab("Chat"); vm.selectSession(sessionId) })
                                 Box {
                                     SettingsIconButton(Icons.Rounded.MoreVert, uiText("Chat project actions"), { actions = true })
                                     DropdownMenu(actions, { actions = false }) { DropdownMenuItem({ Text(uiText("Remove from project")) }, { actions = false; detach(row) }) }

@@ -94,7 +94,7 @@ internal fun serverOutcomeStatus(outcome: String): SettingsStatus = when (outcom
 }
 
 /** Whether [page] already holds data, so a reload keeps it on screen with a thin bar instead of a blank page. */
-internal fun serverHasCache(page: String, state: NativeServerState): Boolean = when (page) {
+internal fun serverHasCache(page: String, state: NativeServerState): Boolean = (if (serverCheckpointPage(page)) "Session checkpoints" else page) in state.answered || when (page) {
     "Health" -> state.overall.isNotBlank() || state.version.isNotBlank() || state.components.isNotEmpty()
     "Logs" -> state.logs.isNotEmpty()
     "Server updates" -> state.update != null || state.applying || state.requestedAt.isNotBlank()
@@ -344,7 +344,7 @@ private fun LazyListScope.serverLogs(state: NativeServerState, onLogFile: (Strin
                         }
                     }
                 }
-                state.loading -> SettingsSkeletonRows(3)
+                state.loading && !serverHasCache("Logs", state) -> SettingsSkeletonRows(3)
                 else -> SettingsEmpty(uiText("No matching log entries."), Icons.Rounded.SearchOff)
             }
         }
@@ -460,7 +460,7 @@ private fun LazyListScope.serverCheckpoints(context: Context, state: NativeServe
                         value = uiText("Files: {0} · {1}").replace("{1}", Formatter.formatShortFileSize(context, checkpoint.bytes)).replace("{0}", "${checkpoint.files}"),
                         testTag = "server-checkpoint-${checkpoint.session}")
                 }
-                state.loading -> SettingsSkeletonRows(3)
+                state.loading && !serverHasCache("Session checkpoints", state) -> SettingsSkeletonRows(3)
                 else -> SettingsEmpty(uiText("No backups yet."), Icons.Rounded.Restore)
             }
         }

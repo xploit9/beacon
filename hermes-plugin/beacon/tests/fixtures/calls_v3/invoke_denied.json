@@ -1,0 +1,12 @@
+{
+  "request_id": "req-synthetic-0002",
+  "tool_id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+  "tool": "t_hermes_notes_create",
+  "tool_name": "t_hermes_notes_create",
+  "read_only": false,
+  "approved_by": null,
+  "status": "denied",
+  "ran_on_hermes": false,
+  "server_ms": {},
+  "reason": "Owner denied this operation"
+}

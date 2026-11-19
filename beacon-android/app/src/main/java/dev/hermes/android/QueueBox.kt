@@ -24,6 +24,35 @@ internal val STARTED_OUTCOMES = setOf("completed", "interrupted", "rejected", "f
  */
 internal fun QueuedMessage.notSent(): Boolean = state == "settled" && outcome in NOT_SENT_OUTCOMES && rowId.isBlank()
 
+/** D6: a message that never left the phone (Hermes was out of reach). It waits in the box as "Not sent" and goes by itself once Hermes answers again. */
+internal const val OFFLINE_OUTCOME = "not_sent_offline"
+internal fun QueuedMessage.waitingForConnection(): Boolean = state == "queued" && outcome == OFFLINE_OUTCOME
+/** P2-3: the saved list (per account and profile) of chats holding messages that wait for Hermes. */
+internal const val OFFLINE_OUTBOX_KIND = "offline-outbox"
+/**
+ * P2-3: the next message of a chat that is not open to send now that Hermes is back: the first one the phone still holds (Hermes has the
+ * accepted ones, in order), and only when it is a "Not sent" one; anything else before it (a message waiting on a reply, or one whose
+ * outcome Hermes must confirm) is settled in the chat first, so the order holds. A held one (TURN's or WEDGE's hold, saved on the same
+ * message) waits for its Send: the outbox never sends it, nor anything behind it.
+ */
+internal fun nextOfflineToSend(draft: dev.hermes.android.core.Draft): QueuedMessage? =
+    draft.queued.firstOrNull { it.kind == "queue" && it.state in setOf("queued", "sending", "unknown") }?.takeIf { it.waitingForConnection() && it.held.isBlank() }
+/**
+ * CHAT-121 follow-up 9: a waiting message whose file could not get through (AttachmentStalled: its tries failed, or its one text frame lost the socket
+ * under it). It stays in the box as "Not sent" with its Send, saved so a restart keeps it, and goes again only on that tap: nothing sends it by itself.
+ */
+internal const val FILE_NOT_SENT_OUTCOME = "not_sent_file"
+internal fun QueuedMessage.fileNotSent(): Boolean = state == "queued" && outcome == FILE_NOT_SENT_OUTCOME
+
+/** The line the chat shows above the box for a held message (TURN-121's hold): the first waiting one's reason, or "" when none is held. */
+internal fun queuedHoldLine(queued: List<QueuedMessage>): String = queued.firstOrNull { it.state == "queued" && it.held.isNotBlank() }?.held.orEmpty()
+
+/**
+ * Whether a box row says "Not sent": one Hermes never started, one that never left the phone while Hermes was out of reach (D6, the offline outbox),
+ * and one whose file could not get through (chat join). A message merely waiting says nothing.
+ */
+internal fun queueBoxSaysNotSent(item: QueuedMessage): Boolean = item.state != "queued" || item.waitingForConnection() || item.fileNotSent()
+
 /** In the box: waiting to be sent, or not sent. */
 internal fun QueuedMessage.inBox(): Boolean = state == "queued" || notSent()
 
@@ -37,7 +66,7 @@ internal fun canSteerQueued(item: QueuedMessage, replying: Boolean): Boolean =
 /** The one main button of a box row: Steer into the running reply, Send a waiting message now, or Retry one that was not sent. Retry never appears on a message that is merely waiting. */
 internal enum class QueueBoxAction { Steer, Send, Retry, None }
 internal fun queueBoxAction(item: QueuedMessage, replying: Boolean): QueueBoxAction = when {
-    item.notSent() -> QueueBoxAction.Retry
+    item.notSent() || item.waitingForConnection() -> QueueBoxAction.Retry
     canSteerQueued(item, replying) -> QueueBoxAction.Steer
     item.state == "queued" && !replying -> QueueBoxAction.Send
     else -> QueueBoxAction.None

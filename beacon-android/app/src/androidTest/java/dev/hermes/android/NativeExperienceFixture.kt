@@ -49,7 +49,7 @@ private val HERMES_CREATE_FIELDS = setOf("request_id", "source", "cwd", "model",
 private const val FIXTURE_CLIENT_PROFILE = "X-Fixture-Client-Profile"
 
 internal class NativeExperienceFixture(private val ownerName: String = "synthetic-owner") : WebSocket.Factory {
-    private class FixtureRpcFailure(val code: Int, message: String) : RuntimeException(message)
+    private class FixtureRpcFailure(val code: Int, message: String, val field: String? = null) : RuntimeException(message)
     val requests = CopyOnWriteArrayList<JSONObject>()
     val rejectedRequests = CopyOnWriteArrayList<JSONObject>()
     val sessions = ConcurrentHashMap<String, JSONObject>()
@@ -158,7 +158,11 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     @Volatile var omitResumeYolo = false
     @Volatile var rejectPromptResponse = false
     @Volatile var onPromptResponse: (() -> Unit)? = null
+    /** Runs once as an answer reaches the socket, before it is recorded or rejected: a case changes the chat's state while the answer is in flight. */
+    @Volatile var beforePromptResponse: (() -> Unit)? = null
     @Volatile var commandCatalogFailure = false
+    /** How many renames Hermes' unique-title rule refused (on a real canonical Hermes each one is a logged dispatch crash). */
+    @Volatile var refusedTitles = 0
     @Volatile var commandDistractors = 0
     /** More built-ins Hermes' catalog lists, as (name, description). */
     @Volatile var extraCommands: List<Pair<String, String>> = emptyList()
@@ -253,9 +257,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
      * ("not in plugins.enabled") makes it 403 "Plugin not authorized". Live on the demo's Work profile (probe-demo.txt, 9 Nov).
      */
     @Volatile var pluginOffProfiles: Set<String> = emptySet()
+    /**
+     * Profiles whose own config turned Beacon off (`plugins.disabled`): the ticket is refused as for [pluginOffProfiles], and the plugin's turn-on leaves them off when the phone asks by
+     * itself (`auto`, answered `enabled: false`); only the owner's own Turn on (no `auto`) turns them on (admin_api.enable_plugin_for_profile).
+     */
+    @Volatile var pluginDisabledProfiles: Set<String> = emptySet()
     /** Chats Hermes refuses to read: their session and message routes answer 403, as for a chat the signed-in owner may no longer open. */
     @Volatile var deniedSessionIds: Set<String> = emptySet()
-    /** What the plugin's profile-enable route answers: 200 turns the profile on; another status is a route that is missing (404) or refuses. */
+    /** What the plugin's profile-enable route answers: 200 turns the profile on (or leaves a [pluginDisabledProfiles] one off for `auto`); another status is a route that is missing (404) or refuses. */
     @Volatile var profileEnableStatus = 200
     /** Holds that answer until a test counts the latch down, so the card's "Turning on" state can be seen. */
     @Volatile var profileEnableGate: java.util.concurrent.CountDownLatch? = null
@@ -276,11 +285,59 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     val createdByRequest = ConcurrentHashMap<String, String>()
     /** The fields of the create that made each request_id's session: Hermes refuses a retry that carries other fields (gateway/session_local.py:340-343). */
     val createFieldsByRequest = ConcurrentHashMap<String, JSONObject>()
+    /** Request ids whose chat was deleted: Hermes retires a deleted chat's create and refuses that id again with not_found (hermes_state_local.py:51-54). */
+    val retiredRequests: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private fun retireRequestsOf(key: String) = createdByRequest.filterValues { it == key }.keys.forEach { createdByRequest.remove(it); retiredRequests.add(it) }
+    /** Deletes [key] on Hermes the way the dashboard or another client does: the chat is gone, and so is its create's request id. */
+    fun deleteOnHermes(key: String) { sessions.remove(key); retireRequestsOf(key) }
     @Volatile var holdPromptAcknowledgement = false
+    /** CHATFIX-121 follow-up 2: only this chat's prompt.submit answers are held (released with [releasePromptAcknowledgement]). */
+    @Volatile var holdPromptOf: String? = null
     @Volatile var holdSteerAcknowledgement = false
     @Volatile var steerStatus = "steered"
     @Volatile var steerFailureCode: Int? = null
     @Volatile var canonicalAuthority = false
+    /** A canonical chat's pending admissions as Hermes' resume lists them (WEDGE-121: a turn lost in a restart is `unknown`); null lists none. */
+    @Volatile var lostPending: JSONArray? = null
+    /** What Beacon's read-only lost-turn route answers: chat id to the messages Hermes holds queued behind its lost reply (follow-up 3). */
+    @Volatile var lostChats: Map<String, Int> = emptyMap()
+    /** Follow-up 4: bot profile to its Bot Chat id, for the route's bots read; the lost admissions are [lostPending]'s. */
+    @Volatile var lostBots: Map<String, String> = emptyMap()
+    private fun lostUnknown() = JSONArray().apply {
+        lostPending?.let { rows -> (0 until rows.length()).map(rows::getJSONObject).filter { it.string("status") == "unknown" }
+            .forEach { put(json("admission_id" to it.string("admission_id"), "execution_generation" to it.opt("execution_generation"))) } }
+    }
+    private fun holdsLostTurn() = lostPending?.let { rows -> (0 until rows.length()).any { rows.getJSONObject(it).string("status") == "unknown" } } == true
+    /** The admissions the app let go with prompt.resolve_unknown, in order. */
+    val resolvedLost = CopyOnWriteArrayList<String>()
+    /** Like Hermes' canonical pending controls: the prompts it waits on, listed in every resume snapshot until answered (rules27). */
+    val canonicalOpenPrompts = CopyOnWriteArrayList<JSONObject>()
+    /** Each canonical prompt answer Hermes took: prompt id to the choice or answer. */
+    val respondedPrompts = CopyOnWriteArrayList<Pair<String, String>>()
+    /** Every subscription to a runtime's events (session.events.since), a re-subscribe after a drop included. */
+    val eventSubscriptions = AtomicInteger()
+    /**
+     * CHATFIX-121: Hermes' replay ring dropped every frame up to this sequence (event_replay.is_truncated: last_seen < evicted_through; the ring keeps 512 frames
+     * per session). A session.events.since from an older cursor then answers with no frames and snapshot_required (gateway/session_events.py since()). 0 keeps
+     * every frame, as before.
+     */
+    @Volatile var replayEvictedThrough = 0L
+    /** The cursor (last_seen) of each session.events.since that answered snapshot_required. */
+    val truncatedReplays = CopyOnWriteArrayList<Long>()
+    /** CHATFIX-121: the next this many session.resume calls fail with [resumeFailureCode] (403 is Hermes refusing the sign-in); 0 answers every one, as before. */
+    val failingResumes = AtomicInteger()
+    @Volatile var resumeFailureCode = 503
+    /** CHATFIX-121 follow-up 1: a session.resume refusal ([failingResumes]) is held until [releaseHeldRefusals], so it lands after the app has moved on. */
+    @Volatile var holdResumeRefusals = false
+    private val heldRefusals = CopyOnWriteArrayList<() -> Unit>()
+    fun heldRefusalCount() = heldRefusals.size
+    fun releaseHeldRefusals() { heldRefusals.toList().also { heldRefusals.clear() }.forEach { it() } }
+    /** CHATFIX-121: the sockets the app closed (WebSocket.close or cancel), by the id [nativeSocketMethods] names them with. */
+    val closedSockets: MutableSet<Int> = ConcurrentHashMap.newKeySet()
+    /** CHATFIX-121: live events go to the stream's own collector (the socket whose second session.events.since made it one). */
+    fun liveRoutedToCollector() = activeNativeSocketId != 0 && activeNativeSocketId == liveCollectorSocketId
+    /** Hermes refuses prompt.resolve_unknown (not a stale generation): nothing is let go. */
+    @Volatile var refuseLostClose = false
     /** The chats the fixture's plugin was told are threads (a Hermes with session authority cannot store the thread source). */
     val pluginThreadMarks: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
     @Volatile var omitCanonicalResumeProfile = false
@@ -295,6 +352,27 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     /** The next canonical submission waits behind another turn (Hermes holds it queued) until a test starts it. */
     val queueNextCanonicalSubmission = java.util.concurrent.atomic.AtomicBoolean(false)
     val canonicalAdmissions = ConcurrentHashMap<String, JSONObject>()
+    /**
+     * CHATQA-121 follow-up 5: like Hermes (hermes_state_runtime.py admit_session_input), a canonical submit is keyed by session and submission id. The same
+     * payload is answered with the admission Hermes already holds (its current state, nothing admitted twice); another payload gets admission_conflict.
+     */
+    private val canonicalSubmissions = ConcurrentHashMap<String, Pair<String, String>>()
+    /** Follow-up 5: the canonical submits per submission id (fresh and asked again), so a test counts every ask. */
+    val canonicalSubmits = ConcurrentHashMap<String, AtomicInteger>()
+    /** Follow-up 5: like Hermes, the person's row is written when the turn starts and carries the submission id in its display metadata (gateway/session_display.py). */
+    @Volatile var persistCanonicalUserRows = false
+    private val canonicalAdmissionInputs = ConcurrentHashMap<String, Triple<String, String, String>>()
+    /** Follow-up 5: the network drops as the next prompt goes out; its socket fails before Hermes reads it, so Hermes never gets it. */
+    @Volatile var dropNextPromptUnread = false
+    val unreadPrompts = AtomicInteger()
+    /** Follow-up 5: Hermes holds another payload under [submission] (asking again with this one gets admission_conflict). */
+    fun holdOtherPayloadUnder(submission: String) { canonicalSubmissions.replaceAll { key, value -> if (key.endsWith("|$submission")) "another payload" to value.second else value } }
+    /** Follow-up 5: the admissions Hermes holds under [submission]. */
+    fun canonicalAdmissionsFor(submission: String): Int = canonicalSubmissions.keys.count { it.endsWith("|$submission") }
+    /** Follow-up 5: the person's rows Hermes keeps with [text], in every session. */
+    fun userRows(text: String): Int = sessions.values.sumOf { session ->
+        session.optJSONArray("messages")?.let { rows -> (0 until rows.length()).count { rows.getJSONObject(it).string("role") == "user" && rows.getJSONObject(it).string("text") == text } } ?: 0
+    }
     /** The status each canonical submit was answered with (Hermes answers every fresh submit "queued"). */
     val submitAnswers = CopyOnWriteArrayList<String>()
     /** The admission whose turn runs now: Hermes stamps every frame of that turn with it (session_events.publish). */
@@ -336,6 +414,10 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     @Volatile var nativeTurnStatus = "idle"
     val nativeStatusProbes = CopyOnWriteArrayList<String>()
     @Volatile var refuseConnection = false
+    /** CHATFIX-121 follow-up 4: a slow phone or a busy emulator: every read of a chat's saved rows (`/api/sessions/...`) answers this much later. */
+    @Volatile var sessionReadDelayMs = 0L
+    /** CHATFIX-121 follow-up 5: another account signed in on this server; Hermes names it as the signed-in user. Null is the fixture's own account. */
+    @Volatile var signedInOwner: String? = null
     val refusedConnections = java.util.concurrent.atomic.AtomicInteger()
     /** Stored id -> runtime id a later `session.resume` of that conversation binds (other conversations keep their own). */
     val resumeRuntimeSessionIds = ConcurrentHashMap<String, String>()
@@ -350,13 +432,32 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     @Volatile var nativeStatusFailure = false
     @Volatile var persistTerminalMessages = false
     @Volatile var terminalOnActiveList: JSONObject? = null
+    /** CHATQA-121 follow-up 3: stored ids whose turn Hermes runs although this phone never sent it (the background outbox, another device, a schedule). */
+    val unseenTurns = ConcurrentHashMap.newKeySet<String>()
+    /** Hermes holds an admitted turn in [stored] that this phone never sent: the inventory lists it with [nativeTurnStatus], and its next event subscription gets emitted events. */
+    fun holdUnseenTurn(stored: String) {
+        require(sessions.containsKey(stored)) { "Synthetic session missing: $stored" }
+        unseenTurns += stored
+        pendingNativeStreams += unseenRuntime(stored)
+    }
+    fun unseenRuntime(stored: String): String = if (canonicalAuthority) stored else currentRuntimeSessionIds[stored] ?: sessions.getValue(stored).string("session_id")
     @Volatile var customTabLaunches = 0
     @Volatile var callbackFailure: Throwable? = null
     private val nativeEvents = CopyOnWriteArrayList<JSONObject>()
     private val nativeEventSequence = AtomicInteger()
     fun releasePromptAcknowledgement() = releaseCreateAcknowledgement()
+    /** CHATQA-121 follow-up 4: the sockets whose answers are held, so a test can drop the network while those answers are on their way. */
+    private val heldSockets = CopyOnWriteArrayList<Pair<WebSocketListener, WebSocket>>()
+    /** The network drops while held answers are on their way: Hermes has the requests (recorded and handled), the answers never reach the phone, and their sockets fail. */
+    fun dropHeldAcknowledgements(keepHolding: Boolean = false) {
+        val sockets = synchronized(delayedCreates) {
+            if (!keepHolding) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; holdSteerAcknowledgement = false }
+            delayedCreates.clear(); heldSockets.toList().also { heldSockets.clear() }
+        }
+        sockets.distinctBy { System.identityHashCode(it.second) }.forEach { (listener, socket) -> listener.onFailure(socket, java.io.IOException("Synthetic network drop"), null) }
+    }
     fun releaseCreateAcknowledgement() {
-        val queued = synchronized(delayedCreates) { holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; holdSteerAcknowledgement = false; holdReceiptAcknowledgement = false; holdActiveListAcknowledgement = false; holdConfigAcknowledgement = false; holdBranchAcknowledgement = false; holdHiddenAcknowledgement = false; holdVaultListAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
+        val queued = synchronized(delayedCreates) { heldSockets.clear(); holdCreateAcknowledgement = false; holdPromptAcknowledgement = false; holdSteerAcknowledgement = false; holdReceiptAcknowledgement = false; holdActiveListAcknowledgement = false; holdConfigAcknowledgement = false; holdBranchAcknowledgement = false; holdHiddenAcknowledgement = false; holdVaultListAcknowledgement = false; delayedCreates.toList().also { delayedCreates.clear() } }
         queued.forEach { it() }
     }
     fun setCanonicalAdmission(id: String, status: String, outcome: String = "") {
@@ -373,6 +474,9 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     fun startCanonicalTurn(admission: String, live: Boolean = false) {
         val current = requireNotNull(canonicalAdmissions[admission])
         canonicalAdmissions[admission] = current.copy().put("status", "started").put("execution_generation", 7)
+        if (persistCanonicalUserRows) canonicalAdmissionInputs.remove(admission)?.let { (session, submission, text) ->
+            sessions[session]?.optJSONArray("messages")?.put(json("role" to "user", "text" to text, "row_id" to sequence.incrementAndGet(), "display_metadata" to json("submission_id" to submission)))
+        }
         nativeTurnStatus = "working"
         executingAdmission = admission
         if (live) emitNativeEvent("message.start", JSONObject())
@@ -648,12 +752,34 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         val frame = json("id" to id, "method" to method, "params" to payload.copy().put("session_id", sessionId))
         check(openNativeServerRequests.putIfAbsent(id, frame) == null) { "Duplicate synthetic server request id: $id" }
     }
+    /** CHAT-121 follow-up 11: how many next sockets open but never become ready (their gateway.ready never comes), as a link that cannot carry their admission. */
+    val holdReady = AtomicInteger()
+    val heldReadySockets = AtomicInteger()
+    /** Hermes closes the socket the reply streams on (a close frame, not a network drop). */
+    fun closeActiveNativeStream(code: Int = 1011, reason: String = "Synthetic server close") {
+        val (listener, socket) = awaitActiveNativeSocket(0)
+        activeNativeListener = null
+        activeNativeSocket = null
+        activeNativeSessionId = null
+        listener.onClosing(socket, code, reason)
+        listener.onClosed(socket, code, reason)
+    }
     fun interruptActiveNativeStream() {
         val (listener, socket) = awaitActiveNativeSocket(0)
         activeNativeListener = null
         activeNativeSocket = null
         activeNativeSessionId = null
         listener.onFailure(socket, java.io.IOException("Synthetic native WebSocket interruption"), null)
+    }
+    /** The ids of the sockets [dropActiveNativeStream] dropped, in order (CHATFIX-121 follow-up 4: which subscriber a drop hit). */
+    val droppedNativeSockets = CopyOnWriteArrayList<Int>()
+    /** CHATFIX-121: the phone's link drops under the followed stream while Hermes keeps running the turn: its next subscription gets the live frames again. */
+    fun dropActiveNativeStream() {
+        val (listener, socket) = awaitActiveNativeSocket(0)
+        droppedNativeSockets += activeNativeSocketId
+        activeNativeListener = null
+        activeNativeSocket = null
+        listener.onFailure(socket, java.io.IOException("Synthetic link drop"), null)
     }
     val scope = Scope("https://ui-fixture.invalid", ownerName, "default", nativeProvider = "fixture")
     // Saved screen answers outlive a case; each case starts from what its own fixture serves.
@@ -680,6 +806,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             // A network that is down refuses ordinary requests too, not only the live connection.
             if (refuseConnection) throw java.net.ConnectException("Synthetic connection refused")
             val request = chain.request()
+            if (sessionReadDelayMs > 0 && request.url.encodedPath.startsWith("/api/sessions/")) Thread.sleep(sessionReadDelayMs)
             check(request.url.host == "ui-fixture.invalid") { "UI fixture may not access a real host" }
             if (request.url.encodedPath in setOf("/api/fs/download", "/api/files/download", "/api/file/raw")) {
                 val path = request.url.queryParameter("path").orEmpty()
@@ -952,6 +1079,13 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             200 to json("history_retention_days" to historyRetentionDays)
         }
         path == "/api/plugins/beacon/mobile/calls" -> if (callHistoryRouteMissing) 404 to json("detail" to "Unknown route") else 200 to callHistoryResponse.copy()
+        // Like lost_turns_api.py: only the asked chats (and bots), read-only; each lost reply with what Discard takes.
+        path == "/api/plugins/beacon/mobile/lost-turns" && method == "GET" -> 200 to json("lost" to JSONObject().apply {
+            url?.queryParameter("ids").orEmpty().split(',').filter(String::isNotBlank).forEach { id -> lostChats[id]?.let { put(id, json("waiting" to it, "unknown" to lostUnknown())) } }
+        }).apply {
+            val bots = url?.queryParameter("bots").orEmpty().split(',').filter(String::isNotBlank)
+            if (bots.isNotEmpty()) put("bots", JSONObject().apply { bots.forEach { bot -> lostBots[bot]?.let { put(bot, json("session_id" to it, "waiting" to 0, "unknown" to lostUnknown())) } } })
+        }
         path == "/api/plugins/beacon/mobile/notifications/events" -> {
             val after = url?.queryParameter("after")?.toLongOrNull() ?: 0L
             val wait = url?.queryParameter("wait")?.toLongOrNull() ?: 0L
@@ -1068,9 +1202,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             profileEnableGate?.await(30, java.util.concurrent.TimeUnit.SECONDS)
             val target = body.string("profile")
             if (profileEnableStatus != 200) profileEnableStatus to json("detail" to if (profileEnableStatus == 404) "Not Found" else "Synthetic enable failure")
-            else { val changed = target in pluginOffProfiles; pluginOffProfiles = pluginOffProfiles - target; 200 to json("ok" to true, "profile" to target, "enabled" to true, "changed" to changed) }
+            else if (body.optBoolean("auto") && target in pluginDisabledProfiles) 200 to json("ok" to true, "profile" to target, "enabled" to false, "changed" to false)
+            else {
+                val changed = target in pluginOffProfiles || target in pluginDisabledProfiles
+                pluginOffProfiles = pluginOffProfiles - target; pluginDisabledProfiles = pluginDisabledProfiles - target
+                200 to json("ok" to true, "profile" to target, "enabled" to true, "changed" to changed)
+            }
         }
-        path == "/api/plugins/beacon/mobile/gateway-ticket" -> if (profile in pluginOffProfiles) 403 to json("detail" to "Plugin not authorized") else 404 to json("detail" to "Not Found")
+        path == "/api/plugins/beacon/mobile/gateway-ticket" -> if (profile in pluginOffProfiles || profile in pluginDisabledProfiles) 403 to json("detail" to "Plugin not authorized") else 404 to json("detail" to "Not Found")
         path == "/api/auth/ws-ticket" -> 200 to json("ticket" to "synthetic-once")
         path == "/auth/native/authorize" -> 200 to json("ready" to true)
         path == "/auth/native/token" -> if (body.string("code").isBlank() || body.string("code_verifier").isBlank()) 400 to json("detail" to "Invalid code or verifier") else { currentRefreshToken = "synthetic-refresh"; 200 to json("access_token" to "synthetic-access", "refresh_token" to currentRefreshToken, "expires_at" to 2_000_000_000L, "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner) }
@@ -1086,7 +1225,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 200 to json("access_token" to "synthetic-access-$number", "refresh_token" to currentRefreshToken, "expires_at" to (System.currentTimeMillis() / 1000 + 3600), "token_type" to "Bearer", "provider" to "fixture", "user_id" to scope.owner)
             }
         }
-        path == "/api/auth/me" -> 200 to json("user_id" to scope.owner, "provider" to scope.nativeProvider)
+        path == "/api/auth/me" -> 200 to json("user_id" to (signedInOwner ?: scope.owner), "provider" to scope.nativeProvider)
         path == "/auth/logout" -> 200 to json("ok" to true)
         // Like Hermes' own route: the profile's current model and provider beside the provider list. /api/profile/defaults reads the model from here (since b8dbad4c).
         path == "/api/model/options" -> 200 to json("model" to profileModel, "provider" to "fixture", "providers" to JSONArray().put(json("slug" to "fixture", "name" to "Configured provider", "models" to JSONArray(listOf("synthetic-model", "other-model", "confirm-model")))))
@@ -1232,6 +1371,9 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             body.optString("cadence").takeIf { it.isNotBlank() }?.let { checkupCapabilities?.put("checkup_cadence", it) }
             200 to json("ok" to true)
         }
+        path == "/api/plugins/beacon/mobile/health" -> 200 to json("plugin" to json("installed" to "1.2.0", "running" to "1.2.0", "gateway" to "1.2.0"), "dashboard" to json("current" to true),
+            "gateway" to json("known" to true, "running" to true, "current" to true, "busy" to false), "calls" to json("ready" to true, "provider" to "gemini", "reason" to ""),
+            "push" to json("ready" to true, "sender" to true, "targets" to 1, "reason" to ""), "cached" to false)
         path == "/api/plugins/beacon/mobile/bootstrap" -> 200 to json("contract_version" to 2, "backend" to "hermes-dashboard", "owner_id" to scope.owner, "profile" to profile, "voice" to json("available" to false)).apply {
             bootstrapPluginStatus?.let { put("optional_features", json("plugin" to it)) }
         }
@@ -1244,15 +1386,21 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             override fun request() = request
             override fun queueSize() = 0L
             override fun send(bytes: ByteString) = false
-            override fun close(code: Int, reason: String?) = true
-            override fun cancel() = Unit
+            override fun close(code: Int, reason: String?): Boolean { closedSockets += socketId; return true }
+            override fun cancel() { closedSockets += socketId }
             override fun send(text: String): Boolean {
                 val frame = JSONObject(text)
                 if (!frame.has("method")) {
+                    beforePromptResponse?.also { beforePromptResponse = null }?.invoke()
                     if (rejectPromptResponse) { rejectPromptResponse = false; return false }
                     nativeServerResponses += frame.copy()
                     frame.opt("id")?.takeIf { it != JSONObject.NULL }?.let { openNativeServerRequests.remove(it.toString()); vaultPromptAnswered(it.toString(), frame.optJSONObject("result")?.optString("value").orEmpty()) }
                     onPromptResponse?.also { onPromptResponse = null }?.invoke()
+                    return true
+                }
+                if (dropNextPromptUnread && frame.optString("method") == "prompt.submit") {
+                    dropNextPromptUnread = false; unreadPrompts.incrementAndGet()
+                    listener.onFailure(this, java.io.IOException("Synthetic network drop before Hermes read the prompt"), null)
                     return true
                 }
                 requests += frame.copy()
@@ -1290,12 +1438,13 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                         return true
                     }
                     val deferred = synchronized(delayedCreates) {
-                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit" || holdSteerAcknowledgement && method == "session.steer" || holdReceiptAcknowledgement && method == "prompt.receipt" || holdActiveListAcknowledgement && method == "session.active_list" ||
+                        if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit" || method == "prompt.submit" && holdPromptOf != null && params.string("session_id") == holdPromptOf || holdSteerAcknowledgement && method == "session.steer" || holdReceiptAcknowledgement && method == "prompt.receipt" || holdActiveListAcknowledgement && method == "session.active_list" ||
                             holdConfigAcknowledgement && method == "config.set" || holdBranchAcknowledgement && method == "session.branch" || holdHiddenAcknowledgement && method == "session.set_hidden" ||
-                            holdVaultListAcknowledgement && method == "vault.list") { delayedCreates += { listener.onMessage(this, response) }; true } else false
+                            holdVaultListAcknowledgement && method == "vault.list") { delayedCreates += { listener.onMessage(this, response) }; heldSockets += listener to this; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
                     if (!deferred && method == "session.events.since") {
+                        eventSubscriptions.incrementAndGet()
                         val runtimeSessionId = params.string("session_id")
                         val reads = replayReads.computeIfAbsent(this) { AtomicInteger() }.incrementAndGet()
                         if (pendingNativeStreams.remove(runtimeSessionId)) {
@@ -1316,7 +1465,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                         }
                     }
                 } catch (error: FixtureRpcFailure) {
-                    listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to error.code, "message" to error.message)).toString())
+                    // In the socket log, so a failure shows which socket (which caller) a refusal went to.
+                    nativeSocketMethods.add(socketId to "REFUSED ${frame.optString("method")}")
+                    val refusal = json("jsonrpc" to "2.0", "id" to frame.getString("id"), "error" to json("code" to error.code, "message" to error.message).apply {
+                        // Like Hermes' _refusal_data: the reason, plus the field when the refusal names one.
+                        error.field?.let { put("data", json("reason" to error.message, "field" to it)) }
+                    }).toString()
+                    if (holdResumeRefusals && frame.optString("method") == "session.resume") heldRefusals += { listener.onMessage(this, refusal) }
+                    else listener.onMessage(this, refusal)
                 } catch (error: IllegalArgumentException) {
                     val missing = error.message == "Synthetic session missing"
                     // Like Hermes: the canonical authority refuses a session it does not hold with 4001 not_found (gateway/session_controls.py:372-374, hermes_state_runtime.py:75);
@@ -1331,6 +1487,10 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         }
         // Like a network that is down: the connection never opens, so nothing can have been sent.
         if (refuseConnection) { refusedConnections.incrementAndGet(); listener.onFailure(socket, java.net.ConnectException("Synthetic connection refused"), null) }
+        else if (holdReady.getAndUpdate { if (it > 0) it - 1 else 0 } > 0) {
+            heldReadySockets.incrementAndGet()
+            listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Synthetic wire").build())
+        }
         else {
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Synthetic wire").build())
             listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to json("session_authority" to canonicalAuthority))).toString())
@@ -1369,6 +1529,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             "projects.project_sessions" -> json("project" to json("id" to params.getString("project_id"), "label" to "Travel", "sessionIds" to JSONArray().put("chat-a").put("chat-b"), "previewSessions" to JSONArray().put(json("id" to "chat-a", "title" to "Travel planning", "profile" to scope.profile))))
             "session.resume" -> {
                 require(!historyFailure) { "Synthetic history unavailable" }
+                if (failingResumes.getAndUpdate { (it - 1).coerceAtLeast(0) } > 0) throw FixtureRpcFailure(resumeFailureCode, if (resumeFailureCode == 403) "forbidden" else "Synthetic resume unavailable")
                 if (profileSessionIds[params.string("profile")]?.contains(id) == false) throw IllegalArgumentException("Synthetic session missing")
                 val row = sessions[id] ?: unpromptedShells.remove(id)?.also { sessions[id] = it }
                 row?.copy()?.apply {
@@ -1380,12 +1541,16 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                     if (canonicalAuthority) {
                         remove("session_key"); getJSONObject("info").remove("stored_session_id")
                         // Like Hermes' canonical resume (gateway/session_controls.py): the snapshot always lists its open prompts, here none; a server request answers through the stream.
-                        put("stored_session_id", id).put("execution_generation", 7).put("running", nativeTurnStatus in setOf("working", "waiting")).put("prompts", JSONArray())
+                        put("stored_session_id", id).put("execution_generation", 7).put("running", nativeTurnStatus in setOf("working", "waiting")).put("prompts", JSONArray(canonicalOpenPrompts.map { it.copy() }))
+                        lostPending?.let { put("pending", JSONArray(it.toString())) }
                         getJSONObject("info").put("profile_name", params.string("profile")).apply {
                             if (omitCanonicalResumeProfile) remove("profile_id") else put("profile_id", canonicalProfileId(params.string("profile")))
                         }
                     }
                     put("messages_omitted", params.optBoolean("omit_messages"))
+                    // Hermes' resume counts the chat's rows (gateway/session_controls.py:130/135); the reconcile after a cut-short replay requires it. Only the
+                    // eviction cases (CHATFIX-121) get it, so every other case keeps its answer.
+                    if (replayEvictedThrough > 0) put("message_count", rows("messages").size)
                     put("messages", JSONArray(if (params.optBoolean("omit_messages")) emptyList<JSONObject>() else rows("messages").map { message -> message.copy().apply {
                         put("text", nativeDisplayText(message, params.optBoolean("inline_images", true)))
                         remove("content"); remove("attachments")
@@ -1408,6 +1573,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 // ...and a source that is not one of its surfaces (gateway/session_policy.py:430, SURFACES): the thread source is refused there, which is what the real gateway does.
                 if (canonicalAuthority && params.has("source") && params.string("source") !in setOf("cli", "tui", "gui", "acp", "tool", "oneshot")) throw FixtureRpcFailure(4001, "invalid_params")
                 val request = if (canonicalAuthority) params.string("request_id") else ""
+                if (request.isNotBlank() && request in retiredRequests) throw FixtureRpcFailure(4001, "not_found")
                 val made = request.takeIf { it.isNotBlank() }?.let { createdByRequest[it] }?.takeIf { sessions.containsKey(it) }
                 // A resumed request_id must carry the same frozen request, else invalid_params (gateway/session_local.py:340-343): the retry's fields equal the first create's.
                 if (made != null) createFieldsByRequest[request]?.let { first ->
@@ -1424,10 +1590,21 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                     if (request.isNotBlank()) { createdByRequest[request] = key; createFieldsByRequest[request] = JSONObject(params.toString()) }
                 }) }
             }
-            "session.events.since" -> json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(),
-                "events" to JSONArray(nativeEvents.filter { it.optLong("seq") > params.optLong("last_seen", 0) }),
-                "open_requests" to JSONArray(openNativeServerRequests.values.filter { it.optJSONObject("params")?.string("session_id") == params.string("session_id") }))
-            "session.active_list" -> {
+            "session.events.since" -> {
+                val lastSeen = params.optLong("last_seen", 0)
+                // Like Hermes' since(): a cursor the ring moved past gets no frames and is told to read a snapshot (only when a test evicted the ring).
+                val evicted = replayEvictedThrough > 0 && lastSeen < replayEvictedThrough
+                if (evicted) truncatedReplays += lastSeen
+                json("epoch" to "synthetic", "latest_seq" to nativeEventSequence.get(),
+                    "events" to JSONArray(if (evicted) emptyList() else nativeEvents.filter { it.optLong("seq") > lastSeen }),
+                    "open_requests" to JSONArray(openNativeServerRequests.values.filter { it.optJSONObject("params")?.string("session_id") == params.string("session_id") }))
+                    .apply { if (evicted) put("truncated", true).put("snapshot_required", true).put("last_sequence", nativeEventSequence.get()).put("replay_epoch", "synthetic").put("count", 0) }
+            }
+            "session.active_list" -> if (params.optString("current_session_id").isBlank() && unseenTurns.isNotEmpty()) {
+                if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
+                // The inventory read (no current session), as Hermes lists every live session: each turn it holds unseen, with the one turn status.
+                json("sessions" to JSONArray(unseenTurns.filter(sessions::containsKey).map { stored -> json("id" to unseenRuntime(stored), "session_key" to stored, "status" to nativeTurnStatus) }))
+            } else {
                 if (nativeStatusFailure) { nativeStatusProbes.add("failed"); throw IllegalArgumentException("Synthetic active status unavailable") }
                 val observedStatus = nativeTurnStatus
                 val runtime = params.optString("current_session_id")
@@ -1450,7 +1627,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             "session.title" -> {
                 // Hermes titles are unique per profile (idx_sessions_title_unique).
                 renameFailure?.let { throw FixtureRpcFailure(500, it) }
-                if (sessions.any { (key, row) -> key != id && row.getJSONObject("info").string("title") == params.getString("title") }) throw FixtureRpcFailure(4022, "Title already in use")
+                if (sessions.any { (key, row) -> key != id && row.getJSONObject("info").string("title") == params.getString("title") }) { refusedTitles++; throw FixtureRpcFailure(4022, "Title already in use") }
                 sessions.getValue(id).getJSONObject("info").put("title", params.getString("title")); json("ok" to true)
             }
             "session.set_hidden" -> { val hidden = params.getBoolean("hidden"); sessions.getValue(id).getJSONObject("info").put("hidden", hidden); json("hidden" to hidden, "session_key" to id) }
@@ -1458,8 +1635,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             "session.close" -> { closedSessions.add(id); json("closed" to true) }
             "session.delete" -> {
                 require(id in closedSessions) { "cannot delete an active session" }
-                if (deleteMissingAfterClose) { sessions.remove(id); throw FixtureRpcFailure(4007, "session not found") }
-                sessions.remove(id); json("deleted" to id)
+                if (deleteMissingAfterClose) { sessions.remove(id); retireRequestsOf(id); throw FixtureRpcFailure(4007, "session not found") }
+                sessions.remove(id); retireRequestsOf(id); json("deleted" to id)
             }
             "session.branch" -> { val key = "branch-${sequence.incrementAndGet()}"; val rows = sessions.getValue(id).getJSONArray("messages"); history(key, params.string("name", "Branch"), JSONArray((0 until params.optInt("count", rows.length()).coerceIn(0, rows.length())).map(rows::get))).also { sessions[key] = it } }
             "session.compress" -> json("status" to "aborted")
@@ -1505,17 +1682,34 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 json("pairs" to JSONArray().apply { repeat(commandDistractors) { put(JSONArray().put("/candidate$it").put("The help text describes another command")) } }.put(JSONArray().put("/help").put("Show available commands")).put(JSONArray().put("/model").put("Choose a model")).apply { extraCommands.forEach { (name, description) -> put(JSONArray().put(name).put(description)) } })
             }
             "prompt.submit" -> {
+                if (canonicalAuthority) {
+                    val submission = params.string("submission_id")
+                    canonicalSubmits.computeIfAbsent(submission) { AtomicInteger() }.incrementAndGet()
+                    // Follow-up 5: the same request id with the same payload answers with the admission Hermes holds; another payload is refused.
+                    val digest = params.keys().asSequence().filter { it != "session_id" && it != "profile" }.sorted().joinToString("\u0000") { "$it=${params.opt(it)}" }
+                    canonicalSubmissions["$id|$submission"]?.let { (held, admission) ->
+                        if (held != digest) throw FixtureRpcFailure(4001, "admission_conflict", "request_id")
+                        return canonicalAdmissions.getValue(admission).copy()
+                    }
+                }
                 val rowId = sequence.incrementAndGet()
                 if (canonicalAuthority) {
                     require(params.string("submission_id").isNotBlank()) { "Canonical submission identity is required" }
                     // Like Hermes (hermes_state_runtime.admit_session_input): every fresh submit is answered "queued", an idle chat too. A chat nothing else
                     // runs claims the row at once (the turn starts and its frames carry the admission); one held behind another turn waits for a test to start it.
-                    val behindAnotherTurn = queueNextCanonicalSubmission.getAndSet(false)
+                    // Like Hermes (claim_session_input refuses unknown_execution): a submit while a lost turn holds the chat is queued behind it.
+                    val behindLost = holdsLostTurn()
+                    val behindAnotherTurn = queueNextCanonicalSubmission.getAndSet(false) || behindLost
                     val admission = "admission-$rowId"
                     val result = json("admission_id" to admission, "ref" to json("profile_id" to canonicalProfileId(params.string("profile")), "session_id" to id),
                         "sequence" to rowId, "status" to "queued", "outcome" to null, "authority_epoch" to 1, "execution_generation" to null)
                     canonicalAdmissions[admission] = result.copy()
+                    canonicalSubmissions["$id|${params.string("submission_id")}"] = params.keys().asSequence().filter { it != "session_id" && it != "profile" }.sorted()
+                        .joinToString("\u0000") { "$it=${params.opt(it)}" } to admission
+                    canonicalAdmissionInputs[admission] = Triple(id, params.string("submission_id"), params.string("text"))
                     submitAnswers += result.string("status")
+                    if (behindLost) lostPending = JSONArray(lostPending.toString()).put(json("admission_id" to admission, "status" to "queued", "outcome" to JSONObject.NULL,
+                        "execution_generation" to JSONObject.NULL, "sequence" to rowId, "authority_epoch" to 1, "input_id" to admission, "text" to params.string("text")))
                     if (behindAnotherTurn) { if (nativeTurnStatus != "working") nativeTurnStatus = "starting" } else startCanonicalTurn(admission)
                     result
                 } else {
@@ -1533,8 +1727,37 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                     admissionReceiptRefOverride?.let { ref.put("session_id", it) }
                     admissionReceiptProfileOverride?.let { ref.put("profile_id", it) }
                 }
-            "session.interrupt" -> json("ok" to true)
+            "session.interrupt" -> if (!canonicalAuthority) json("ok" to true) else {
+                // Like Hermes' canonical interrupt: the session's handle, naming the generation it stopped.
+                val runtime = params.string("session_id")
+                json("ref" to json("profile_id" to canonicalProfileId(params.string("profile").ifBlank { scope.profile }), "session_id" to (runtimeStoredSessionIds[runtime] ?: runtime)),
+                    "execution_generation" to params.opt("execution_generation"), "execution_state" to "running")
+            }
+            // Like Hermes (hermes_state_runtime.resolve_unknown_session_input): only the lost row's own generation lets it go; it ends interrupted.
+            // Like Hermes' canonical prompt answer: the open prompt is settled once; a second answer finds it already resolved.
+            "approval.respond", "clarify.respond" -> {
+                val id = params.string("prompt_id")
+                val open = canonicalOpenPrompts.firstOrNull { it.string("prompt_id") == id }
+                if (open != null) { canonicalOpenPrompts.remove(open); respondedPrompts += id to params.string("choice", params.string("answer")) }
+                json("prompt_id" to id, "status" to if (open != null) "resolved" else "already_resolved")
+            }
+            "prompt.resolve_unknown" -> {
+                if (refuseLostClose) throw FixtureRpcFailure(4003, "permission_denied")
+                val rows = lostPending?.let { (0 until it.length()).map(it::getJSONObject) }.orEmpty()
+                val lost = rows.firstOrNull { it.string("admission_id") == params.string("admission_id") && it.string("status") == "unknown" &&
+                    it.optLong("execution_generation", -1) == params.optLong("execution_generation", -2) } ?: throw FixtureRpcFailure(4001, "stale_generation")
+                resolvedLost += lost.string("admission_id")
+                // Like Hermes (resolve_unknown resumes the paused FIFO): a message queued behind it starts now.
+                val rest = rows.filter { it !== lost }
+                val next = rest.firstOrNull { it.string("status") == "queued" }
+                lostPending = JSONArray(rest.filter { it !== next }).takeIf { it.length() > 0 }
+                next?.let { startCanonicalTurn(it.string("admission_id")) }
+                lost.copy().put("status", "terminal").put("outcome", "interrupted")
+            }
             "vault.list", "vault.sources", "vault.source.set", "vault.unlock", "vault.lock", "vault.add", "vault.remove" -> vaultRpc(method, params)
+            // CHATQA-121 follow-up 5: like Hermes' image.attach_bytes, the bytes are staged under a path of their own, a new one each call.
+            "image.attach_bytes" -> json("attached" to true, "path" to "/synthetic/staged/image-${sequence.incrementAndGet()}.png", "mime" to "image/png")
+            "image.detach" -> json("detached" to true)
             else -> throw IllegalArgumentException("Synthetic fixture has no response for $method")
         }
     }

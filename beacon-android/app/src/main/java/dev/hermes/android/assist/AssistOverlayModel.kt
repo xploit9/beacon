@@ -1,6 +1,8 @@
 package dev.hermes.android.assist
 
 import dev.hermes.android.ChatState
+import dev.hermes.android.data.APP_CONNECTION_ERROR
+import dev.hermes.android.core.rows
 import dev.hermes.android.ui.BeaconDustMood
 import dev.hermes.android.ui.presenceState
 import dev.hermes.android.ui.sphere.SphereState
@@ -36,17 +38,26 @@ internal enum class OverlayPhase { Summoning, Open, Dismissing, Hidden }
 internal enum class OverlayLine { Microphone, VoiceKey, SignIn, NotHeard, NoRecognizer, NotSent, CallFailed, Waiting, Unlock }
 
 /**
- * Why a call didn't start or dropped, for the six reasons the call service words itself ([full] is its constant in DirectVoice.kt).
+ * Why a call didn't start or dropped, for the reasons the call words itself ([full] is its constant in DirectVoice.kt, or the app's
+ * line for a Hermes it cannot reach, which the call's grant and a press that found no Hermes both use).
  * The overlay's line says only the short form, next to the one action; any other reason is the plain "Couldn't start the call".
  */
 internal enum class CallReason(val full: String) {
     HermesNoAnswer(CALL_HERMES_NO_ANSWER),
+    HermesUnreachable(APP_CONNECTION_ERROR),
     VoiceNoAnswer(CALL_VOICE_NO_ANSWER),
     MicFailed(CALL_MIC_FAILED),
     Dropped(CALL_DROPPED),
     VoiceStopped(CALL_VOICE_STOPPED),
     SignInExpired(CALL_SIGN_IN_EXPIRED),
 }
+
+/**
+ * Whether a call that failed for [reason] is tried once more by itself. Not a sign-in that expired or a microphone that failed, and not a
+ * Hermes that cannot be reached: the call already waited its reach budget, so a second start would only say the same later (device round 4, F3).
+ */
+internal fun retryableCallFailure(reason: CallReason?): Boolean =
+    reason != CallReason.SignInExpired && reason != CallReason.MicFailed && reason != CallReason.HermesUnreachable
 
 /**
  * The [CallReason] a call service's [reason] words, or null for any other. The service puts its line in the phone's language before
@@ -358,14 +369,36 @@ internal data class AnswerProgress(val answer: String, val streaming: Boolean, v
 
 internal fun answerFrom(chat: ChatState, before: Set<String>, sessionId: String): AnswerProgress? {
     if (sessionId.isBlank() || chat.sessionId != sessionId) return null
-    val fresh = chat.messages.filter { it.id !in before }
+    val fresh = dev.hermes.android.foldRepeatedFinal(chat.messages).filter { it.id !in before }
     val replies = fresh.filter { it.role == "assistant" }
     val live = chat.streamId.isNotBlank()
-    val text = (replies.map { it.text.trim() } + listOfNotNull(chat.liveText.trim().takeIf { live && it.isNotEmpty() })).filter { it.isNotEmpty() }.joinToString("\n\n")
+    val unsaved = unsavedAnswerWords(chat, before, fresh, live)
+    // Hermes' own failure note closes a cut turn: the words said before it sit above it, where they were said.
+    val noteAt = replies.indexOfFirst { it.displayKind == "failed_turn" }.let { if (it < 0) replies.size else it }
+    val text = (replies.take(noteAt).map { it.text.trim() } + unsaved.kept + replies.drop(noteAt).map { it.text.trim() } + unsaved.live).filter { it.isNotEmpty() }.joinToString("\n\n")
     // Accepted once Hermes holds the question: its own message came back, a reply streams, or the send is still settling.
     val accepted = live || fresh.any { it.role == "user" } || replies.isNotEmpty() || chat.uncertain.isNotBlank()
     val streaming = live || chat.uncertain.isNotBlank() || replies.isEmpty()
     return AnswerProgress(text, streaming, accepted)
+}
+
+/** The words of this question's reply that Hermes' saved rows do not hold: the replies a cut kept, then the closed live segments and the live words. */
+internal data class UnsavedAnswerWords(val kept: List<String>, val live: List<String>)
+
+/**
+ * The same words the chat draws for the turn, retired by the same rules: a kept copy of the turn's n-th segment goes once Hermes holds n of them, and a sealed segment goes by its place
+ * in the turn (keptRowsNotSaved and sealedNotSaved, run whenever history arrives); only a copy with no place is told by its words. A kept copy that was already there when the
+ * question was asked ([before] holds its id) belongs to an earlier turn of this chat and stays out.
+ */
+internal fun unsavedAnswerWords(chat: ChatState, before: Set<String>, fresh: List<dev.hermes.android.Message>, live: Boolean): UnsavedAnswerWords {
+    val saved = fresh.filter { it.role == "assistant" && it.displayKind != "unconfirmed_reply" }.map { dev.hermes.android.sameWords(it.text) }.toSet()
+    val kept = chat.raw.rows(dev.hermes.android.UNCONFIRMED_REPLIES).filter { row ->
+        val words = row.optString("text").trim()
+        row.optString("id") !in before && words.isNotEmpty() && !words.startsWith("Operation interrupted") &&
+            (row.optString("id").startsWith(dev.hermes.android.KEPT_IN_TURN) || dev.hermes.android.sameWords(words) !in saved)
+    }.sortedBy { it.optInt("_segment").takeIf { place -> place > 0 } ?: Int.MAX_VALUE }.map { it.optString("text").trim() }
+    val sealed = if (live) chat.liveSealed.map { it.trim() } + listOf(chat.liveText.trim()) else emptyList()
+    return UnsavedAnswerWords(kept, sealed.filter { it.isNotEmpty() })
 }
 
 /** The longest chat title a chip shows before an ellipsis. */
@@ -380,8 +413,9 @@ internal fun chipTitle(title: String): String {
 
 /** The newest conversation that is not the assistant's own: the Continue chip. */
 internal fun lastChat(rows: List<org.json.JSONObject>, assistantSession: String, profile: String): AssistChip.Continue? = rows.asSequence()
+    .filterNot { row -> dev.hermes.android.ui.rowIsChat(row, assistantSession) } // also the assistant's chat listed under a newer session id
     .map { row -> Triple(dev.hermes.android.core.sessionRowId(row), row.optString("title").trim(), row.optString("profile").ifBlank { profile }) }
-    .firstOrNull { (id, title, _) -> id.isNotBlank() && id != assistantSession && title.isNotBlank() }
+    .firstOrNull { (id, title, _) -> id.isNotBlank() && title.isNotBlank() }
     ?.let { (id, title, rowProfile) -> AssistChip.Continue(chipTitle(title), id, rowProfile) }
 
 // --- the ground under the overlay ---

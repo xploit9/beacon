@@ -19,7 +19,7 @@ class LiveSealedSegmentsTest {
     private val last = "Done. The picture shows a few shapes."
 
     private fun row(role: String, content: String, vararg extra: Pair<String, Any?>) =
-        json("role" to role, "content" to content, "row_id" to "$role-${content.hashCode()}", *extra)
+        json("role" to role, "content" to content, "row_id" to Math.floorMod("$role|$content|${extra.joinToString { it.second.toString() }}".hashCode(), 900_000) + 1000, *extra)
     /** The assistant row Hermes saves for a message with words and one tool call. */
     private fun call(words: String, id: String) = row("assistant", words, "tool_calls" to JSONArray().put(json("id" to id)))
     private fun result(id: String) = row("tool", "ok", "tool_call_id" to id)
@@ -36,7 +36,7 @@ class LiveSealedSegmentsTest {
         fun saved(rows: List<JSONObject>) {
             val live = settleLive(chat, rows, null, boundary, "")
             chat = chat.copy(messages = rows.mapIndexed { i, m -> Message.from(m, i, "s") }, raw = JSONObject().put("messages", JSONArray(rows)),
-                streamId = if (live.streamEnded) "" else chat.streamId, liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools, liveSealed = live.sealed)
+                streamId = if (live.streamEnded) "" else chat.streamId, liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools, liveSealed = live.sealed, liveSealedAt = live.sealedAt)
         }
         /** The same history read arriving as the stream's own state_saved event. */
         fun stateSaved(rows: List<JSONObject>) = event("state_saved", json("session" to json("messages" to JSONArray(rows))))
@@ -202,11 +202,16 @@ class LiveSealedSegmentsTest {
         assertEquals(listOf(last), shown(run.chat))
     }
 
-    @Test fun anEarlierTurnsSentenceDoesNotHoldTheRunningTurnsWords() {
-        val earlier = listOf(row("user", "first question"), call(first, "old-1"), row("assistant", "All done."))
-        assertEquals(listOf(first), sealedWordsNotSaved(earlier + ask, listOf(first)))
-        assertEquals("Its own turn's saved row holds it", emptyList<String>(), sealedWordsNotSaved(earlier + ask + call(first, "new-1"), listOf(first)))
-        assertEquals("Spacing is not part of the words", emptyList<String>(), sealedWordsNotSaved(listOf(ask, row("assistant", "I'll  look at the image first,\nthen run the check.")), listOf(first)))
+    @Test fun aSealedSegmentIsHeldByItsPlaceInTheTurnNeverByItsWords() {
+        // The turn's own rows: nothing saved yet, or one model message with words (whatever those words say).
+        assertEquals(listOf(first) to listOf(1), sealedNotSaved(listOf(first), listOf(1), emptyList()))
+        assertEquals("Its own turn's saved row holds it", emptyList<String>() to emptyList<Int>(), sealedNotSaved(listOf(first), listOf(1), listOf(call(first, "new-1"))))
+        assertEquals("Words saved differently are held all the same", emptyList<String>() to emptyList<Int>(),
+            sealedNotSaved(listOf(first), listOf(1), listOf(row("assistant", "I'll look at the image first"))))
+        assertEquals("The same words saved as another place do not hold it", listOf(first) to listOf(2), sealedNotSaved(listOf(first), listOf(2), listOf(call(first, "new-1"))))
+        assertEquals("A place not known stays until the stream ends", listOf(first) to listOf(0), sealedNotSaved(listOf(first), listOf(0), listOf(call(first, "new-1"))))
+        assertEquals("With no turn known nothing is judged saved", listOf(first) to listOf(1), sealedNotSaved(listOf(first), listOf(1), null))
+        assertEquals("Hermes' own notes are not model messages", listOf(first) to listOf(1), sealedNotSaved(listOf(first), listOf(1), listOf(row("assistant", "This turn did not complete.", "display_kind" to "failed_turn"))))
     }
 
     @Test fun nothingIsLeftWhenTheTurnEndsFailsOrIsCancelled() {
@@ -234,11 +239,12 @@ class LiveSealedSegmentsTest {
         run.event("tool_complete", json("tid" to "vision-1", "name" to "terminal"))
         wordsThenTool(run, second, "terminal-1")
         val frame = run.boundary.saveInto(json("cursor" to "c1", "text" to run.chat.liveText, "reasoning" to run.chat.liveReasoning,
-            "tools" to JSONArray(run.chat.liveTools), "sealed" to JSONArray(run.chat.liveSealed), "terminal" to false))
+            "tools" to JSONArray(run.chat.liveTools), "sealed" to JSONArray(run.chat.liveSealed), "sealed_at" to JSONArray(run.chat.sealedPlaces()), "ordinal" to run.chat.liveOrdinal, "terminal" to false))
         // The frame as stored and read back.
         val stored = JSONObject(frame.toString())
-        val restored = ChatState(sessionId = "s", streamId = "runtime-s", messages = emptyList(), raw = JSONObject().put("messages", JSONArray(listOf(ask)))).copy(
-            liveText = stored.string("text"), liveTools = stored.rows("tools"), liveSealed = sealedFromFrame(stored))
+        val restored = ChatState(sessionId = "s", streamId = "runtime-s", messages = listOf(Message.from(ask, 0, "s")), raw = JSONObject().put("messages", JSONArray(listOf(ask)))).copy(
+            liveText = stored.string("text"), liveTools = stored.rows("tools"), liveSealed = sealedFromFrame(stored), liveSealedAt = sealedPlacesFromFrame(stored), liveOrdinal = stored.optInt("ordinal"))
+        assertEquals("The places come back with the words", listOf(1), restored.sealedPlaces())
         assertEquals(listOf(first, second), shown(restored))
         // History that already holds the first message drops it from the restored words.
         val afterRead = withoutSavedLive(restored, listOf(ask, call(first, "vision-1"), result("vision-1")), LiveAssistantBoundary.from(stored))
@@ -253,7 +259,7 @@ class LiveSealedSegmentsTest {
 
     @Test fun aTurnKeepsAtMostTheNewestSealedSegments() {
         val many = (1..40).map { "Step $it" }
-        val kept = sealedWordsNotSaved(listOf(ask), many)
+        val kept = sealedNotSaved(many, (1..40).toList(), emptyList()).first
         assertEquals(24, kept.size)
         assertEquals("Step 40", kept.last())
         assertEquals(24, sealedFromFrame(json("sealed" to JSONArray(many))).size)

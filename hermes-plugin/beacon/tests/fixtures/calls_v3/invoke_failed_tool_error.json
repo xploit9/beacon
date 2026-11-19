@@ -1,0 +1,20 @@
+{
+  "request_id": "req-synthetic-0005",
+  "tool_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+  "tool": "notes_search",
+  "tool_name": "notes_search",
+  "read_only": true,
+  "approved_by": null,
+  "status": "failed",
+  "ran_on_hermes": true,
+  "server_ms": {
+    "queue": 0.412,
+    "authority": 12.104,
+    "catalogue": 3.215,
+    "profile": 1.702,
+    "execute": 420.551,
+    "total": 438.031
+  },
+  "error_code": "tool_error",
+  "reason": "Read-only tool failed"
+}

@@ -1,0 +1,6 @@
+{
+  "request_id": "handover-synthetic-0001",
+  "text": "Find the three cheapest synthetic flights next week and put them in the chat.",
+  "mode": "background",
+  "callback": true
+}

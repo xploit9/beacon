@@ -54,15 +54,29 @@ internal fun choiceDisplayLabel(value: String, labels: Map<String, String>, offe
 
 internal fun chatModelLabel(conversationModel: String, profileDefault: String): String = conversationModel.ifBlank { profileDefault }
 internal fun chatReasoningLabel(conversationEffort: String, sessionEffort: String, profileDefault: String): String = conversationEffort.ifBlank { sessionEffort }.ifBlank { profileDefault }
+/** The chip names the chat's model as the model picker does: the picker's label for it, else its id read as a name (never the raw id). */
+internal fun chatModelTitle(model: String, groups: List<JSONObject>): String {
+    if (model.isBlank()) return ""
+    val listed = groups.firstNotNullOfOrNull { group -> group.rows("models").firstOrNull { it.string("id") == model || group.string("provider_id") + "/" + it.string("id") == model } }
+    return modelTitle(listed?.string("label").orEmpty(), listed?.string("id") ?: model)
+}
 
 internal data class HistoryAttachmentReference(val kind: String, val name: String)
 internal data class HistoryAttachmentPresentation(val text: String, val attachments: List<HistoryAttachmentReference>)
 
 private val historyAttachmentReference = Regex("""(^|[ \t])@(image|file):(`[^`\r\n]+`|"[^"\r\n]+"|'[^'\r\n]+'|[^ \t\r\n]+)""")
 private val attachmentUuidPrefix = Regex("""(?i)^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32})-""")
+/**
+ * What Hermes' @-reference expander appends below the typed text and stores with the row (agent/context_references.py): each file's type, size and
+ * path on the host. Hermes drops it the same way for titles (agent/title_generator.py, _CONTEXT_FOOTER_RE); the references themselves stay as chips.
+ */
+private val hermesContextFooter = Regex("""(?:\r?\n)+--- (?:Context Warnings|Attached Context) ---\r?\n.*""", RegexOption.DOT_MATCHES_ALL)
+
+/** [text] without Hermes' footer (above): what is below the owner's words of a stored user row and is never theirs. */
+internal fun withoutHermesContextFooter(text: String): String = text.replace(hermesContextFooter, "")
 
 internal fun historyAttachmentPresentation(source: String): HistoryAttachmentPresentation {
-    val normalized = source.replace("\r\n", "\n").replace('\r', '\n')
+    val normalized = withoutHermesContextFooter(source.replace("\r\n", "\n").replace('\r', '\n'))
     val attachments = mutableListOf<HistoryAttachmentReference>()
     val text = normalized.lineSequence().map { line ->
         // Native Hermes quotes any path with spaces, so an unquoted reference ends at the first space.

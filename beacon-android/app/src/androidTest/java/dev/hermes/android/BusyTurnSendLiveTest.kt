@@ -38,7 +38,8 @@ class BusyTurnSendLiveTest {
         require(prior[stringPreferencesKey("origin")].isNullOrBlank()) { "Use an isolated debug install without a saved connection" }
         val authFile = File(app.filesDir, "live-auth.json")
         val credentials = try { JSONObject(authFile.readText(Charsets.UTF_8).removePrefix("\uFEFF")) } finally { if (authFile.exists()) check(authFile.delete()) }
-        require(credentials.optString("purpose") == "beacon_busy_send_demo") { "A dedicated demo fixture is required" }
+        // Chat join (rules25): the shared demo fixture stages its sign-in as "beacon_visual_tour_demo" (demo-fixture.py), as the other live tests read it.
+        require(credentials.optString("purpose") in setOf("beacon_busy_send_demo", "beacon_visual_tour_demo")) { "A dedicated demo fixture is required" }
         val origin = trustedOrigin(credentials.getString("origin"))
         val existingAuth = app.auth.read(origin)
         require(existingAuth.owner.isBlank() && existingAuth.cookies.isEmpty() && existingAuth.bearer == null && existingAuth.loopbackSession == null) { "Use a debug install without saved credentials" }

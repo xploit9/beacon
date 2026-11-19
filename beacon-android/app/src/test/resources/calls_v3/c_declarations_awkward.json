@@ -1,0 +1,55 @@
+{
+  "call_contract": 3,
+  "tool_declarations_complete": true,
+  "tool_declarations_omitted": 0,
+  "tool_declarations": [
+    {
+      "name": "weather_lookup",
+      "description": "Look up a synthetic forecast.",
+      "parameters": {
+        "type": "object",
+        "title": "Forecast request",
+        "additionalProperties": false,
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "properties": {
+          "place": {"type": ["string", "null"], "minLength": 1, "maxLength": 200.0, "pattern": "^[^\\n]+$"},
+          "source": {"type": "string", "format": "uri", "default": "https://example.com/forecast"},
+          "days": {"type": "integer", "minimum": 1, "maximum": 14.5},
+          "units": {"type": ["null", "string"], "enum": ["metric", "imperial"]},
+          "stops": {"type": "array", "minItems": 0, "maxItems": 5, "items": {"type": "object", "properties": {"label": {"type": "string"}}, "required": ["label"]}},
+          "extra": {"type": "object"},
+          "either": {"anyOf": [{"type": "string"}, {"type": "number"}]}
+        },
+        "required": ["place"]
+      },
+      "read_only": true,
+      "tool_id": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1"
+    },
+    {"name": "untyped_array", "description": "An array without items: Gemini Live refuses the whole setup for it.",
+     "parameters": {"type": "object", "properties": {"raw": {"type": ["array", "null"]}}}},
+    {"name": "unresolved_ref", "description": "A schema the plugin failed to inline.",
+     "parameters": {"type": "object", "properties": {"item": {"$ref": "#/$defs/item"}}}},
+    {"name": "leftover_one_of", "description": "A oneOf the plugin did not convert.",
+     "parameters": {"type": "object", "properties": {"choice": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}}},
+    {"name": "numeric_enum", "description": "An enum of numbers.",
+     "parameters": {"type": "object", "properties": {"level": {"type": "integer", "enum": [1, 2, 3]}}}},
+    {"name": "mixed_union", "description": "A union of two real types.",
+     "parameters": {"type": "object", "properties": {"value": {"type": ["string", "integer"]}}}},
+    {"name": "fractional_count", "description": "A count that is not whole.",
+     "parameters": {"type": "object", "properties": {"tags": {"type": "array", "items": {"type": "string"}, "minItems": 1.5}}}},
+    {"name": "too_deep", "description": "Seven levels.",
+     "parameters": {"type": "object", "properties": {"a": {"type": "object", "properties": {"b": {"type": "object", "properties": {"c": {"type": "object", "properties": {"d": {"type": "object", "properties": {"e": {"type": "object", "properties": {"f": {"type": "string"}}}}}}}}}}}}}},
+    {"name": "abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcdefghij_abcd", "description": "A seventy-character name.",
+     "parameters": {"type": "object", "properties": {}}},
+    {"name": "1starts_with_digit", "description": "A name Gemini refuses.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "mail.search", "description": "A dot is fine for a declaration but not for a response.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "hermes_memory", "description": "Takes a call function's name.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "hermes_notes", "description": "Takes the reserved prefix.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "phone_dialer", "description": "Takes the phone prefix.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "discover_tools", "description": "Takes a call function's name.", "parameters": {"type": "object", "properties": {}}},
+    {"name": "notes_find", "description": "Find synthetic notes.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}, "read_only": true},
+    {"name": "notes_find", "description": "The same name again.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}},
+    {"name": "no_description", "description": "  ", "parameters": {"type": "object", "properties": {}}},
+    {"name": "string_root", "description": "A root that is not an object.", "parameters": {"type": "string"}}
+  ]
+}

@@ -52,8 +52,12 @@ class VoiceConnectTest {
     private fun greetingWords(text: String) = json("serverContent" to json("outputTranscription" to json("text" to text)))
     private fun greetingDone() = json("serverContent" to json("generationComplete" to true, "turnComplete" to true))
 
-    /** A Gemini Live double: records every frame, answers setup unless held. */
-    private class Provider(val holdSetup: Boolean = false) : WebSocket.Factory {
+    /**
+     * A Gemini Live double: records every frame, answers setup unless held, or ends the session at its setup ([refuse]: the provider closes it;
+     * [dropAtSetup]: the connection is lost), or never opens ([failOpen]). With [echoClose] a socket closed or cancelled here reports its own end, as OkHttp's does.
+     */
+    private class Provider(val holdSetup: Boolean = false, val refuse: Boolean = false, val echoClose: Boolean = false,
+        val dropAtSetup: Boolean = false, val failOpen: Boolean = false) : WebSocket.Factory {
         val frames = CopyOnWriteArrayList<JSONObject>()
         val sockets = CopyOnWriteArrayList<Pair<WebSocket, WebSocketListener>>()
         override fun newWebSocket(request: okhttp3.Request, listener: WebSocketListener): WebSocket {
@@ -61,15 +65,18 @@ class VoiceConnectTest {
                 override fun request() = request
                 override fun queueSize() = 0L
                 override fun send(bytes: ByteString) = false
-                override fun close(code: Int, reason: String?) = true
-                override fun cancel() = Unit
+                override fun close(code: Int, reason: String?): Boolean { if (echoClose) listener.onClosed(this, code, reason.orEmpty()); return true }
+                override fun cancel() { if (echoClose) listener.onFailure(this, java.io.IOException("Canceled"), null) }
                 override fun send(text: String): Boolean {
                     val frame = JSONObject(text); frames += frame
+                    if (frame.has("setup") && refuse) { listener.onClosing(this, 1008, "Synthetic refusal"); return true }
+                    if (frame.has("setup") && dropAtSetup) { listener.onFailure(this, java.io.IOException("Synthetic: connection lost"), null); return true }
                     if (frame.has("setup") && !holdSetup) listener.onMessage(this, json("setupComplete" to json()).toString())
                     return true
                 }
             }
             sockets += socket to listener
+            if (failOpen) { listener.onFailure(socket, java.io.IOException("Synthetic: no network"), null); return socket }
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
             return socket
         }
@@ -202,6 +209,8 @@ class VoiceConnectTest {
         var cancelState="queued"
         var inlineStatus:String?=null
         var callbackConsent="unset"
+        /** A 1.2.0 plugin whose /work keeps the consent it had (so the app would turn the call back on with its own POST). */
+        var workIgnoresCallback=false
         var completedReply=""
         val inlineInvocations=CopyOnWriteArrayList<JSONObject>()
         var accepted:()->Unit={}
@@ -263,7 +272,7 @@ class VoiceConnectTest {
                     path.endsWith("/work") -> {
                         val buffer=okio.Buffer();request.body!!.writeTo(buffer);preparations+=JSONObject(buffer.readUtf8());posts+=path
                         val body=preparations.last()
-                        native.callbackConsent=if(body.optBoolean("callback")) "requested" else if(body.has("callback")) "declined" else native.callbackConsent
+                        if(!native.workIgnoresCallback) native.callbackConsent=if(body.optBoolean("callback")) "requested" else if(body.has("callback")) "declined" else native.callbackConsent
                         if(body.has("tool_request_id")) {
                             val transfer=native.inlineStatus=="needs_approval"
                             if(transfer) native.inlineStatus="transferred"
@@ -293,14 +302,15 @@ class VoiceConnectTest {
         }
 
     private fun handOffDraft(c:Call)=c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
-        json("id" to "draft-once","name" to "hermes_work","args" to json("text" to "Prepare a synthetic draft only","callback" to true))))))
+        json("id" to "draft-once","name" to "hermes_work","args" to json("text" to "Prepare a synthetic draft only",dev.hermes.android.voice.GeminiWire.OWNER_ASKED_FOR_CALL_BACK to true))))))
 
     private fun adaptiveTool(c:Call,id:String,name:String,args:JSONObject)=c.provider.receive(json("toolCall" to json("functionCalls" to JSONArray().put(
         json("id" to id,"name" to name,"args" to args)))))
 
     private suspend fun adaptiveResult(c:Call,name:String):JSONObject {
-        fun responses()=c.provider.frames.mapNotNull { it.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.optJSONObject(0) }
-        assertTrue(waitFor { responses().any { it.optString("name")==name } })
+        fun responses()=c.provider.frames.flatMap { f -> f.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } }.orEmpty() }
+        // An approval's state waits up to 4 s before the model hears it (device round 2): the first answer can take that long.
+        assertTrue(withTimeoutOrNull(6500) { while (responses().none { it.optString("name")==name }) delay(10); true } == true)
         return responses().last { it.optString("name")==name }.getJSONObject("response")
     }
 
@@ -310,12 +320,35 @@ class VoiceConnectTest {
         try {
             c.voice.start();c.microphone()
             adaptiveTool(c,"quick-native","hermes_work",json("text" to "Synthetic protected quick read","mode" to "inline"))
-            val receipt=adaptiveResult(c,"hermes_work")
-            assertEquals("inline",receipt.getString("work_mode"));assertFalse(receipt.optString("message").contains("offer"))
+            assertTrue(waitFor { native.prompts.size==1 })
             native.completedReply="Synthetic protected result"
-            assertTrue(withTimeoutOrNull(6000) { while(c.provider.frames.none { it.toString().contains("Verified update from Hermes")&&it.toString().contains(native.completedReply) }) delay(10);true }==true)
+            // Calls contract v3, section 4: inline work is answered by its result, as hermes_work's own final response.
+            fun completed()=c.provider.frames.flatMap { f -> f.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } }.orEmpty() }
+                .lastOrNull { it.optString("name")=="hermes_work" }?.getJSONObject("response")?.takeIf { it.optString("status")=="completed" }
+            assertTrue(withTimeoutOrNull(7000) { while(completed()==null) delay(10);true }==true)
+            val receipt=completed()!!
+            assertEquals(native.completedReply,receipt.getString("result"));assertFalse(receipt.getBoolean("will_update"))
+            assertTrue("No scripted turn", c.provider.frames.none { it.toString().contains("Verified update from Hermes") })
+            assertTrue("No offer in any answer", c.provider.frames.filter { it.has("toolResponse") }.none { it.toString().contains("offer") })
             assertEquals(1,native.prompts.size);assertEquals("unset",native.callbackConsent)
             assertTrue(posts.none { it.endsWith("/callback") })
+        } finally { c.close() }
+    }
+
+    // REVIEW-E3 finding 3: a follow's call back goes on with its own request or not at all; no POST afterwards turns it on without the
+    // owner's answer to a question (the same guard as hermes_callback). A decline is still sent.
+    @Test(timeout=10000) fun aFollowNeverTurnsTheCallBackOnAfterItsRequest()=runBlocking {
+        val native=ContinuationNative().apply { inlineStatus="running";workIgnoresCallback=true }
+        val prepared=CopyOnWriteArrayList<JSONObject>();val posts=CopyOnWriteArrayList<String>()
+        val c=Call(client=continuationClient(native,prepared,posts))
+        try {
+            c.voice.start();c.microphone()
+            adaptiveTool(c,"quick-action","invoke_tool",json("tool_id" to "a".repeat(64),"arguments" to "{\"query\":\"synthetic\"}"))
+            val original=adaptiveResult(c,"invoke_tool")
+            adaptiveTool(c,"follow-existing","hermes_follow",json("request_id" to original.getString("request_id"),"callback" to true))
+            adaptiveResult(c,"hermes_follow")
+            delay(1_700)
+            assertTrue(posts.toString(),posts.none { it.endsWith("/callback") });assertEquals("unset",native.callbackConsent)
         } finally { c.close() }
     }
 
@@ -347,7 +380,9 @@ class VoiceConnectTest {
             adaptiveTool(c,"pending-action","invoke_tool",json("tool_id" to "a".repeat(64),"arguments" to "{\"query\":\"synthetic\"}"))
             val original=adaptiveResult(c,"invoke_tool")
             adaptiveTool(c,"transfer-pending","hermes_follow",json("request_id" to original.getString("request_id")))
-            assertEquals("queued",adaptiveResult(c,"hermes_follow").getString("status"))
+            val followed=adaptiveResult(c,"hermes_follow")
+            // Device round 1: an admitted hand-over is said at once as handed_over.
+            assertEquals("handed_over",followed.getString("status"));assertEquals("durable-job",followed.getString("job_id"))
             assertEquals(1,native.inlineInvocations.size);assertEquals(1,native.prompts.size)
             assertEquals("Continue the exact original receipt",native.prompts.single().getString("text"))
             assertEquals("stored",native.prompts.single().getString("session_id"))
@@ -380,10 +415,12 @@ class VoiceConnectTest {
         try {
             c.voice.start();c.microphone();handOffDraft(c)
             val result=invocationResult(c)
-            assertEquals("queued",result.getString("status"));assertEquals("scheduled",result.getString("callback"))
-            assertEquals("durable-job",result.getString("job_id"))
+            assertEquals("handed_over",result.getString("status"));assertEquals("requested",result.getString("callback_consent"))
+            assertEquals("durable-job",result.getString("job_id"));assertTrue(result.getBoolean("will_update"))
             handOffDraft(c)
-            assertTrue(waitFor { c.provider.frames.count { it.has("toolResponse") }>=2 })
+            delay(500)
+            // Calls contract v3, section 6: the same open call is not told its state again; it keeps the job and the callback it had.
+            assertEquals(1,c.provider.frames.count { it.has("toolResponse") })
             assertEquals(1,native.prompts.size);assertEquals(1,preparations.size)
         } finally { c.close() }
     }
@@ -415,10 +452,12 @@ class VoiceConnectTest {
         }
     }
 
+    /** The first result as Hermes gave it (a request still running past the notice is told "still_running" first: CallLinkState). */
     private suspend fun invocationResult(c: Call): JSONObject {
-        assertTrue("The model receives the tool result", waitFor { c.provider.frames.any { it.has("toolResponse") } })
-        return c.provider.frames.first { it.has("toolResponse") }.getJSONObject("toolResponse")
-            .getJSONArray("functionResponses").getJSONObject(0).getJSONObject("response")
+        fun results() = c.provider.frames.flatMap { f -> f.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } }.orEmpty() }
+            .map { it.getJSONObject("response") }.filter { it.optString("status") != "still_running" }
+        assertTrue("The model receives the tool result", waitFor { results().isNotEmpty() })
+        return results().first()
     }
 
     @Test(timeout = 18000) fun nameLookupWaitsForAValidCatalogueBeyondTheOldEightSecondDeadline() = runBlocking {
@@ -446,9 +485,9 @@ class VoiceConnectTest {
             try {
                 c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); invokeWeather(c)
                 val result = invocationResult(c)
-                assertTrue("An unverified lookup must be unavailable or not sent: $result", result.optString("status") in setOf("unavailable", "not_sent"))
-                assertFalse(result.toString().contains("no tool named", ignoreCase = true))
-                assertEquals("hermes_work", result.optString("fallback_tool"))
+                assertEquals("failed", result.optString("status"))
+                assertNotEquals("An unread tool list is never a confirmed missing tool: $result", "tool_unknown", result.optString("detail"))
+                assertEquals(false, result.get("ran_on_hermes"))
                 assertTrue("Lookup failure never invokes a tool", invocations.isEmpty())
             } finally { c.close() }
         }
@@ -468,52 +507,37 @@ class VoiceConnectTest {
         return (0 until declarations.length()).map { declarations.getJSONObject(it).getString("name") }.toSet()
     }
 
-    @Test(timeout = 15000) fun aFirstToolSearchThatTimesOutIsRetriedOnceAndTheModelGetsTheTools() = runBlocking {
+    // Calls contract v3: no retry ladder and no "still starting" script. A tool search is one request; the model gets its real
+    // answer, or a failure with its reason, and decides itself what to do next (CALLS-A Part 2).
+    @Test(timeout = 15000) fun aToolSearchThatFailsIsAnsweredOnceWithItsReasonAndNoScript() = runBlocking {
+        val searches = AtomicInteger()
+        val c = Call(client = lookupClient({ searches.incrementAndGet(); 504 to json("detail" to "Tool lookup still settling") }, CopyOnWriteArrayList()), streamsMicrophone = false)
+        try {
+            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); discoverCall(c)
+            val result = lastToolResponse(c)
+            assertEquals("One search, not a ladder", 1, searches.get())
+            assertEquals("failed", result.getString("status")); assertEquals("http_504", result.getString("detail"))
+            assertFalse(result.getBoolean("will_update")); assertFalse(result.has("message")); assertFalse(result.has("fallback_tool"))
+        } finally { c.close() }
+    }
+
+    @Test(timeout = 15000) fun aCatalogueStillStartingIsSaidAsHermesSaidItEveryTime() = runBlocking {
         val searches = AtomicInteger()
         val c = Call(client = lookupClient({
-            if (searches.incrementAndGet() == 1) 504 to json("detail" to "Tool lookup still settling")
-            else 200 to json("tools" to JSONArray().put(json("name" to "search_mail", "tool_id" to "a".repeat(64))))
+            if (searches.incrementAndGet() == 2) 200 to json("tools" to JSONArray().put(json("name" to "search_mail", "tool_id" to "a".repeat(64))))
+            else 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0)
         }, CopyOnWriteArrayList()), streamsMicrophone = false)
-        try {
-            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); discoverCall(c)
-            val result = lastToolResponse(c)
-            assertEquals("one retry after the first answer failed", 2, searches.get())
-            assertEquals("search_mail", result.getJSONArray("tools").getJSONObject(0).getString("name"))
-            assertNotEquals("unavailable", result.optString("status"))
-            assertFalse("The owner is not shown a failed search for a catalogue that was only starting",
-                c.events.any { it.optString("type") == "tool_receipt" && it.optString("tool_name") == "discover_tools" && it.optString("status") == "failed" })
-        } finally { c.close() }
-    }
-
-    @Test(timeout = 15000) fun aCatalogueThatIsStillStartingIsRetriedOnceAndThenSaidToBeStartingNotUnavailable() = runBlocking {
-        val searches = AtomicInteger()
-        val c = Call(client = lookupClient({ searches.incrementAndGet(); 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0) }, CopyOnWriteArrayList()),
-            streamsMicrophone = false)
-        try {
-            c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); discoverCall(c)
-            val result = lastToolResponse(c)
-            assertEquals(2, searches.get())
-            assertEquals("starting", result.getString("status"))
-            assertTrue(result.getString("message").contains("hermes_work"))
-            assertNotEquals("unavailable", result.optString("status"))
-        } finally { c.close() }
-    }
-
-    // Ponytail review, 7 Nov 2026 (finding 7): "still starting" must end, or a hung MCP server leaves the call asking for ever.
-    @Test(timeout = 25000) fun theSecondStillStartingAnswerInARowIsAFailureSoTheModelHandsOffInsteadOfAskingAgain() = runBlocking {
-        val searches = AtomicInteger()
-        val c = Call(client = lookupClient({ searches.incrementAndGet(); 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0) }, CopyOnWriteArrayList()),
-            streamsMicrophone = false)
         try {
             c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
             discoverCall(c, "discover-1")
-            assertEquals("starting", lastToolResponse(c, 1).getString("status"))
+            val first = lastToolResponse(c, 1)
+            assertEquals("starting", first.getString("status")); assertFalse(first.has("message"))
             discoverCall(c, "discover-2")
-            val second = lastToolResponse(c, 2)
-            assertEquals("unavailable", second.getString("status"))
-            assertEquals("hermes_work", second.getString("fallback_tool"))
-            assertTrue(second.getString("message").contains("Call hermes_work now"))
-            assertEquals("each search looked twice, no more", 4, searches.get())
+            assertEquals("search_mail", lastToolResponse(c, 2).getJSONArray("tools").getJSONObject(0).getString("name"))
+            discoverCalls(c, "mail-3", "calendar-3")
+            val together = toolResponses(c, 4)
+            assertEquals("starting", together.getValue("mail-3").getString("status")); assertEquals("starting", together.getValue("calendar-3").getString("status"))
+            assertEquals("Each search is one request", 4, searches.get())
         } finally { c.close() }
     }
 
@@ -522,52 +546,24 @@ class VoiceConnectTest {
 
     /** Every tool result the model has received so far, by function call id, once at least [count] responses are in. */
     private suspend fun toolResponses(c: Call, count: Int): Map<String, JSONObject> {
-        assertTrue("The model receives $count tool results", waitFor { c.provider.frames.count { it.has("toolResponse") } >= count })
-        return c.provider.frames.filter { it.has("toolResponse") }.flatMap { frame ->
+        fun all() = c.provider.frames.filter { it.has("toolResponse") }.flatMap { frame ->
             val responses = frame.getJSONObject("toolResponse").getJSONArray("functionResponses")
             (0 until responses.length()).map { responses.getJSONObject(it) }
-        }.associate { it.getString("id") to it.getJSONObject("response") }
+        }
+        // One release can carry several results in one tool response (CallLinkState): the results are counted, not the frames.
+        assertTrue("The model receives $count tool results", waitFor { all().size >= count })
+        return all().associate { it.getString("id") to it.getJSONObject("response") }
     }
 
-    // Ponytail re-review, 7 Nov 2026 (N3): the count means two rounds of asking over time, not two searches of one turn.
-    @Test(timeout = 25000) fun twoSearchesAskedInTheSameTurnAreOneStillStartingRoundNotTwo() = runBlocking {
-        val c = Call(client = lookupClient({ 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0) }, CopyOnWriteArrayList()),
-            streamsMicrophone = false)
-        try {
-            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
-            discoverCalls(c, "mail-1", "calendar-1")
-            val together = toolResponses(c, 2)
-            assertEquals("the mail search is told to try once more", "starting", together.getValue("mail-1").getString("status"))
-            assertEquals("and so is the calendar search, it is not handed off early", "starting", together.getValue("calendar-1").getString("status"))
-            discoverCalls(c, "mail-2")
-            val later = toolResponses(c, 3).getValue("mail-2")
-            assertEquals("the model's own second try after that answer is the one that hands off", "unavailable", later.getString("status"))
-            assertEquals("hermes_work", later.getString("fallback_tool"))
-        } finally { c.close() }
-    }
-
-    @Test(timeout = 15000) fun theCallInstructionSaysWhenToStopAskingForTheToolList() = runBlocking {
+    @Test(timeout = 15000) fun theCallInstructionSaysWhereToFindMoreToolsAndWhenToHandOver() = runBlocking {
         val c = Call(client = lookupClient({ 200 to json("tools" to JSONArray()) }, CopyOnWriteArrayList()), streamsMicrophone = false)
         try {
             c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
-            assertTrue(c.provider.setups().first().toString().contains("do not ask again: call hermes_work"))
-        } finally { c.close() }
-    }
-
-    @Test(timeout = 25000) fun aSearchThatFindsTheToolsStartsTheStillStartingCountAgain() = runBlocking {
-        val searches = AtomicInteger()
-        val c = Call(client = lookupClient({
-            if (searches.incrementAndGet() == 3) 200 to json("tools" to JSONArray().put(json("name" to "search_mail", "tool_id" to "a".repeat(64))))
-            else 200 to json("status" to "starting", "tools" to JSONArray(), "total_matches" to 0)
-        }, CopyOnWriteArrayList()), streamsMicrophone = false)
-        try {
-            c.voice.start(); assertTrue(waitFor { "listening" in c.states() })
-            discoverCall(c, "discover-1")
-            assertEquals("starting", lastToolResponse(c, 1).getString("status"))
-            discoverCall(c, "discover-2")
-            assertEquals("search_mail", lastToolResponse(c, 2).getJSONArray("tools").getJSONObject(0).getString("name"))
-            discoverCall(c, "discover-3")
-            assertEquals("a later cold start is told once again, not failed at once", "starting", lastToolResponse(c, 3).getString("status"))
+            // Calls contract v3, section 7: no scripted hand-off after failed lookups; the model is told where tools are and when to hand over.
+            val setup = c.provider.setups().first().toString()
+            assertTrue(setup.contains(dev.hermes.android.voice.CallInstruction.DISCOVER.trim()))
+            assertTrue(setup.contains("hand it to Hermes with hermes_work right away"))
+            assertFalse(setup.contains("do not ask again: call hermes_work"))
         } finally { c.close() }
     }
 
@@ -581,14 +577,12 @@ class VoiceConnectTest {
             assertTrue("hermes_work", "hermes_work" in declaredTools(c))
             assertTrue("hermes_follow", "hermes_follow" in declaredTools(c))
             val instruction = c.provider.setups().first().toString()
-            assertTrue(instruction.contains("hermes_work is always available"))
-            assertTrue(instruction.contains("Never say you are routing, handing off or sending something to Hermes unless you call hermes_work"))
+            assertTrue(instruction.contains("hand it to Hermes with hermes_work right away"))
+            assertTrue(instruction.contains("never say it without making the call"))
             discoverCall(c)
             val result = lastToolResponse(c)
-            assertEquals(2, searches.get())
-            assertEquals("unavailable", result.getString("status"))
-            assertEquals("hermes_work", result.getString("fallback_tool"))
-            assertTrue(result.getString("message").contains("Call hermes_work now"))
+            assertEquals(1, searches.get())
+            assertEquals("failed", result.getString("status")); assertEquals("http_504", result.getString("detail"))
         } finally { c.close() }
     }
 
@@ -599,7 +593,7 @@ class VoiceConnectTest {
             c.voice.start(); assertTrue(waitFor { "listening" in c.states() }); invokeWeather(c)
             val result = invocationResult(c)
             assertEquals("failed", result.getString("status"))
-            assertTrue(result.toString().contains("no tool named", ignoreCase = true))
+            assertEquals("tool_unknown", result.getString("detail"))
             assertTrue(invocations.isEmpty())
         } finally { c.close() }
     }
@@ -839,6 +833,123 @@ class VoiceConnectTest {
         } finally { voice.close(); scope.cancel(); client.closeNative() }
     }
 
+    /**
+     * A tap right after the owner opens a chat meets its warm session still connecting (about 1.2-1.4 s after the chat opens on the
+     * emulator, 14 Nov 2026). The call takes it as it is: the same socket and setup carry on, and the greeting is asked for the
+     * moment setup is answered, so a call never waits longer than a fresh connection would.
+     */
+    @Test fun aSessionTakenBeforeItsSetupAnsweredCarriesOnAndGreetsAtOnce() = runBlocking {
+        val provider = Provider(holdSetup = true)
+        var clock = 1_000L
+        val warm = LiveSession(Scope("https://voice-fixture.invalid", "owner", "default", session = "stored"), gemini, context, provider) { clock }
+        assertEquals("Setup goes out when the socket opens, before any tap", 1, provider.setups().size)
+        clock = 1_300L
+        warm.startTurn(liveStartCue(context))
+        assertTrue("No greeting is asked for before setup is answered", provider.cues().isEmpty())
+        val heard = CopyOnWriteArrayList<String>()
+        warm.attach(object : WebSocketListener() { override fun onMessage(webSocket: WebSocket, text: String) { heard += text } })
+        clock = 1_900L
+        provider.receive(json("setupComplete" to json()))
+        assertEquals("One socket: the call carried on the session it took", 1, provider.sockets.size)
+        assertEquals("One setup: nothing was sent again", 1, provider.setups().size)
+        assertEquals("The greeting is asked for as soon as setup is answered", 1, provider.cues().size)
+        assertEquals(1_900L, warm.setupAt); assertEquals(1_900L, warm.cueSentAt)
+        assertTrue("The call hears the setup answer itself", heard.any { JSONObject(it).has("setupComplete") })
+        warm.close()
+    }
+
+    /**
+     * Right after the owner switches chats, a call finds the new chat's context only together with its session (fault suite,
+     * 14 Nov 2026: the context was published first, a tap 0.36 s after the switch found it alone and opened a second connection).
+     */
+    @Test fun aChatsContextIsNeverReadyWithoutItsSession() = runBlocking {
+        val provider = Provider(holdSetup = true)
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { 0L })
+        val chatA = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-a")
+        val chatB = chatA.session("chat-b")
+        fun prefetched(chat: Scope) = dev.hermes.android.voice.PrefetchedContext(chat, "", JSONObject(context.toString()).put("selected_session_id", chat.session), 0L)
+        prewarm.prepare(chatA, gemini, prefetched(chatA), provider)
+        assertNotNull(prewarm.context(chatA, ""))
+        assertNull("Before chat B is prepared a call finds nothing of it, and connects on its own", prewarm.context(chatB, ""))
+        prewarm.prepare(chatB, gemini, prefetched(chatB), provider)
+        assertNotNull(prewarm.context(chatB, ""))
+        val taken = prewarm.claim(chatB, gemini)
+        assertNotNull("The context comes with its session, still connecting", taken)
+        assertEquals(chatB, taken!!.target); assertTrue(taken.setupAt < 0)
+        assertEquals("Chat A's session made way for B's; no other connection", 2, provider.sockets.size)
+        assertTrue(provider.sockets.size == provider.setups().size)
+        taken.close()
+    }
+
+    private fun prefetchedFor(chat: Scope) = dev.hermes.android.voice.PrefetchedContext(chat, "", JSONObject(context.toString()).put("selected_session_id", chat.session), 0L)
+
+    /** A call between BeaconCallService's `starting` and its claim: busy (active || starting) and starting, as the service reports it. */
+    private class StartingCall { @Volatile var starting = false; @Volatile var active = false; val busy get() = active || starting }
+
+    /**
+     * Device round 1 (14 Nov 2026), leg C and the fault-suite baseline: the session was ready (or connecting) at the tap, but the prewarm
+     * loop looked between the call's `starting` and its claim, saw a busy call and closed it, so the call opened a second session
+     * (2,368 / 2,727 ms to the first audio instead of 0.8-1.1 s). A starting call always takes the session it finds.
+     */
+    @Test fun aStartedCallTakesItsReadySessionWhenThePrewarmLooksBeforeTheClaim() = runBlocking {
+        val provider = Provider()
+        val call = StartingCall()
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { call.busy }, clock = { 0L }, callStarting = { call.starting })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-c")
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        assertTrue("Ready before the tap", prewarm.ready(chat))
+        call.starting = true
+        // The loop wakes on the touch-down poke while the start reads the owner's name.
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        call.active = true
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        val taken = prewarm.claim(chat, gemini)
+        assertNotNull("The started call takes the ready session", taken)
+        assertFalse(taken!!.dead)
+        assertTrue("Still ready: nothing was set up again", taken.setupAt >= 0)
+        assertEquals("One provider session for the call", 1, provider.sockets.size)
+        taken.close()
+    }
+
+    /** The same window when the chat's call entry leaves as the call screen opens (the loop's no-entry path), with the session still connecting. */
+    @Test fun aStartedCallTakesItsConnectingSessionWhenTheEntryLeavesBeforeTheClaim() = runBlocking {
+        val provider = Provider(holdSetup = true)
+        val call = StartingCall()
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { call.busy }, clock = { 0L }, callStarting = { call.starting })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-b")
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        call.starting = true; call.active = true
+        prewarm.drop()
+        val taken = prewarm.claim(chat, gemini)
+        assertNotNull("The started call takes the session still connecting", taken)
+        assertFalse(taken!!.dead); assertTrue(taken.setupAt < 0)
+        assertEquals(1, provider.sockets.size)
+        taken.close()
+    }
+
+    /** A live call that did not take the session (a locked start, another chat) never has a second provider session beside its own. */
+    @Test fun aLiveCallLeavesNoWarmSessionBesideItsOwn() = runBlocking {
+        val provider = Provider()
+        val call = StartingCall()
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { call.busy }, clock = { 0L }, callStarting = { call.starting })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-a")
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        call.active = true
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        assertFalse("Closed once the call is live", prewarm.ready(chat))
+        assertEquals("Nothing new opens beside the call", 1, provider.sockets.size)
+    }
+
+    /** A call that starts without taking the warm session (an incoming call, a locked phone) closes it at once: one provider session per call. */
+    @Test fun aCallThatDoesNotTakeTheWarmSessionClosesItAtTheClaim() = runBlocking {
+        val provider = Provider()
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { 0L })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-d")
+        prewarm.prepare(chat, gemini, prefetchedFor(chat), provider)
+        assertNull(prewarm.claim(null, gemini))
+        assertFalse("The session the call did not take is closed at its claim", prewarm.ready(chat))
+    }
+
     @Test fun heldFramesAreNeverPresentedByAWarmSessionNobodyTook() = runBlocking {
         val provider = Provider()
         val warm = LiveSession(Scope("https://voice-fixture.invalid", "owner", "default", session = "stored"), gemini, context, provider) { 0L }
@@ -901,11 +1012,11 @@ class VoiceConnectTest {
     @Test fun theLiveSetupGreetsOnceInTheOwnersLanguageAndOtherwiseAnswersWithHermesTools() {
         val instruction = liveInstruction(context, gemini.personalityInstruction, gemini.model)
         assertTrue(instruction.contains("\"Maya\"") && instruction.contains("otherwise Arabic") && instruction.contains("one short, warm greeting"))
-        assertTrue("The session answers the owner itself", instruction.contains("You answer the owner yourself, in your own voice"))
+        assertTrue("The session answers the owner itself", instruction.contains("Answer yourself as soon as the owner finishes"))
         assertTrue(liveInstruction(json("profile" to "default")).contains("without using any name"))
         val callback = liveInstruction(json("callback" to json("reason" to "the flight check")))
         assertTrue(callback.contains("callback the owner asked for") && callback.contains("the flight check"))
-        assertFalse("The callback reason is data, not the trusted opening", callback.substringAfter("Trusted natural opening guidance:\n").substringBefore('\n').contains("the flight check"))
+        assertFalse("The callback reason is data, not the trusted opening", callback.substringAfter("Call opening:\n").substringBefore('\n').contains("the flight check"))
         val setup = liveSetup(gemini, context).getJSONObject("setup")
         val tools = setup.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
         val names = (0 until tools.length()).map { tools.getJSONObject(it).getString("name") }
@@ -920,5 +1031,145 @@ class VoiceConnectTest {
         assertTrue(warmIdleLimitMs("gemini") > warmIdleLimitMs("grok"))
         assertTrue("Gemini and OpenAI stay warm while the entry shows", warmRenewsWhenIdle("gemini") && warmRenewsWhenIdle("openai"))
         assertFalse("Grok rests after its idle minute", warmRenewsWhenIdle("grok"))
+    }
+
+    /** [chat]'s context as the plugin returned it, with [summary] as its conversation so far (a newer message changes it). */
+    private fun contextFor(chat: Scope, summary: String = "") = dev.hermes.android.voice.PrefetchedContext(chat, "",
+        JSONObject(context.toString()).put("selected_session_id", chat.session).apply { if (summary.isNotBlank()) put("context_summary", summary) }, 0L)
+
+    /**
+     * CHAT-121 follow-up 10: a warm-up is a whole call setup (about 43 KB) in the phone's one upload queue. While the provider refused it, chat-121-10 sent
+     * another at every look, 25 s apart, on any link (the demo's Gemini on 17 Nov: a 43 KB upload every 25 s while a chat was on screen). A refusal now rests
+     * the warm-up for 2 minutes, then 4, then 8; the Call button showing again does not end the rest, another key does.
+     */
+    @Test fun aWarmUpTheProviderRefusesRestsInsteadOfSendingItsSetupAtEveryLook() = runBlocking {
+        val provider = Provider(refuse = true, echoClose = true)
+        var now = 0L
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { now })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-r")
+        prewarm.prepare(chat, gemini, contextFor(chat), provider)
+        while (now < 500_000) { now += 25_000; prewarm.prepare(chat, gemini, contextFor(chat), provider) }
+        assertEquals("a setup at 0 s, one after the 2-minute rest, one after the 4-minute rest", 3, provider.setups().size)
+        assertEquals("resting: setup refused", prewarm.status)
+        assertFalse(prewarm.ready(chat))
+        // The Call button showing again (a send emptied the composer) is no new try.
+        prewarm.pressed(arm = false)
+        now += 25_000; prewarm.prepare(chat, gemini, contextFor(chat), provider)
+        assertEquals(3, provider.setups().size)
+        // A new key is tried at once.
+        val rekeyed = VoiceSessionCredentials("gemini", "fixture-provider-key-2", defaultVoiceModel("gemini"), defaultVoiceName("gemini"), "balanced", 1)
+        prewarm.prepare(chat, rekeyed, contextFor(chat), provider)
+        assertEquals(4, provider.setups().size)
+    }
+
+    /**
+     * CHAT-121 follow-up 10: on a link too slow for a call (the setup not answered 6 s after its socket opened; a working link answers in 0.7-1.3 s) the
+     * warm-up rests. The chat's newer context sends no second setup while the first is on its way, and none during the rest; the context it was set up with
+     * stays published with it until then. Another network ends the rest at once.
+     */
+    @Test fun aSetupTheLinkCarriesSlowlyRestsTheWarmUpUntilAnotherNetwork() = runBlocking {
+        val provider = Provider(holdSetup = true, echoClose = true)
+        var now = 0L
+        var network = "cellular"
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { now }, network = { network })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-s")
+        prewarm.prepare(chat, gemini, contextFor(chat), provider)
+        now += 1_000
+        prewarm.prepare(chat, gemini, contextFor(chat, "A newer message"), provider)
+        assertEquals("a setup on its way is not replaced", 1, provider.setups().size)
+        assertEquals("the context it was set up with stays published with it", "", prewarm.context(chat, "")?.optString("context_summary"))
+        now += 6_000
+        prewarm.prepare(chat, gemini, contextFor(chat, "A newer message"), provider)
+        assertEquals("resting: slow link", prewarm.status)
+        assertFalse(prewarm.ready(chat))
+        for (look in 1..4) { now += 25_000; prewarm.prepare(chat, gemini, contextFor(chat, "Message $look"), provider) }
+        assertEquals("no other setup while it rests", 1, provider.setups().size)
+        network = "wifi"; now += 1_000
+        prewarm.prepare(chat, gemini, contextFor(chat, "Message 5"), provider)
+        assertEquals("another network: a new warm-up", 2, provider.setups().size)
+    }
+
+    /**
+     * CHAT-121 follow-up 10, calls stay instant on a working link: the setup answered at once, then the chat's context changes three times and each change
+     * replaces the warm session at once with one set up with it, ready for a call, and nothing rests. The replaced sessions report their own end (as OkHttp's
+     * do after a cancel), and that is not taken for a refusal.
+     */
+    @Test fun onAWorkingLinkEachContextChangeStillReplacesTheWarmSessionAtOnce() = runBlocking {
+        val provider = Provider(echoClose = true)
+        var now = 0L
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { now })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-w")
+        prewarm.prepare(chat, gemini, contextFor(chat), provider)
+        assertTrue(prewarm.ready(chat))
+        for (change in 1..3) {
+            now += 25_000
+            prewarm.prepare(chat, gemini, contextFor(chat, "Message $change"), provider)
+            assertTrue("change $change: ready at once", prewarm.ready(chat))
+            assertEquals("Message $change", prewarm.context(chat, "")?.optString("context_summary"))
+        }
+        assertEquals(4, provider.setups().size)
+        assertEquals("ready", prewarm.status)
+        val taken = prewarm.claim(chat, gemini)
+        assertNotNull(taken)
+        assertTrue("the call takes a session already set up", taken!!.setupAt >= 0)
+        taken.close()
+    }
+
+    /**
+     * CHAT-121 follow-up 10: only a setup that went can rest the warm-up. A socket that never opened (no network, a handover) sent no setup, and a connection
+     * lost at its setup, not closed by the provider, says nothing of the provider or the link: the next look opens another, as chat-121-10 did.
+     */
+    @Test fun aSocketThatNeverOpenedOrAConnectionLostAtItsSetupRestsNothing() = runBlocking {
+        for ((name, provider) in listOf("never opened" to Provider(failOpen = true, echoClose = true), "lost at its setup" to Provider(dropAtSetup = true, echoClose = true))) {
+            var now = 0L
+            val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { now })
+            val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-l")
+            prewarm.prepare(chat, gemini, contextFor(chat), provider)
+            now += 25_000
+            prewarm.prepare(chat, gemini, contextFor(chat), provider)
+            assertEquals(name, 2, provider.sockets.size)
+            assertFalse("$name: ${prewarm.status}", prewarm.status.startsWith("resting"))
+        }
+    }
+
+    /**
+     * CHAT-121 follow-up 10, window 3: the chat's Call button leaves when a message is typed, and the prewarm then drops its session. A setup the link
+     * carried slowly (answered 22 s after its socket opened) still rests the warm-up: on chat-121-11's first build it was dropped unlearned, and the
+     * button's return sent another whole setup into the 2 KB/s queue, in front of the message's own submit.
+     */
+    @Test fun aSlowSetupStillRestsTheWarmUpWhenTheCallButtonLeavesFirst() = runBlocking {
+        val provider = Provider(holdSetup = true, echoClose = true)
+        var now = 0L
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { now }, network = { "cellular" })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-d")
+        prewarm.prepare(chat, gemini, contextFor(chat), provider)
+        now += 22_000
+        provider.receive(json("setupComplete" to json()))
+        prewarm.drop()
+        now += 80_000
+        prewarm.prepare(chat, gemini, contextFor(chat, "A newer message"), provider)
+        assertEquals("no second setup after the slow one", 1, provider.setups().size)
+        assertEquals("resting: slow link", prewarm.status)
+    }
+
+    /**
+     * CHAT-121 follow-up 10, window 3: the Call button left 2 s after a warm-up went (a message typed), before its setup was answered. The session is kept,
+     * never presented, until it shows what the link is: answered 22 s after its socket opened, it rests the warm-up, and the button's return sends no
+     * second setup into the slow link.
+     */
+    @Test fun aSetupStillOnItsWayWhenTheCallButtonLeavesStillRestsTheWarmUpOnceAnswered() = runBlocking {
+        val provider = Provider(holdSetup = true, echoClose = true)
+        var now = 0L
+        val prewarm = dev.hermes.android.voice.CallPrewarm(dev.hermes.android.BeaconApplication(), { null }, { false }, clock = { now }, network = { "cellular" })
+        val chat = Scope("https://voice-fixture.invalid", "owner", "default", session = "chat-e")
+        prewarm.prepare(chat, gemini, contextFor(chat), provider)
+        now += 2_000
+        prewarm.drop()
+        now += 20_000
+        provider.receive(json("setupComplete" to json()), 0)
+        now += 60_000
+        prewarm.prepare(chat, gemini, contextFor(chat, "A newer message"), provider)
+        assertEquals("no second setup after the slow one", 1, provider.setups().size)
+        assertEquals("resting: slow link", prewarm.status)
     }
 }

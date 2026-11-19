@@ -172,10 +172,41 @@ class TranslationKeysTest {
             "UpdateFailureStrings" to UpdateFailureStrings, "PluginRowStrings" to PluginRowStrings, "CallToolStrings" to CallToolStrings, "CallStrings" to CallStrings, "CallFailureStrings" to CallFailureStrings,
             "PhoneAccessStrings" to (PhoneAccessStrings + PhoneAccessLabels), "ErrorStrings" to ErrorStrings, "DeliveryNameStrings" to DeliveryNameStrings, "ScheduleBuilderStrings" to ScheduleBuilderStrings, "HistoryRetentionStrings" to HistoryRetentionStrings, "VoiceStyleStrings" to VoiceStyleStrings,
             "BotModeNavigationStrings" to BotModeNavigationStrings, "ScheduleRunStrings" to ScheduleRunStrings,
+            // Chat join (rules23): EMU-JOIN's host reason-code lines, shown through uiText on every agent-phone screen.
+            "AgentPhoneLines" to dev.hermes.android.agentphone.AgentPhoneLines.templates.values.toList(),
         )
         lists.forEach { (name, texts) -> assertTrue("$name is empty, so nothing is checked.", texts.isNotEmpty()) }
         val missing = untranslated(lists.flatMap { (name, texts) -> texts.map { it to name } })
         assertTrue("These fixed labels show in English in another language. Add their translations to native-locales.json:\n" +
+            missing.joinToString("\n"), missing.isEmpty())
+    }
+
+    // Chat join (Root msg_eeff791d557e): a line can reach notice() through a constant or a String helper, which the literal scan above cannot see.
+    // CARDS-121's three answer lines did, with no translation anywhere, and so did four 1.2.0 progress notices. A constant named ..._NOTICE is an
+    // on-screen line, and so is every result of a constant or helper passed to notice().
+    @Test fun everyNoticeLineReachedThroughAConstantOrAHelperIsTranslatedInEveryLanguage() {
+        val sources = File(app, "src/main").walkTopDown().filter { it.extension == "kt" }.sortedBy { it.path }.map { it.name to it.readText().replace("\r\n", "\n") }.toList()
+        val constant = Regex("""\bconst val ([A-Z][A-Z0-9_]*)\s*=\s*"((?:[^"\\\n]|\\.)*)"""")
+        val constants = sources.flatMap { (_, text) -> constant.findAll(text).map { it.groupValues[1] to unescape(it.groupValues[2]) } }.toMap()
+        // A String helper with an expression body, read up to the next top-level declaration.
+        val helper = Regex("""(?m)^(?:internal |private )?fun ([a-z][A-Za-z0-9]*)\([^)]*\)\s*:\s*String\s*=""")
+        val declaration = Regex("""(?m)^(?:internal |private |public )?(?:fun|val|const|class|object|data|enum|sealed|interface|/\*\*|@)""")
+        val helpers = sources.flatMap { (_, text) -> helper.findAll(text).map { m ->
+            m.groupValues[1] to text.substring(m.range.last + 1, declaration.find(text, m.range.last + 1)?.range?.first ?: text.length) } }.toMap()
+        val constantName = Regex("""\b([A-Z][A-Z0-9_]+)\b""")
+        fun results(body: String) = shown(body.trim()) + constantName.findAll(body).filter { m -> m.groupValues[1] in constants &&
+            listOf("->", "==", "!=").none { body.drop(m.range.last + 1).trimStart().startsWith(it) } }.map { constants.getValue(it.groupValues[1]) }
+        val noticeCall = Regex("""\bnotice\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*([,()])""")
+        val found = sources.flatMap { (name, text) -> noticeCall.findAll(text).flatMap { m ->
+            val at = "$name:${text.take(m.range.first).count { c -> c == '\n' } + 1}"
+            when {
+                m.groupValues[2] != "(" -> listOfNotNull(constants[m.groupValues[1]])
+                else -> helpers[m.groupValues[1]]?.let(::results).orEmpty()
+            }.map { it to at }
+        } } + constants.filterKeys { "NOTICE" in it }.map { (name, text) -> text to name }
+        assertTrue("Found only ${found.size} lines through constants and helpers, so the scan is broken.", found.size >= 10)
+        val missing = untranslated(found.filter { it.first.isNotBlank() })
+        assertTrue("These notice lines reach the screen through a constant or a helper and show in English in another language. Add their translations to native-locales.json:\n" +
             missing.joinToString("\n"), missing.isEmpty())
     }
 

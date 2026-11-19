@@ -77,7 +77,10 @@ private fun clearVaultInput(value: JSONObject) { value.keys().asSequence().toLis
     // The profile the settings are open for (Manage profile > Vault), else the one in use: the page always shows one profile's own vault.
     val active = vm.settingsProfileClient()
     val version = vm.settingsProfileVersion()
-    val state = remember(active, version) { VaultPageState(active?.let { vm.screens.exact(it.scope, VAULT_CACHE_KEY)?.value }?.let { runCatching { VaultSnapshot.from(it) }.getOrNull() }) }
+    val settingsTarget by vm.settingsProfile.collectAsStateWithLifecycle()
+    // Before the client exists (a cold start, or offline) the saved list of the signed-in profile shows, read-only.
+    val savedOwner = if (active == null && settingsTarget.isBlank()) vm.restoredScope() else null
+    val state = remember(active, version, savedOwner) { VaultPageState((active?.scope ?: savedOwner)?.let { vm.screens.exact(it, VAULT_CACHE_KEY)?.value }?.let { runCatching { VaultSnapshot.from(it) }.getOrNull() }) }
     val coroutine = rememberCoroutineScope()
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val context = LocalContext.current
@@ -128,7 +131,7 @@ private fun clearVaultInput(value: JSONObject) { value.keys().asSequence().toLis
     LaunchedEffect(state.message) { if (state.message == "Saved" || state.message == "Removed") { delay(3000); state.message = "" } }
     val snapshot = state.snapshot
     val view = vaultView(ui.connected, state.loading, snapshot, state.failure)
-    val ready = (view == VaultView.Items || view == VaultView.Empty) && !state.busy && !state.loading
+    val ready = (view == VaultView.Items || view == VaultView.Empty) && !state.busy && !state.loading && active != null
     SettingsPage(uiText("Vault"), vm::backFromSettings, subtitle = profileDisplayName(profile, profiles),
         actions = { SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh"), { refresh() }, enabled = !state.loading && !state.busy) },
         refreshing = state.loading || state.busy, testTag = "vault-page") {
@@ -194,7 +197,7 @@ private fun clearVaultInput(value: JSONObject) { value.keys().asSequence().toLis
             if (chosen.backend != "local") Text(uiText("Managed in") + " " + vaultBadge(chosen, snapshot?.sources.orEmpty()))
         } },
         confirmButton = { TextButton(onClick = { state.selected = null }) { Text(uiText("Close")) } },
-        dismissButton = if (chosen.backend == "local") ({ TextButton(onClick = { state.removing = chosen }, enabled = !state.busy) { Text(uiText("Remove")) } }) else null,
+        dismissButton = if (chosen.backend == "local") ({ TextButton(onClick = { state.removing = chosen }, enabled = !state.busy && active != null) { Text(uiText("Remove")) } }) else null,
     )
     state.removing?.let { item ->
         SettingsConfirmDialog(uiText("Remove this item?"), item.label, uiText("Remove"), onConfirm = {
@@ -256,9 +259,25 @@ internal fun vaultStateRow(view: VaultView): VaultStateRow? = when (view) {
  * from the card and the site ([card], [site]) and does not repeat the warning (UX review P1-2); [line] is Hermes' own command, kept for a
  * wording this parser does not know. Hermes sends no amount, so [amount] is only what a prompt carries.
  */
-internal data class ApprovalFace(val title: String, val line: String, val detail: String, val amount: String, val payment: Boolean, val code: Boolean, val card: String = "", val site: String = "")
+internal data class ApprovalFace(val title: String, val line: String, val detail: String, val amount: String, val payment: Boolean, val code: Boolean, val card: String = "", val site: String = "",
+    /** The agent's own phone (L9's combined question): [site] is the shop's app or site and [price] the amount read from its screen. */
+    val shop: Boolean = false, val price: String = "")
 
 private val cardFillCommand = Regex("""^Fill payment card '(.+)' on (\S+)$""")
+
+// L9's one combined question for a purchase on the agent's own phone (EMU-DESIGN §5.3, agent_phone_vault.py `_card_question`):
+// "Pay £12.40 at Kanto Foods with Visa?", or "Fill Visa in Kanto Foods?" when no amount could be read. The amount is the first
+// " at " away, the card the last " with " (a shop's name may hold either word).
+private val phoneCardPay = Regex("""^Pay (.+?) at (.+) with (.+)\?$""")
+private val phoneCardFill = Regex("""^Fill (.+?) in (.+)\?$""")
+
+/** The one question a card approval asks, in the phone's language, the owner's words (card, site, shop, amount) isolated. */
+@Composable internal fun cardQuestion(face: ApprovalFace): String = when {
+    face.shop && face.price.isNotBlank() -> PhoneLine(uiText("Pay {0} at {1} with {2}?"), listOf(face.price, face.site, face.card)).shown()
+    face.shop -> PhoneLine(uiText("Fill {0} in {1}?"), listOf(face.card, face.site)).shown()
+    face.card.isNotBlank() -> cardPaymentLine(uiText("Pay with your {0} on {1}?"), face.card, face.site)
+    else -> face.line
+}
 
 /** "Pay with your Visa on shop.example?" in the phone's language: [template] is the translated sentence, the card and the site are isolated as the owner's own words. */
 internal fun cardPaymentLine(template: String, card: String, site: String): String = PhoneLine(template, listOf(card, site)).shown()
@@ -269,6 +288,12 @@ internal fun approvalFace(p: JSONObject): ApprovalFace {
     val payment = p.string("surface") == "vault-payment"
     if (payment) {
         val amount = p.opt("amount")?.takeUnless { it == JSONObject.NULL }?.toString()?.trim().orEmpty()
+        phoneCardPay.matchEntire(command.trim())?.destructured?.let { (price, shop, card) ->
+            return ApprovalFace("Confirm card payment", command, "", amount, payment = true, code = false, card = card, site = shop, shop = true, price = price)
+        }
+        phoneCardFill.matchEntire(command.trim())?.destructured?.let { (card, shop) ->
+            return ApprovalFace("Confirm card payment", command, "", amount, payment = true, code = false, card = card, site = shop, shop = true)
+        }
         val fill = cardFillCommand.matchEntire(command.trim())
         // https:// is not said to a person; an http:// page or a port stays, because that is what the owner checks before paying.
         val site = fill?.groupValues?.get(2)?.removePrefix("https://")?.removeSuffix("/").orEmpty()

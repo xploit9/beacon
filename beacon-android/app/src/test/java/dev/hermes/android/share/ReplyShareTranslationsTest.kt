@@ -35,8 +35,8 @@ class ReplyShareTranslationsTest {
 
     @Test fun aTranslationIsNotJustTheEnglishLine() {
         // Names such as Beacon stay; a whole line left in English is a missed translation (the one-word "Reply" differs in every language here).
-        // French spells "image" the way English does.
-        val spelledAlike = setOf("fr: 1 image", "fr: {0} images")
+        // French spells "image", and Italian "file", the way English does.
+        val spelledAlike = setOf("fr: 1 image", "fr: {0} images", "it: 1 file")
         val same = languages.flatMap { language -> lines.filter { catalog.getJSONObject(language).optString(normalized(it)) == it }.map { "$language: $it" } }.filterNot { it in spelledAlike }
         assertTrue("left in English: $same", same.isEmpty())
     }

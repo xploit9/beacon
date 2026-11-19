@@ -15,6 +15,8 @@ import org.junit.Assert.*
 import org.junit.Test
 
 /** Controlled native contracts from bf0203a; no native process, owner records or network. */
+private const val RESTART_SPINNER = "( ˘⌣˘)♡ deliberating..."
+
 class ChatDeliveryTest {
     private class Wire(val canonical: Boolean = true, val strictEpoch: Boolean = true, store: AuthStore? = null) : WebSocket.Factory {
         val calls = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
@@ -190,7 +192,7 @@ class ChatDeliveryTest {
             "running" to false, "pending" to JSONArray().put(json("status" to "unknown", "admission_id" to "synthetic-admission")),
             "active_stream_id" to JSONObject.NULL, "messages" to JSONArray())), false, LiveAssistantBoundary())
         assertEquals("An old epoch has no current stream authority", "", after?.streamId)
-        assertEquals("Reply status unknown", after?.status)
+        assertEquals("A reply Hermes lost in its restart says so (WEDGE-121)", "Hermes restarted during this reply.", after?.status)
         assertEquals("retained-receipt", after?.uncertain)
         assertEquals("", after?.liveText)
         assertEquals("Old epoch", after?.raw?.rows("_unconfirmed_replies")?.singleOrNull()?.string("text"))
@@ -207,6 +209,279 @@ class ChatDeliveryTest {
             withTimeout(1500) { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { types += it.type } }
             assertEquals(listOf("server_turn_started", "tool", "token", "done"), types)
             assertEquals(0, wire.historyReads)
+        } finally { wire.client.closeNative() }
+    }
+
+    /**
+     * TURN-121 follow-up 3, WEDGE's restart run (restart4, 17 Nov 04:10-04:18): after a Hermes restart a bubble "( ˘⌣˘)♡ deliberating..." sat under Hermes'
+     * "did not complete" note. That line is Hermes' kawaii spinner (agent/turn_iteration_prep.announce_api_call). Hermes sends it only as `thinking.delta`
+     * (agent.thinking_callback, gateway/local_viewer_events.py:44) and clears it with an empty `thinking.delta` once the model answers
+     * (agent/turn_api_call.stop_thinking_spinner). The model's own words come as `message.delta`, and its whole commentary as `message.interim`
+     * (agent/stream_delivery._deliver_interim: "commentary is model text"). So the frame type tells status from words; the text is never read.
+     * The frames run through the app's real mapping in Hermes' order for one model call that started a tool, then the restart's epoch reset
+     * (reconciliation.required with an unknown admission) and Hermes' settle with its failed_turn row.
+     */
+    private suspend fun restartRunFrames(words: List<Pair<String, JSONObject>> = emptyList(), spinnerAfterTool: Boolean = false): List<SseEvent> = coroutineScope {
+        val wire = Wire()
+        val frames = mutableListOf<JSONObject>()
+        fun add(type: String, payload: JSONObject) { frames += wire.event(frames.size + 1L, type, payload) }
+        add("message.start", JSONObject())
+        add("thinking.delta", json("text" to RESTART_SPINNER))
+        words.forEach { (type, payload) -> add(type, payload) }
+        add("thinking.delta", json("text" to ""))
+        add("tool.start", json("id" to "tool-sleep", "name" to "terminal", "context" to "sleep 600"))
+        // The next model call's announcement, had the loop started one before the restart cut it.
+        if (spinnerAfterTool) add("thinking.delta", json("text" to RESTART_SPINNER))
+        wire.latest = frames.size.toLong()
+        wire.replay = JSONArray(frames)
+        val seen = java.util.concurrent.CopyOnWriteArrayList<SseEvent>()
+        val all = CompletableDeferred<Unit>()
+        val collector = launch { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { seen += it; if (seen.size == frames.size) all.complete(Unit) } }
+        try { withTimeout(3000) { all.await() } } finally { collector.cancel(); wire.client.closeNative() }
+        seen.toList()
+    }
+
+    private val restartPrompt = json("id" to 1418, "role" to "user", "content" to "Synthetic sleep then answer")
+    private val restartToolRow = json("id" to 1419, "role" to "assistant", "content" to "", "tool_calls" to JSONArray().put(json("id" to "tool-sleep", "function" to json("name" to "terminal"))))
+    private val restartBoundary = json("id" to 1420, "role" to "assistant", "display_kind" to "failed_turn",
+        "content" to "This turn did not complete. Some actions may already have run; verify their effects before resending.")
+
+    /** What the transcript draws after [events], the restart's epoch reset and Hermes' settle, with each kept row as its bubble shows it, plus every live state on the way. */
+    private fun afterRestart(events: List<SseEvent>, toolRowWords: String = ""): Pair<List<Pair<String, String>>, List<ChatState>> {
+        // Hermes saves the model message, its words and its tool call together, before the tool runs (agent/turn_tool_round.py).
+        val toolRow = restartToolRow.copy().put("content", toolRowWords)
+        var s = ChatState(sessionId = "stored-a", streamId = "stored-a", status = "Working",
+            messages = listOf(dev.hermes.android.Message.from(restartPrompt, 0, "stored-a")), raw = json("session_id" to "stored-a", "messages" to JSONArray().put(restartPrompt)))
+        val live = mutableListOf<ChatState>()
+        var boundary = LiveAssistantBoundary()
+        for (event in events) {
+            val payload = event.payload()
+            val next = boundary.after(event.type, payload)
+            s = liveAfterEvent(s, event.type, payload, boundary.closed, next) ?: s
+            boundary = next
+            live += s
+        }
+        fun session(rows: List<JSONObject>, pending: JSONArray) = json("session_id" to "stored-a", "running" to false, "active_stream_id" to JSONObject.NULL,
+            "pending" to pending, "messages" to JSONArray(rows))
+        // The restart: a new replay epoch and Hermes' snapshot with the admission it cannot settle yet (reconciliation.required -> state_saved, replay_reset).
+        s = present(liveAfterEvent(s, "state_saved", json("replay_reset" to true, "session" to session(listOf(restartPrompt, toolRow),
+            JSONArray().put(json("status" to "unknown", "admission_id" to "synthetic-admission")))), boundary.closed, boundary))
+        live += s
+        // Hermes settles the cut turn and closes it with its boundary row.
+        s = present(liveAfterEvent(s, "state_saved", json("session" to session(listOf(restartPrompt, toolRow, restartBoundary), JSONArray())), false, LiveAssistantBoundary()))
+        val kept = s.raw.rows("_unconfirmed_replies").mapIndexed { i, row ->
+            dev.hermes.android.Message.from(row, i, "stored-a") to row.string("_history_user_row_id").takeIf { row.string("_history_row_id").isBlank() }.orEmpty() }
+        // A kept reply's bubble draws its words, or its reasoning when it has none (ChatScreen, "unconfirmed-reply:").
+        return dev.hermes.android.ui.placeKeptReplies(s.messages, kept).map { it.id to if (it.displayKind == "unconfirmed_reply") it.text.ifBlank { it.reasoning } else it.text } to live
+    }
+
+    private fun <T> present(value: T?): T { assertNotNull(value); return value!! }
+
+    @Test(timeout = 10_000) fun hermesSpinnerCutByARestartIsStatusAndNeverAKeptBubble() = runBlocking {
+        for (spinnerAfterTool in listOf(false, true)) {
+            val (shown, live) = afterRestart(restartRunFrames(spinnerAfterTool = spinnerAfterTool))
+            assertEquals("after the settle: the prompt, the tool step and Hermes' own note, no bubble of Hermes' status (spinner after tool: $spinnerAfterTool)",
+                listOf("1418" to "Synthetic sleep then answer", "1419" to "", "1420" to restartBoundary.string("content")), shown)
+            assertTrue("Hermes' spinner is status, never reply words or reasoning: ${live.map { it.liveText to it.liveReasoning }}",
+                live.none { "deliberating" in it.liveText || "deliberating" in it.liveReasoning })
+            assertEquals("the spinner shows as the live status line", "Thinking", live[1].status)
+        }
+    }
+
+    @Test(timeout = 10_000) fun wordsSaidBeforeTheCutToolStepShowOnceFromHermesRowWithNoSpinnerBubble() = runBlocking {
+        // Streamed words and whole commentary alike: Hermes saved them with the tool call they came with, so its row shows them and no kept copy does.
+        // Words the restart cut after the last saved step are kept (follow-up 4: aCodexReplyCutByARestart…, anAgentLoopReplyCutByARestart…).
+        for (words in listOf("message.delta" to json("text" to "I will run it and report back."),
+                "message.interim" to json("text" to "I will run it and report back.", "already_streamed" to false))) {
+            val (shown) = afterRestart(restartRunFrames(listOf(words), spinnerAfterTool = true), toolRowWords = "I will run it and report back.")
+            assertEquals("${words.first}: the words once, in Hermes' row, above its note, with no spinner bubble",
+                listOf("1418" to "Synthetic sleep then answer", "1419" to "I will run it and report back.", "1420" to restartBoundary.string("content")), shown)
+        }
+    }
+
+    /**
+     * TURN-121 follow-up 4: the words of a reply a restart or reconnect cut are kept with the tool steps between them, in the order said, until Hermes' saved rows hold them.
+     * Frame order from Hermes' source:
+     * - Codex app-server runtime (agent/codex_runtime.py make_codex_app_server_event_bridge): each agentMessage streams as `message.delta`; each command item starts and
+     *   ends as `tool.start`/`tool.complete` with the id its saved row will carry (_stable_call_id mirrors CodexEventProjector); the turn is saved only at its end
+     *   ("this turn will be missing after restart/resume"), as an assistant row of words, an assistant row with the tool call, and the tool row.
+     * - Agent loop (agent/turn_tool_round.py): the model message, words and tool calls together, is saved before the tool runs; then `message.delta` with text null
+     *   closes the reply box and the tool starts.
+     * After a restart Hermes closes the turn with its failed_turn row: "not processed" when only the prompt was saved, the partial note otherwise (agent/turn_failure_copy.py).
+     */
+    private suspend fun mappedFrames(frames: List<Pair<String, JSONObject>>): List<SseEvent> = coroutineScope {
+        val wire = Wire()
+        val events = frames.mapIndexed { i, (type, payload) -> wire.event(i + 1L, type, payload) }
+        wire.latest = events.size.toLong()
+        wire.replay = JSONArray(events)
+        val seen = java.util.concurrent.CopyOnWriteArrayList<SseEvent>()
+        val all = CompletableDeferred<Unit>()
+        val collector = launch { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { seen += it; if (seen.size == events.size) all.complete(Unit) } }
+        try { withTimeout(3000) { all.await() } } finally { collector.cancel(); wire.client.closeNative() }
+        seen.toList()
+    }
+
+    private fun toolStart(id: String, name: String = "exec_command") = "tool.start" to json("tool_id" to id, "tool_call_id" to id, "name" to name, "tool_name" to name, "context" to "synthetic")
+    private fun toolDone(id: String, name: String = "exec_command") = "tool.complete" to json("tool_id" to id, "tool_call_id" to id, "name" to name, "tool_name" to name, "summary" to "done")
+    private fun words(text: String) = "message.delta" to json("text" to text)
+    private val cutPrompt = json("id" to 1500, "role" to "user", "content" to "Synthetic check the files")
+    private fun savedWords(id: Int, text: String) = json("id" to id, "role" to "assistant", "content" to text)
+    private fun savedCall(id: Int, text: String, call: String) = savedWords(id, text).put("tool_calls",
+        JSONArray().put(json("id" to call, "type" to "function", "function" to json("name" to "terminal", "arguments" to "{}"))))
+    private fun savedResult(id: Int, call: String) = json("id" to id, "role" to "tool", "tool_call_id" to call, "content" to "ok")
+    private fun hermesNote(id: Int, text: String) = json("id" to id, "role" to "assistant", "display_kind" to "failed_turn", "content" to text)
+    private val notProcessed = "Your request was not processed. Send it again if you still want me to carry it out."
+    private val partialNote = "This turn did not complete. Some actions may already have run; verify their effects before resending."
+
+    /** The chat after [events] on a phone holding [phoneRows], a live-frame round trip, the epoch reset with Hermes' saved [resetRows], then each later history read. */
+    private fun cutByRestart(events: List<SseEvent>, phoneRows: List<JSONObject>, resetRows: List<JSONObject>, vararg later: List<JSONObject>, midStream: Pair<Int, List<JSONObject>>? = null,
+                             ownSend: QueuedMessage? = null): ChatState {
+        val (streamed, boundary) = streamed(events, phoneRows, midStream, ownSend)
+        var s = streamed
+        // A reconnect restores the live frame first (BeaconViewModel: "tools" and "sealed" as saved; the rest of the live state as it was).
+        s = s.copy(liveTools = JSONArray(JSONArray(s.liveTools).toString()).objects(), liveSealed = sealedFromFrame(JSONObject(json("sealed" to JSONArray(s.liveSealed)).toString())))
+        fun session(rows: List<JSONObject>, pending: JSONArray = JSONArray()) = json("session_id" to "stored-a", "running" to false, "active_stream_id" to JSONObject.NULL,
+            "pending" to pending, "messages" to JSONArray(rows))
+        s = present(liveAfterEvent(s, "state_saved", json("replay_reset" to true, "session" to session(resetRows, JSONArray().put(json("status" to "unknown", "admission_id" to "synthetic-cut")))),
+            boundary.closed, boundary))
+        for (rows in later) s = present(liveAfterEvent(s, "state_saved", json("session" to session(rows)), false, LiveAssistantBoundary()))
+        return s
+    }
+
+    /** The chat after [events] on a phone holding [phoneRows] (with this phone's own send [ownSend], if any), and its live boundary. */
+    private fun streamed(events: List<SseEvent>, phoneRows: List<JSONObject>, midStream: Pair<Int, List<JSONObject>>? = null, ownSend: QueuedMessage? = null): Pair<ChatState, LiveAssistantBoundary> {
+        var s = ChatState(sessionId = "stored-a", streamId = "stored-a", status = "Working", messages = phoneRows.mapIndexed { i, r -> dev.hermes.android.Message.from(r, i, "stored-a") },
+            raw = json("session_id" to "stored-a", "messages" to JSONArray(phoneRows)).apply { ownSend?.let { put("_display_submission_id", it.submissionId) } },
+            queued = listOfNotNull(ownSend))
+        var boundary = LiveAssistantBoundary()
+        for ((index, event) in events.withIndex()) {
+            val payload = event.payload()
+            val next = boundary.after(event.type, payload)
+            s = liveAfterEvent(s, event.type, payload, boundary.closed, next) ?: s
+            boundary = next
+            // A history read while the turn still runs: the saved front of the turn leaves the live lists.
+            midStream?.takeIf { it.first == index }?.let { (_, rows) -> s = present(liveAfterEvent(s, "state_saved", json("session" to json("session_id" to "stored-a",
+                "running" to true, "active_stream_id" to "stored-a", "messages" to JSONArray(rows))), boundary.closed, boundary)) }
+        }
+        return s to boundary
+    }
+
+    /** The end of a turn Hermes' receipt did not prove (BeaconViewModel: terminalReplyVisible false) after the phone read Hermes' saved rows [held] with the reply still on screen. */
+    private fun unprovenEnd(events: List<SseEvent>, held: List<JSONObject>, phoneRows: List<JSONObject> = listOf(cutPrompt)): ChatState =
+        dev.hermes.android.releaseTerminalChat(streamed(events, phoneRows, midStream = events.lastIndex to held).first, "stored-a", replyConfirmed = false, terminalStatus = "")
+
+    /** What the transcript draws: saved rows by role and id, each kept row as its tool cards and words in the order said. */
+    private fun drawn(s: ChatState): List<String> {
+        val kept = s.raw.rows("_unconfirmed_replies")
+        val byId = kept.associateBy { it.string("id") }
+        val placed = dev.hermes.android.ui.placeKeptReplies(s.messages, kept.mapIndexed { i, row ->
+            dev.hermes.android.Message.from(row, i, "stored-a") to row.string("_history_user_row_id").takeIf { row.string("_history_row_id").isBlank() }.orEmpty() })
+        return placed.flatMap { m ->
+            val row = byId[m.id] ?: return@flatMap listOf("${m.role}:${m.id}")
+            row.rows("live_tools_before").map { "card:${toolIdentity(it)}" } + listOfNotNull(m.text.takeIf(String::isNotBlank)?.let { "kept:$it" }) +
+                row.rows("live_tools").map { "card:${toolIdentity(it)}" }
+        }
+    }
+
+    @Test(timeout = 10_000) fun aCodexReplyCutByARestartKeepsEveryWordAndToolStepInOrder() = runBlocking {
+        // Nothing saved: words before, between and after three tool steps, the first step before any words.
+        val events = mappedFrames(listOf("message.start" to JSONObject(), toolStart("exec-t0"), toolDone("exec-t0"), words("Looking at the folder. "), words("Two files."),
+            toolStart("exec-t1"), toolDone("exec-t1"), words("The first one is fine."), toolStart("exec-t2"), words("Now the second")))
+        val s = cutByRestart(events, listOf(cutPrompt), listOf(cutPrompt), listOf(cutPrompt, hermesNote(1501, notProcessed)))
+        assertEquals(listOf("user:1500", "card:exec-t0", "kept:Looking at the folder. Two files.", "card:exec-t1", "kept:The first one is fine.", "card:exec-t2",
+            "kept:Now the second", "assistant:1501"), drawn(s))
+    }
+
+    @Test(timeout = 10_000) fun anAgentLoopReplyCutByARestartShowsSavedWordsOnceAndKeepsTheUnsavedRest() = runBlocking {
+        // Hermes saved "Checking the files." with its tool call before the tool ran; the restart cut the next words. Their words may repeat the saved ones:
+        // the kept copy is judged by Hermes' ids and its place in the turn, never by its text.
+        val saved = listOf(cutPrompt, savedCall(1501, "Checking the files.", "call-1"), savedResult(1502, "call-1"))
+        for (after in listOf("Both files are fine", "Checking the files.")) {
+            val events = mappedFrames(listOf("message.start" to JSONObject(), "thinking.delta" to json("text" to RESTART_SPINNER), words("Checking the files."),
+                "message.delta" to json("text" to JSONObject.NULL), toolStart("call-1", "terminal"), toolDone("call-1", "terminal"),
+                "thinking.delta" to json("text" to RESTART_SPINNER), "thinking.delta" to json("text" to ""), words(after)))
+            // The phone had not read Hermes' saved rows yet, or it had.
+            for (phone in listOf(listOf(cutPrompt), saved)) {
+                val s = cutByRestart(events, phone, saved, saved + hermesNote(1503, partialNote))
+                assertEquals("'$after', phone rows ${phone.size}", listOf("user:1500", "assistant:1501", "tool:1502", "kept:$after", "assistant:1503"), drawn(s))
+            }
+        }
+    }
+
+    @Test(timeout = 10_000) fun keptWordsGiveWayToHermesSavedTurnByItsIdsAndPlaceNotItsWords() = runBlocking {
+        // A reconnect reset while Codex still runs the turn: nothing saved yet. Hermes then saves the whole turn, with final words that differ from the streamed ones.
+        val events = mappedFrames(listOf("message.start" to JSONObject(), words("Looking at the folder."), toolStart("exec-t1"), toolDone("exec-t1"), words("Done looking")))
+        val savedTurn = listOf(cutPrompt, savedWords(1501, "Looking at the folder."), savedCall(1502, "", "exec-t1"), savedResult(1503, "exec-t1"),
+            savedWords(1504, "Done looking at both files."))
+        val s = cutByRestart(events, listOf(cutPrompt), listOf(cutPrompt), savedTurn)
+        assertEquals(listOf("user:1500", "assistant:1501", "assistant:1502", "tool:1503", "assistant:1504"), drawn(s))
+        assertEquals("no kept copy is left once Hermes holds the turn", emptyList<JSONObject>(), s.raw.rows("_unconfirmed_replies"))
+    }
+
+    @Test(timeout = 10_000) fun theOrderHoldsWhenTheSavedFrontOfTheTurnLeavesTheLiveViewMidStream() = runBlocking {
+        // The phone reads Hermes' saved front (the first words with their step) while the turn runs; a later step and words stay unsaved until the restart.
+        val events = mappedFrames(listOf("message.start" to JSONObject(), words("Checking the files."), toolStart("call-1", "terminal"), toolDone("call-1", "terminal"),
+            words("The first is fine."), toolStart("exec-t2"), words("Now the second")))
+        val front = listOf(cutPrompt, savedCall(1501, "Checking the files.", "call-1"), savedResult(1502, "call-1"))
+        val s = cutByRestart(events, listOf(cutPrompt), front, front + hermesNote(1503, partialNote), midStream = 4 to front)
+        assertEquals(listOf("user:1500", "assistant:1501", "tool:1502", "kept:The first is fine.", "card:exec-t2", "kept:Now the second", "assistant:1503"), drawn(s))
+    }
+
+    @Test(timeout = 10_000) fun aReplyThePhoneAlreadyHoldsIsDrawnOnceAtAnUnprovenEndAndAtAReset() = runBlocking {
+        // Hermes' saved words equal the streamed ones, or differ (a final Hermes rewrote): its row is the reply's place in the turn either way.
+        for (saved in listOf("All done.", "All done, both files are fine.")) {
+            val events = mappedFrames(listOf("message.start" to JSONObject(), words("All done.")))
+            val held = listOf(cutPrompt, savedWords(1501, saved))
+            assertEquals("unproven end, '$saved'", listOf("user:1500", "assistant:1501"), drawn(unprovenEnd(events, held)))
+            assertEquals("reset, '$saved'", listOf("user:1500", "assistant:1501"), drawn(cutByRestart(events, listOf(cutPrompt), held, midStream = events.lastIndex to held)))
+        }
+    }
+
+    @Test(timeout = 10_000) fun wordsShownAgainForASavedSegmentDoNotMoveTheTurnOn() = runBlocking {
+        // The phone already holds Hermes' saved first message when its frames arrive (a replay after a fresh attach, or commentary sent after its save):
+        // the step's held call id puts those words back in their place, so the next words are the turn's second, not its third.
+        val front = listOf(cutPrompt, savedCall(1501, "Checking the files.", "call-1"), savedResult(1502, "call-1"))
+        val whole = front + savedWords(1503, "Both files are fine.")
+        val events = mappedFrames(listOf("message.start" to JSONObject(), words("Checking the files."), "message.delta" to json("text" to JSONObject.NULL),
+            toolStart("call-1", "terminal"), toolDone("call-1", "terminal"), words("Both files are fine")))
+        // A reconnect cut the reply; Hermes then saved the rest of the turn.
+        val reset = cutByRestart(events, front, front, whole)
+        assertEquals(listOf("user:1500", "assistant:1501", "tool:1502", "assistant:1503"), drawn(reset))
+        assertEquals("no kept copy is left once Hermes holds the turn", emptyList<JSONObject>(), reset.raw.rows("_unconfirmed_replies"))
+        // An end Hermes' receipt did not prove, with the whole turn held by then.
+        assertEquals(listOf("user:1500", "assistant:1501", "tool:1502", "assistant:1503"), drawn(unprovenEnd(events, whole, phoneRows = front)))
+    }
+
+    @Test(timeout = 10_000) fun aCutReplyWhosePromptThePhoneDoesNotHoldYetIsKeptUnboundNotRetiredByAnOlderTurn() = runBlocking {
+        // This phone sent the question; the phone holds only the turn before it when the restart cuts the reply.
+        val older = listOf(json("id" to 1400, "role" to "user", "content" to "Synthetic earlier question"), savedWords(1401, "Earlier answer."))
+        val sent = QueuedMessage("Synthetic check the files", state = "sent", submissionId = "synthetic-send")
+        val events = mappedFrames(listOf("message.start" to JSONObject(), words("Looking at the folder."), toolStart("exec-t1"), toolDone("exec-t1"), words("Now the files")))
+        val s = cutByRestart(events, older, older + cutPrompt, older + cutPrompt + hermesNote(1501, notProcessed), ownSend = sent)
+        assertTrue("not bound to the older turn: ${s.raw.rows("_unconfirmed_replies")}", s.raw.rows("_unconfirmed_replies").all { it.string("_history_user_row_id").isEmpty() })
+        val shown = drawn(s)
+        assertEquals(shown.toString(), listOf("kept:Looking at the folder.", "card:exec-t1", "kept:Now the files"), shown.filter { it.startsWith("kept:") || it.startsWith("card:") })
+        assertTrue(shown.toString(), shown.containsAll(listOf("user:1400", "assistant:1401", "user:1500", "assistant:1501")))
+    }
+
+    @Test(timeout = 10_000) fun aCutReplyWithNoWordsKeepsNothing() = runBlocking {
+        val events = mappedFrames(listOf("message.start" to JSONObject(), "thinking.delta" to json("text" to RESTART_SPINNER), toolStart("exec-t0"), toolDone("exec-t0")))
+        val s = cutByRestart(events, listOf(cutPrompt), listOf(cutPrompt), listOf(cutPrompt, hermesNote(1501, notProcessed)))
+        assertEquals(listOf("user:1500", "assistant:1501"), drawn(s))
+    }
+
+    /** TURN-121 D2: Hermes' thinking_callback frames (spinner faces, wait lines, an empty clear) rewrite the live status line; they are not reasoning. */
+    @Test(timeout = 10_000) fun hermesThinkingFramesReachTheChatAsStatusNotReasoning() = runBlocking {
+        val wire = Wire().apply { latest = 4 }
+        wire.replay = JSONArray().put(wire.event(1, "message.start"))
+            .put(wire.event(2, "thinking.delta", json("text" to "⏳ rate limited — resets in ~5m, retrying in 300s (attempt 1/3)")))
+            .put(wire.event(3, "reasoning.delta", json("text" to "Planning")))
+            .put(wire.event(4, "message.complete", json("status" to "completed")))
+        val seen = mutableListOf<Pair<String, String>>()
+        try {
+            withTimeout(1500) { NativeOperations(wire.client).stream("/api/chat/stream", mapOf("session_id" to "stored-a"), "") { seen += it.type to it.payload().string("text") } }
+            assertEquals(listOf("server_turn_started", "thinking", "reasoning", "done"), seen.map { it.first })
+            assertEquals("⏳ rate limited — resets in ~5m, retrying in 300s (attempt 1/3)", seen[1].second)
         } finally { wire.client.closeNative() }
     }
 

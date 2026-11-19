@@ -1,0 +1,11 @@
+{
+  "status": "hermes_unreachable",
+  "state_source": "phone",
+  "request_id": "req-synthetic-0001",
+  "tool": "notes_search",
+  "elapsed_ms": 6200,
+  "ran_on_hermes": false,
+  "retry_safe": true,
+  "will_update": true,
+  "detail": "connection_lost"
+}

@@ -1,0 +1,17 @@
+{
+  "request_id": "handover-synthetic-0001",
+  "status": "queued",
+  "admission_id": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+  "job_id": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+  "stored_session_id": "stored-synthetic-0001",
+  "runtime_session_id": "stored-synthetic-0001",
+  "callback_consent": "requested",
+  "outcome": null,
+  "server_ms": {
+    "authority": 8.012,
+    "admit": 140.204,
+    "total": 160.93
+  },
+  "error_code": null,
+  "reason": null
+}

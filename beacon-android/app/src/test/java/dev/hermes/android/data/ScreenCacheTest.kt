@@ -213,7 +213,8 @@ class ScreenCacheTest {
         assertTrue(screenReadCacheable("/api/crons/history", mapOf("job_id" to "j"), "p"))
         assertFalse("chat-scoped reads stay live", screenReadCacheable("/api/crons/history", mapOf("session_id" to "s"), "p"))
         assertFalse(screenReadCacheable("/api/session/usage", mapOf("session_id" to "s"), "p"))
-        assertFalse("MCP server configs can hold secrets", screenReadCacheable("/api/mcp/servers", emptyMap(), "p"))
+        assertTrue("MCP server configs can hold secrets, so only their redacted rows are kept (redactMcpServers)", screenReadCacheable("/api/mcp/servers", emptyMap(), "p"))
+        assertFalse("the plain allowlist still names no MCP path", "/api/mcp/servers" in screenReadPaths)
         // The one chat-keyed read is a chat's project (no messages); every other chat-scoped read stays live.
         assertTrue(screenReadCacheable("/api/projects/for-session", mapOf("chat" to "c"), "p"))
         assertFalse(screenReadCacheable("/api/crons/history", mapOf("chat" to "c"), "p"))

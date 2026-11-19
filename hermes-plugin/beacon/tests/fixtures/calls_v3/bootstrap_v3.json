@@ -1,0 +1,28 @@
+{
+  "contract_version": 2,
+  "backend": "hermes-dashboard",
+  "owner_id": "owner-synthetic",
+  "profile": "default",
+  "voice": {
+    "provider": "gemini",
+    "available": true,
+    "configured": true,
+    "availability_scope": "plugin_enabled"
+  },
+  "capabilities": {
+    "native_jobs": true,
+    "pc_recording": false,
+    "callbacks": true,
+    "push": false,
+    "permanent_recording_retention": false
+  },
+  "call_contract": 3,
+  "call_capabilities": {
+    "tool_declarations": true,
+    "invoke_wait": true,
+    "call_updates": true,
+    "handover": true,
+    "call_diagnostics": true,
+    "tool_receipt_cause": true
+  }
+}

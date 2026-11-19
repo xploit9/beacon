@@ -421,11 +421,21 @@ class AssistOverlayModelTest {
         assertNull(lastChat(listOf(rows[0]), "beacon", "default"))
     }
 
+    // Hermes lists a chat it compressed under its newest session's id; the assistant's chat is still not "your last chat".
+    @Test fun continueNeverOffersTheAssistantsChatListedUnderANewerSession() {
+        val moved = JSONObject().put("session_id", "beacon-3").put("title", "hi").put("_lineage_root_id", "beacon")
+            .put("_lineage_ids", org.json.JSONArray(listOf("beacon", "beacon-2", "beacon-3")))
+        val other = JSONObject().put("session_id", "c2").put("title", "Budget")
+        assertEquals("c2", lastChat(listOf(moved, other), "beacon", "default")!!.sessionId)
+        assertNull(lastChat(listOf(moved), "beacon", "default"))
+    }
+
     // --- N-2: the short reasons of a call that didn't start ---
 
-    /** The six reasons DirectVoice.kt words, each with the short line the overlay shows beside its one action. */
+    /** The reasons a call words (DirectVoice.kt, and the app's line for a Hermes it cannot reach), each with the overlay's short line beside its one action. */
     private val shortReasons = mapOf(
         CallReason.HermesNoAnswer to ("Hermes didn't answer" to CALL_HERMES_NO_ANSWER),
+        CallReason.HermesUnreachable to ("Can't reach Hermes" to dev.hermes.android.data.APP_CONNECTION_ERROR),
         CallReason.VoiceNoAnswer to ("The voice service didn't answer" to CALL_VOICE_NO_ANSWER),
         CallReason.MicFailed to ("The microphone didn't start" to CALL_MIC_FAILED),
         CallReason.Dropped to ("The call dropped" to CALL_DROPPED),
@@ -440,7 +450,7 @@ class AssistOverlayModelTest {
     private fun source(name: String) = File(appRoot, "src/main/java/dev/hermes/android/assist/$name").readText()
 
     @Test fun everyCallConstantMapsToItsShortReasonOrToTheGenericLine() {
-        // The six constants of DirectVoice.kt each map to their reason, whatever whitespace the call state carries around them.
+        // Each constant maps to its reason, whatever whitespace the call state carries around it.
         shortReasons.forEach { (reason, texts) ->
             assertEquals(reason, callReason(texts.second))
             assertEquals(reason, callReason("  ${texts.second} "))
@@ -467,7 +477,7 @@ class AssistOverlayModelTest {
             shortReasons.forEach { (reason, texts) ->
                 assertEquals("$language ${texts.second}", reason, callReason(said(texts.second)) { listOf(said(it)) })
             }
-            assertEquals("$language has six different wordings", 6, shortReasons.values.map { said(it.second) }.toSet().size)
+            assertEquals("$language has a wording for each reason", shortReasons.size, shortReasons.values.map { said(it.second) }.toSet().size)
             // A translated line of another kind is generic.
             assertNull(language, callReason(said("Couldn't start the call")) { listOf(said(it)) })
         }

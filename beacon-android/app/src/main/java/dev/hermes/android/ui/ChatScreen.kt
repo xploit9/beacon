@@ -51,6 +51,8 @@ import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
@@ -95,7 +97,8 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.MissingVoiceKeyException
 import dev.hermes.android.data.NativeMediaBytes
-import dev.hermes.android.data.PROFILE_PLUGIN_OFF_ERROR
+import dev.hermes.android.data.BeaconOffLines
+import dev.hermes.android.data.localizedTurnLine
 import dev.hermes.android.data.VoiceKeyStore
 import dev.hermes.android.voice.transcriptLabel
 import dev.hermes.android.voice.CallState
@@ -312,6 +315,27 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
 /** The phone's 12/24-hour setting, for the times chats and lists show. */
 @Composable private fun phoneIs24Hour(): Boolean = android.text.format.DateFormat.is24HourFormat(LocalContext.current)
 
+/**
+ * A status or failure line as the owner reads it now: in their language (Hermes' own English sentence only in an English UI), with a limit's reset time drawn at this
+ * moment with the phone's 12/24-hour clock (the time today, else the day and time), and only while it is still ahead.
+ */
+@Composable internal fun turnLineText(line: String): String {
+    val translate = uiTextLookup()
+    val locale = uiLocale()
+    val is24 = phoneIs24Hour()
+    return localizedTurnLine(line, translate, clock = { at ->
+        val zone = java.time.ZoneId.systemDefault()
+        val time = java.time.Instant.ofEpochMilli(at).atZone(zone)
+        val sameDay = time.toLocalDate() == java.time.LocalDate.now(zone)
+        val pattern = if (sameDay) nativeClockPattern(locale, is24) else nativeDayPattern(locale, withYear = false, withWeekday = true) + " " + nativeClockPattern(locale, is24)
+        time.format(java.time.format.DateTimeFormatter.ofPattern(pattern, locale))
+    }, english = locale.language == "en")
+}
+
+/** The status line repeats the failure that Hermes' newest row already explains (its reason is drawn under it): it is not shown twice. */
+internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: String): Boolean = newest != null &&
+    dev.hermes.android.data.turnErrorHeadline(status).let { headline -> headline.isNotBlank() && headline == dev.hermes.android.data.turnErrorHeadline(dev.hermes.android.failedTurnReason(newest)) }
+
 @Composable fun SessionList(vm: BeaconViewModel, modifier: Modifier = Modifier, beforeHistory: @Composable () -> Unit = {}) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     // Only the open chat's id matters to the list: a streamed token must not recompose every row.
@@ -352,6 +376,7 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
     val searching = searchFocused || search.isNotBlank()
     LaunchedEffect(allProfiles, ui.origin, ui.owner) { if (allProfiles) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     LaunchedEffect(search, archived, view, hidden, order, allProfiles) { kotlinx.coroutines.delay(250); vm.refreshSessions(search, archived, force = false, threads = view == HistoryView.Threads, allProfiles = allProfiles) }
+    LaunchedEffect(ui.showSessions) { if (ui.showSessions) vm.refreshSessions(search, archived, force = true, threads = view == HistoryView.Threads, allProfiles = allProfiles, joinActive = true) }
     // The rows are worked out once per input, not on every recomposition of the list.
     val loaded = remember(ui.sessions, archived, allProfiles, ui.profile, view, hidden) {
         ui.sessions.filter {
@@ -380,7 +405,7 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
         if (!searching) item("destinations", contentType = "destinations") { beforeHistory() }
         // Beacon is the always-there agent: a presence card above History, not a row among the chats. Its tab keeps its conversation.
         if (view != HistoryView.Threads && !archived && (search.isBlank() || assistantTitle.contains(search.trim(), ignoreCase = true))) item("beacon-row", contentType = "beacon") {
-            val assistantRow = loaded.firstOrNull { ui.assistantSessionId.isNotBlank() && sessionRowId(it) == ui.assistantSessionId && it.string("profile", ui.profile) == preferences.assistantProfile }
+            val assistantRow = loaded.firstOrNull { rowIsChat(it, ui.assistantSessionId) && it.string("profile", ui.profile) == preferences.assistantProfile }
             val glance = glances.rows["${preferences.assistantProfile}:${ui.assistantSessionId}"]
             val activity = assistantRow?.let(::rowActivityMillis) ?: 0L
             val presence = rememberBeaconPresence(vm, ui.assistantSessionId, assistantRow?.string("active_stream_id").orEmpty().isNotBlank())
@@ -526,7 +551,7 @@ internal fun historySourceFilterShown(sources: List<String>, hidden: Set<String>
                     preview = if (caption.isBlank()) line else if (line.isBlank()) caption else "$caption · $line",
                     time = time, pinned = row.optBoolean("pinned"), thread = thread,
                     unread = chatUnread(activity, glance, glances.base[rowProfile] ?: Long.MAX_VALUE, open = openHere && ui.tab in setOf("Chat", "Beacon")),
-                    streaming = row.string("active_stream_id").isNotBlank(), selected = openHere,
+                    streaming = row.string("active_stream_id").isNotBlank(), selected = openHere, cutOff = "$rowProfile:$id" in ui.lostChats,
                     modifier = Modifier.semantics { selected = openHere }.combinedClickable(onLongClickLabel = uiText("Chat actions"), onLongClick = { menuFor = rowKey }) { vm.tab("Chat"); vm.openConversation(row) }.testTag("history-row:$rowTag"),
                 )
                 DropdownMenu(menuFor == rowKey, { menuFor = null }, modifier = Modifier.testTag("history-row-menu")) {
@@ -571,7 +596,7 @@ private val proactivePromptDismissedKey = stringPreferencesKey("proactive_prompt
 private data class CallTranscriptMetadata(val durationSeconds: Long?, val provider: String?)
 
 internal fun callTranscriptGroupsMatchingSearch(groups: List<CallTranscriptGroup>, search: String): List<CallTranscriptGroup> =
-    groups.filter { group -> search.isBlank() || group.lines.any { it.text.contains(search, ignoreCase = true) } }
+    groups.filter { group -> search.isBlank() || group.lines.any { it.text.contains(search.trim(), ignoreCase = true) } }
 
 /** A Bot Chat speaks as its bot: its reply label and composer hint use the bot's name, not the assistant's. */
 internal fun botChatName(activeBotProfile: String?, botSessionId: String, chatSessionId: String, profiles: List<JSONObject>): String? =
@@ -595,9 +620,11 @@ internal fun transcriptStatusShown(status: String, streaming: Boolean, connected
 
 /** Fixed texts the chat shows through variables: tool outcomes and the header's status line. */
 internal val ChatStrings get() = ToolOutcome.entries.map(::toolOutcomeLabel) + friendlyToolNames.values + listOf("typing…", "thinking…", "On a call",
+    // The live status row and the line a turn ends on (TURN-121).
+    "Thinking", "Responding", "Finishing", "Working", dev.hermes.android.TURN_STOPPED, dev.hermes.android.TURN_RESTARTED,
     "Send now", "Queue", "Run command", "Not sent", "Not confirmed yet", "Delivered", "Answered", "Change the reply…", "Queue a message…",
     // What Send in the queue box says when it cannot start (they reach the snackbar through a variable).
-    "Tap your message to check it.", "Wait for the current reply first.", "Finish the call or answer the request first.", "Check again", "Turn on", "Copy command")
+    "Tap your message to check it.", "Wait for the current reply first.", "Finish the call or answer the request first.", "Turn on", "Retry")
 
 /**
  * What the menu of a bubble the phone still tracks offers. Hermes already holds a message it accepted, so only a message of unknown outcome
@@ -642,26 +669,37 @@ internal fun savedRepliesOnce(retained: List<Message>, saved: List<Message>): Li
  * turn (between that prompt and the next one; a steer does not end a turn) has the same words, and otherwise it sits at the end of that turn, above any later
  * question, never at the bottom below it. A reply with no prompt row (kept by an older build, or rebuilt from a history row that went missing) is judged against the newest turn and placed by its time as before.
  * A reply whose prompt is no longer in the loaded history belongs to a turn that is gone and is not shown.
+ * A reply that never came leaves no bubble: a copy with no words (reasoning or progress only, kept by an older build) is not shown, and neither is Hermes' own stop copy
+ * ("Operation interrupted…", agent/turn_recovery.py, kept by an older build). Real words always stay, also when Hermes closed their turn with its failed_turn row (a turn that
+ * failed mid-answer, or one a restart cut): Hermes saved no reply for them, so this copy is the only one of what the owner read. They sit above that row, where they were said.
  */
 internal fun placeKeptReplies(shown: List<Message>, kept: List<Pair<Message, String>>): List<Message> {
     fun isPrompt(message: Message) = message.role == "user" && message.displayKind != "steer"
     val unbound = mutableListOf<Message>()
     val before = mutableMapOf<Int, MutableList<Message>>()
     for ((reply, prompt) in kept) {
+        if (reply.text.isBlank() || reply.text.trimStart().startsWith(HERMES_STOP_COPY)) continue
         if (prompt.isBlank()) { unbound += reply; continue }
         val at = shown.indexOfFirst { it.id == prompt && isPrompt(it) }
         if (at < 0) { if (shown.none(::isPrompt)) unbound += reply; continue }
-        val end = (at + 1 until shown.size).firstOrNull { isPrompt(shown[it]) } ?: shown.size
+        val turnEnd = (at + 1 until shown.size).firstOrNull { isPrompt(shown[it]) } ?: shown.size
+        // Words of a turn Hermes closed with its failed_turn row go above that row: they came before it.
+        val end = (at + 1 until turnEnd).firstOrNull { shown[it].role == "assistant" && shown[it].displayKind == "failed_turn" } ?: turnEnd
         val words = sameWords(reply.text)
-        val answered = reply.text.isNotBlank() && (at + 1 until end).any { shown[it].role == "assistant" && shown[it].displayKind != "unconfirmed_reply" && sameWords(shown[it].text) == words }
+        // A copy kept by its place in the turn is judged by Hermes' ids and order when history arrives (keptRowsNotSaved), never by its words.
+        val answered = !reply.id.startsWith(dev.hermes.android.KEPT_IN_TURN) && reply.text.isNotBlank() && (at + 1 until end).any { shown[it].role == "assistant" && shown[it].displayKind != "unconfirmed_reply" && sameWords(shown[it].text) == words }
         if (!answered) before.getOrPut(end) { mutableListOf() } += reply
     }
     val out = ArrayList<Message>(shown.size + kept.size)
     shown.forEachIndexed { index, message -> before[index]?.let { out += it }; out += message }
     before[shown.size]?.let { out += it }
-    val legacy = savedRepliesOnce(unbound, shown.filterNot { it.displayKind.startsWith("local_input") }).sortedBy { it.recordedAt.takeIf { at -> at > 0 } ?: Long.MAX_VALUE }
+    val (placedUnbound, noPlace) = unbound.partition { it.id.startsWith(dev.hermes.android.KEPT_IN_TURN) }
+    val legacy = (savedRepliesOnce(noPlace, shown.filterNot { it.displayKind.startsWith("local_input") }) + placedUnbound).sortedBy { it.recordedAt.takeIf { at -> at > 0 } ?: Long.MAX_VALUE }
     return dev.hermes.android.voice.interleaveCallMessages(out, legacy)
 }
+
+/** Every stop copy Hermes writes as an interrupted turn's text starts so (agent/turn_recovery.py, turn_api_error.py, turn_empty_response.py, turn_recovery_autorecover.py). */
+private const val HERMES_STOP_COPY = "Operation interrupted"
 
 /** Hermes keeps a photo the owner sends in its own upload folder: ".../native-inputs/<hash>/upload_<id>.<image ending>". Only such a path is ever fetched for a thumbnail. */
 private val ownUploadPath = Regex("""(?i)(?:^|[\\/])native-inputs[\\/][0-9a-f]{16,128}[\\/]upload_[A-Za-z0-9_-]{1,64}\.(?:png|jpe?g|webp|gif|heic|avif)$""")
@@ -735,15 +773,16 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     // Saved call turns and alerts sit among the messages by the time they happened.
     val messages = remember(chatState.messages, chatState.callMessages, chatState.alerts, chatState.sessionId, chatState.queued, chatState.raw) {
         val localTimes = chatState.queued.filter { it.rowId.isNotBlank() }.associate { it.rowId to it.createdAt }
-        val native = visibleTranscriptMessages(chatState.messages).map { row -> localTimes[row.id]?.let { row.copy(recordedAt = it) } ?: row }
+        val native = dev.hermes.android.foldRepeatedFinal(visibleTranscriptMessages(chatState.messages)).map { row -> localTimes[row.id]?.let { row.copy(recordedAt = it) } ?: row }
         val inputs = dev.hermes.android.chatTimelineMessages(native, chatState.queued)
-        val withKept = placeKeptReplies(inputs, chatState.raw.rows("_unconfirmed_replies").mapIndexed { index, row -> Message.from(row, index, chatState.sessionId) to row.string("_history_user_row_id").takeIf { row.string("_history_row_id").isBlank() }.orEmpty() })
+        val withKept = placeKeptReplies(inputs, chatState.raw.rows("_unconfirmed_replies").mapIndexed { index, row -> Message.from(row, index, chatState.sessionId) to dev.hermes.android.keptTurnPrompt(row, chatState.raw.rows("messages")).takeIf { row.string("_history_row_id").isBlank() }.orEmpty() })
         dev.hermes.android.voice.interleaveCallMessages(
             dev.hermes.android.voice.interleaveCallMessages(withKept, chatState.callMessages.map { Message("call:${it.eventId}", it.role, it.text, sessionId = chatState.sessionId, recordedAt = it.at) }),
             chatState.alerts.map { Message("alert:${it.noticeId}", "assistant", it.text, sessionId = chatState.sessionId, recordedAt = it.createdAt) },
         )
     }
     val alertsByMessageId = remember(chatState.alerts) { chatState.alerts.associateBy { "alert:${it.noticeId}" } }
+    val keptRows = remember(chatState.raw) { chatState.raw.rows("_unconfirmed_replies").associateBy { it.string("id") } }
     val callTranscriptGroups = remember(chatState.callMessages) { groupCallTranscriptEvents(chatState.callMessages) }
     val callIdByMessageId = remember(messages) {
         messages.mapNotNull { message ->
@@ -789,7 +828,9 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val commandReport by vm.commandReport.collectAsStateWithLifecycle()
     val settings = LocalBeaconSettings.current
     val ready = !beacon || vm.isBeaconConversation()
-    val beaconOpeningShown = beaconOpeningSkeletonShown(beacon, ready, ui.beaconOpening, ui.beaconError)
+    // UX-121 P3-10: a re-open of the Beacon chat already on screen (from the cache) keeps it shown, with the composer idle; the skeleton is for nothing to show.
+    val keptWhileOpening = beacon && !ready && ui.beaconOpening && ui.beaconError.isBlank() && vm.isBeaconConversation(whileOpening = true)
+    val beaconOpeningShown = beaconOpeningSkeletonShown(beacon, ready, ui.beaconOpening, ui.beaconError) && !keptWhileOpening
     val proactiveScope = (vm.pcScope() ?: Scope(ui.origin, ui.owner, ui.profile)).copy(profile = preferences.assistantProfile, session = "")
     val proactiveKey = proactiveSettingsKey(proactiveScope)
     val proactive = profileDefaults[proactiveKey]
@@ -934,7 +975,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     var questionAnswers by rememberSaveable(ui.origin, ui.owner, ui.profile, chat.sessionId, questionId,
         stateSaver = androidx.compose.runtime.saveable.mapSaver<Map<String, String>>(save = { it }, restore = { saved -> saved.mapValues { it.value as String } })) { mutableStateOf(emptyMap<String, String>()) }
     // Matches are worked out once typing pauses (a long transcript is scanned per keystroke otherwise); emptying the box clears them at once.
-    val findQuery = search
+    val findQuery = search.trim()
     val matchingCallGroups = remember(callTranscriptGroups, findQuery) { callTranscriptGroupsMatchingSearch(callTranscriptGroups, findQuery) }
     val matchingCallIds = remember(matchingCallGroups) { matchingCallGroups.mapTo(mutableSetOf()) { it.callId } }
     // Find keeps the whole transcript: matches are highlighted and stepped through, never filtered.
@@ -949,7 +990,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         if (findQuery.isBlank()) emptyList() else visibleMessages.map { it.value }.filter { message ->
             val callId = callIdByMessageId[message.id]
             if (callId != null) callId in matchingCallIds
-            else message.text.contains(findQuery, true) || message.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(findQuery, true) == true }
+            else findableText(message.role, message.text).contains(findQuery, true) || message.tools.any { tool -> foldedToolResults.byCallId[toolCallResultId(tool)]?.content?.contains(findQuery, true) == true }
         }.map { it.id }
     }
     val findMatchSet = remember(findMatches) { findMatches.toSet() }
@@ -960,8 +1001,11 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val liveShown = chat.streamId.isNotBlank() || chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank()
     val liveBubble = chat.liveText.isNotBlank() || chat.liveSealed.isNotEmpty()
     val sendingShown = chatSendInFlight(chat)
-    // Blue ticks: Beacon's reply follows the message in this chat, or its reply is streaming now. Read from the rows shown.
-    val answeredIds = remember(messages, liveShown) { answeredOwnMessageIds(messages, liveShown) }
+    // Blue ticks: Beacon's reply follows the message in this chat, or its first answer words are on screen now. Read from the rows shown.
+    val replyAnswering = replyWordsShown(chat)
+    // Why the box holds its messages, also after a cold start (the status line lives only in memory): the line the turn before them ended on.
+    val transcriptLine = chat.status.ifBlank { queuedHoldLine(chat.queued) }
+    val answeredIds = remember(messages, replyAnswering) { answeredOwnMessageIds(messages, replyAnswering) }
     // A send whose outcome is unknown and that has no copy among the messages the phone holds is shown by this bubble.
     val unconfirmedSend = ready && chat.uncertain.isNotBlank() && chat.status != "Sending" && chat.queued.none { it.id == chat.uncertain }
     // A screen reader hears the reply once, when it is complete.
@@ -1063,7 +1107,8 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
             } else { permissionClient=active.detached();permissionConversation=conversation;microphone.launch(Manifest.permission.RECORD_AUDIO) }
         }
     }
-    val callThisChat: () -> Unit = { vm.client?.let { requestCall(it,chat.sessionId) };Unit }
+    // The Beacon tab's call goes the side button's way (callBeacon): a Beacon chat Hermes' plugin no longer holds gives way to the current one (backlog 57).
+    val callThisChat: () -> Unit = { if(ui.tab=="Beacon") vm.callBeacon() else vm.client?.let { requestCall(it,chat.sessionId) };Unit }
     LaunchedEffect(pendingVoiceCall,ui.tab,ui.morePage,permanentBotChat,chat.sessionId) {
         val pending=pendingVoiceCall?:return@LaunchedEffect
         if(ui.tab !in setOf("Chat","Beacon") && !permanentBotChat) return@LaunchedEffect
@@ -1193,13 +1238,13 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
             if (canonical && showSearch) FindBar(search, { search = it }, onClose = { showSearch = false; search = "" }, focusRequester = searchFocusRequester)
             // While the conversation opens (answering a call does this too) the chat shows its skeleton, with the composer below in place.
             if (beaconOpeningShown) ChatSkeleton(Modifier.weight(1f).fillMaxWidth())
-            else if (beacon && !ready) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
+            else if (beacon && !ready && !keptWhileOpening) Box(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState())) {
                 // Not opening, so it is either unavailable (with its error) or waiting for a retry.
                 EmptyState(assistantText(if (ui.beaconError.isBlank()) "Opening Beacon…" else "Can't open Beacon"), uiText(ui.beaconError), action = if (ui.beaconOpening) "" else uiText("Retry"), onAction = { vm.openBeacon() })
-            } else if (chat.sessionId.isBlank() || chat.status == PROFILE_PLUGIN_OFF_ERROR) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
+            } else if (chat.sessionId.isBlank() || chat.status in BeaconOffLines) Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(Modifier.widthIn(max = 280.dp).fillMaxWidth(.9f).aspectRatio(1f).clipToBounds().testTag("chat-sphere-empty")) { ChatSphere(Modifier.fillMaxSize(), sphereState, sphereIntensity, sphereToolCallBurst, !sphereMotionEnabled) }
-                // A chat the owner opened where Hermes does not serve Beacon stays that chat: the same card, with Turn on opening it again.
-                FirstChatCard(vm, ui, existingChat = chat.sessionId.isNotBlank())
+                // A chat the owner opened where Hermes refused Beacon (and the phone could not turn it on) stays that chat: the same card, its button opening it again.
+                FirstChatCard(vm, ui, existingChatLine = if (chat.sessionId.isNotBlank()) chat.status else "")
             }
             else if (!chat.projectionReady) ChatSkeleton(Modifier.weight(1f).fillMaxWidth())
             else Column(Modifier.weight(1f).fillMaxWidth()) {
@@ -1238,13 +1283,17 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().testTag("transcript-layer")) {
                     // About 80% of the width, never wider than 560 dp on a large screen.
                     val bubbleMax = (maxWidth * 0.8f).coerceAtMost(560.dp)
+                    // A reply holding a table may take the whole row, inside the list's 12 dp edges (D20).
+                    // Capped, so on an unfolded phone or a tablet a table reply stays a bubble; its prose keeps ReadableWidth (RichContent).
+                    val transcriptMax = tableBubbleMax(maxWidth, bubbleMax)
                     // The empty chat's sphere shrinks with the room above the keyboard, so its words stay in view.
                     val viewportHeight = maxHeight
                     // While the scroll-to-latest button shows, the list ends above it, so it never covers the last bubble's time.
                     val latestShown = ready && !follow && list.canScrollForward
                     val shownBottom by animateDpAsState(if (latestShown) 72.dp else 12.dp, if (motionEnabled) tween(200) else snap(), label = "transcript-bottom")
                     // A notice sits over the bottom of this layer, where the last row's buttons are (the approval card's): the list ends above it, and following the tail keeps the row in view.
-                    val feedbackInset = with(LocalDensity.current) { feedbackInsetPx.toDp() }
+                    // The notice making room is a move of the last row, and the approval card is the last row: it glides instead of jumping, and the card takes no tap while it does (PromptSettle).
+                    val feedbackInset by animateDpAsState(with(LocalDensity.current) { feedbackInsetPx.toDp() }, if (motionEnabled) tween(200) else snap(), label = "transcript-feedback-inset")
                     val transcriptBottom = shownBottom + feedbackInset
                     LazyColumn(Modifier.fillMaxSize().nestedScroll(ownerScroll).testTag("conversation-transcript"), state = list, contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 12.dp, bottom = transcriptBottom)) {
                     if (missingPluginShown) item("missing-beacon-plugin", contentType = "missing-plugin") {
@@ -1268,10 +1317,14 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                         if (local != null && message.displayKind in setOf("local_input", "local_input_unresolved")) {
                             QueuedMessageRow(vm, local, bubbleMax, canDismiss = chat.uncertain != local.id, unconfirmed = chat.uncertain == local.id && chat.status != "Sending", answered = message.id in answeredIds)
                         } else if (message.displayKind == "unconfirmed_reply") {
-                            Column(Modifier.fillMaxWidth().padding(top = 10.dp).testTag("unconfirmed-reply:${message.id}")) {
-                                ChatBubble(own = false, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) {
+                            // The tool steps said around these words stay with them, in the order said, as finished steps.
+                            val keptRow = keptRows[message.id]
+                            Column(Modifier.fillMaxWidth().padding(top = 10.dp).testTag("unconfirmed-reply:${message.id}"), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                keptRow?.rows("live_tools_before")?.takeIf { it.isNotEmpty() }?.let { Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity("", it) } }
+                                ChatBubble(own = false, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), if (holdsMarkdownTable(message.text)) transcriptMax else bubbleMax) {
                                     BubbleText(message.text.ifBlank { message.reasoning }, vm, null, interactive = false)
                                 }
+                                keptRow?.rows("live_tools")?.takeIf { it.isNotEmpty() }?.let { Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity("", it) } }
                             }
                         } else if (group != null) {
                             val metadata = callMetadata[group.callId]
@@ -1281,7 +1334,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             AlertRow(alert, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, vm, taskResultScope,
                                 canChoose = pluginStatus == "available" && ui.connected && vm.client != null && alert.expiresAt > System.currentTimeMillis() / 1000,
                                 onChoose = { emailRule = EmailRuleRequest(alert.noticeId, it) })
-                        } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, toolResultsByCallId = foldedToolResults.byCallId, toolsRunning = message.id in runningTurnIds, resultTitle = toolResultTitles[message.id].orEmpty(), confirmedLocalId = chat.queued.firstOrNull { it.state == "sent" && it.rowId == message.id }?.id, answered = message.id in answeredIds, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, find = if (findHit == FindHit.None) "" else search, findHit = findHit)
+                        } else if (message.displayKind == "failed_turn" && dev.hermes.android.failedTurnReason(message).isNotBlank()) Column(Modifier.fillMaxWidth()) {
+                            MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, tableMax = transcriptMax, toolResultsByCallId = foldedToolResults.byCallId, toolsRunning = message.id in runningTurnIds, resultTitle = toolResultTitles[message.id].orEmpty(), confirmedLocalId = chat.queued.firstOrNull { it.state == "sent" && it.rowId == message.id }?.id, answered = message.id in answeredIds, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, find = if (findHit == FindHit.None) "" else search, findHit = findHit)
+                            Text(turnLineText(dev.hermes.android.failedTurnReason(message)), Modifier.padding(start = 16.dp, top = 4.dp).testTag("failure-reason:${message.id}"), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        } else MessageRow(vm, message, transcriptIndex[message.id] ?: index, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax, tableMax = transcriptMax, toolResultsByCallId = foldedToolResults.byCallId, toolsRunning = message.id in runningTurnIds, resultTitle = toolResultTitles[message.id].orEmpty(), confirmedLocalId = chat.queued.firstOrNull { it.state == "sent" && it.rowId == message.id }?.id, answered = message.id in answeredIds, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, find = if (findHit == FindHit.None) "" else search, findHit = findHit)
                     }
                     if (liveShown) item("live", contentType = "live") {
                         // Same bubble and spacing as the stored reply, so replacing this row does not move the text.
@@ -1290,14 +1346,16 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             // Words the model said before a tool step stay here, as ordinary bubbles in the order said, until the saved rows hold them.
                             val liveWords = chat.liveSealed + listOfNotNull(chat.liveText.takeIf { it.isNotBlank() })
                             chat.liveSealed.forEachIndexed { index, words ->
-                                ChatBubble(own = false, BubbleGroup(startsRun = liveGroup.startsRun && index == 0, joinedTop = index > 0 || liveGroup.joinedTop, tail = index == liveWords.lastIndex), bubbleMax, Modifier.testTag("live-sealed:$index")) {
-                                    BubbleText(words, vm, vm.authenticatedScope(), interactive = false); BubbleMeta(0L, LIVE_REPLY_ID, null, reserve = true) }
+                                ChatBubble(own = false, BubbleGroup(startsRun = liveGroup.startsRun && index == 0, joinedTop = index > 0 || liveGroup.joinedTop, tail = index == liveWords.lastIndex), if (holdsMarkdownTable(words)) transcriptMax else bubbleMax, Modifier.testTag("live-sealed:$index")) {
+                                    // A reply still arriving shows file names only; its cards come once it is stored (its last tag may be half a path).
+                                    CompositionLocalProvider(LocalFileTags provides FileTags.Names) { BubbleText(words, vm, vm.authenticatedScope(), interactive = false) }; BubbleMeta(0L, LIVE_REPLY_ID, null, reserve = true) }
                             }
                             // A blank meta line holds the place of the stored reply time.
-                            if (chat.liveText.isNotBlank()) ChatBubble(own = false, if (chat.liveSealed.isEmpty()) liveGroup else BubbleGroup(startsRun = false, joinedTop = true, tail = true), bubbleMax) { BubbleText(chat.liveText, vm, vm.authenticatedScope(), interactive = false); BubbleMeta(0L, LIVE_REPLY_ID, null, reserve = true) }
+                            if (chat.liveText.isNotBlank()) ChatBubble(own = false, if (chat.liveSealed.isEmpty()) liveGroup else BubbleGroup(startsRun = false, joinedTop = true, tail = true), if (holdsMarkdownTable(chat.liveText)) transcriptMax else bubbleMax) { CompositionLocalProvider(LocalFileTags provides FileTags.Names) { BubbleText(chat.liveText, vm, vm.authenticatedScope(), interactive = false) }; BubbleMeta(0L, LIVE_REPLY_ID, null, reserve = true) }
                             Row(Modifier.heightIn(min = 32.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 BeaconSignal(BeaconMotionMode.Pulse, size = 18.dp)
-                                Text(chat.status.ifBlank { uiText("Working") }, Modifier.testTag("message-activity-status").semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                // Hermes' own wait line shows as Hermes wrote it; the app's own lines are translated.
+                                Text(turnLineText(chat.status.ifBlank { "Working" }), Modifier.testTag("message-activity-status").semantics { liveRegion = LiveRegionMode.Polite }, style = if (lostReplyLine(chat.status)) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
@@ -1308,27 +1366,31 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                         // A card that comes up after another one was answered or ended is shown as a new request, and its buttons stay off for a moment.
                         val promoted = p.has(PROMPT_PROMOTED_AT)
                         val guarded = rememberPromptGuard(p)
+                        val settle = rememberPromptSettle(p)
+                        val settled = settle.settled()
                         PromptEntrance(promoted, motionEnabled) { Glass(Modifier.padding(top = 10.dp)) { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             if (promoted) Text(uiText("Next request"), Modifier.testTag("next-request"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
                             Text(uiText(face.title), style = MaterialTheme.typography.titleMedium)
                             // A card fill asks one short question naming the card and the site; any other approval keeps the description over its command.
-                            if (face.payment) Text(if (face.card.isNotBlank()) cardPaymentLine(uiText("Pay with your {0} on {1}?"), face.card, face.site) else face.line, Modifier.testTag("approval-line")) else Text(p.string("description", p.string("command", uiText("Hermes asks to continue."))))
+                            if (face.payment) Text(cardQuestion(face), Modifier.testTag("approval-line")) else Text(p.string("description", p.string("command", uiText("Hermes asks to continue."))))
                             if (face.detail.isNotBlank()) Text(face.detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.testTag("approval-detail"))
                             if (face.amount.isNotBlank()) Text(uiText("Amount") + ": " + face.amount, modifier = Modifier.testTag("approval-amount"))
                             if (face.code) CodeBlock(if (exactBeaconAction) "json" else "shell", p.string("command"), vm)
-                            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Button(onClick = { promptScope?.let { vm.approval("once", p, it) } }, enabled = !guarded && promptScope != null && "once" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Allow once")) }
-                                if (!exactBeaconAction && "session" in p.optJSONArray("choices")?.strings().orEmpty()) OutlinedButton(onClick = { promptScope?.let { vm.approval("session", p, it) } }, enabled = !guarded && promptScope != null) { Text(uiText("For this chat")) }
-                                TextButton(onClick = { promptScope?.let { vm.approval("deny", p, it) } }, enabled = !guarded && promptScope != null && "deny" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Deny")) }
-                                if (!exactBeaconAction && "always" in p.optJSONArray("choices")?.strings().orEmpty()) TextButton(onClick = { promptScope?.let { vm.approval("always", p, it) } }, enabled = !guarded && promptScope != null) { Text(uiText("Always allow")) }
+                            FlowRow(Modifier.promptSettle(settle), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                // UX-121 P3-13: one pair for every Hermes request card (filled yes, outlined Deny); the other choices are text buttons.
+                                Button(onClick = settled { promptScope?.let { vm.approval("once", p, it) } }, enabled = !guarded && promptScope != null && "once" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Allow once")) }
+                                OutlinedButton(onClick = settled { promptScope?.let { vm.approval("deny", p, it) } }, enabled = !guarded && promptScope != null && "deny" in p.optJSONArray("choices")?.strings().orEmpty()) { Text(uiText("Deny")) }
+                                if (!exactBeaconAction && "session" in p.optJSONArray("choices")?.strings().orEmpty()) TextButton(onClick = settled { promptScope?.let { vm.approval("session", p, it) } }, enabled = !guarded && promptScope != null) { Text(uiText("For this chat")) }
+                                if (!exactBeaconAction && "always" in p.optJSONArray("choices")?.strings().orEmpty()) TextButton(onClick = settled { promptScope?.let { vm.approval("always", p, it) } }, enabled = !guarded && promptScope != null) { Text(uiText("Always allow")) }
                             }
                         } } }
                     } }
                     chat.clarification?.let { p -> item("clarify:$questionId", contentType = "clarify") { Box(Modifier.padding(top = 10.dp)) { Clarification(vm, p, promptScope, questionAnswers) { id, value -> questionAnswers = questionAnswers + (id to value) } } } }
-                    if (chatSendInFlight(chat)) item("sending", contentType = "sending") { SendingMessage(composerDraft.text, groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
+                    if (chatSendInFlight(chat)) item("sending", contentType = "sending") { SendingMessage(vm.pendingSendText(), groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
                     else if (unconfirmedSend) item("unconfirmed-send", contentType = "unconfirmed") { UnconfirmedSendRow(vm, vm.pendingSendText(), groups[SENDING_MESSAGE_ID] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), bubbleMax) }
                     // Offline, the top banner already says the chat is saved; the transcript does not repeat it.
-                    else if (transcriptStatusShown(chat.status, chat.streamId.isNotBlank(), ui.connected)) item { Text(uiText(chat.status), Modifier.padding(top = 10.dp), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    else if (transcriptStatusShown(transcriptLine, chat.streamId.isNotBlank(), ui.connected) && !failureShownUnder(visibleMessages.lastOrNull()?.value, transcriptLine) &&
+                        !(dev.hermes.android.lostChoiceShown(chat) && dev.hermes.android.isRestartLine(transcriptLine))) item { Text(turnLineText(transcriptLine), Modifier.padding(top = 10.dp).testTag("transcript-status"), style = if (lostReplyLine(transcriptLine)) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
                     }
                     if (latestShown) SmallFloatingActionButton(
                         onClick = { follow = true; scope.launch { val last = (list.layoutInfo.totalItemsCount - 1).coerceAtLeast(0); if (motionEnabled) list.animateScrollToItem(last) else list.scrollToItem(last) } },
@@ -1447,7 +1509,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 onOlder = { if (findMatches.isNotEmpty()) findPosition = (findPosition + 1).coerceAtMost(findMatches.size - 1) },
                 onNewer = { findPosition = (findPosition - 1).coerceAtLeast(0) })
         }
-        if ((ready || beaconOpeningShown) && !activeHere && !finding) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
+        if ((ready || beaconOpeningShown || keptWhileOpening) && !activeHere && !finding) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
             if (!shortWindow && ready) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
             Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }, opening = !ready) }
         }
@@ -1646,11 +1708,27 @@ internal fun acceptsInitialConversationEdit(
                     if (recordError(catalog).isNotBlank()) item { TextButton(onClick = { vm.loadSlashCatalog(force = true) }) { Text(uiText("Retry commands")) } }
                 }
             }
+            // Hermes restarted during the last reply and the owner's messages wait behind it: they go only on this Send (Hermes' own Discard).
+            // UX-121 P3-17 (Root): why, then what to do, at body size; the transcript's own restart line stays hidden meanwhile, so it is never said twice.
+            if (lostChoiceShown(chat)) Column(Modifier.fillMaxWidth().padding(start = 14.dp).testTag("lost-reply-choice")) {
+                Text(uiText(LOST_REPLY_STATUS), Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(uiText("Your waiting message hasn't been sent."), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    TextButton(onClick = { vm.sendAfterLostReply() }, modifier = Modifier.heightIn(min = 48.dp).testTag("lost-reply-send")) { Text(uiText("Send it")) }
+                }
+            }
             val queueBox = queueBoxItems(chat.queued)
             if (queueBox.isNotEmpty()) QueueBox(vm, queueBox, replying = chat.streamId.isNotBlank())
             val voiceAction = composerUsesVoice(draft.text, files.size, preparing.size)
             val streaming = chat.streamId.isNotBlank()
             val sending = chatSendInFlight(chat)
+            val heldBySend = sending && !opening && vm.heldBySend()
+            // D7: Send is off while a tap would be refused (no conversation yet, the chat still loading), and the line says why; with no
+            // connection Send still works and the message waits as "Not sent" (P2-2).
+            val sendRefusal = if (opening) null else vm.sendRefusal()
+            val sendReady = !opening && sendRefusal == null
+            if (sendRefusal != null && (draft.text.isNotBlank() || files.isNotEmpty())) Text(uiText(sendRefusal), Modifier.fillMaxWidth().padding(horizontal = 12.dp).testTag("composer-send-refusal"),
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             // Relay-style composer surface: one pill with a hairline border.
             Surface(Modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh, border = BorderStroke(if (inputFocused) 2.dp else 1.dp, if (inputFocused) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outlineVariant)) {
                 Column(Modifier.padding(horizontal = 6.dp, vertical = 3.dp)) {
@@ -1690,7 +1768,7 @@ internal fun acceptsInitialConversationEdit(
                         }
                     }
                     Box(Modifier.weight(1f).contentReceiver(imagePasteReceiver)) {
-                        OutlinedTextField(if (sending) TextFieldValue("") else draft, if (sending) { _ -> } else changeDraft, placeholder = { Text(if (sending) uiText("Sending…") else if (callActive) uiText("Finish your call to continue typing") else if (readOnly) uiText("Branch this chat to reply") else if (streaming) uiText(busyComposerPlaceholder(files.isNotEmpty(), busyAction)) else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = editorHeight).testTag("message-input").focusRequester(inputFocus).onFocusChanged { inputFocused = it.isFocused }.onPreviewKeyEvent { event ->
+                        OutlinedTextField(if (heldBySend) TextFieldValue("") else draft, changeDraft, placeholder = { Text(if (heldBySend) uiText("Sending…") else if (callActive) uiText("Finish your call to continue typing") else if (readOnly) uiText("Branch this chat to reply") else if (streaming) uiText(busyComposerPlaceholder(files.isNotEmpty(), busyAction)) else assistantText("Message Beacon")) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp, max = editorHeight).testTag("message-input").focusRequester(inputFocus).onFocusChanged { inputFocused = it.isFocused }.onPreviewKeyEvent { event ->
                             val key = event.nativeKeyEvent
                             val pastedImage = key.action == android.view.KeyEvent.ACTION_DOWN && key.repeatCount == 0 && key.keyCode == android.view.KeyEvent.KEYCODE_V && key.isCtrlPressed && pasteClipboardImage()
                             if (pastedImage) true else {
@@ -1724,7 +1802,7 @@ internal fun acceptsInitialConversationEdit(
                         Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) { Row(verticalAlignment = Alignment.CenterVertically) {
                         NativeApprovalMenu(vm, enabled = canonical && !callActive && !readOnly)
                         Box(Modifier.weight(1f, fill = false).widthIn(max = 168.dp)) {
-                            val modelLabel = chatModelLabel(chat.raw.string("model"), defaults?.string("model").orEmpty())
+                            val modelLabel = chatModelTitle(chatModelLabel(chat.raw.string("model"), defaults?.string("model").orEmpty()), data["picker:models"]?.rows("groups").orEmpty())
                             val effortLabel = chatReasoningLabel(sessionEffort, effort, defaults?.string("reasoning_effort").orEmpty())
                             val modelOptionsDescription = uiText("Choose model and reasoning options")
                             val reasoningLabel = uiText("Reasoning effort")
@@ -1767,7 +1845,7 @@ internal fun acceptsInitialConversationEdit(
                             val callPress = dev.hermes.android.voice.rememberCallEntryPrewarm(vm.client, chat.sessionId, callEnabled)
                             FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-beacon"), enabled = callEnabled, interactionSource = callPress) { Icon(Icons.Rounded.GraphicEq, assistantText("Call Beacon in this chat"), Modifier.size(composerActionIconSize)) }
                         } else {
-                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = composerSendEnabled(editable, preparing.isNotEmpty(), chat.uncertain.isNotBlank(), callActive, readOnly, retainedPage)) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Queue" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Queue" else if (chat.streamId.isNotBlank()) "Send now" else "Send"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = composerSendEnabled(editable, preparing.isNotEmpty(), chat.uncertain.isNotBlank(), callActive, readOnly, retainedPage) && sendReady) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Queue" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Queue" else if (chat.streamId.isNotBlank()) "Send now" else "Send"), Modifier.size(composerActionIconSize)) }
                         }
                     }
                 }
@@ -1778,7 +1856,7 @@ internal fun acceptsInitialConversationEdit(
         Column(Modifier.fillMaxWidth().heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text(uiText("Message details"), style = MaterialTheme.typography.titleLarge)
             if (readOnly) Text(uiText("This chat is read-only. Branch it to continue."))
-            if (chat.status.isNotBlank()) Text(uiText(chat.status), color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (chat.status.isNotBlank()) Text(turnLineText(chat.status), color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (chat.uncertain.isNotBlank()) {
                 Text(uiText("Not sure this message arrived. Check the chat, then resend or dismiss."))
                 TextButton(onClick = { vm.reconcileSend() }) { Text(uiText("Check if it arrived")) }
@@ -1951,7 +2029,7 @@ private fun performLocalAction(vm: BeaconViewModel, action: LocalAction, copyId:
     when (action) {
         LocalAction.Check -> if (unconfirmed) vm.reconcileSend() else vm.checkQueuedReceipt(copyId)
         LocalAction.Resend -> vm.openForm(if (unconfirmed) resendForm(vm) else resendLocalForm(vm, copyId))
-        LocalAction.RemoveCopy -> if (unconfirmed) vm.reviewPendingSend() else vm.removeUnresolvedLocalMessage(copyId)
+        LocalAction.RemoveCopy -> if (unconfirmed) vm.removePendingSend() else vm.removeUnresolvedLocalMessage(copyId)
     }
 }
 
@@ -2024,7 +2102,8 @@ private fun localActionTag(action: LocalAction): String = when (action) {
 }
 
 @Composable private fun QueueBoxRow(vm: BeaconViewModel, item: QueuedMessage, replying: Boolean) {
-    val failed = item.state != "queued"
+    // One the offline outbox holds, or whose file could not get through, says so too, with its button (CHATQA D6, CHAT-121 follow-up 9).
+    val failed = queueBoxSaysNotSent(item)
     val words = item.text.ifBlank { uiText("Attachment") }
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(start = 14.dp).testTag("queue-row:${item.id}"), verticalAlignment = Alignment.CenterVertically) {
         if (item.attachments.isNotEmpty()) Row(Modifier.padding(end = 6.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2061,7 +2140,7 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
     return result
 }
 
-@Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, group: BubbleGroup, bubbleMax: Dp, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), toolsRunning: Boolean = false, resultTitle: String = "", confirmedLocalId: String? = null, answered: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}, find: String = "", findHit: FindHit = FindHit.None) {
+@Composable private fun MessageRow(vm: BeaconViewModel, message: Message, index: Int, group: BubbleGroup, bubbleMax: Dp, tableMax: Dp = bubbleMax, toolResultsByCallId: Map<String, FoldedToolResult> = emptyMap(), toolsRunning: Boolean = false, resultTitle: String = "", confirmedLocalId: String? = null, answered: Boolean = false, onToolExpanded: (Boolean) -> Unit = {}, find: String = "", findHit: FindHit = FindHit.None) {
     val context = LocalContext.current
     val origin = vm.authenticatedScope()?.session(message.sessionId.ifBlank { vm.chat.value.sessionId })
     val settings = LocalBeaconSettings.current
@@ -2085,10 +2164,13 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
     val hasContent = displayText.isNotBlank() || history.attachments.isNotEmpty() || parts.media.isNotEmpty()
     val openMessageActions = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); actions = true }
     val copySource: (String) -> Unit = { text -> runCatching { ensureClipboardFits(text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(assistantMessageLabel, text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn't copy all of it. Select part of the text and copy that.") }; Unit }
-    val copyFormatted = { runCatching { val (text, html) = formattedClipboard(displayText); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText(assistantMessageLabel, text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn't copy all of it. Select part of the text and copy that.") }; Unit }
-    val share = { runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(displayText), "Share message")) }.onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this message") }; Unit }
-    val quote = { vm.quoteInReply(presentation.text) }
-    val readAloud = { if (reading) vm.stopReadAloud() else vm.readAloud(presentation.text); Unit }
+    // Outside the bubble a reply names its files, never a MEDIA: tag or a path on the computer; the owner's own words stay as typed.
+    val outsideText = remember(displayText, own) { if (own) displayText else dev.hermes.android.core.withFileNames(displayText, keepCode = true) }
+    val copyFormatted = { runCatching { val (text, html) = formattedClipboard(outsideText); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newHtmlText(assistantMessageLabel, text, html)) }.onSuccess { vm.notice("Formatted message copied") }.onFailure { vm.notice("Couldn't copy all of it. Select part of the text and copy that.") }; Unit }
+    val share = { runCatching { context.startActivity(Intent.createChooser(formattedShareIntent(outsideText), "Share message")) }.onFailure { vm.notice(if (it is IllegalArgumentException) it.message.orEmpty() else "No app is available to share this message") }; Unit }
+    val quote = { vm.quoteInReply(if (own) presentation.text else dev.hermes.android.core.withFileNames(presentation.text, keepCode = true)) }
+    // A reply reads its files by name, never a path on the computer.
+    val readAloud = { if (reading) vm.stopReadAloud() else vm.readAloud(if (own) presentation.text else dev.hermes.android.core.withFileNames(presentation.text)); Unit }
     val a11yActions = if (!hasContent) emptyList() else listOf(
         CustomAccessibilityAction(uiText("Copy")) { copyFormatted(); true },
         CustomAccessibilityAction(uiText("Quote in reply")) { quote(); true },
@@ -2105,9 +2187,9 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
             DropdownMenuItem({ Text(uiText(if (reading) "Stop read aloud" else "Read aloud")) }, { actions = false; readAloud() }, leadingIcon = { Icon(if (reading) Icons.Rounded.Stop else Icons.AutoMirrored.Rounded.VolumeUp, null) }, enabled = reading || displayText.isNotBlank(), modifier = Modifier.testTag("message-read-aloud:${message.id}"))
             DropdownMenuItem({ Text(uiText("Select text")) }, { actions = false; selecting = true }, leadingIcon = { Icon(Icons.Rounded.SelectAll, null) }, enabled = displayText.isNotBlank(), modifier = Modifier.testTag("message-select:${message.id}"))
             HorizontalDivider()
-            DropdownMenuItem({ Text(uiText("Copy as plain text")) }, { actions = false; copySource(displayText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
+            DropdownMenuItem({ Text(uiText("Copy as plain text")) }, { actions = false; copySource(outsideText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
             DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = false)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new chat") } } }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.CallSplit, null) })
-            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = true)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, parts.text, titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
+            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = true)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, editAndBranchDraft(message.text), titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
             if (confirmedLocalId != null) DropdownMenuItem({ Text(uiText("Remove this copy")) }, { actions = false; vm.removeConfirmedLocalCopy(confirmedLocalId) })
         }
     }
@@ -2126,7 +2208,7 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
             }
         } else if (hasContent) {
             Box((if (selecting) Modifier else Modifier.messageGestures(openMessageActions, a11yActions)).testTag("message-bubble:${message.id}")) {
-                ChatBubble(own, group, bubbleMax, findHit = findHit) {
+                ChatBubble(own, group, if (!own && holdsMarkdownTable(displayText)) tableMax else bubbleMax, findHit = findHit) {
                     // A scheduled result filed in this thread reads as a post, headed by the job that made it.
                     if (post != null) Row(Modifier.padding(bottom = 2.dp).testTag("channel-post:${message.id}"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                         Icon(Icons.Rounded.Schedule, null, Modifier.size(14.dp), tint = MaterialTheme.colorScheme.primary)
@@ -2134,7 +2216,8 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
                     }
                     if (displayText.isNotBlank()) {
                         if (own && !settings.optBoolean("render_user_markdown", true)) { if (selecting) SelectableText(findHighlighted(displayText, find)) else Text(findHighlighted(displayText, find), style = MaterialTheme.typography.bodyLarge.contentDirection()) }
-                        else BubbleText(displayText, vm, origin, message.mediaSnapshots, message.id, find = find, selectable = selecting)
+                        // Files come from replies; a MEDIA: tag the owner typed stays text.
+                        else CompositionLocalProvider(LocalFileTags provides if (own) FileTags.Typed else FileTags.Cards, LocalMessageKey provides message.id) { BubbleText(displayText, vm, origin, message.mediaSnapshots, message.id, find = find, selectable = selecting) }
                     }
                     HistoryAttachmentChips(history.attachments)
                     pairedMedia.forEach { (media, at) ->
@@ -2551,7 +2634,7 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
     // A running tool opens like Relay's; history and preparing tools start folded.
     val toolKey = tool.toolKey(0)
     var expanded by rememberSaveable(toolKey) { mutableStateOf(false) }
-    val finished = outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed || outcome == ToolOutcome.Dispatched
+    val finished = outcome == ToolOutcome.Completed || outcome == ToolOutcome.Failed || outcome == ToolOutcome.Dispatched || outcome == ToolOutcome.Stopped
     val duration = toolDurationLabel(tool.durationSeconds())
     // Native tool events carry a duration but no clock time; like Relay, a finished call shows its message's recorded time.
     val time = messageTimeLabel(messageTime.takeIf { finished } ?: 0L, is24Hour = phoneIs24Hour())
@@ -2573,6 +2656,7 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
         ToolOutcome.Running -> Icons.Rounded.HourglassTop to MaterialTheme.colorScheme.primary
         ToolOutcome.Dispatched -> Icons.AutoMirrored.Rounded.Send to MaterialTheme.colorScheme.secondary
         ToolOutcome.NoResult -> Icons.AutoMirrored.Rounded.HelpOutline to MaterialTheme.colorScheme.onSurfaceVariant
+        ToolOutcome.Stopped -> Icons.Rounded.Stop to MaterialTheme.colorScheme.onSurfaceVariant
     }
     val label = uiText(toolOutcomeLabel(outcome))
     Surface(Modifier.fillMaxWidth().testTag("tool-card").semantics { contentDescription = "$name, $label" + (if (meta.isNotBlank() && outcome != ToolOutcome.Dispatched && outcome != ToolOutcome.NoResult) ", $meta" else "") }, shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surfaceContainerHigh) {
@@ -2802,7 +2886,9 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
     // A question that comes up after another one was answered or ended is shown as a new request, and its buttons stay off for a moment.
     val promoted = prompt.has(PROMPT_PROMOTED_AT)
     val guarded = rememberPromptGuard(prompt)
-    PromptEntrance(promoted, rememberNativeMotionEnabled()) { Glass { Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    val settle = rememberPromptSettle(prompt)
+    val settled = settle.settled()
+    PromptEntrance(promoted, rememberNativeMotionEnabled()) { Glass { Column(Modifier.promptSettle(settle).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         if (promoted) Text(uiText("Next request"), Modifier.testTag("next-request"), style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
         Text(prompt.string("question", uiText("Question for you")), style = MaterialTheme.typography.titleMedium)
         if (questions.any { it.string("qid").isBlank() || it.string("question").isBlank() }) {
@@ -2811,11 +2897,11 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
             TextButton(onClick = { vm.selectSession(vm.chat.value.sessionId, dropQuestion = true) }) { Text(uiText("Refresh question")) }
         } else if (questions.isNotEmpty()) {
             questions.forEach { q -> val id = q.getString("qid"); Text(q.getString("question")); OutlinedTextField(answers[id].orEmpty(), { onAnswer(id, it) }, label = { Text(uiText("Your answer")) }, modifier = Modifier.fillMaxWidth()); q.optJSONArray("choices")?.strings()?.forEach { choice -> TextButton(onClick = { onAnswer(id, choice) }) { Text(choice, style = LocalTextStyle.current.contentDirection()) } } }
-            Button(onClick = { promptScope?.let { vm.clarifyBatch(JSONObject(questions.associate { question -> question.getString("qid") to answers[question.getString("qid")] }), prompt, it) } }, enabled = !guarded && promptScope != null && questions.all { answers[it.string("qid")].orEmpty().isNotBlank() }) { Text(uiText("Continue")) }
+            Button(onClick = settled { promptScope?.let { vm.clarifyBatch(JSONObject(questions.associate { question -> question.getString("qid") to answers[question.getString("qid")] }), prompt, it) } }, enabled = !guarded && promptScope != null && questions.all { answers[it.string("qid")].orEmpty().isNotBlank() }) { Text(uiText("Continue")) }
         } else {
-            prompt.optJSONArray("choices")?.strings()?.forEach { choice -> OutlinedButton(onClick = { promptScope?.let { vm.clarify(choice, prompt, it) } }, enabled = !guarded && promptScope != null) { Text(choice) } }
+            prompt.optJSONArray("choices")?.strings()?.forEach { choice -> OutlinedButton(onClick = settled { promptScope?.let { vm.clarify(choice, prompt, it) } }, enabled = !guarded && promptScope != null) { Text(choice) } }
             OutlinedTextField(answer, { onAnswer("", it) }, label = { Text(uiText("Your answer")) }, modifier = Modifier.fillMaxWidth())
-            Button(onClick = { promptScope?.let { vm.clarify(answer, prompt, it) } }, enabled = !guarded && promptScope != null && answer.isNotBlank()) { Text(uiText("Continue")) }
+            Button(onClick = settled { promptScope?.let { vm.clarify(answer, prompt, it) } }, enabled = !guarded && promptScope != null && answer.isNotBlank()) { Text(uiText("Continue")) }
         }
     } } }
 }
@@ -2833,6 +2919,29 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
     }
     return guarded
 }
+
+/**
+ * The card's own guard against moving under a finger ([PromptSettle]): its buttons' place is watched, and a tap is taken only once they have stood still and the finger went down after.
+ * One per request, so a card that has only just come up is where it is, not a card that moved.
+ */
+@Composable private fun rememberPromptSettle(prompt: JSONObject): PromptSettle = remember(prompt.string("approval_id", prompt.string("clarify_id", prompt.string("id")))) { PromptSettle() }
+
+/** Wraps a card button's click: it runs only when the card is still ([PromptSettle.admits]); the check is made when the click arrives, so a move in the last frame is counted. */
+private fun PromptSettle.settled(): (() -> Unit) -> (() -> Unit) = { action -> { if (admits(android.os.SystemClock.elapsedRealtime())) action() } }
+
+/** Reports where the card's buttons are, and when a finger goes down on the card or comes up from it, without taking part in the touch. */
+private fun Modifier.promptSettle(settle: PromptSettle): Modifier = this
+    .onGloballyPositioned { c -> val at = c.positionInWindow(); settle.placed(at.x, at.y, c.size.width, c.size.height, android.os.SystemClock.elapsedRealtime()) }
+    .pointerInput(settle) {
+        awaitPointerEventScope {
+            while (true) {
+                val event = awaitPointerEvent(androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (event.changes.any { it.pressed && !it.previousPressed }) settle.pressed(now)
+                if (event.changes.none { it.pressed }) settle.released(now)
+            }
+        }
+    }
 
 /** A card that came up after another one fades in, so the owner sees a new request arrive; the first card of a chat appears as it always did. */
 @Composable private fun PromptEntrance(promoted: Boolean, motionEnabled: Boolean, content: @Composable () -> Unit) {

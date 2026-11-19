@@ -182,6 +182,18 @@ tap away.
   <img src="https://github.com/user-attachments/assets/fef40144-4888-40db-bf96-6bd03cfa2cde" width="80%" alt="Two panes on an unfolded phone">
 </p>
 
+## Your agent's own phone
+
+Beacon can set up an Android phone for your agent on the computer that runs Hermes. The agent uses it for apps, sign-ins and
+payments. It is not your phone.
+
+- **What it needs.** A computer that can run a virtual phone (not a small online server), about 16 GB of free space and 8 GB of
+  memory, and Hermes sign-in turned on. Set it up in Settings > Assistant.
+- **Payments ask.** The agent asks you in Beacon before it pays, sends, deletes, installs or changes an account. A saved card is
+  only filled after you approve it, and scheduled orders can't use cards from your vault.
+- **Linux.** On Linux, restarting Hermes turns the phone off. It starts again the next time it's needed.
+- **Removing it.** Remove the phone in Beacon before you uninstall Beacon.
+
 ## Manage phones
 
 See and remove linked phones in Settings › Connection, or on the dashboard's **Beacon** tab.

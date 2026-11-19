@@ -231,6 +231,36 @@ def test_assistant_conversation_registration_verifies_and_persists_per_profile(h
     assert client.put(path, json={'profile': 'work', 'session_id': session}).status_code == 403
 
 
+def test_the_beacon_chat_of_a_canonical_login_registers_with_that_logins_principal(harness, monkeypatch):
+    # Demo, 17 Nov: a chat made under a canonical login is owned by that login's principal. Verified without it the phone's Beacon chat was refused
+    # ("Owned assistant conversation unavailable") on every try, so the plugin never knew it and no notice could say it came from the Beacon chat.
+    api, client, _, home, _ = harness
+    _write_config(home, {})
+    _use_real_settings(api, monkeypatch)
+    _native_profiles(monkeypatch, ['default'])
+    monkeypatch.setattr(api, 'voice_principal', lambda request, owner, provider: 'principal-of-the-login')
+    seen = []
+
+    def verify(owner, provider, profile, stored, runtime=None, history=True, principal=None):
+        seen.append(principal)
+        if principal != 'principal-of-the-login':
+            raise LookupError('not owned')
+        return {'id': stored}
+
+    monkeypatch.setattr(api.native, 'verify', verify)
+    assert api.mobile.claim_owner('owner', 'basic')
+    path = '/api/plugins/beacon/mobile/assistant-conversation'
+    session = 'local-20261117-beacon'
+    put = client.put(path, json={'profile': 'default', 'session_id': session})
+    assert put.status_code == 200, put.text
+    assert put.json() == {'registered': True, 'conversation_id': session}
+    assert api.mobile.settings(profile='default').get('scheduled_callback_conversation_id') == session
+    got = client.get(path + '?profile=default')
+    assert got.status_code == 200, got.text
+    assert got.json() == {'conversation_id': session}
+    assert seen and set(seen) == {'principal-of-the-login'}
+
+
 def test_assistant_conversation_registration_replaces_a_gone_stored_chat(harness, monkeypatch):
     api, client, _, home, _ = harness
     _write_config(home, {})

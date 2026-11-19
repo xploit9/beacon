@@ -41,11 +41,13 @@ class ChatTicksTest {
         assertEquals(SendTick.Pending, localSendTick(local("settled", "cancelled"), answered = true))
     }
 
-    @Test fun aMessageHermesRanShowsTwoBlueTicksWhateverItsTurnDid() {
-        // Hermes settles completed, failed, rejected and interrupted only for a turn it started (settle_session_input), so Hermes started the
-        // message: two blue ticks, with or without a reply row after it.
-        for (outcome in listOf("completed", "failed", "rejected", "interrupted")) {
-            assertEquals(outcome, SendTick.Answered, localSendTick(local("settled", outcome), answered = false))
+    @Test fun aMessageIsBlueOnlyWhenItsTurnWasAnswered() {
+        // Root's rule (TURN-121): blue only once answer words arrive. A completed turn answered the message, with or without a reply row after it.
+        assertEquals(SendTick.Answered, localSendTick(local("settled", "completed"), answered = false))
+        // Hermes started a failed, rejected or interrupted turn (it settles those only for a turn it started) but did not answer it: two grey ticks,
+        // blue only when a reply row follows (words a stopped turn saved).
+        for (outcome in listOf("failed", "rejected", "interrupted")) {
+            assertEquals(outcome, SendTick.Delivered, localSendTick(local("settled", outcome), answered = false))
             assertEquals(outcome, SendTick.Answered, localSendTick(local("settled", outcome), answered = true))
         }
     }
@@ -156,8 +158,11 @@ class ChatTicksTest {
         assertEquals(SendTick.Answered, tickOf(settled, rows, replying = true))
     }
 
-    @Test fun aReplyWithToolsOnlyStillMeansBeaconIsOnIt() {
-        assertEquals(setOf("1"), answeredOwnMessageIds(listOf(own("1"), reply("2", text = "")), replying = false))
+    // Chat join (Root msg_1f1ef8bc48aa, the brief's "blue only with the message's own answer words"): a reply with tools only is not an answer
+    // yet; its tool row and the status line show Beacon is on it. Before the merge (1.1.34) this test said the opposite.
+    @Test fun aReplyWithToolsOnlyIsNotAnAnswerYet() {
+        assertEquals(emptySet<String>(), answeredOwnMessageIds(listOf(own("1"), reply("2", text = "")), replying = false))
+        assertEquals(setOf("1"), answeredOwnMessageIds(listOf(own("1"), reply("2", text = ""), reply("3")), replying = false))
     }
 
     @Test fun anAlertACallLineOrABackgroundResultIsNotAReplyToTheMessage() {

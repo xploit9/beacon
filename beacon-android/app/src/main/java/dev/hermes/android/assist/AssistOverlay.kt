@@ -743,6 +743,7 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
         // The short reason the call service gave (it names whose side failed) without its second instruction, which the action carries.
         OverlayLine.CallFailed -> when (callFailure) {
             CallReason.HermesNoAnswer -> uiText("Hermes didn't answer")
+            CallReason.HermesUnreachable -> uiText("Can't reach Hermes")
             CallReason.VoiceNoAnswer -> uiText("The voice service didn't answer")
             CallReason.MicFailed -> uiText("The microphone didn't start")
             CallReason.Dropped -> uiText("The call dropped")

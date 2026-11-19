@@ -15,6 +15,10 @@ data class Projection(@PrimaryKey val key: String, val scope: String, val encryp
 
 data class ProjectionMetadata(val key: String, val scope: String, val updated: Long, val protected: Boolean, val bytes: Long, val encryptedSize: Long)
 
+/** Where the app keeps the id of the Beacon chat for an account and profile; the chat opener writes it and the notification code reads it. */
+internal const val BEACON_SESSION_CACHE_KIND = "beacon-session"
+internal const val LEGACY_BEACON_SESSION_CACHE_KIND = "xara-session" // Migrate the existing encrypted conversation pointer on first read.
+
 @Dao interface ProjectionDao {
     @Query("SELECT `key`, scope, updated, protected, bytes, length(encrypted) AS encryptedSize FROM projections WHERE `key`=:key") suspend fun get(key: String): ProjectionMetadata?
     @Query("SELECT substr(encrypted, :start, :count) FROM projections WHERE `key`=:key") suspend fun encryptedChunk(key: String, start: Int, count: Int): ByteArray?
@@ -22,6 +26,7 @@ data class ProjectionMetadata(val key: String, val scope: String, val updated: L
     @Query("DELETE FROM projections WHERE `key`=:key") suspend fun delete(key: String)
     @Query("DELETE FROM projections WHERE `key`=:key OR `key`=:legacyKey") fun deleteCurrent(key: String, legacyKey: String)
     @Query("DELETE FROM projections WHERE protected=0 AND updated<:before") suspend fun expire(before: Long)
+    @Query("DELETE FROM projections WHERE scope=:scope AND protected=0") fun deleteUnprotectedOf(scope: String)
     @Query("SELECT COALESCE(SUM(length(encrypted)),0) FROM projections") suspend fun total(): Long
     @Query("SELECT `key`, scope, updated, protected, bytes, length(encrypted) AS encryptedSize FROM projections WHERE protected=0 ORDER BY updated ASC LIMIT 1") suspend fun oldest(): ProjectionMetadata?
 }
@@ -63,8 +68,19 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
         } } } ?: return null
         return if (legacySelectionMatchesNativeCreator(client, id)) id else null
     }
-    suspend fun writeSession(scope: Scope, value: String) = persistSessionProjection(value) { write(scope, "session", it) }
+    private val recent = RecentTranscripts()
+    /** The transcript of [scope] as this process last saved it, or null: drawn at once when its chat opens again. */
+    fun recentSession(scope: Scope): String? = recent.get(scope.key)
+    /** The sign-out and device-removal clear delete the account's "screens" row; the transcripts held in process memory go with it. */
+    private fun forgetRecent(kind: String, scope: Scope) { if (kind == "screens") recent.clear() else if (kind == "session") recent.remove(scope.key) }
+    suspend fun writeSession(scope: Scope, value: String) { recent.put(scope.key, value); persistSessionProjection(value) { write(scope, "session", it) } }
     suspend fun read(scope: Scope, kind: String): String? = readMany(scope, listOf(kind))[kind]
+    /** When [kind] was last saved for [scope], from the row's metadata alone (nothing is decrypted); null when nothing is saved. */
+    suspend fun updatedAt(scope: Scope, kind: String): Long? = withContext(Dispatchers.IO) {
+        lock.withLock { db.rows().let { rows -> rows.get(key(scope, kind)) ?: rows.get(legacyKey(scope, kind)) }?.updated }
+    }
+    /** The Beacon chat this phone keeps for [scope]'s account and profile, as the app wrote it when it opened or adopted it; null when none is saved or it cannot be read. */
+    suspend fun beaconChat(scope: Scope): String? = try { readMigrating(scope.copy(session = ""), BEACON_SESSION_CACHE_KIND, LEGACY_BEACON_SESSION_CACHE_KIND)?.takeIf { it.isNotBlank() } } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
     suspend fun readMigrating(scope: Scope, kind: String, legacyKind: String): String? = withContext(Dispatchers.IO) {
         require(kind != legacyKind)
         lock.withLock {
@@ -124,7 +140,7 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
                 var oldSize = rows.get(id)?.encryptedSize ?: 0
                 var totalSize = rows.total()
                 while (totalSize - oldSize + encrypted.size > LIMIT) {
-                    val oldest = rows.oldest() ?: error("Protected drafts fill local storage. Export or finish a draft before continuing.")
+                    val oldest = rows.oldest() ?: error("Phone storage for drafts is full. Send or clear a draft.")
                     rows.delete(oldest.key)
                     totalSize -= oldest.encryptedSize
                     if (oldest.key == id) oldSize = 0
@@ -136,12 +152,18 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
     suspend fun delete(scope: Scope, kind: String) { delete(scope, kind, null) }
     internal suspend fun deleteIfCurrent(scope: Scope, kind: String, removal: DeviceRemovalAuthority): Boolean = withContext(Dispatchers.IO) {
         require(scope.sameAccount(removal.scope)) { "Removal belongs to another account" }
-        lock.withLock { db.withTransaction {
+        lock.withLock { forgetRecent(kind, scope); db.withTransaction {
             // Room has acquired its transaction before AuthStore is held; the guarded DAO call cannot suspend.
             removal.ifCurrent { db.rows().deleteCurrent(key(scope, kind), legacyKey(scope, kind)) }
         } }
     }
-    suspend fun delete(scope: Scope, kind: String, expected: String?): Boolean = withContext(Dispatchers.IO) { lock.withLock { db.withTransaction {
+    /** Sign-out and device removal: every unprotected row of one scope, whatever its kind (a chat's saved transcript, its attachment notes, its read marks). Drafts and the other protected rows follow their own rules. */
+    internal suspend fun deleteUnprotected(scope: Scope, removal: DeviceRemovalAuthority?): Boolean = withContext(Dispatchers.IO) {
+        if (removal != null) require(scope.sameAccount(removal.scope)) { "Removal belongs to another account" }
+        // Chat join (rules21): the transcripts held in memory (CACHEFIX-B) go too, so a write that landed after the first sweep cannot draw again.
+        lock.withLock { recent.clear(); db.withTransaction { removal?.ifCurrent { db.rows().deleteUnprotectedOf(scope.key) } ?: run { db.rows().deleteUnprotectedOf(scope.key); true } } }
+    }
+    suspend fun delete(scope: Scope, kind: String, expected: String?): Boolean = withContext(Dispatchers.IO) { lock.withLock { forgetRecent(kind, scope); db.withTransaction {
         val rows = db.rows()
         if (expected != null) {
             val row = rows.get(key(scope, kind)) ?: rows.get(legacyKey(scope, kind)) ?: return@withTransaction true
@@ -152,5 +174,5 @@ class ProjectionCache internal constructor(private val db: ProjectionDb, private
         rows.delete(key(scope, kind)); rows.delete(legacyKey(scope, kind)); true
     } } }
     suspend fun trim() = withContext(Dispatchers.IO) { lock.withLock { db.rows().expire(System.currentTimeMillis() - MAX_AGE) } }
-    companion object { const val LIMIT = 128L * 1024 * 1024; private const val MAX_AGE = 2 * 24 * 60 * 60 * 1000L }
+    companion object { const val LIMIT = 128L * 1024 * 1024; internal const val MAX_AGE = 2 * 24 * 60 * 60 * 1000L }
 }

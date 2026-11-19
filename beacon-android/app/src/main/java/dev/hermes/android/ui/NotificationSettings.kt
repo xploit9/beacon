@@ -97,7 +97,7 @@ private sealed interface TestResult {
     data object Missing : TestResult
 }
 
-private const val PUSH_STATUS_PATH = "/api/plugins/beacon/mobile/notifications/status"
+private const val PUSH_STATUS_PATH = dev.hermes.android.data.PUSH_STATUS_READ_PATH
 private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/test"
 
 /** How long ago [at] was, in the one wording the whole app uses ("5 min ago", "2 h ago"), in the phone's language. */
@@ -153,7 +153,8 @@ private const val PUSH_TEST_PATH = "/api/plugins/beacon/mobile/notifications/tes
     var historyRetentionDays by remember(ownerScope) { mutableStateOf<Int?>(null) }
     var historyRetentionSaving by remember(ownerScope) { mutableStateOf(false) }
     var historyRetentionError by remember(ownerScope) { mutableStateOf("") }
-    val historyRetentionKey = "$HISTORY_RETENTION_KEY:${ownerScope.orEmpty()}"
+    // Before the client exists (a cold start, or offline) the saved answer of the signed-in account is the one under its own scope.
+    val historyRetentionKey = "$HISTORY_RETENTION_KEY:${(ownerScope ?: vm.restoredScope()?.key).orEmpty()}"
     val historyRetentionRecord = data[historyRetentionKey]
     LaunchedEffect(ownerScope, historyRetentionRecord) {
         when {
@@ -541,8 +542,8 @@ private fun failureCause(failure: Throwable): String = generateSequence(failure)
     val detail = error.message?.takeIf { error is ApiFailure || Regex("[A-Z][A-Z0-9_]+").matches(it) }
     error.javaClass.simpleName + (detail?.let { ": $it" } ?: "")
 }
-private const val HISTORY_RETENTION_KEY = "history-retention"
-private const val HISTORY_RETENTION_PATH = "/api/plugins/beacon/mobile/history-retention"
+private const val HISTORY_RETENTION_KEY = dev.hermes.android.data.HISTORY_RETENTION_READ_KEY
+private const val HISTORY_RETENTION_PATH = dev.hermes.android.data.HISTORY_RETENTION_READ_PATH
 internal val historyRetentionChoices = listOf(0 to "Forever", 365 to "1 year", 90 to "90 days", 30 to "30 days")
 internal val HistoryRetentionStrings = historyRetentionChoices.map { it.second }
 internal fun historyRetentionLabel(days: Int): String = historyRetentionChoices.firstOrNull { it.first == days }?.second ?: "Unavailable"

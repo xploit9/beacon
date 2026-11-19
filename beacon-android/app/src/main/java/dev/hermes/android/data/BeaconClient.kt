@@ -23,15 +23,48 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
 
 /** [plugin]: the failure came from the optional Beacon plugin, whose 401 is a plugin answer, never a native sign-out. */
-class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message) {
+open class ApiFailure(val status: Int, override val message: String, val plugin: Boolean = false) : IOException(message) {
     internal val detail = message
 }
 internal class LoopbackSessionRefreshFailed : IOException("Hermes restarted. Paste the link again.")
 internal const val HERMES_LOOPBACK_SESSION_HEADER = "X-Hermes-Session-Token"
 private const val MAX_LOOPBACK_ROOT_BYTES = 256L * 1024L
 private const val BEACON_PLUGIN_PATH = "/api/plugins/beacon/"
+/** The app's version on every request to the Beacon plugin (no app before file cards sent it), so the plugin knows what this phone shows. */
+internal const val APP_VERSION_HEADER = "X-Beacon-App-Version"
 internal const val CANONICAL_TICKET_PATH = BEACON_PLUGIN_PATH + "mobile/gateway-ticket"
 internal const val CANONICAL_SOCKET_PATH = BEACON_PLUGIN_PATH + "gateway/ws"
+/** Beacon's read-only route: which chats hold a reply Hermes lost in a restart (WEDGE-121 follow-up 3). */
+internal const val LOST_TURNS_PATH = BEACON_PLUGIN_PATH + "mobile/lost-turns"
+/** The most chats one lost-turn read asks about: the route's own cap. */
+internal const val LOST_TURN_READ_MAX = 200
+/** A lost reply's admission and the generation Hermes stamped on it: what Discard (prompt.resolve_unknown) takes. */
+internal data class LostAdmission(val admissionId: String, val generation: Long)
+/** A chat holding a reply Hermes lost in a restart: the messages Hermes holds queued behind it, its lost admissions and, for a bot, its chat. */
+internal data class LostTurnChat(val waiting: Int, val unknown: List<LostAdmission>, val chat: String = "")
+private fun lostTurnChat(o: JSONObject?): LostTurnChat = LostTurnChat((o?.optInt("waiting") ?: 0).coerceAtLeast(0),
+    o?.rows("unknown").orEmpty().mapNotNull { row ->
+        val generation = (row.opt("execution_generation") as? Number)?.toLong()
+        row.string("admission_id").takeIf { it.isNotBlank() && generation != null && generation >= 0 }?.let { LostAdmission(it, generation!!) }
+    }, o?.string("session_id").orEmpty())
+/** The route's answer for the asked chats that hold a lost reply; a chat not in it holds none. */
+internal fun lostTurnsFrom(answer: JSONObject, asked: Collection<String>): Map<String, LostTurnChat> {
+    val lost = answer.optJSONObject("lost") ?: return emptyMap()
+    return asked.filter { lost.has(it) }.associateWith { lostTurnChat(lost.optJSONObject(it)) }
+}
+/** The route's answer for the asked bots whose Bot Chat holds a lost reply; [LostTurnChat.chat] is that chat. */
+internal fun lostBotsFrom(answer: JSONObject, asked: Collection<String>): Map<String, LostTurnChat> {
+    val bots = answer.optJSONObject("bots") ?: return emptyMap()
+    return asked.filter { bots.has(it) }.associateWith { lostTurnChat(bots.optJSONObject(it)) }.filterValues { it.chat.isNotBlank() }
+}
+/**
+ * How often a call's Hermes connection is pinged. OkHttp fails the whole connection, and every request on it, when the last pong has not
+ * been read by the time the next ping is due, so this is also the longest the phone or its path may stall without losing a healthy link.
+ * 1.5 s (8a30d432) lost healthy links in device round 3 (LINK-121): a starved phone read a pong that came back in 1 ms too late, its
+ * timer ran up to 2.2 s late and its microphone stream stopped for up to 4.7 s; a mobile path that loses a packet or two is as late.
+ * A dead path still fails its requests within 5-10 s, before their own limits (12 s for a tool or a hand-over, 24 s for /updates).
+ */
+internal const val CALL_PING_INTERVAL_MS = 5_000L
 internal class CanonicalRouteMissing : RuntimeException("Canonical gateway route is unavailable")
 private val GATEWAY_JSON_STRING = "\"" + """(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*""" + "\""
 private val GATEWAY_JSON_VALUE = """(?:$GATEWAY_JSON_STRING|true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"""
@@ -69,6 +102,9 @@ private fun Response.isLoopbackSessionRejection() = runCatching {
     JSONObject(peekBody(4 * 1024L).string()).optString("detail") == "Unauthorized"
 }.getOrDefault(false)
 
+/** A monotonic clock for [BeaconClient.hermesProgressAt] (ms). */
+internal fun progressClockMs(): Long = System.nanoTime() / 1_000_000L
+
 class BeaconClient internal constructor(initial: AuthContext, private val authStore: AuthStore?, private val socketFactory: WebSocket.Factory? = null, private val sharedHttp: OkHttpClient? = null, private val detachedView: Boolean = false, private val persistContext: Boolean = true, private val credentialSource: BeaconClient? = null, private val canonicalScopes: MutableSet<Scope> = mutableSetOf(), private val configureHttp: (OkHttpClient.Builder) -> Unit) {
     constructor(initial: AuthContext, authStore: AuthStore? = null, persistContext: Boolean = true) : this(initial, authStore, null, null, persistContext = persistContext, configureHttp = {})
     private val origin = trustedOrigin(initial.origin).toHttpUrl()
@@ -86,6 +122,15 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     @Volatile private var cookieVersion = authStore?.authorityEpoch?.readVersion()
     @Volatile private var cookieAuthorityLost = false
     val scope get() = auth.scope()
+    /**
+     * When Hermes last showed progress on this client's own connections ([progressClockMs]; 0 = never): a new connection reached it, or
+     * an answer's headers came back. A call press never starts over an attempt that showed progress during the press (REVIEW-F7 P3-3: a
+     * connect Hermes served slowly after its handshake was cut). A held tunnel shows none, and neither does a request on a pooled
+     * connection until its answer comes (the socket may have died with the network).
+     */
+    @Volatile internal var hermesProgressAt = 0L
+        private set
+    private val progressSeen = java.util.Collections.newSetFromMap(java.util.WeakHashMap<okhttp3.Connection, Boolean>())
     // A coroutine Mutex: the refresh suspends (network read with timeout) while holding the lock.
     private val loopbackRefreshLock = kotlinx.coroutines.sync.Mutex()
     val http: OkHttpClient = (sharedHttp?.newBuilder() ?: OkHttpClient.Builder()).cookieJar(object : CookieJar {
@@ -104,7 +149,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             jar.saveFromResponse(url, if (url.encodedPath == OPTIONAL_BOOTSTRAP_PATH) cookies.filter { nativeSessionCookie(it.name) } else cookies)
         }
     }).followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false).connectTimeout(15, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).apply {
-        if (sharedHttp == null) { addInterceptor(bearerAuthInterceptor()); configureHttp(this) }
+        if (sharedHttp == null) { addInterceptor(bearerAuthInterceptor()); addNetworkInterceptor(progressInterceptor()); configureHttp(this) }
     }.build()
     private val nativeAuth = NativeAuth(auth.origin, http.newBuilder().cookieJar(CookieJar.NO_COOKIES).build())
     private val operationLock = kotlinx.coroutines.sync.Mutex()
@@ -260,6 +305,8 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             retainCookieRotationLocked()
         }
     }
+    /** The app's own client (not a detached view): its native connection is the open chat's (CHAT-121 follow-up 11). */
+    internal val ownsChatConnection get() = !detachedView
     fun detached(): BeaconClient = BeaconClient(auth.copy(cookies = jar.snapshot()), authStore, socketFactory, http, detachedView = true, persistContext = persistContext, configureHttp = configureHttp, credentialSource = credentialSource, canonicalScopes = canonicalScopes).also {
         it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion
     }
@@ -274,6 +321,20 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             auth.copy(profile = profile, bearer = source.auth.bearer?.copy(profile = profile), loopbackSession = source.auth.loopbackSession, cookies = jar.snapshot()),
             authStore, socketFactory, source.http, detachedView = true, persistContext = false,
             configureHttp = configureHttp, credentialSource = source, canonicalScopes = canonicalScopes,
+        ).also { it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion }
+    }
+    /**
+     * The client for one call's requests to Hermes (calls contract v3, section 6): connections of its own, each pinged every
+     * [CALL_PING_INTERVAL_MS], so a dead path fails the requests on it within 5-10 s and the next request opens a new connection, while
+     * a phone or path that stops for a few seconds keeps its link; every request says which call contract the app speaks. Same account
+     * and credentials as this client.
+     */
+    internal fun forCall(): BeaconClient {
+        // Idle connections close after 30 s, so pings stop soon after the call (requests that settle late return theirs to this pool).
+        val calls = http.newBuilder().connectionPool(okhttp3.ConnectionPool(5, 30, TimeUnit.SECONDS)).pingInterval(CALL_PING_INTERVAL_MS, TimeUnit.MILLISECONDS)
+            .addInterceptor { chain -> chain.proceed(chain.request().newBuilder().header("X-Beacon-Call-Contract", "3").build()) }.build()
+        return BeaconClient(auth.copy(cookies = jar.snapshot()), authStore, socketFactory, calls, detachedView = true, persistContext = false,
+            configureHttp = configureHttp, credentialSource = credentialSource ?: this, canonicalScopes = canonicalScopes,
         ).also { it.expectedCookies = expectedCookies; it.cookieVersion = cookieVersion }
     }
     fun url(path: String, query: Map<String, String> = emptyMap()): HttpUrl {
@@ -300,6 +361,8 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             if (bearer != null) header("Authorization", "Bearer " + bearer.accessToken)
             else loopback?.let { header(HERMES_LOOPBACK_SESSION_HEADER, it.token) }
             NativePairing.deviceHeader(path, scope)?.let { header("X-Beacon-Device-ID", it) }
+            // The plugin keeps this per phone and tells the agent about file cards only when the owner's newest phone shows them.
+            if (path.startsWith(BEACON_PLUGIN_PATH)) header(APP_VERSION_HEADER, dev.hermes.android.BuildConfig.VERSION_NAME)
         }
         method(method, body)
     }
@@ -317,16 +380,32 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     internal suspend fun nativeSessionAuthority(): Boolean = native.sessionAuthority()
     internal suspend fun nativeTurnLease(storedSessionId: String, expectedRuntimeSessionId: String? = null): NativeTurnLease =
         native.turnLease(storedSessionId, expectedRuntimeSessionId)
-    internal suspend fun nativeTurnRpc(lease: NativeTurnLease, method: String, params: JSONObject): JSONObject =
-        native.turnRpc(lease, method, params)
+    internal suspend fun nativeTurnRpc(lease: NativeTurnLease, method: String, params: JSONObject, inline: InlineFile? = null): JSONObject =
+        native.turnRpc(lease, method, params, inline)
+    internal suspend fun nativeAttachmentLimits(): Pair<Boolean, AttachmentLimits> = native.attachmentLimits()
     internal suspend fun nativeVoiceSubmit(binding: NativeSessionBinding, params: JSONObject, jpeg: String?, legacyJobCapacity: Boolean,
         sendLock: Any, callOwned: () -> Boolean, markAttempt: () -> Boolean, permitted: () -> Boolean): JSONObject =
         native.voiceSubmit(binding, params, jpeg, legacyJobCapacity, sendLock, callOwned, markAttempt, permitted)
     internal fun nativeAnswerServerRequest(method: String, requestId: String, sessionId: String, payload: JSONObject): JSONObject =
         native.answerServerRequest(method, requestId, sessionId, payload)
-    /** Asks the plugin to turn Beacon on for the profile this client is signed in to (never another one); the answer waits for Hermes. */
-    internal suspend fun turnOnBeaconForProfile(): JSONObject =
-        nativeRequest(PROFILE_PLUGIN_ENABLE_PATH, "POST", JSONObject().put("profile", auth.profile), timeoutMillis = PROFILE_TURN_ON_TIMEOUT_MS)
+    /**
+     * Asks the plugin to turn Beacon on for the profile this client is signed in to (never another one); the answer waits for Hermes. [auto]: the phone asks by itself, and a profile
+     * that turned Beacon off on Hermes stays off (`enabled: false`); without it this is the owner's own Turn on.
+     */
+    internal suspend fun turnOnBeaconForProfile(auto: Boolean): JSONObject =
+        nativeRequest(PROFILE_PLUGIN_ENABLE_PATH, "POST", JSONObject().put("profile", auth.profile).apply { if (auto) put("auto", true) }, timeoutMillis = PROFILE_TURN_ON_TIMEOUT_MS)
+    /**
+     * Hermes refused Beacon for this client's profile ([beaconOffForProfile]): Beacon is turned on as the Hermes dashboard serves every profile, with nobody asked. The plugin
+     * serialises turn-ons and answers a repeat without writing, so concurrent refusals may each ask. Throws [BeaconOffFailure] when that did not work; an ended sign-in, a lost
+     * loopback session or a removed phone stays what it is.
+     */
+    private suspend fun turnBeaconOnAfterRefusal() {
+        val answer = try { turnOnBeaconForProfile(auto = true) } catch (e: IOException) {
+            if (e is NativeAuthExpiredException || e is LoopbackSessionRefreshFailed || e is DeviceRemovedFailure) throw e
+            throw BeaconOffFailure(e)
+        }
+        if (answer.opt("enabled") != true) throw BeaconOffFailure(null)
+    }
     suspend fun nativeRequest(path: String, method: String = "GET", body: JSONObject? = null, params: Map<String, String> = emptyMap(), timeoutMillis: Long? = null): JSONObject {
         require(NativeOperationPolicy.direct(path, method)) { "Unsupported native endpoint" }
         val bound = requestAuthority(path.startsWith(BEACON_PLUGIN_PATH))
@@ -343,6 +422,19 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         return "/api/plugins/beacon/mobile/phone/requests/$id"
     }
     internal suspend fun phoneRequests(): JSONObject = nativeRequest("/api/plugins/beacon/mobile/phone/requests")
+    /**
+     * Which of [ids] hold a reply Hermes lost in a restart, with how many messages Hermes holds queued behind each. Beacon's read-only route
+     * reads Hermes' own admission rows; nothing is resumed or written. A chat not in the answer holds none.
+     */
+    internal suspend fun lostTurnChats(ids: Collection<String>): Map<String, LostTurnChat> {
+        if (ids.isEmpty()) return emptyMap()
+        return lostTurnsFrom(nativeRequest(LOST_TURNS_PATH, params = mapOf("ids" to ids.joinToString(","))), ids)
+    }
+    /** Which of [bots] hold a lost reply in their Bot Chat: the same read-only route, which finds each bot's chat as Hermes does (its exact title). */
+    internal suspend fun lostTurnBots(bots: Collection<String>): Map<String, LostTurnChat> {
+        if (bots.isEmpty()) return emptyMap()
+        return lostBotsFrom(nativeRequest(LOST_TURNS_PATH, params = mapOf("bots" to bots.joinToString(","))), bots)
+    }
     internal suspend fun phoneDecision(id: String, approved: Boolean): JSONObject = nativeRequest(phoneRequestPath(id) + "/decision", "POST", json("approved" to approved))
     internal suspend fun phoneResult(id: String, result: JSONObject): JSONObject = nativeRequest(phoneRequestPath(id) + "/result", "POST", json("result" to result))
     internal suspend fun phoneState(state: JSONObject): JSONObject = nativeRequest("/api/plugins/beacon/mobile/phone/state", "PUT", state)
@@ -378,6 +470,12 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
     suspend fun nativeEvents(onEvent: suspend (JSONObject) -> Unit) = native.events(onEvent)
     fun closeNative() = native.close()
+    // A network interceptor runs once a connection to Hermes is up (TLS done). A connection's first request marks that it was just made; a
+    // pooled one's does not. The answer's headers mark again.
+    private fun progressInterceptor() = Interceptor { chain ->
+        if (chain.connection()?.let { synchronized(progressSeen) { progressSeen.add(it) } } == true) hermesProgressAt = progressClockMs()
+        chain.proceed(chain.request()).also { hermesProgressAt = progressClockMs() }
+    }
     private fun bearerAuthInterceptor() = Interceptor { chain ->
         val request = chain.request()
         val response = chain.proceed(request)
@@ -519,13 +617,22 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
             result
         }
         val bound = requestBound.scope; val authority = requestBound.version
-        try { fetch() }
+        suspend fun attempt() = try { fetch() }
         catch (error: IOException) {
             if (error !is java.net.SocketException && error !is java.net.UnknownHostException) throw error
             if (method != "GET" || authority == null || scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
             kotlinx.coroutines.delay(150)
             if (scope != bound || scopeGeneration.get() != requestBound.generation || nativeAuthorityVersion() != authority) throw error
             fetch()
+        }
+        // Hermes refuses before the plugin does anything (canonical_transport.native_policy), so after Beacon is turned on the same request runs once more. Only for this client's
+        // own profile, never for the turn-on itself; a second refusal is the turn-on not taking.
+        try { attempt() }
+        catch (refusal: ApiFailure) {
+            if (refusal is BeaconOffFailure || !beaconOffForProfile(refusal) || !path.startsWith(BEACON_PLUGIN_PATH) || path == PROFILE_PLUGIN_ENABLE_PATH ||
+                query["beacon_profile"] != bound.profile || scope != bound || auth.profile != bound.profile) throw refusal
+            turnBeaconOnAfterRefusal()
+            try { attempt() } catch (again: ApiFailure) { throw if (again !is BeaconOffFailure && beaconOffForProfile(again)) BeaconOffFailure(again) else again }
         }
     }
     suspend fun call(path: String, query: Map<String, String> = emptyMap(), method: String = "GET", data: JSONObject? = null, maxBytes: Int = 32 * 1024 * 1024): JSONObject = operationLock.withLock { NativeOperations(this).call(path, query, method, data, maxBytes) }
@@ -722,12 +829,12 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
         // The ViewModel removed local authority before push cleanup; this old client must not erase a newer sign-in.
     }
     suspend fun stream(path: String, query: Map<String, String>, lastId: String = "", onEvent: suspend (SseEvent) -> Unit) {
-        detached().nativeStream(path, query, lastId, onEvent)
+        detached().nativeStream(path, query, lastId, onEvent = onEvent)
     }
     /** Consume on a dedicated client so busy-turn controls address its live connection. */
-    internal suspend fun nativeStream(path: String, query: Map<String, String>, lastId: String = "", onEvent: suspend (SseEvent) -> Unit) {
+    internal suspend fun nativeStream(path: String, query: Map<String, String>, lastId: String = "", onOpen: (suspend () -> Unit)? = null, onEvent: suspend (SseEvent) -> Unit) {
         require(path in setOf("/api/chat/stream", "/api/session/stream")) { "Streaming this capability is unavailable in native Hermes" }
-        NativeOperations(this).stream(path, query, lastId, onEvent)
+        NativeOperations(this).stream(path, query, lastId, onOpen, onEvent)
     }
     suspend fun upload(path: String, file: File, name: String, mime: String, sessionId: String, directory: String = "."): JSONObject = withContext(Dispatchers.IO) {
         operationLock.withLock {

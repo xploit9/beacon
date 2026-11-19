@@ -283,6 +283,29 @@ class QueueBoxTest {
         assertEquals("", again.admissionStatus)
     }
 
+    /**
+     * CHAT-121 follow-up 9: a waiting message whose file could not get through (its tries failed) stays in the box and says "Not sent", with its Send, as
+     * the offline outbox's message does; a message merely waiting says nothing. It is saved that way, so a restart keeps it, and the words are the box's
+     * own ("Not sent", "Send"), already in every language of the catalog.
+     */
+    @Test fun aQueuedMessageWhoseFileCouldNotGetThroughSaysNotSentWithItsSend() {
+        val stopped = QueuedMessage("Synthetic report attached", listOf(json("name" to "Synthetic report.pdf")), state = "queued", outcome = FILE_NOT_SENT_OUTCOME, id = "f9")
+        val waiting = stopped.copy(outcome = "", id = "w9")
+        assertTrue(stopped.fileNotSent() && stopped.inBox())
+        assertTrue(queueBoxSaysNotSent(stopped))
+        assertFalse(queueBoxSaysNotSent(waiting))
+        assertEquals(QueueBoxAction.Send, queueBoxAction(stopped, replying = false))
+        assertEquals(listOf("w9", "f9"), queueBoxItems(listOf(stopped.copy(createdAt = 200), waiting.copy(createdAt = 100))).map { it.id })
+        val restarted = QueuedMessage.decode(JSONObject(stopped.encode().toString()))
+        assertTrue("saved as not sent", restarted.fileNotSent() && queueBoxSaysNotSent(restarted))
+        // A message Hermes never started keeps its own "Not sent" and Retry.
+        assertTrue(queueBoxSaysNotSent(item("settled", "cancelled")))
+        val app = listOf(".", "app", "beacon-android/app").map { java.io.File(it) }.first { java.io.File(it, "src/main/assets/native-locales.json").isFile }
+        val catalog = JSONObject(java.io.File(app, "src/main/assets/native-locales.json").readText(Charsets.UTF_8).removePrefix("﻿"))
+        for (language in catalog.keys()) for (words in listOf("not sent", "send"))
+            assertTrue("$language: $words", catalog.getJSONObject(language).optString(words).isNotBlank())
+    }
+
     @Test fun onlyAMessageInTheBoxCanBeRetriedEditedOrRemovedFromIt() {
         assertTrue(item("queued").inBox())
         assertTrue(item("settled", "cancelled").inBox())

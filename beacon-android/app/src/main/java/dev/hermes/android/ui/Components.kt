@@ -135,16 +135,13 @@ val LocalOpenNavigationMenu = staticCompositionLocalOf<(() -> Unit)?> { null }
     }
 }
 /** [centered] is for a state that sits under a centred picture (a null [icon] when the picture is already there). */
-@Composable fun EmptyState(title: String, description: String, icon: ImageVector? = Icons.Rounded.ChatBubbleOutline, action: String = "", onAction: () -> Unit = {}, centered: Boolean = false,
-    secondaryAction: String = "", onSecondaryAction: () -> Unit = {}, selectable: Boolean = false) {
+@Composable fun EmptyState(title: String, description: String, icon: ImageVector? = Icons.Rounded.ChatBubbleOutline, action: String = "", onAction: () -> Unit = {}, centered: Boolean = false) {
     val align = if (centered) androidx.compose.ui.text.style.TextAlign.Center else androidx.compose.ui.text.style.TextAlign.Start
     Column(Modifier.fillMaxWidth().padding(32.dp), verticalArrangement = Arrangement.spacedBy(12.dp), horizontalAlignment = if (centered) androidx.compose.ui.Alignment.CenterHorizontally else androidx.compose.ui.Alignment.Start) {
         if (icon != null) Icon(icon, null, modifier = Modifier.size(32.dp), tint = MaterialTheme.colorScheme.primary)
         Text(title, Modifier.semantics { heading() }, style = MaterialTheme.typography.headlineSmall, textAlign = align)
-        val body: @Composable () -> Unit = { Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = align) }
-        if (description.isNotBlank()) { if (selectable) androidx.compose.foundation.text.selection.SelectionContainer { body() } else body() }
+        if (description.isNotBlank()) Text(description, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = align)
         if (action.isNotBlank()) Button(onClick = onAction, modifier = Modifier.padding(top = if (description.isBlank()) 8.dp else 0.dp).heightIn(min = 48.dp)) { Text(action) }
-        if (secondaryAction.isNotBlank()) OutlinedButton(onClick = onSecondaryAction, modifier = Modifier.heightIn(min = 48.dp)) { Text(secondaryAction) }
     }
 }
 
@@ -493,6 +490,7 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
     thread: Boolean = false,
     streaming: Boolean = false,
     selected: Boolean = false,
+    cutOff: Boolean = false,
 ) {
     val scheme = MaterialTheme.colorScheme
     val unreadLabel = uiText("Unread reply")
@@ -512,6 +510,8 @@ internal fun bubbleShape(own: Boolean, joinedTop: Boolean, tail: Boolean): Round
             }
             Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
                 Text(preview, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium.rowStart(), color = scheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+                // Hermes lost this chat's last reply in a restart (Beacon's read-only route): one short word, before the person opens it.
+                if (cutOff && !streaming) Text(uiText("Reply cut off"), Modifier.padding(start = 8.dp).testTag("lost-turn-marker"), style = nativeMetadataStyle(), color = scheme.error, maxLines = 1)
                 if (streaming) CircularProgressIndicator(Modifier.padding(start = 8.dp).size(14.dp), strokeWidth = 2.dp)
                 else if (unread) Box(Modifier.padding(start = 8.dp).size(10.dp).clip(CircleShape).background(scheme.primary).testTag("unread-dot"))
             }

@@ -28,6 +28,13 @@ internal fun tableColumnWidths(rows: List<List<String>>, measure: (String) -> In
         (rows.take(200).maxOfOrNull { row -> row.getOrNull(column).orEmpty().lineSequence().maxOfOrNull(measure) ?: 0 }?.plus(24) ?: 100).coerceIn(100, 280)
     }
 
+/** UX-121 P3-17 (Root): a table a little wider than its bubble wraps its widest column to fit [available] dp, when that column keeps 100 dp; else it scrolls. */
+internal fun tableFitWidths(widths: List<Int>, available: Int): List<Int> {
+    val widest = widths.indices.maxByOrNull { widths[it] } ?: return widths
+    val room = available - (widths.sum() - widths[widest])
+    return if (widths.sum() > available && room >= 100) widths.toMutableList().also { it[widest] = room } else widths
+}
+
 internal fun slashMatches(name: String, description: String, draft: String): Boolean =
     draft.startsWith('/') && !draft.substringAfter('/').contains(' ') &&
         (name.removePrefix("/").startsWith(draft.removePrefix("/"), true) || draft.removePrefix("/").length >= 3 && description.contains(draft.removePrefix("/"), true))

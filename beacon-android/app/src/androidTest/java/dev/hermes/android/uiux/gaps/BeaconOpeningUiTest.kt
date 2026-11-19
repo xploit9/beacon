@@ -53,6 +53,34 @@ class BeaconOpeningUiTest {
         compose.onNodeWithTag("composer-model-effort").assertIsNotEnabled()
     }
 
+    /**
+     * UX-121 P3-10 (CHATFIX-121 follow-up 1): the account's Beacon chat is already on screen from the cache (its handle, its messages) and an open of it
+     * runs again (a language change, a return to the app). It stays shown, with the composer idle until the open ends; the skeleton is for nothing to show.
+     */
+    @Test fun aReopenKeepsTheBeaconChatAlreadyOnScreen() = withClientlessVm(compose) { vm ->
+        fun set(name: String, value: Any?) = BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
+        val owner = dev.hermes.android.core.Scope("https://hermes.example.com", "synthetic-owner", vm.preferences.value.assistantProfile)
+        compose.runOnIdle {
+            set("cachedOwnerScope", owner)
+            set("sourceScope", owner.session("beacon-chat"))
+            (BeaconViewModel::class.java.getDeclaredField("saved").apply { isAccessible = true }.get(vm) as androidx.lifecycle.SavedStateHandle)["beacon:${owner.key}"] = "beacon-chat"
+            vm.chatFlow.value = ChatState(sessionId = "beacon-chat", title = "Beacon", projectionReady = true,
+                messages = listOf(dev.hermes.android.Message.from(json("role" to "assistant", "content" to "Synthetic saved reply", "row_id" to 1), 0, "beacon-chat")))
+            vm.appFlow.value = AppState(origin = owner.origin, owner = owner.owner, profile = owner.profile, authenticated = true, tab = "Beacon", connected = true,
+                restoringSession = false, beaconOpening = true, bootstrap = json("optional_features" to json("plugin" to "available")))
+        }
+        compose.setContent {
+            NativeLocalization("en") { BeaconTheme {
+                CompositionLocalProvider(LocalAssistantName provides "Beacon", LocalBeaconSettings provides JSONObject()) { ChatScreen(vm, beacon = true) }
+            } }
+        }
+        compose.waitForIdle()
+        compose.onNodeWithTag("chat-skeleton").assertDoesNotExist()
+        compose.onNodeWithText("Synthetic saved reply", substring = true).assertExists()
+        compose.onNodeWithText("Opening Beacon…").assertDoesNotExist()
+        compose.onNodeWithTag("message-input").assertIsDisplayed().assertIsNotEnabled()
+    }
+
     @Test fun anErrorKeepsItsOwnPageWithRetryAndNoComposer() = withClientlessVm(compose) { vm ->
         show(vm, opening = false, error = "Synthetic failure")
         compose.onNodeWithTag("chat-skeleton").assertDoesNotExist()

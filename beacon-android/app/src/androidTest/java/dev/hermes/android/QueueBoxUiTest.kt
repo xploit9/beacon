@@ -254,6 +254,17 @@ class QueueBoxUiTest {
         assertEquals(1, vm.chat.value.queued.count { it.id == id })
     }
 
+    // Chat join (Root, after the chat-121-10 fold): a file that could not get through says "Not sent" once, on its row with its Send.
+    @Test fun aStalledFileSaysNotSentOnceWithItsSend() = withFixture { vm, _ ->
+        val stalled = QueuedMessage("Synthetic report attached", listOf(json("name" to "Synthetic report.pdf", "mime" to "application/pdf")),
+            state = "queued", outcome = FILE_NOT_SENT_OUTCOME, held = queuedHoldReason(dev.hermes.android.data.AttachmentStalled()))
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(status = "", queued = listOf(stalled)) }
+        compose.waitForIdle()
+        compose.onNodeWithTag("queue-not-sent:${stalled.id}").assertIsDisplayed()
+        compose.onAllNodesWithText("Not sent", substring = true).assertCountEquals(1)
+        compose.onNodeWithTag("queue-send:${stalled.id}").assertIsDisplayed()
+    }
+
     @Test fun aTapOnAHeldBubbleOpensItsMenuLikeALongPress() = withFixture { vm, _ ->
         val now = System.currentTimeMillis()
         val unknown = QueuedMessage("Synthetic message of unknown outcome", state = "unknown", admissionId = "admission-synthetic", createdAt = now - 20_000)
@@ -307,7 +318,7 @@ class QueueBoxUiTest {
 
     /**
      * The commonest path, end to end with Hermes' real sequence: Hermes answers this send "queued" (it does to every fresh send), then starts the turn
-     * and streams its reply. The ticks turn blue while the reply is still streaming, not when it ends.
+     * and streams its reply. The ticks stay grey through Thinking, a wait line and tool progress, and turn blue at the reply's first words, while it still streams.
      */
     @Test fun aSendOnAnIdleChatTurnsBlueWhileItsReplyStreams() = withFixture(canonical = true) { vm, fixture ->
         openWatchedChat(vm)
@@ -317,13 +328,20 @@ class QueueBoxUiTest {
         val id = vm.chat.value.queued.single().id
         assertEquals("Hermes answered the send as queued, as it does for every fresh send", listOf("queued"), fixture.submitAnswers.toList())
         compose.waitUntil(15_000) { vm.chat.value.streamId == "chat-a" && fixture.liveCollectorSubscriptions.get() > 0 }
+        // Root's rule (TURN-121): Thinking, Hermes' wait line and tool progress are not an answer. Hermes started the turn, and the ticks stay grey.
+        fixture.emitNativeEvent("reasoning.delta", json("text" to "Planning the reply"))
+        fixture.emitNativeEvent("thinking.delta", json("text" to "⏳ waiting on example-model — 30s with no output yet"))
+        fixture.emitNativeEvent("tool.start", json("tool_call_id" to "tool-grey", "name" to "terminal", "context" to ""))
+        compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.admissionStatus == "started" && vm.chat.value.liveTools.isNotEmpty() }
+        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-message:$id"))
+        compose.onNode(tickIn(id, "delivered"), useUnmergedTree = true).assertExists()
+        compose.onAllNodes(tickIn(id, "answered"), useUnmergedTree = true).assertCountEquals(0)
         fixture.emitNativeEvent("message.delta", json("text" to "The reply is still streaming"))
         compose.waitUntil(15_000) { vm.chat.value.liveText == "The reply is still streaming" }
-        // The reply has not ended, and the ticks are blue.
+        // The reply has not ended, and its first words turn the ticks blue.
         assertTrue(vm.chat.value.streamId.isNotBlank())
-        compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.admissionStatus == "started" }
         compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-message:$id"))
-        compose.onNode(tickIn(id, "answered"), useUnmergedTree = true).assertExists()
+        compose.waitUntil(15_000) { compose.onAllNodes(tickIn(id, "answered"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         compose.onAllNodes(tickIn(id, "delivered"), useUnmergedTree = true).assertCountEquals(0)
     }
 
@@ -354,9 +372,9 @@ class QueueBoxUiTest {
 
     /**
      * R9 Nice 8: Hermes answers a fresh send "queued", claims the row afterwards and pushes the stamped `message.start` to the stream the phone has attached
-     * (gateway/session_events.py publish -> fanout.write). The ticks are grey until that live frame, blue when it arrives, and the stamp is gone after the terminal frame.
+     * (gateway/session_events.py publish -> fanout.write). That live frame starts the turn; the ticks stay grey until its first words (Root's rule, TURN-121), and the stamp is gone after the terminal frame.
      */
-    @Test fun theStampedStartThatArrivesLiveAfterTheQueuedAnswerTurnsTheTicksBlue() = withFixture(canonical = true) { vm, fixture ->
+    @Test fun theStampedStartThatArrivesLiveAfterTheQueuedAnswerStartsTheTurnAndItsWordsTurnTheTicksBlue() = withFixture(canonical = true) { vm, fixture ->
         openWatchedChat(vm)
         compose.waitUntil(15_000) { vm.preferences.value.busySendLoaded }
         // Answered "queued"; Hermes shows the chat working as it takes the row, and the stamped start comes later, as a live frame on the stream the phone has attached.
@@ -375,10 +393,12 @@ class QueueBoxUiTest {
         fixture.startCanonicalTurn(sent.admissionId, live = true)
         compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.admissionStatus == "started" }
         compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-message:${sent.id}"))
-        compose.onNode(tickIn(sent.id, "answered"), useUnmergedTree = true).assertExists()
+        compose.onNode(tickIn(sent.id, "delivered"), useUnmergedTree = true).assertExists()
         // The reply ends: the terminal frame is the last one that carries the stamp.
         fixture.emitNativeEvent("message.delta", json("text" to "The reply is streaming"))
         compose.waitUntil(15_000) { vm.chat.value.liveText == "The reply is streaming" }
+        compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-message:${sent.id}"))
+        compose.waitUntil(15_000) { compose.onAllNodes(tickIn(sent.id, "answered"), useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
         fixture.nativeTurnStatus = "idle"
         fixture.emitNativeEvent("message.complete", json("text" to "The reply is streaming"))
         assertNull("The stamp is cleared right after the terminal frame", fixture.executingAdmission)
@@ -416,7 +436,7 @@ class QueueBoxUiTest {
         assertTrue("nothing was sent again by itself", fixture.requests.none { it.string("method") == "prompt.submit" })
     }
 
-    @Test fun aMessageWhoseTurnFailedStaysInTheChatWithTwoBlueTicks_andNothingOffersToSendItAgain() = withFixture(canonical = true) { vm, fixture ->
+    @Test fun aMessageWhoseTurnFailedStaysInTheChatWithTwoGreyTicks_andNothingOffersToSendItAgain() = withFixture(canonical = true) { vm, fixture ->
         val item = QueuedMessage("Synthetic message whose turn failed", state = "accepted", admissionId = "admission-synthetic")
         compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(queued = listOf(item)) }
         runBlocking { vm.checkpointNow() }
@@ -429,8 +449,9 @@ class QueueBoxUiTest {
         compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.let { it.state == "settled" && it.outcome == "failed" } == true }
         compose.waitForIdle()
         compose.onNodeWithTag("conversation-transcript").performScrollToNode(hasTestTag("queued-message:${item.id}"))
-        // Hermes settles a failed turn only for one it started: the message was started, so the ticks are blue though no reply follows.
-        compose.onNode(tickIn(item.id, "answered"), useUnmergedTree = true).assertExists()
+        // Hermes settles a failed turn only for one it started: the message reached Hermes but was never answered (Root's rule, TURN-121), so two grey ticks.
+        compose.onNode(tickIn(item.id, "delivered"), useUnmergedTree = true).assertExists()
+        compose.onAllNodes(tickIn(item.id, "answered"), useUnmergedTree = true).assertCountEquals(0)
         compose.onAllNodesWithText("Synthetic message whose turn failed").assertCountEquals(1)
         compose.onAllNodesWithTag("queue-box").assertCountEquals(0)
         compose.onAllNodesWithTag("queue-not-sent:${item.id}").assertCountEquals(0)

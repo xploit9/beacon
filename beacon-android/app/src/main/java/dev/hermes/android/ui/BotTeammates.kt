@@ -220,12 +220,12 @@ internal class RowQuick(val icon: ImageVector, val label: String, val tag: Strin
  * A bot as a chat-list row: its avatar in the colour it has in the group chat, its name and its role, and on the right its [status] (blank for none).
  * A tap opens its chat; a long press opens [actions]; [quick] adds one more button at the end of the row.
  */
-@Composable internal fun TeammateRow(name: String, profile: String, role: String, isOpen: Boolean, actions: List<RowAction>, tag: String, status: String = "", quick: RowQuick? = null, onOpen: () -> Unit) {
+@Composable internal fun TeammateRow(name: String, profile: String, role: String, isOpen: Boolean, actions: List<RowAction>, tag: String, status: String = "", quick: RowQuick? = null, cutOff: Boolean = false, onOpen: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     Box {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             ChatListRow(
-                id = profile, title = name, preview = role, time = status, selected = isOpen,
+                id = profile, title = name, preview = role, time = status, selected = isOpen, cutOff = cutOff,
                 modifier = Modifier.weight(1f).semantics { selected = isOpen }.combinedClickable(onLongClickLabel = uiText("Bot actions"), onLongClick = { menu = true }, onClick = onOpen).testTag(tag),
             )
             quick?.let { IconButton(onClick = it.onClick, modifier = Modifier.size(48.dp).testTag(it.tag)) { Icon(it.icon, it.label) } }

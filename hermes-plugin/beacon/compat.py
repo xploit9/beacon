@@ -207,6 +207,10 @@ ENABLE_STOPS = 'Turning Beacon on for another profile from the phone needs a Bea
 # any_site_card.py needs stops that one feature, and browser_vault itself keeps working.
 CARD_FILE = 'any_site_card.py'
 CARD_STOPS = 'Using a saved card on any site needs a Beacon update for this Hermes'
+# The agent phone's vault bridge reaches Hermes' vault store, backends, prompts, card consent and redaction by name; a gap there stops
+# saved logins, cards and codes on the assistant's phone, and the phone itself keeps working.
+PHONE_VAULT_FILE = 'agent_phone_vault.py'
+PHONE_VAULT_STOPS = "Saved logins on the assistant's phone need a Beacon update for this Hermes"
 
 
 def stopped(gone):
@@ -216,6 +220,8 @@ def stopped(gone):
         sentences.append(ENABLE_STOPS)
     if any(f'({CARD_FILE})' in line for line in gone):
         sentences.append(CARD_STOPS)
+    if any(f'({PHONE_VAULT_FILE})' in line for line in gone):
+        sentences.append(PHONE_VAULT_STOPS)
     return sentences
 
 

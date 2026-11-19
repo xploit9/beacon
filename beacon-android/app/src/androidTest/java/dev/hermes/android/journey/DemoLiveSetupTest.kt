@@ -32,7 +32,7 @@ class DemoLiveSetupTest {
     } }
     @get:Rule val rules: RuleChain = RuleChain.outerRule(ownerRuntimeOptIn).around(optIn).around(compose)
 
-    @Test(timeout = 120_000) fun selectDisposableDemoAndVerifyItsOnlyLocalRecipient() = runBlocking {
+    @Test(timeout = 180_000) fun selectDisposableDemoAndVerifyItsOnlyLocalRecipient() = runBlocking {
         val app = compose.activity.application as BeaconApplication
         val args = InstrumentationRegistry.getArguments()
         val profile = args.getString("beaconQaProfile").orEmpty()
@@ -58,6 +58,14 @@ class DemoLiveSetupTest {
         withContext(Dispatchers.Main.immediate) { vm.finishSetupWizard(keepConnected = true) }
         withTimeout(45_000) { while (vm.ui.value.setupWizard || vm.ui.value.loading || KeepConnectedService.status(app) != KeepConnectedService.STATUS_CONNECTED) delay(100) }
         check(KeepConnectedService.isEnabledFor(app, scope) && vm.client === client)
+        // finishSetupWizard also starts the first chat's create. A process that ends before Hermes answers leaves that create's marker, and every later stage then meets a dead
+        // New chat (F8 live round 7): wait for the first chat to finish, and make a failed one again.
+        withTimeout(60_000) {
+            while (vm.chat.value.sessionId.isBlank() || vm.ui.value.newChatOpening) {
+                if (!vm.ui.value.newChatOpening && vm.ui.value.newChatError.isNotBlank()) withContext(Dispatchers.Main.immediate) { vm.retryInitialChat() }
+                delay(100)
+            }
+        }
         File(app.filesDir, "demo-live-setup.json").writeText(json("run" to java.util.UUID.randomUUID().toString(), "profile" to profile, "origin_sha256" to scope.origin.digest(),
             "device_id" to device, "local_delivery" to true, "fcm_targets" to 0, "ready" to true).toString())
     }

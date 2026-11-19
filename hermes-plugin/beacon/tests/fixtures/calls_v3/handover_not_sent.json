@@ -1,0 +1,16 @@
+{
+  "request_id": "handover-synthetic-0002",
+  "status": "not_sent",
+  "admission_id": null,
+  "job_id": null,
+  "stored_session_id": "stored-synthetic-0001",
+  "runtime_session_id": "stored-synthetic-0001",
+  "callback_consent": "unset",
+  "outcome": null,
+  "server_ms": {
+    "authority": 7.5,
+    "total": 9.25
+  },
+  "error_code": "queue_full",
+  "reason": "queue_full"
+}

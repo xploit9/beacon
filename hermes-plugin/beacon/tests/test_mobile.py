@@ -396,7 +396,8 @@ def test_call_authorization_is_offloaded_from_event_loop(harness,monkeypatch):
     result=asyncio.run(api.call(request,'call'))
 
     assert result[2]=={'profile':'default','conversation':'native','closed':0}
-    assert [step for step,_ in observed]==['identity-owner','connect','owned','seen','identity-profile','conversation-owner','verified-conversation']
+    # The first connect/write is the call-contract count (CALLS-CONTRACT.md section 8), then the call row and its last-seen time.
+    assert [step for step,_ in observed]==['identity-owner','connect','seen','connect','owned','seen','identity-profile','conversation-owner','verified-conversation']
     assert all(thread_id!=loop_thread for _,thread_id in observed)
 
 def test_visual_tool_and_aggregated_clock_evidence_is_scoped_and_validated(harness):
@@ -1447,7 +1448,7 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call','pre_approval_request','post_approval_response'}
     # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them), and the saved-card tool in the browser toolset (test_any_site_card covers it).
     assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_continue_call_work','beacon_create_proactive_request',
-                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked','beacon_pay_with_card',
+                                            'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked','beacon_pay_with_card','agent_phone',
                                             *plugin.phone_tools.NAMES,*plugin.email_drafts.NAMES}
     assert all(callable(handler) for name,handler in hooks)
 

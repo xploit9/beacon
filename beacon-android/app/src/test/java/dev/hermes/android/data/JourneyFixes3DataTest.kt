@@ -26,17 +26,21 @@ class JourneyFixes3DataTest {
     }
 
     @Test fun aRejectedModelGetsOneShortLine() {
-        val line = "The model rejected this request. Try again or pick another model."
+        // TURN-121: trying again cannot change a rejection, so the line names the fix only.
+        val line = "The model rejected this request. Pick another model."
         for (code in listOf("model_not_found", "model_entitlement", "provider_policy_blocked", "format_error")) {
             val event = json("status" to "error", "error" to "HTTP 400 model_not_supported", "error_surface" to json("layer" to "provider", "code" to code, "retryable" to false))
             assertEquals(code, line, turnErrorText(event))
         }
     }
 
-    @Test fun otherFailedTurnsKeepTheirGenericText() {
+    @Test fun aRateLimitSaysTheModelIsBusyAndOtherFailuresKeepTheirGenericText() {
+        // TURN-121 (CHATQA-121 D3): Hermes' failure code is no longer dropped; a frame that names no known code keeps the generic line.
         val rateLimited = json("error" to "HTTP 429", "error_surface" to json("layer" to "provider", "code" to "rate_limit", "retryable" to true))
-        assertEquals(apiFailureText(500, "HTTP 429"), turnErrorText(rateLimited))
+        assertEquals("The model is busy. Try again in a moment.", turnErrorHeadline(turnErrorText(rateLimited)))
         assertEquals(apiFailureText(500, "boom"), turnErrorText(json("message" to "boom")))
         assertEquals(apiFailureText(500, ""), turnErrorText(json()))
+        // TURN-121 follow-up 1 (decision 7): a dropped stream has its own line.
+        assertEquals("The connection to the model dropped. Try again.", turnErrorHeadline(turnErrorText(json("message" to "stream_drop", "error_surface" to json("layer" to "streaming", "code" to "stream_drop", "retryable" to true)))))
     }
 }

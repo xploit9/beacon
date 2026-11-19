@@ -1,5 +1,6 @@
 package dev.hermes.android.ui
 
+import dev.hermes.android.core.copy
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
 import androidx.activity.compose.BackHandler
@@ -14,6 +15,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
+import dev.hermes.android.data.NativeMemoryState
+import dev.hermes.android.data.parseNativeSkills
+import dev.hermes.android.parseBotSummaries
 import kotlinx.coroutines.delay
 
 @Composable internal fun NativePhonePreferences(vm: BeaconViewModel, page: String) {
@@ -26,8 +30,16 @@ import kotlinx.coroutines.delay
     val editor = vm.phoneSettings
     val roster by vm.botMode.state.collectAsStateWithLifecycle()
     val choosing by vm.settingsProfileSelecting.collectAsStateWithLifecycle()
-    val skills by editor.skills.collectAsStateWithLifecycle()
-    val memory by editor.memory.collectAsStateWithLifecycle()
+    val liveSkills by editor.skills.collectAsStateWithLifecycle()
+    val liveMemory by editor.memory.collectAsStateWithLifecycle()
+    // Until the editor holds this profile's lists (a cold start still reconnecting, or offline), the saved copy of this account and profile shows; with no client it is read-only.
+    val savedOwner = profileClient?.scope ?: if (target.isBlank()) vm.restoredScope() else null
+    val savedSkills = savedOwner?.takeIf { page == "Skills" && liveSkills.skills.isEmpty() && !liveSkills.editing }?.let { vm.screens.exact(it, "settings:skills")?.value }
+    val savedMemory = savedOwner?.takeIf { page == "Memory" && liveMemory.documents.isEmpty() && liveMemory.editing.isBlank() }?.let { vm.screens.exact(it, "settings:memory")?.value }
+    val seeded = savedSkills != null || savedMemory != null
+    val offlineCopy = seeded && profileClient == null
+    val skills = if (savedSkills != null) remember(savedSkills, liveSkills) { liveSkills.copy(skills = parseNativeSkills(savedSkills.copy())) } else liveSkills
+    val memory = if (savedMemory != null) remember(savedMemory, liveMemory) { runCatching { NativeMemoryState.parse(liveMemory.scope, savedMemory.getJSONObject("status"), savedMemory.getJSONObject("notes")).copy(loading = liveMemory.loading, error = liveMemory.error) }.getOrDefault(liveMemory) } else liveMemory
     var discard by remember { mutableStateOf<(() -> Unit)?>(null) }
     val saving = if (page == "Skills") skills.saving else memory.saving
     val dirty = if (page == "Skills") skills.editing && skills.draft != skills.content?.content else memory.editing.isNotBlank() && memory.draft != memory.documents.firstOrNull { it.target == memory.editing }?.content
@@ -56,15 +68,16 @@ import kotlinx.coroutines.delay
             else SettingsIconButton(Icons.Rounded.Refresh, uiText("Refresh skills"), { skills.selected?.let(editor::openSkill) ?: editor.loadSkills() }, enabled = profileClient != null && !skills.loading && !skills.saving && !skills.editing)
         }
         // The editor is still binding to this profile: a placeholder page with the thin bar, not a lone progress line.
-        if (editor.scopeKey != profileClient?.scope?.key) SettingsList(refreshing = true, testTag = "settings-binding") { item { SettingsSection(testTag = "settings-binding-section") { SettingsSkeletonRows(3) } } }
+        // Chat join: CACHEFIX-A shows the saved copy here (seeded); CACHEFIX-B binds the editor to the restored account before the client exists.
+        if (!seeded && editor.scopeKey != (profileClient?.scope?.key ?: vm.settingsRestoredScopeKey)) SettingsList(refreshing = true, testTag = "settings-binding") { item { SettingsSection(testTag = "settings-binding-section") { SettingsSkeletonRows(3) } } }
         else if (page == "Skills") NativeSkillsScreen(skills, editor::skillSearch, editor::openSkill,
             onBack = { leave(editor::closeSkill) }, onToggle = editor::toggleSkill,
             onEdit = { editing -> if (editing) editor.skillEdit(true) else leave { editor.skillEdit(false) } },
             onDraft = editor::skillDraft, onSave = editor::saveSkill,
             onRetry = { if (skills.editing) leave { editor.skillEdit(false); skills.selected?.let(editor::openSkill) } else skills.selected?.let(editor::openSkill) ?: editor.loadSkills() },
-            renderInstructions = { Markdown(skillInstructionBody(it), vm) })
+            renderInstructions = { Markdown(skillInstructionBody(it), vm) }, readOnly = offlineCopy)
         else NativeMemoryScreen(memory, editor::editMemory, editor::memoryDraft, editor::saveMemory,
-            onCancel = { leave { editor.editMemory("") } }, renderNotes = { Markdown(it, vm) })
+            onCancel = { leave { editor.editMemory("") } }, renderNotes = { Markdown(it, vm) }, readOnly = offlineCopy)
     }
     discard?.let { action -> AlertDialog(onDismissRequest = { discard = null }, title = { Text(uiText("Discard unsaved changes?")) },
         text = { Text(uiText(if (page == "Memory") "Your saved notes stay unchanged." else "Your saved instructions stay unchanged.")) },
@@ -88,7 +101,9 @@ import kotlinx.coroutines.delay
         Header(if (backups) uiText("File backups") else uiText(settingsLabel(page)), "", back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current, actions = {
             SettingsIconButton(Icons.Rounded.Refresh, uiText(if (page == "Server updates") "Refresh update status" else "Refresh"), { vm.phoneSettings.loadServer(page) }, enabled = !state.loading)
         })
-        NativeServerSettings(page, state, { vm.phoneSettings.loadServer(page, force = true) },
+        // Until Hermes has been asked, an empty page is not an answer: it says it is checking, never "no backups" or "isn't available".
+        val shown = if (state.asked || serverHasCache(page, state) || state.error.isNotBlank() || vm.client == null && !ui.loading && !ui.restoringSession) state else state.copy(loading = true)
+        NativeServerSettings(page, shown, { vm.phoneSettings.loadServer(page, force = true) },
             onApplyUpdate = { if (vm.app.calls.state.value.active) vm.notice(callBlocksUpdate) else confirm = true },
             onLogFile = vm.phoneSettings::logFile, onLogSearch = vm.phoneSettings::logSearch, onReviewUnknown = { reviewUnknown = true })
     }
@@ -108,9 +123,13 @@ import kotlinx.coroutines.delay
     val profileCatalog = data["navigation-profiles"]
     val profileRows = profileCatalog?.rows("profiles").orEmpty()
     val profileLoading = ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading"))
-    val state by vm.phoneSettings.bots.collectAsStateWithLifecycle()
+    val liveBots by vm.phoneSettings.bots.collectAsStateWithLifecycle()
     val target by vm.settingsProfile.collectAsStateWithLifecycle()
     val selecting by vm.settingsProfileSelecting.collectAsStateWithLifecycle()
+    // The list opens with the profiles last saved for this account and profile, before the first read (and before the client exists).
+    val savedBotsScope = vm.client?.scope ?: vm.restoredScope()
+    val savedBots = if (liveBots.profiles.isEmpty() && liveBots.selected == null) savedBotsScope?.let { vm.screens.exact(it, "settings:bots")?.value }?.let { stored -> runCatching { parseBotSummaries(stored.copy()) }.getOrNull() } else null
+    val state = if (!savedBots.isNullOrEmpty()) liveBots.copy(profiles = savedBots) else liveBots
     val models by vm.phoneSettings.botModels.collectAsStateWithLifecycle()
     val admin by vm.profileAdmin.state.collectAsStateWithLifecycle()
     var creating by rememberSaveable { mutableStateOf(false) }
@@ -147,7 +166,7 @@ import kotlinx.coroutines.delay
             onEditDescription = { vm.profileAdmin.clearError(); describing = true }, onEditInstructions = { vm.profileAdmin.clearError(); instructing = true },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },
             onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it },
-            activeProfile = ui.profile, approvals = { ProfileApprovalSettings(vm) })
+            activeProfile = ui.profile, approvals = { ProfileApprovalSettings(vm) }, readOnly = vm.settingsProfileClient() == null)
     }
     state.selected?.let { bot ->
         if (describing) EditRoleDialog(bot.profile, bot.description, admin, onSave = { text -> vm.profileAdmin.setRole(bot.profile, text) { vm.phoneSettings.botEdited(bot.profile, description = it) } },

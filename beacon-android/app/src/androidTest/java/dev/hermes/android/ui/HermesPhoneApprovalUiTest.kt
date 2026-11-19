@@ -133,6 +133,33 @@ class HermesPhoneApprovalUiTest {
         // Whether an unmarked number reorders depends on the platform's bidi rules; only the marked one is ours to guarantee.
     }
 
+    /**
+     * CHATFIX-121 follow-up 1 (B9, UX-121 P3-13): the card's frames in dark, light and Arabic (right to left), saved only on a run with shots=1. A larger
+     * text size set here does not reach the dialog's own window, so that frame needs the phone's own font size.
+     */
+    @Test fun theCardsFramesForTheReview() {
+        val instrumentation = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation()
+        if (androidx.test.platform.app.InstrumentationRegistry.getArguments().getString("shots") != "1") return
+        val variant = androidx.compose.runtime.mutableStateOf("dark")
+        compose.setContent {
+            CompositionLocalProvider(LocalLayoutDirection provides if (variant.value == "ar") LayoutDirection.Rtl else LayoutDirection.Ltr) {
+                NativeLocalization(if (variant.value == "ar") "ar" else "en") { BeaconTheme(dark = variant.value != "light") {
+                    PhoneApprovalCard(line, false, false, false, onAllow = {}, onDeny = {}, onClose = {})
+                } }
+            }
+        }
+        val dir = java.io.File(instrumentation.targetContext.filesDir, "native-experience/call-card").apply { mkdirs() }
+        for (name in listOf("dark", "light", "ar")) {
+            compose.runOnIdle { variant.value = name }
+            compose.onNodeWithTag("phone-request-allow").assertIsDisplayed()
+            compose.onNodeWithTag("phone-request-deny").assertIsDisplayed()
+            instrumentation.uiAutomation.waitForIdle(350, 3000)
+            val bitmap = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
+            java.io.File(dir, "$name.png").outputStream().use { assertTrue(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)) }
+            bitmap.recycle()
+        }
+    }
+
     @Test fun allowDenyAndDoneAreFullSizeTargets() {
         show()
         compose.onNodeWithTag("phone-request-allow").assertHeightIsAtLeast(48.dp).assertWidthIsAtLeast(48.dp)

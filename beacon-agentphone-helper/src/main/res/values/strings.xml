@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Beacon</string>
+    <!-- Beacon's entry in Android's autofill list: the vault item's label. -->
+    <string name="entry">Beacon · %1$s</string>
+    <string name="save_offline">Beacon can\'t save this right now.</string>
+</resources>

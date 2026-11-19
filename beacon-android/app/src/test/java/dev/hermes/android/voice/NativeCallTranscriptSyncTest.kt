@@ -440,4 +440,60 @@ class NativeCallTranscriptSyncTest {
         } finally { worker.cancel() }
     }
 
+    /** The call engine's tool receipt for a link state, as the contract's link-state fixture describes it. */
+    private fun linkReceipt(name: String): JSONObject {
+        val state = JSONObject(requireNotNull(javaClass.getResource("/calls_v3/$name")).readText())
+        return JSONObject().put("type", "tool_receipt").put("request_id", state.getString("request_id")).put("tool_name", state.getString("tool"))
+            .put("status", state.getString("status")).put("error_code", state.getString("detail"))
+    }
+
+    @Test fun linkStatesKeepTheTimelinesV2Values() {
+        fun mapped(name: String) = requireNotNull(timelineToolReceipt(linkReceipt(name)))
+        mapped("link_state_still_running.json").let { assertEquals("running", it.getString("status")); assertFalse(it.has("error_code")) }
+        mapped("link_state_hermes_unreachable.json").let { assertEquals("unavailable", it.getString("status")); assertEquals("network", it.getString("error_code")) }
+        mapped("link_state_lost_result.json").let { assertEquals("uncertain", it.getString("status")); assertEquals("timeout", it.getString("error_code")) }
+        mapped("link_state_failed.json").let { assertEquals("failed", it.getString("status")); assertFalse("connection_lost is not a timeline code", it.has("error_code")) }
+        mapped("link_state_failed.json").let { assertEquals(setOf("type", "request_id", "tool_name", "status"), it.keys().asSequence().toSet()) }
+    }
+
+    @Test fun aReceiptAPluginWouldRefuseIsNeverQueued() {
+        val ok = JSONObject().put("type", "tool_receipt").put("request_id", "req-synthetic").put("tool_name", "notes_search")
+        assertNull(timelineToolReceipt(JSONObject(ok.toString()).put("status", "invented")))
+        assertNull(timelineToolReceipt(JSONObject(ok.toString()).put("status", "running").put("request_id", "bad id")))
+        assertNull(timelineToolReceipt(JSONObject(ok.toString()).put("status", "running").put("tool_name", "x".repeat(201))))
+        assertNull(timelineToolReceipt(JSONObject(ok.toString()).put("status", "running").put("tool_name", "")))
+        val kept = requireNotNull(timelineToolReceipt(JSONObject(ok.toString()).put("status", "failed").put("error_code", "tool_http_failure").put("result", "private words")))
+        assertEquals("tool_http_failure", kept.getString("error_code")); assertFalse(kept.has("result"))
+        assertFalse(requireNotNull(timelineToolReceipt(JSONObject(ok.toString()).put("status", "failed").put("error_code", "tool_unknown"))).has("error_code"))
+    }
+
+    /**
+     * LINK-121: what lost the link goes to Hermes on the receipt, as the plugin's category, and only to a plugin whose call contract says it
+     * takes it (call_capabilities.tool_receipt_cause): an older plugin refuses the whole batch on a cause_class it does not take.
+     */
+    @Test fun aLostLinksCauseGoesOnlyToAPluginThatTakesIt() {
+        val takes = JSONObject(requireNotNull(javaClass.getResource("/calls_v3/context_v3.json")).readText())
+        val older = JSONObject(takes.toString()).apply { getJSONObject("call_capabilities").remove("tool_receipt_cause") }
+        assertTrue("the contract fixture is a plugin that takes it", takesToolReceiptCause(takes))
+        assertFalse(takesToolReceiptCause(older))
+        assertFalse("a v2 plugin never", takesToolReceiptCause(JSONObject(takes.toString()).put("call_contract", 2)))
+        assertFalse("no context yet, no cause", takesToolReceiptCause(null))
+        val lost = linkReceipt("link_state_hermes_unreachable.json").put("cause_class", "StreamResetException")
+        fun cause(value: JSONObject, context: JSONObject?) = requireNotNull(timelineToolReceipt(value, takesToolReceiptCause(context))).opt("cause_class")
+        assertNull("an older plugin gets the receipt without it", cause(lost, older))
+        assertNull(cause(lost, null))
+        assertFalse(requireNotNull(timelineToolReceipt(lost)).has("cause_class"))
+        assertEquals("io", cause(lost, takes))
+        val timedOut = linkReceipt("link_state_lost_result.json")
+        assertEquals("socket_timeout", cause(timedOut.put("cause_class", "CallRequestTimeout"), takes))
+        assertEquals("connect", cause(timedOut.put("cause_class", "ConnectException"), takes))
+        assertEquals("dns", cause(timedOut.put("cause_class", "UnknownHostException"), takes))
+        assertEquals("ssl_handshake", cause(timedOut.put("cause_class", "SSLHandshakeException"), takes))
+        assertEquals("a category already is kept", "eof", cause(timedOut.put("cause_class", "eof"), takes))
+        assertNull("nothing to name, nothing sent", cause(timedOut.put("cause_class", ""), takes))
+        assertNull("never anything but a class name", cause(timedOut.put("cause_class", "io: private detail"), takes))
+        assertNull(cause(timedOut.put("cause_class", "x".repeat(81)), takes))
+        val kept = requireNotNull(timelineToolReceipt(lost, true))
+        assertEquals(setOf("type", "request_id", "tool_name", "status", "error_code", "cause_class"), kept.keys().asSequence().toSet())
+    }
 }

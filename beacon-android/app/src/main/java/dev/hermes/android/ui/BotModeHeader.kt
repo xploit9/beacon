@@ -13,6 +13,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -21,10 +22,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.isSpecified
 import androidx.compose.ui.unit.sp
 
 // The top of the drawer in Bot Mode: where the profile pill is in the normal drawer, a Bot Mode header takes its place. Profiles do not
@@ -43,11 +44,13 @@ private val HeaderMarkSize = 32.dp
 @Composable internal fun drawerHeaderHeight(): Dp {
     val type = MaterialTheme.typography
     val density = LocalDensity.current
-    return with(density) {
-        val title = if (type.titleMedium.lineHeight.isSpecified) type.titleMedium.lineHeight.toDp() else type.titleMedium.fontSize.toDp() * 1.5f
-        val small = if (type.labelSmall.lineHeight.isSpecified) type.labelSmall.lineHeight.toDp() else type.labelSmall.fontSize.toDp() * 1.5f
-        maxOf(DrawerHeaderMinHeight, title + small + DrawerHeaderPadding)
+    // The two lines as Text lays them out at this text size. Line heights read as dp fall short at large text (Android scales big text
+    // less than small, and a line height with it), which cut "Switch profile" at 1.5x.
+    val measurer = rememberTextMeasurer()
+    val lines = remember(type, density, measurer) {
+        measurer.measure("Ag", type.titleMedium, maxLines = 1, density = density).size.height + measurer.measure("Ag", type.labelSmall, maxLines = 1, density = density).size.height
     }
+    return with(density) { maxOf(DrawerHeaderMinHeight, lines.toDp() + DrawerHeaderPadding) }
 }
 
 /**

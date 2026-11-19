@@ -17,9 +17,6 @@ internal class GrokWire(private val providerName: String = "Grok") {
     private var responseId=""
     private var responseItemsFull=false
     private val endedResponses=linkedSetOf<String>()
-    private val delivered=linkedMapOf<String,String>()
-    // DirectVoice admits at most 64 mutations; unfinished receipts outlive the recent read cache.
-    private val pendingDelivered=mutableMapOf<String,String>()
     private var responding=false
     private var responsePending=false
     // The calls of the latest response still without an output: xAI answers parallel calls once every output is in.
@@ -75,18 +72,17 @@ internal class GrokWire(private val providerName: String = "Grok") {
                 rows.optJSONObject(i)?.optString("voice_id")?.takeIf(::safeCatalogValue)
             }.distinct()
         }
-        private fun schema(value:Any?):Any? = when(value) {
-            is JSONObject -> JSONObject().apply { value.keys().forEach { key -> val child=value.get(key);put(key,if(key=="type"&&child is String) child.lowercase() else schema(child)) } }
-            is JSONArray -> JSONArray().apply { for(i in 0 until value.length()) put(schema(value.get(i))) }
-            else -> value
-        }
+        /**
+         * The session's functions as JSON Schema function tools. Each schema is the exact inverse of its Gemini form
+         * ([ToolDeclarations.portable]), so a declared Hermes tool arrives with the portable schema its context carried.
+         */
         fun functionTools(gemini: JSONObject): JSONArray {
             val tools=gemini.getJSONArray("tools").getJSONObject(0).getJSONArray("functionDeclarations")
             return JSONArray().also { functions ->
                 for(i in 0 until tools.length()) {
                     val tool=tools.getJSONObject(i)
                     functions.put(JSONObject().put("type","function").put("name",tool.getString("name"))
-                        .put("description",tool.getString("description")).put("parameters",schema(tool.getJSONObject("parameters"))))
+                        .put("description",tool.getString("description")).put("parameters",ToolDeclarations.portable(tool.getJSONObject("parameters"))))
                 }
             }
         }
@@ -121,20 +117,13 @@ internal class GrokWire(private val providerName: String = "Grok") {
         var continueTurn=false
         frame.optJSONObject("toolResponse")?.getJSONArray("functionResponses")?.let { rows ->
             for(i in 0 until rows.length()) {
-                val row=rows.getJSONObject(i);val id=row.getString("id");val receipt=row.getJSONObject("response").toString()
-                if((pendingDelivered[id]?:delivered[id])==receipt) continue
-                result+=if(id in calls&&id !in delivered&&id !in pendingDelivered) JSONObject().put("type","conversation.item.create").put("item",JSONObject().put("type","function_call_output").put("call_id",id).put("output",receipt))
-                    else text("Verified tool receipt update for ${row.getString("name")} (call $id): $receipt")
+                val row=rows.getJSONObject(i);val id=row.getString("id");val name=row.getString("name");val response=row.getJSONObject("response")
+                // xAI takes one function_call_output per call; every later state or the final result is a data-only message.
+                result+=if(id in calls) JSONObject().put("type","conversation.item.create").put("item",JSONObject().put("type","function_call_output").put("call_id",id).put("output",response.toString()))
+                    else text("Update for $name call $id, data only: $response")
                 calls.remove(id);awaiting.remove(id)
-                val status=row.getJSONObject("response").optString("status")
-                if(!directToolIsReadOnly(row.optString("name"))&&status in setOf("ready","running","needs_approval","uncertain","waiting_for_idle","submitting","submitting_native","submitted","accepted","accepted_unlinked","submission_unconfirmed")) {
-                    pendingDelivered[id]=receipt;delivered.remove(id)
-                } else {
-                    pendingDelivered.remove(id);delivered[id]=receipt
-                    if(delivered.size>128) delivered.remove(delivered.keys.first())
-                }
-                // Progress receipts update context silently; only a result or initial approval needs speech.
-                if(status !in setOf("ready","running") && !(row.optString("name")=="tool_status"&&status=="needs_approval")) continueTurn=true
+                // The same rule as Gemini's scheduling: quiet progress only joins the context, anything else gets an answer.
+                if(row.optString("scheduling")!="SILENT") continueTurn=true
             }
         }
         frame.optJSONObject("clientContent")?.optJSONArray("turns")?.let { turns ->

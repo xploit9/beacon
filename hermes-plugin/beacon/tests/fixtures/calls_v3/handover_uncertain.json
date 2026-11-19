@@ -1,0 +1,17 @@
+{
+  "request_id": "handover-synthetic-0003",
+  "status": "uncertain",
+  "admission_id": null,
+  "job_id": "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6",
+  "stored_session_id": "stored-synthetic-0001",
+  "runtime_session_id": "stored-synthetic-0001",
+  "callback_consent": "unset",
+  "outcome": null,
+  "server_ms": {
+    "authority": 7.5,
+    "admit": 5000.0,
+    "total": 5012.25
+  },
+  "error_code": "admission_unconfirmed",
+  "reason": "admission_unconfirmed"
+}

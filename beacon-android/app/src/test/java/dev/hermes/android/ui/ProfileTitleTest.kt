@@ -1,12 +1,9 @@
 package dev.hermes.android.ui
 
 import dev.hermes.android.core.json
-import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
-import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
 
 /**
  * UX re-check of F9, NEW-P1-2, as corrected by review R29 Should 1. An empty chat titled "default" or "coder" reads like a placeholder, and another
@@ -44,15 +41,10 @@ class ProfileTitleTest {
         assertEquals("Beacon", profileTitle("", emptyList(), "Beacon", "default"))
     }
 
-    /** The Turn on Beacon sheet names the profile itself, never by the assistant's name; "this profile" is left for a missing id. */
-    @Test fun theTurnOnSheetNamesTheProfileItself() {
+    /** With no fallback name the profile is named by itself, never by the assistant's name; nothing is left for a missing id. */
+    @Test fun withNoFallbackTheProfileIsNamedByItself() {
         assertEquals("Coder", profileTitle("coder", profiles, "", ""))
         assertEquals("Work", profileTitle("work", profiles, "", ""))
         assertEquals("", profileTitle("", emptyList(), "", ""))
-        val locales = JSONObject(File(listOf(".", "app", "beacon-android/app").first { File(it, "src/main/assets/native-locales.json").isFile }, "src/main/assets/native-locales.json").readText())
-        for (language in locales.keys()) {
-            val shown = locales.getJSONObject(language).optString("turn on beacon for this profile?")
-            assertTrue("$language: $shown", shown.isNotBlank() && "Beacon" in shown && (language == "en" || shown != "Turn on Beacon for this profile?"))
-        }
     }
 }

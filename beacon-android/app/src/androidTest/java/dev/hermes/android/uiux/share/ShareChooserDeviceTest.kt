@@ -106,7 +106,7 @@ class ShareChooserDeviceTest {
     private fun send(text: String? = null, subject: String? = null, vararg images: Uri): Intent {
         val intent = Intent(if (images.size > 1) Intent.ACTION_SEND_MULTIPLE else Intent.ACTION_SEND).setClass(app, ShareActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        intent.type = if (images.isEmpty()) "text/plain" else "image/*"
+        intent.type = if (images.isEmpty()) "text/plain" else "*/*"
         text?.let { intent.putExtra(Intent.EXTRA_TEXT, it) }
         subject?.let { intent.putExtra(Intent.EXTRA_SUBJECT, it) }
         when (images.size) {
@@ -127,6 +127,39 @@ class ShareChooserDeviceTest {
         requireNotNull(app.contentResolver.openOutputStream(uri)).use { it.write(png) }
         inserted += uri
         return uri
+    }
+
+    /** A synthetic document in Downloads (CHAT-121 follow-up 3), removed after the test like the images. */
+    private fun document(name: String, mime: String): Uri {
+        val values = ContentValues().apply {
+            put(MediaStore.Downloads.DISPLAY_NAME, name); put(MediaStore.Downloads.MIME_TYPE, mime); put(MediaStore.Downloads.RELATIVE_PATH, "Download/BeaconShareTest")
+        }
+        val uri = requireNotNull(app.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values))
+        requireNotNull(app.contentResolver.openOutputStream(uri)).use { it.write("%PDF-1.4 synthetic".toByteArray()) }
+        inserted += uri
+        return uri
+    }
+
+    /** CHAT-121 follow-up 3: a document shared from another app is offered to a chat (before, the chooser said Beacon could only take images). */
+    @Test fun documentsAreOfferedAndCountedAsFiles() {
+        signedIn()
+        ActivityScenario.launch<ShareActivity>(send(null, null, image("five"), document("ملف تجريبي.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))).use {
+            compose.onNodeWithText("2 files").assertIsDisplayed()
+        }
+        val pdf = document("Synthetic summary 2026.pdf", "application/pdf")
+        ActivityScenario.launch<ShareActivity>(send(null, null, pdf)).use {
+            compose.onNodeWithText("1 file").assertIsDisplayed()
+            compose.onNodeWithTag("beacon-share-note").assertDoesNotExist()
+            // Picking New chat hands the document itself to the app (with the read grant, as for images).
+            compose.onNodeWithTag("beacon-share-new").performClick()
+            val until = System.currentTimeMillis() + 20_000
+            while (System.currentTimeMillis() < until && SharedIntake.lastOffered?.content?.files != listOf(pdf.toString())) Thread.sleep(25)
+            val share = requireNotNull(SharedIntake.lastOffered) { "nothing was handed to the app" }
+            assertEquals(dev.hermes.android.share.ShareTarget.NewChat, share.target)
+            assertEquals(listOf(pdf.toString()), share.content.files)
+            assertTrue("a document is not an image", !share.content.onlyImages)
+        }
     }
 
     private fun row(id: String, title: String, vararg extra: Pair<String, Any>) = json("session_id" to id, "title" to title).apply { extra.forEach { put(it.first, it.second) } }
@@ -161,7 +194,7 @@ class ShareChooserDeviceTest {
             compose.onNodeWithText("1 image").assertIsDisplayed()
         }
         ActivityScenario.launch<ShareActivity>(send(null)).use {
-            compose.onNodeWithText("Beacon can only take text, links and images.").assertIsDisplayed()
+            compose.onNodeWithText("Beacon can only take text, links, images and documents.").assertIsDisplayed()
             compose.onNodeWithTag("beacon-share-beacon").assertDoesNotExist()
         }
         ActivityScenario.launch<ShareActivity>(send("x".repeat(40_001))).use {
@@ -171,7 +204,7 @@ class ShareChooserDeviceTest {
         // A file path and one of Beacon's own providers are never read.
         val own = Uri.parse("content://${app.packageName}.files/shared/secret.png")
         ActivityScenario.launch<ShareActivity>(send(null, null, own)).use {
-            compose.onNodeWithText("Beacon can only take text, links and images.").assertIsDisplayed()
+            compose.onNodeWithText("Beacon can only take text, links, images and documents.").assertIsDisplayed()
         }
     }
 
@@ -194,7 +227,7 @@ class ShareChooserDeviceTest {
             val share = requireNotNull(SharedIntake.lastOffered) { "nothing was handed to the app" }
             assertEquals(dev.hermes.android.share.ShareTarget.Chat("chat-a"), share.target)
             assertEquals("remember the milk", share.content.text)
-            assertTrue(share.content.images.isEmpty())
+            assertTrue(share.content.files.isEmpty())
             val deadline = System.currentTimeMillis() + 15_000
             while (System.currentTimeMillis() < deadline && resumed().none { it is BeaconActivity }) Thread.sleep(50)
             assertTrue("Beacon opened with the choice", resumed().any { it is BeaconActivity })

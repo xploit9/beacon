@@ -140,7 +140,7 @@ internal val EditBlockedStrings = listOf("This file isn't plain text. Download i
     // With no folder browsed yet, open in the first project's folder instead of the host's whole home.
     val projectFolder = initialFilesFolder("", data["native-projects"])
     var navigated by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
-    var directory by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(initialFilesFolder(vm.pcFolder(), data["native-projects"])) }
+    var directory by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(vm.filesFolder()) }
     LaunchedEffect(projectFolder) { if (directory.isBlank() && !navigated && projectFolder.isNotBlank()) directory = projectFolder }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected) { if (ui.connected && vm.pcFolder().isBlank()) vm.ensureLoaded("native-projects", "/api/projects") }
     var chooseFolder by remember(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }

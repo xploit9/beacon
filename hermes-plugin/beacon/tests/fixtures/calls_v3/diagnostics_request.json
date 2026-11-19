@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "client_event_id": "6f1c2a5e-0b7d-4c3a-9e2f-1a2b3c4d5e6f",
+      "call_id": null,
+      "tapped_at": 1794651219848,
+      "provider": "gemini",
+      "trigger": "tap",
+      "app_version": "1.2.1",
+      "call_contract": 3,
+      "outcome": "failed",
+      "failed_stage": "grant_ok",
+      "shown": "hermes_unreachable",
+      "stages": [
+        {
+          "stage": "grant_sent",
+          "elapsed_ms": 25
+        },
+        {
+          "stage": "grant_ok",
+          "elapsed_ms": 4012,
+          "error_code": "timeout",
+          "cause_class": "socket_timeout"
+        }
+      ]
+    }
+  ]
+}

@@ -80,7 +80,7 @@ def build_router(identity, body, native, principal_for):
                 'approval': 'groups.approve' in methods, 'change_members': False, 'retry': False}
 
     async def roster(request):
-        owner, provider, profile, cfg = identity(request)
+        owner, provider, profile, cfg = await asyncio.to_thread(identity, request)
         result = await rpc(owner, provider, profile, 'profiles.list', include_sessions=False)
         rows = []
         for row in result.get('profiles', []):
@@ -96,7 +96,7 @@ def build_router(identity, body, native, principal_for):
         return owner, provider, profile, rows
 
     async def room(request, rid):
-        owner, provider, profile, cfg = identity(request)
+        owner, provider, profile, cfg = await asyncio.to_thread(identity, request)
         if not isinstance(rid, str) or not rid or len(rid) > 128:
             raise HTTPException(400, "Choose a native shared space")
         result = await rpc(owner, provider, profile, 'groups.state', room_id=rid)
@@ -114,7 +114,7 @@ def build_router(identity, body, native, principal_for):
     @router.get('')
     async def snapshot(request: Request):
         owner, provider, profile, bots = await roster(request)
-        _, _, _, cfg = identity(request)
+        _, _, _, cfg = await asyncio.to_thread(identity, request)
         rooms = await rpc(owner, provider, profile, 'groups.list', limit=100, offset=0)
         def authorized(row):
             members = row.get('members') or []
@@ -214,7 +214,7 @@ def build_router(identity, body, native, principal_for):
 
     @router.post('/space/{rid}/delete')
     async def delete_space(rid: str, request: Request):
-        owner, provider, profile, cfg = identity(request)
+        owner, provider, profile, cfg = await asyncio.to_thread(identity, request)
         value = await body(request, 4096)
         event, expected = value.get('event_id'), value.get('expected_name')
         if (set(value) != {'event_id', 'expected_name'} or not isinstance(expected, str) or not expected or len(expected) > 256
@@ -300,8 +300,8 @@ def build_router(identity, body, native, principal_for):
         value = await body(request, 1024)
         if set(value) != {'bot'} or not isinstance(value.get('bot'), str):
             raise HTTPException(400, 'Choose a bot')
-        owner, provider, _, _ = identity(request)
-        _, _, bot, _ = identity(request, value['bot'])
+        owner, provider, _, _ = await asyncio.to_thread(identity, request)
+        _, _, bot, _ = await asyncio.to_thread(identity, request, value['bot'])
         principal = principal_for(request, owner, provider) or None
         def verified(stored):
             return native.verify(owner, provider, bot, stored, principal=principal) if principal else native.verify(owner, provider, bot, stored)

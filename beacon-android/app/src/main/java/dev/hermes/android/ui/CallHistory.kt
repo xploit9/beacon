@@ -150,7 +150,7 @@ internal fun groupCallAttempts(calls: List<CallHistoryEntry>): List<CallHistoryI
 }
 
 /** The last pages this phone loaded, per account and profile, so the sheet opens with them and refreshes behind. */
-private object CallHistoryMemory {
+internal object CallHistoryMemory {
     private var owner: Any? = null
     private var calls = emptyList<CallHistoryEntry>()
     private var next: String? = null
@@ -160,6 +160,8 @@ private object CallHistoryMemory {
         if (key == null) return
         owner = key; this.calls = calls; this.next = next
     }
+    /** Sign-out: the call list leaves memory with the account's other screens. */
+    @Synchronized fun clear() { owner = null; calls = emptyList(); next = null }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

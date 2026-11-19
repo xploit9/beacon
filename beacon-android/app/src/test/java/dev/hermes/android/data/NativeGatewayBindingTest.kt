@@ -1,6 +1,7 @@
 package dev.hermes.android.data
 
 import dev.hermes.android.core.*
+import dev.hermes.android.waitsForOwner
 import dev.hermes.android.voice.finishCallOnce
 import kotlinx.coroutines.*
 import okhttp3.*
@@ -28,8 +29,42 @@ class NativeGatewayBindingTest {
         var relayStatus = 404
         var relayBody = """{"detail":"Not Found"}"""
         var onTicket: (() -> Unit)? = null
+        /** How many next socket upgrades the plugin refuses before they open (403, as Starlette answers a socket closed before accept). */
+        var refuseUpgrades = 0
+        /** The status a refused upgrade answers: 403 for the plugin's at-once refusals, 429 for a 1.2.1 socket that waited for a worker. */
+        var refuseUpgradeStatus = 403
+        /** File frames that came in pieces (canonical_transport.PIECE_*): how many pieces, and the largest. */
+        var binaryPieces = 0
+        var largestPiece = 0
+        /** The plugin cannot take a file now (its memory budget is full, or this phone has another file in flight): it answers "busy" at the header. */
+        var pieceBusy = false
+        /** How many next files the plugin gives up on at their sixth piece ("stalled", follow-up 8), and the largest piece of each file's try. */
+        var pieceStalls = 0
+        val fileLargest = mutableListOf<Int>()
+        /** The first piece of each file's try. */
+        val fileFirst = mutableListOf<Int>()
+        /** How many next sockets that carry a file's pieces are lost at their sixth piece (a link that cannot carry the file: Hermes' dashboard closes it). */
+        var socketDrops = 0
+        /** The chat's socket is lost under a file sent in one text frame (data_url), as Hermes' dashboard closes one whose pong waits behind it. */
+        var loseSocketOnTextFile = false
+        /** The chat's own socket is lost at a file socket's this-many-th piece (0: never): a deep drop on the one upload queue takes it with the file's pieces. */
+        var loseChatAtFilePiece = 0
+        /** Every socket lost, the tickets asked for a file's own socket ({"purpose": "file"}), and what those answer (null: as relayStatus). */
+        val lostSockets = mutableListOf<WebSocket>()
+        var fileTickets = 0
+        var fileTicketStatus: Int? = null
+        /** The plugin's rule across one phone's clients (canonical_transport file_phones): a newer file socket ends the older one. Shared by every Wire of one phone. */
+        var filePhone: FilePhone? = null
+        /** File answers withheld until this completes (a file whose upload takes longer than a socket's reopen). */
+        var holdFileAnswers: CompletableDeferred<Unit>? = null
+        /** How many next file sockets take a file's header and pieces and then say nothing: no acknowledgment, no answer, no close (a socket that stays open and answers pings). */
+        var silentFileSockets = 0
+        /** Every socket this wire's client cancelled. */
+        val cancelled: MutableList<WebSocket> = java.util.Collections.synchronizedList(mutableListOf())
         var advertiseReady = true
         var strictCanonicalCreate = false
+        /** How many next session.create frames the plugin answers busy itself (backlog 67: no worker in time; Hermes never sees them). */
+        var busyCreates = 0
         var canonicalCreateResult: JSONObject? = null
         var canonicalResumeResult: JSONObject? = null
         var dropSteerResponse = false
@@ -48,9 +83,15 @@ class NativeGatewayBindingTest {
                 val request = chain.request()
                 httpRequests += request
                 val relay = request.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket"
-                if (relay) onTicket?.invoke()
-                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(if (relay) relayStatus else 200).message("Fixture")
-                    .body((if (relay) relayBody else json("ticket" to "fixture-ticket").toString()).toResponseBody("application/json".toMediaType())).build()
+                // A file's own socket (form 4) asks its ticket with {"purpose": "file"}; the plugin's answer says so.
+                val file = relay && request.body?.let { okio.Buffer().also(it::writeTo).readUtf8() }.orEmpty().contains("\"purpose\":\"file\"")
+                if (relay && !file) onTicket?.invoke()
+                if (file) fileTickets++
+                val status = if (file) fileTicketStatus ?: relayStatus else if (relay) relayStatus else 200
+                val body = if (file && status == 200) JSONObject(relayBody).put("purpose", "file").put("ticket", "fixture-file-ticket").toString()
+                    else if (relay) relayBody else json("ticket" to "fixture-ticket").toString()
+                Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(status).message("Fixture")
+                    .body(body.toResponseBody("application/json".toMediaType())).build()
             }
         }
 
@@ -61,22 +102,93 @@ class NativeGatewayBindingTest {
             val connectionIndex = connectionMethods.lastIndex
             val connectionMessages = mutableListOf<JSONObject>()
             connectionFrames += connectionMessages
-            this.listener = listener
+            // A file's own socket leaves the chat's socket and listener where they are, for the tests that speak on them.
+            val fileSocket = request.header("Sec-WebSocket-Protocol").orEmpty().contains("fixture-file-ticket")
+            val wire = this  // for a file socket's own fake to reach the chat's socket and listener
+            val silent = fileSocket && silentFileSockets > 0 && run { silentFileSockets--; true }
+            if (!fileSocket) this.listener = listener
             val socket = object : WebSocket {
                 override fun request() = request
                 override fun queueSize() = 0L
-                override fun cancel() = Unit
-                override fun close(code: Int, reason: String?) = true
-                override fun send(bytes: ByteString) = false
+                override fun cancel() { cancelled += this; if (fileSocket) filePhone?.release(this) }
+                override fun close(code: Int, reason: String?): Boolean { if (fileSocket) filePhone?.release(this); return true }
+                /** The plugin ended this file socket (a newer one of the same phone opened): it takes and answers nothing more. */
+                @Volatile var ended = false
+                private val pieces = okio.Buffer()
+                private var header: JSONObject? = null
+                private var refused = false
+                private var ident = ""
+                private var held = 0L
+                private var filePieces = 0
+                // As the plugin's relay (follow-ups 6 and 8): a header with the frame's text around the file's base64, then the base64, each piece acknowledged
+                // with the base64 held; the frame is joined from them and Hermes gets it as text. A file it cannot take now is answered "busy" at the header,
+                // one it gives up on "stalled", and its pieces are dropped.
+                override fun send(bytes: ByteString): Boolean {
+                    if (ended) return false
+                    binaryPieces++; largestPiece = maxOf(largestPiece, bytes.size)
+                    if (silent) return true  // taken, never acknowledged
+                    when (bytes[0].toInt()) {
+                        3 -> {
+                            val head = JSONObject(bytes.substring(1).utf8()).also { header = it }
+                            ident = JSONObject(head.getString("head") + head.getString("tail")).getString("id")
+                            held = 0; filePieces = 0; fileLargest += 0; fileFirst += 0
+                            refused = pieceBusy
+                            if (refused) listener.onMessage(this, json("jsonrpc" to "2.0", "id" to ident,
+                                "error" to json("code" to 503, "message" to "Canonical gateway busy", "data" to json("source" to "beacon"))).toString())
+                            return true
+                        }
+                        0, 1 -> {
+                            val last = bytes[0].toInt() == 1
+                            if (refused) { if (last) { header = null; refused = false }; return true }
+                            fileLargest[fileLargest.lastIndex] = maxOf(fileLargest.last(), bytes.size - 1)
+                            if (fileFirst.last() == 0) fileFirst[fileFirst.lastIndex] = bytes.size - 1
+                            if (fileSocket && loseChatAtFilePiece > 0 && filePieces + 1 == loseChatAtFilePiece) {
+                                loseChatAtFilePiece = 0; lostSockets += wire.socket
+                                wire.listener.onFailure(wire.socket, java.io.IOException("fixture lost the chat's socket"), null)
+                            }
+                            if (filePieces + 1 == 6 && socketDrops > 0) {
+                                socketDrops--; lostSockets += this
+                                listener.onFailure(this, java.io.IOException("fixture lost the socket carrying the file"), null)
+                                return false
+                            }
+                            if (++filePieces == 6 && pieceStalls > 0) {
+                                pieceStalls--; refused = !last; pieces.clear()
+                                if (last) header = null
+                                listener.onMessage(this, json("jsonrpc" to "2.0", "id" to ident,
+                                    "error" to json("code" to 408, "message" to "File upload stalled", "data" to json("source" to "beacon"))).toString())
+                                return true
+                            }
+                            pieces.write(bytes.substring(1)); held += bytes.size - 1
+                            listener.onMessage(this, okio.Buffer().writeByte(4).writeLong(held).writeUtf8(ident).readByteString())
+                            if (!last) return true
+                            val head = header ?: return false
+                            header = null
+                            return send(head.getString("head") + pieces.readUtf8() + head.getString("tail"))
+                        }
+                        else -> return false
+                    }
+                }
                 override fun send(text: String): Boolean {
+                    if (ended) return false
                     val frame = JSONObject(text)
                     if (!frame.has("method")) { responses += connectionIndex to frame; return true }
                     connectionMessages += frame
                     val method = frame.getString("method")
                     methods += method
                     connectionCalls += method
+                    if (loseSocketOnTextFile && method == "file.attach" && frame.getJSONObject("params").has("data_url")) {
+                        lostSockets += this
+                        listener.onFailure(this, java.io.IOException("fixture lost the socket under a file"), null)
+                        return true
+                    }
                     if (method == "session.steer" && dropSteerResponse) {
                         listener.onFailure(this, java.io.IOException("fixture lost response"), null)
+                        return true
+                    }
+                    if (method == "session.create" && busyCreates > 0) {
+                        busyCreates--
+                        listener.onMessage(this, json("jsonrpc" to "2.0", "id" to frame.getString("id"),
+                            "error" to json("code" to 503, "message" to "Canonical gateway busy", "data" to json("source" to "beacon"))).toString())
                         return true
                     }
                     val gone = method != "session.resume" && frame.getJSONObject("params").optString("session_id") == reaped
@@ -101,21 +213,45 @@ class NativeGatewayBindingTest {
                         "session.resume" -> if (canonical) canonicalResumeResult?.copy() ?: json("session_id" to runtime, "stored_session_id" to "stored-a", "messages" to JSONArray(), "message_count" to 0, "running" to true, "authority_epoch" to 1, "replay_epoch" to "fixture", "last_sequence" to 0, "subscription_id" to "fixture-subscription", "revision" to 1, "execution_generation" to 7, "pending" to JSONArray(), "prompts" to JSONArray(), "info" to json("desktop_protocol" to "hermes-gateway-v1", "profile_name" to "default")) else json("session_id" to runtime, "session_key" to "stored-a", "messages" to JSONArray(), "info" to JSONObject())
                         "prompt.submit" -> if (canonical) json("admission_id" to "admission-1", "ref" to json("profile_id" to "fixture-home", "session_id" to runtime), "sequence" to 1, "status" to "started", "outcome" to JSONObject.NULL, "authority_epoch" to 1, "execution_generation" to 7) else json("status" to "streaming", "user_row_id" to 1)
                         "session.activate" -> activationResult!!
+                        // gateway/session_ancillary.attach_file: staged under attachments/, its @file: reference back (quoted when the name has spaces).
+                        "file.attach" -> params.optString("name").let { name ->
+                            json("attached" to true, "name" to name, "path" to "/synthetic/attachments/$name", "ref_path" to "attachments/$name",
+                                "ref_text" to "@file:" + "attachments/$name".let { if (it.any(Char::isWhitespace)) "\"$it\"" else it }, "uploaded" to true)
+                        }
                         "session.events.since" -> replayResult.copy()
                         else -> JSONObject()
                     })
                     if (method == "session.activate" && deferActivation) pendingActivation = this to reply
+                    else if (fileSocket && method == "file.attach" && holdFileAnswers != null) holdFileAnswers!!.invokeOnCompletion { if (!ended) listener.onMessage(this, reply.toString()) }
                     else listener.onMessage(this, reply.toString())
                     if (method == "session.resume" && dropAfterSteerRefresh && connectionCalls.count { it == "session.resume" } > 1)
                         listener.onFailure(this, java.io.IOException("fixture lost connection after refresh"), null)
                     return true
                 }
             }
-            this.socket = socket
+            if (!fileSocket) this.socket = socket
+            if (refuseUpgrades > 0) {
+                refuseUpgrades--
+                listener.onFailure(socket, java.net.ProtocolException("Expected HTTP 101 response but was '$refuseUpgradeStatus'"),
+                    Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(refuseUpgradeStatus).message("Refused").build())
+                return socket
+            }
             listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
             if (advertiseReady) listener.onMessage(socket, json("jsonrpc" to "2.0", "method" to "event", "params" to json("type" to "gateway.ready", "payload" to if (canonical) json("session_authority" to true) else json())).toString())
+            // The plugin accepted it: the phone's older file socket ends with a normal close.
+            if (fileSocket) filePhone?.accept(socket) { socket.ended = true; listener.onClosing(socket, 1000, "a newer file socket") }
             return socket
         }
+    }
+
+    /** One phone's file sockets as the plugin keeps them (canonical_transport.file_phones): accepting a newer one ends the older one that is still open. */
+    private class FilePhone {
+        private var current: Pair<WebSocket, () -> Unit>? = null
+        @Volatile var opened = 0
+        @Volatile var ended = 0
+        @Synchronized fun accept(socket: WebSocket, end: () -> Unit) { opened++; current?.let { ended++; it.second() }; current = socket to end }
+        /** A socket that closed or was cancelled is no longer the phone's file socket. */
+        @Synchronized fun release(socket: WebSocket) { if (current?.first === socket) current = null }
     }
 
     private fun relayTicket(profile: String = "default") = json(
@@ -578,6 +714,399 @@ class NativeGatewayBindingTest {
                 val snapshot = wire.client.nativeSessionSnapshot()
                 assertEquals("stored-a", snapshot.getString("session_id")); assertEquals("stored-a", snapshot.getString("stored_session_id"))
                 assertEquals("fixture-subscription", snapshot.getString("subscription_id"))
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    /**
+     * CHAT-121 (device round 4): the plugin turns an admission away at once while its admission workers are taken (its ticket answers 503,
+     * or the socket's upgrade is refused). A new chat asked during the app's startup connections met that and failed before Hermes saw it.
+     * Nothing reached Hermes, so the admission is asked again and the create reaches Hermes exactly once.
+     */
+    @Test(timeout = 15_000) fun aBusyAdmissionIsAskedAgainAndTheCreateReachesHermesOnce() = runBlocking {
+        val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true; strictCanonicalCreate = true; refuseUpgrades = 1 }
+        var tickets = 0
+        wire.onTicket = {
+            tickets++
+            if (tickets <= 2) { wire.relayStatus = 503; wire.relayBody = """{"detail":"Canonical gateway unavailable"}""" }
+            else { wire.relayStatus = 200; wire.relayBody = relayTicket().toString() }
+        }
+        try {
+            val binding = wire.client.post("/api/session/new", json("title" to "Fixture title"))
+            assertEquals("stored-a", binding.getString("session_id"))
+            assertEquals("Two busy tickets, one admitted socket refused before it opened, then one admitted", 4, tickets)
+            assertEquals(2, wire.socketRequests.size)
+            assertEquals("Created once", 1, wire.methods.count { it == "session.create" })
+            assertEquals("Fixture title", wire.acceptedCreates.single().getString("title"))
+        } finally { wire.client.closeNative() }
+    }
+
+    /**
+     * Backlog 67 (CHAT-121 follow-up 11): a create the plugin has no worker for is answered on the socket with its busy error (the plugin used
+     * to close the whole socket, 1013, and every other request on it). The app reads it as the plugin's busy answer, never as an outcome it
+     * must reconcile, and the socket it came on carries the next request: asked again, the create reaches Hermes once.
+     */
+    @Test(timeout = 15_000) fun aCreateThePluginAnswersBusyLeavesItsSocketWorkingAndNothingToReconcile() = runBlocking {
+        val wire = Wire().apply { canonical = true; strictCanonicalCreate = true; busyCreates = 1 }
+        try {
+            val busy = runCatching { wire.client.nativeCreate(json("title" to "Fixture title")) }.exceptionOrNull()
+            assertTrue("$busy", busy != null && nativeGatewayBusy(busy) && !dev.hermes.android.answerLost(busy))
+            val binding = wire.client.nativeCreate(json("title" to "Fixture title"))
+            assertEquals("stored-a", binding.storedSessionId)
+            assertEquals("One socket carried both", 1, wire.socketRequests.size)
+            assertEquals("Hermes created it once", 1, wire.acceptedCreates.size)
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun aPluginThatStaysBusyFailsWithItsOwnAnswerAndNothingReachesHermes() = runBlocking {
+        val wire = Wire().apply { relayStatus = 503; relayBody = """{"detail":"Canonical gateway unavailable"}"""; canonical = true }
+        try {
+            val failure = runCatching { wire.client.post("/api/session/new", json("title" to "Fixture title")) }.exceptionOrNull()
+            assertTrue("The plugin's own refusal surfaces: $failure", failure is ApiFailure && failure.status == 503 && failure.plugin)
+            assertEquals("Asked again after each pause, then the refusal stands", NATIVE_ADMISSION_BUSY_PAUSES_MS.size + 1,
+                wire.httpRequests.count { it.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket" })
+            assertTrue(wire.socketRequests.isEmpty())
+            assertTrue(wire.methods.isEmpty())
+        } finally { wire.client.closeNative() }
+    }
+
+    /** A 1.2.1 plugin waits for an admission worker before it answers "busy" (canonical_transport.bounded_call): the waits must not stack. */
+    @Test(timeout = 15_000) fun aBusyAnswerAfterThePluginWaitedIsNotAskedAgain() = runBlocking {
+        val wire = Wire().apply { relayStatus = 503; relayBody = """{"detail":"Canonical gateway busy"}"""; canonical = true }
+        try {
+            val failure = runCatching { wire.client.post("/api/session/new", json("title" to "Fixture title")) }.exceptionOrNull()
+            assertTrue("The plugin's busy answer surfaces: $failure", failure is ApiFailure && failure.status == 503 && failure.plugin && failure.message == "Canonical gateway busy")
+            assertEquals("Asked once", 1, wire.httpRequests.count { it.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket" })
+            assertTrue(wire.socketRequests.isEmpty())
+            assertTrue(wire.methods.isEmpty())
+        } finally { wire.client.closeNative() }
+    }
+
+    /** REVIEW-121B P3-3: an "unavailable" that came slowly is a gateway that is slow or down, not a 1.2.0 busy refusal; asking it again stacked ~25 s. */
+    @Test(timeout = 15_000) fun anUnavailableAnswerThatCameSlowlyIsNotAskedAgain() = runBlocking {
+        val wire = Wire().apply { relayStatus = 503; relayBody = """{"detail":"Canonical gateway unavailable"}"""; canonical = true }
+        wire.onTicket = { Thread.sleep(NATIVE_ADMISSION_QUICK_MS + 100) }
+        try {
+            val failure = runCatching { wire.client.post("/api/session/new", json("title" to "Fixture title")) }.exceptionOrNull()
+            assertTrue("The plugin's answer surfaces: $failure", failure is ApiFailure && failure.status == 503 && failure.plugin)
+            assertEquals("Asked once", 1, wire.httpRequests.count { it.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket" })
+            assertTrue(wire.socketRequests.isEmpty()); assertTrue(wire.methods.isEmpty())
+        } finally { wire.client.closeNative() }
+    }
+
+    /** REVIEW-121B P3-4: a 1.2.1 plugin refuses a socket that waited for a worker with 429, which is not asked again; its at-once 403 still is. */
+    @Test(timeout = 15_000) fun aSocketRefusedAfterThePluginWaitedIsNotAskedAgainButAnAtOnceRefusalIs() = runBlocking {
+        for ((status, sockets) in listOf(429 to 1, 403 to 2)) {
+            val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true; refuseUpgrades = 1; refuseUpgradeStatus = status }
+            try {
+                val outcome = runCatching { wire.client.post("/api/session/new", json("title" to "Fixture title")) }
+                assertEquals("$status", sockets, wire.socketRequests.size)
+                if (status == 429) {
+                    assertTrue("$status surfaces", generateSequence(outcome.exceptionOrNull()) { it.cause }.any { it is NativeAdmissionRefused && it.status == 429 })
+                    assertTrue(wire.methods.none { it == "session.create" })
+                } else assertEquals("Created once after the at-once refusal", 1, wire.methods.count { it == "session.create" })
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    /**
+     * REVIEW-121B FU-P3-1: the quick-refusal rule timed the whole admission (the ticket, a new connection, the upgrade), so on a slow link or behind
+     * an h2 proxy an at-once socket refusal came after more than a second and was never asked again. Only the step that failed is timed now.
+     */
+    @Test(timeout = 15_000) fun anAtOnceSocketRefusalAfterASlowTicketIsStillAskedAgain() = runBlocking {
+        val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true; refuseUpgrades = 1; refuseUpgradeStatus = 403 }
+        wire.onTicket = { Thread.sleep(NATIVE_ADMISSION_QUICK_MS + 100) }
+        try {
+            val outcome = runCatching { wire.client.post("/api/session/new", json("title" to "Fixture title")) }
+            assertEquals("Asked again after the at-once refusal: ${outcome.exceptionOrNull()}", 2, wire.socketRequests.size)
+            assertEquals(1, wire.methods.count { it == "session.create" })
+        } finally { wire.client.closeNative() }
+    }
+
+    /** REVIEW-121B FU-P3-2: a busy plugin read "Can't reach Hermes" (its socket's 429) or "Hermes is reconnecting" (its ticket's "Canonical gateway busy"). */
+    @Test(timeout = 15_000) fun aBusyPluginReadsBusyNotUnreachable() = runBlocking {
+        val busy = "Hermes is busy. Wait a moment and try again."
+        val wire = Wire().apply { relayStatus = 200; relayBody = relayTicket().toString(); canonical = true; refuseUpgrades = 1; refuseUpgradeStatus = 429 }
+        try {
+            val refused = runCatching { wire.client.post("/api/session/new", json("title" to "Fixture title")) }.exceptionOrNull()
+            assertEquals(busy, appErrorText(requireNotNull(refused)))
+        } finally { wire.client.closeNative() }
+        assertEquals(busy, appErrorText(ApiFailure(503, "Canonical gateway busy", plugin = true)))
+        // Not busy: an at-once refusal is out of reach for now, and "unavailable" is a gateway that is down.
+        assertEquals(APP_CONNECTION_ERROR, appErrorText(java.io.IOException("Native connection interrupted", NativeAdmissionRefused(403, java.io.IOException("refused")))))
+        assertEquals("Hermes is reconnecting. Try again in a moment.", appErrorText(ApiFailure(503, "Canonical gateway unavailable", plugin = true)))
+    }
+
+    /**
+     * CHAT-121 follow-up 4: a file larger than one 8 MiB frame goes to a plugin that says it takes them (its ticket's attach_frame_limit) in pieces,
+     * streamed from the kept file, and Hermes gets the one whole file.attach frame; a plugin that says nothing (1.2.0) gets none of it.
+     */
+    @Test(timeout = 30_000) fun aLargeFileGoesInPiecesToAPluginThatTakesThemAndNotToOneThatDoesNot() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(9 * 1024 * 1024) { (it * 31 % 251).toByte() }); deleteOnExit() }
+        val name = "\u0645\u0644\u0641 \u062a\u062c\u0631\u064a\u0628\u064a 2026.pdf"
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024).put("attach_image_limit", 25L * 1024 * 1024)
+        val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString() }
+        try {
+            val binding = wire.client.nativeSession("stored-a")
+            val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+            assertTrue(lease.attachLimits.pieces)
+            val staged = wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to name),
+                InlineFile(file, "data_url", "data:application/pdf;base64,"))
+            assertEquals("@file:\"attachments/$name\"", staged.getString("ref_text"))
+            val frame = wire.connectionFrames.flatten().single { it.optString("method") == "file.attach" }.getJSONObject("params")
+            assertEquals("data:application/pdf;base64," + java.util.Base64.getEncoder().encodeToString(file.readBytes()), frame.getString("data_url"))
+            assertEquals(name, frame.getString("name"))
+            assertTrue("${wire.binaryPieces} pieces", wire.binaryPieces >= 12 && wire.largestPiece <= ATTACHMENT_PIECE_BYTES + 1)
+        } finally { wire.client.closeNative() }
+        val old = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = relayTicket().toString() }
+        try {
+            val binding = old.client.nativeSession("stored-a")
+            val lease = old.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+            assertFalse(lease.attachLimits.pieces)
+            val refused = runCatching { old.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to name),
+                InlineFile(file, "data_url", "data:application/pdf;base64,")) }.exceptionOrNull()
+            assertTrue("$refused", refused is NativeTurnNotSent)
+            assertEquals(0, old.binaryPieces)
+            assertTrue(old.methods.none { it == "file.attach" })
+        } finally { old.client.closeNative() }
+    }
+
+    /**
+     * CHAT-121 follow-up 6: the plugin answers "busy" at a file's header when it cannot take it now (every phone's files at its memory budget, or this
+     * phone's other file in flight). The phone stops streaming there, drops what it sent, nothing reaches Hermes, and the failure reads as the busy line.
+     */
+    @Test(timeout = 30_000) fun aFileThePluginCannotTakeNowIsBusyAndStopsAtItsHeader() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(9 * 1024 * 1024) { (it * 31 % 251).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); pieceBusy = true }
+        try {
+            val binding = wire.client.nativeSession("stored-a")
+            val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+            val failure = runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                InlineFile(file, "data_url", "data:application/pdf;base64,")) }.exceptionOrNull()
+            assertTrue("$failure", failure is ApiFailure && nativeGatewayBusy(failure))
+            assertEquals("Hermes is busy. Wait a moment and try again.", appErrorText(failure!!))
+            assertTrue("stopped at its header: ${wire.binaryPieces} pieces", wire.binaryPieces <= 3)
+            assertTrue(wire.methods.none { it == "file.attach" })
+        } finally { wire.client.closeNative() }
+    }
+
+    /**
+     * CHAT-121 follow-up 8: a file the plugin gave up on (its pieces stopped coming in time: "stalled") goes again from its header; after three stalls it is
+     * not sent, and a queued message with it waits for the owner. Nothing of a stalled try reaches Hermes. Each try starts again from a small piece, a
+     * quarter of the try before's largest at most, and grows only on its own acknowledgments (follow-up 10; this fake acknowledges at once).
+     */
+    @Test(timeout = 30_000) fun aStalledFileGoesAgainInSmallerPiecesAndIsNotSentAfterThreeStalls() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(9 * 1024 * 1024) { (it * 31 % 251).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        for (stalls in listOf(2, 3)) {
+            val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); pieceStalls = stalls }
+            try {
+                val binding = wire.client.nativeSession("stored-a")
+                val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+                val sent = runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                    InlineFile(file, "data_url", "data:application/pdf;base64,")) }
+                assertEquals("$stalls: ${wire.fileLargest}", 3, wire.fileLargest.size)
+                assertTrue("each try starts small: first ${wire.fileFirst}, largest ${wire.fileLargest}",
+                    wire.fileFirst.drop(1).zip(wire.fileLargest).all { (first, before) -> first in 1..maxOf(ATTACHMENT_PIECE_MIN_BYTES, before / 4) })
+                if (stalls == 2) {
+                    assertTrue("${sent.exceptionOrNull()}", sent.isSuccess)
+                    val frame = wire.connectionFrames.flatten().single { it.optString("method") == "file.attach" }.getJSONObject("params")
+                    assertEquals("data:application/pdf;base64," + java.util.Base64.getEncoder().encodeToString(file.readBytes()), frame.getString("data_url"))
+                } else {
+                    val failure = sent.exceptionOrNull()
+                    assertTrue("$failure", failure is AttachmentStalled && waitsForOwner(failure))
+                    assertTrue(wire.methods.none { it == "file.attach" })
+                }
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    /**
+     * CHAT-121 follow-up 9: a file never takes the chat's socket down. Its pieces go on a socket of its own (its own ticket, attached to the same session), so a
+     * link that cannot carry the file (Hermes' dashboard closes the socket whose pong waits behind it) loses that socket only: the chat's socket carries no
+     * piece, is never lost, and its turn goes on on it. A lost try goes again on a new socket, from a small piece, at most three times; then the file is not
+     * sent and a queued message with it waits for the person. On chat-121-9 the pieces went on the chat's socket, and each loss took it down.
+     */
+    @Test(timeout = 30_000) fun aFilesOwnSocketCarriesItAndLosingItNeverTakesTheChatSocketDown() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(9 * 1024 * 1024) { (it * 37 % 241).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        for (drops in listOf(2, 3)) {
+            val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); socketDrops = drops }
+            try {
+                val binding = wire.client.nativeSession("stored-a")
+                val chat = wire.socket
+                val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+                val sent = runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                    InlineFile(file, "data_url", "data:application/pdf;base64,")) }
+                assertEquals("$drops sockets lost", drops, wire.lostSockets.size)
+                assertTrue("the chat's socket is never lost: ${wire.lostSockets}", wire.lostSockets.none { it === chat })
+                assertTrue("the chat's socket carries no file", wire.connectionMethods.first().none { it == "file.attach" })
+                val chatTickets = wire.httpRequests.count { it.url.encodedPath.endsWith("/gateway-ticket") } - wire.fileTickets
+                assertEquals("the chat's socket is the first and only one it opened", 1, chatTickets)
+                assertEquals("one file socket a try", 3, wire.fileTickets)
+                assertTrue("each try starts small: first ${wire.fileFirst}, largest ${wire.fileLargest}",
+                    wire.fileFirst.drop(1).zip(wire.fileLargest).all { (first, before) -> first in 1..maxOf(ATTACHMENT_PIECE_MIN_BYTES, before / 4) })
+                // Each file socket joined the chat's session before its file.
+                wire.connectionMethods.drop(1).forEach { assertEquals(listOf("client.capabilities", "session.resume"), it.take(2)) }
+                if (drops == 2) {
+                    assertTrue("${sent.exceptionOrNull()}", sent.isSuccess)
+                    val frame = wire.connectionFrames.flatten().single { it.optString("method") == "file.attach" }.getJSONObject("params")
+                    assertEquals("data:application/pdf;base64," + java.util.Base64.getEncoder().encodeToString(file.readBytes()), frame.getString("data_url"))
+                } else {
+                    val failure = sent.exceptionOrNull()
+                    assertTrue("$failure", failure is AttachmentStalled && waitsForOwner(failure))
+                    assertTrue(wire.methods.none { it == "file.attach" })
+                }
+                // The turn goes on, on the chat's same socket.
+                val submitted = runCatching { wire.client.nativeTurnRpc(lease, "prompt.submit", json("session_id" to binding.runtimeSessionId, "text" to "after the file", "submission_id" to "sub-$drops")) }
+                assertTrue("${submitted.exceptionOrNull()}", submitted.isSuccess)
+                assertEquals("prompt.submit", wire.connectionMethods.first().last())
+            } finally { wire.client.closeNative() }
+        }
+    }
+
+    /**
+     * CHAT-121 follow-up 9: the chat's own socket lost while a file's pieces are on its own socket (a phone's upload is one queue, so a sudden deep drop can take
+     * the chat's socket with them). The file is not sent and a queued message with it waits for the person, so it cannot happen again by itself; it was a
+     * plain "not sent" before, which the queue sends again 5 s later. Lost before any piece went, it stays the chat's own change.
+     */
+    @Test(timeout = 30_000) fun theChatsSocketLostWhileAFilesPiecesAreOnTheWayStopsTheMessage() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(2 * 1024 * 1024) { (it * 13 % 239).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); loseChatAtFilePiece = 4 }
+        try {
+            val binding = wire.client.nativeSession("stored-a")
+            val chat = wire.socket
+            val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+            val failure = runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                InlineFile(file, "data_url", "data:application/pdf;base64,")) }.exceptionOrNull()
+            assertTrue("the chat's socket was the one lost", wire.lostSockets.single() === chat)
+            assertTrue("$failure", failure is AttachmentStalled && waitsForOwner(failure))
+            assertEquals("no other try: the chat it was for is gone", 1, wire.fileTickets)
+            assertTrue(wire.methods.none { it == "file.attach" })
+        } finally { wire.client.closeNative() }
+    }
+
+    /**
+     * JOINBFIX-121 (REVIEW-JOINB-121 P2-1): two files sent at once from one phone, each on its own detached client (two chats whose "Not sent" messages the
+     * network's return sends together), must not end each other's file socket. The plugin keeps one file socket per phone and ends the older when a newer
+     * opens, so with both on the way each reopen ended the other's, and each file was "Not sent" after three. One phone has one file on the way: the second
+     * waits for the first. Each file here takes longer than a reopen (Hermes answers only once the test lets it); on the base tree the first ends "stalled".
+     */
+    @Test(timeout = 30_000) fun twoFilesFromOnePhoneGoOneAfterTheOtherAndNeitherEndsTheOthersSocket() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(300 * 1024) { (it * 29 % 247).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        val phone = FilePhone()
+        val hold = CompletableDeferred<Unit>()
+        val wires = List(2) { Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); filePhone = phone; holdFileAnswers = hold } }
+        try {
+            val sends = wires.map { wire ->
+                val binding = wire.client.nativeSession("stored-a")
+                val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+                async(Dispatchers.IO) { runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                    InlineFile(file, "data_url", "data:application/pdf;base64,")) } }
+            }
+            // Both are on the way. Until the second file socket opens (the base tree: at once) the first waits for Hermes' answer; with one file at a time the
+            // second never opens before the first is answered, so the wait ends at its bound.
+            withTimeoutOrNull(1_500) { while (phone.opened < 2) delay(10) }
+            delay(300)
+            hold.complete(Unit)
+            val results = sends.awaitAll()
+            results.forEachIndexed { at, sent -> assertTrue("file $at: ${sent.exceptionOrNull()} (${phone.opened} file sockets opened, ${phone.ended} ended)", sent.isSuccess) }
+            assertEquals("a file socket is never ended by a newer one", 0, phone.ended)
+            assertEquals("one file socket each", listOf(1, 1), wires.map { it.fileTickets })
+            wires.forEach { wire -> assertEquals(1, wire.connectionFrames.flatten().count { it.optString("method") == "file.attach" }) }
+        } finally { hold.complete(Unit); wires.forEach { it.client.closeNative() } }
+    }
+
+    /**
+     * JOINBFIX-121 follow-up 1: the process-wide file lock is never held for ever. The first file's socket takes its pieces and then goes silent (open, no
+     * acknowledgment, no answer: a hung relay, or a link that answers pings and carries nothing). With no bound the first file waits for ever and the second
+     * never goes. With one (the knob is shortened here from 60 s), each silent try is lost after it, the lock is let go between tries so the second file goes
+     * after the first one's first lost try, and the first file ends stalled once its tries are spent.
+     */
+    @Test(timeout = 30_000) fun aFilesSocketThatGoesSilentDoesNotHoldTheLockForEverAndTheNextFileGoes() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(300 * 1024) { (it * 29 % 247).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        val phone = FilePhone()
+        val first = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); filePhone = phone; silentFileSockets = ATTACHMENT_STALL_TRIES }
+        val second = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString(); filePhone = phone }
+        val shortest = attachmentSilenceMs
+        attachmentSilenceMs = 400
+        val doneAt = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        val sends = ArrayList<Deferred<Result<JSONObject>>>()
+        try {
+            fun start(name: String, wire: Wire) = async(Dispatchers.IO) {
+                val binding = wire.client.nativeSession("stored-a")
+                val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+                runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                    InlineFile(file, "data_url", "data:application/pdf;base64,")) }.also { doneAt[name] = System.nanoTime() }
+            }.also { sends += it }
+            val one = start("first", first)
+            withTimeout(10_000) { while (first.binaryPieces == 0) delay(10) }  // the first file's pieces are on the way: it holds the lock
+            val two = start("second", second)
+            val sentSecond = withTimeoutOrNull(8_000) { two.await() }
+            val sentFirst = withTimeoutOrNull(8_000) { one.await() }
+            assertNotNull("the second file never went: the first held the lock for ever", sentSecond)
+            assertTrue("the second file is sent: ${sentSecond!!.exceptionOrNull()}", sentSecond.isSuccess)
+            assertNotNull("the first file never ended", sentFirst)
+            assertTrue("the first file ends stalled once its tries are spent: ${sentFirst!!.exceptionOrNull()}", sentFirst.exceptionOrNull() is AttachmentStalled)
+            assertEquals("each of its tries opened a socket", ATTACHMENT_STALL_TRIES, first.fileTickets)
+            assertTrue("the second went between the first's tries, not after them", doneAt.getValue("second") < doneAt.getValue("first"))
+            assertEquals("one file socket each time, none ended by a newer one", 0, phone.ended)
+        } finally { attachmentSilenceMs = shortest; sends.forEach { it.cancel() }; first.client.closeNative(); second.client.closeNative() }
+    }
+
+    /**
+     * JOINBFIX-121 (REVIEW-JOINB-121 P3-3): a send cancelled while its file socket opens (the wait for Hermes' ready, up to 15 s) cancels that socket, so
+     * it does not hold one of the plugin's file sockets, and this phone's slot, until the plugin's quiet time.
+     */
+    @Test(timeout = 30_000) fun aSendCancelledWhileItsFileSocketOpensCancelsThatSocket() = runBlocking {
+        val file = java.io.File.createTempFile("synthetic", ".pdf").apply { writeBytes(ByteArray(64 * 1024) { (it * 17 % 233).toByte() }); deleteOnExit() }
+        val limits = relayTicket().put("attach_frame_limit", 384L * 1024 * 1024).put("attach_pieces", ATTACHMENT_PIECES_FORM).put("attach_file_limit", 256L * 1024 * 1024)
+        val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = limits.toString() }
+        try {
+            val binding = wire.client.nativeSession("stored-a")
+            val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+            wire.advertiseReady = false  // the file's socket opens, and Hermes' ready never comes
+            val send = launch(Dispatchers.IO) { runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId, "name" to "a.pdf"),
+                InlineFile(file, "data_url", "data:application/pdf;base64,")) } }
+            withTimeoutOrNull(5_000) { while (wire.socketRequests.size < 2) delay(10) }
+            assertEquals("the file's own socket was opened", 2, wire.socketRequests.size)
+            assertTrue("the wait for ready has begun", wire.cancelled.isEmpty())
+            send.cancelAndJoin()
+            assertEquals("the socket the cancelled send opened is cancelled", 1, wire.cancelled.size)
+            assertTrue(wire.cancelled.single().request().header("Sec-WebSocket-Protocol").orEmpty().contains("fixture-file-ticket"))
+        } finally { wire.client.closeNative() }
+    }
+
+    /**
+     * CHAT-121 follow-up 9: on a plugin without file sockets (1.2.0) a file goes in one text frame on the chat's socket. When that socket is lost under it
+     * (Hermes' dashboard closes it on a link too slow for the file), the file is not sent and a queued message with it waits for the person: the queue
+     * never sends it again by itself, so the socket is lost at most once in a row for it. On chat-121-9 it was an unknown outcome, sent again by the queue.
+     */
+    @Test(timeout = 15_000) fun aFileInOneTextFrameWhoseSocketIsLostIsNotSentAgainByItself() = runBlocking {
+        val wire = Wire().apply { canonical = true; runtime = "stored-a"; relayStatus = 200; relayBody = relayTicket().toString(); loseSocketOnTextFile = true }
+        try {
+            val binding = wire.client.nativeSession("stored-a")
+            val lease = wire.client.nativeTurnLease(binding.storedSessionId, binding.runtimeSessionId)
+            val failure = runCatching { wire.client.nativeTurnRpc(lease, "file.attach", json("session_id" to binding.runtimeSessionId,
+                "data_url" to "data:text/plain;base64," + java.util.Base64.getEncoder().encodeToString("synthetic note".toByteArray()), "name" to "note.txt")) }.exceptionOrNull()
+            assertEquals(1, wire.lostSockets.size)
+            assertTrue("$failure", failure is AttachmentStalled && waitsForOwner(failure))
+            assertFalse("a file's own failure says nothing about reaching Hermes", requestNeverSent(failure!!))
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 15_000) fun anAdmissionRefusedForAnotherReasonIsNotAskedAgain() = runBlocking {
+        for ((status, detail) in listOf(500 to "Hermes couldn't do that", 401 to "Verified native session required")) {
+            val wire = Wire().apply { relayStatus = status; relayBody = json("detail" to detail).toString(); canonical = true }
+            try {
+                val failure = runCatching { wire.client.nativeRpc("status") }.exceptionOrNull()
+                assertTrue("$status stays what it was: $failure", generateSequence(failure) { it.cause }.any { it is ApiFailure && it.status == status })
+                assertEquals(1, wire.httpRequests.count { it.url.encodedPath == "/api/plugins/beacon/mobile/gateway-ticket" })
+                assertTrue(wire.methods.isEmpty())
             } finally { wire.client.closeNative() }
         }
     }

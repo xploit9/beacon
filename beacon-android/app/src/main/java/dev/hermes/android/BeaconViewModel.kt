@@ -42,6 +42,7 @@ import dev.hermes.android.voice.FailedCallRedirect
 import dev.hermes.android.voice.failedCallConversation
 import dev.hermes.android.voice.transcriptsFor
 import dev.hermes.android.voice.deriveCallEndTitle
+import dev.hermes.android.voice.renameCallChat
 import dev.hermes.android.voice.interleaveCallMessages
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -57,11 +58,17 @@ private const val MAX_CHAT_ATTACHMENT_BYTES = 12L * 1024 * 1024
 private const val LOCAL_CHECKPOINT_LIMIT_BYTES = 16L * 1024 * 1024
 /** Value of the client-created-shell marker for a chat opened with options; a plain one keeps "1". */
 private const val KEPT_APART_SHELL = "apart"
+/** Tries (and the wait between them) the command list takes to load again after a profile switch. */
+internal const val COMMAND_RELOAD_TRIES = 3
+internal const val COMMAND_RELOAD_DELAY_MS = 2_000L
 /** Per-conversation marker (the cache is scoped by origin, account, profile and session): Beacon delivered a prompt here and has not seen that reply end. It survives process death and expires with the cache. */
 private const val RUN_MARKER = "running-turn"
 /** How many finished turns a thread's wanted name is asked for when Hermes refuses it for a reason other than "that title is taken". */
 internal const val THREAD_TITLE_FAILED_TURNS = 2
-private const val LEGACY_BEACON_SESSION_CACHE_KIND = "xara-session" // Migrate the existing encrypted conversation pointer on first read.
+/** How long a Beacon call asked for while the app is still reaching Hermes waits for the connection: the overlay's own restore budget. */
+private const val BEACON_CALL_CONNECT_MS = 15_000L
+/** How long a Beacon call watches the start it asked for, to meet a refused grant or context ([beaconCallStartFailure]). */
+private const val BEACON_CALL_START_WATCH_MS = 30_000L
 private const val LEGACY_BEACON_OPENING_CACHE_KIND = "xara-opening" // Migrate the existing encrypted creation marker on first read.
 private const val LEGACY_BEACON_SESSION_HANDLE_PREFIX = "xara:" // Migrate existing scoped SavedStateHandle pointers on first read.
 private const val LEGACY_BEACON_TAB_VALUE = "Xara" // Replace the released assistant tab value when restoring state.
@@ -82,13 +89,257 @@ internal fun missedCallRouteFromHistory(history: JSONObject, missed: dev.hermes.
         "state" to "expired", "conversation_ref" to missed.conversation, "session_id" to chat, "conversation_id" to chat)
 }
 /** Where a notification opens: a call or result in another chat opens that chat, not the Beacon tab, which only shows the Beacon chat. */
-internal fun pushDestination(kind: String, id: String, beaconChat: String?): String = when {
-    kind == "task_result" && id.isBlank() -> "Tasks"
-    kind in setOf("incoming_call", "task_result") && (id.isBlank() || id == beaconChat) -> "Beacon"
-    else -> "Chat"
+internal fun pushDestination(kind: String, id: String, beaconChat: String?, assistantChat: Boolean = false): String {
+    if (kind == "task_result" && id.isBlank()) return "Tasks"
+    // The Beacon chat's own notice: Hermes says so (also after it moved the chat to a new session id), or the chat it names is the one this phone keeps.
+    val beacon = assistantChat || id.isNotBlank() && id == beaconChat
+    return when {
+        kind in setOf("incoming_call", "task_result") && (id.isBlank() || beacon) -> "Beacon"
+        kind in setOf("completion", "failure", "approval", "clarify") && beacon -> "Beacon"
+        else -> "Chat"
+    }
 }
 /** The plugin has no Beacon chat for this account (404), is too old to say (405) or refuses this session (401 on a dashboard without sign-in, 403); anything else is a failed lookup. */
 internal fun beaconChatLookupMissing(error: ApiFailure): Boolean = error.status in setOf(401, 403, 404, 405)
+/** How the marker of a Beacon chat create still waiting for its answer names that create's request id (Hermes' retry identity). */
+internal const val BEACON_OPENING_REQUEST = "request:"
+/**
+ * The request id of an earlier Beacon chat create whose answer never came, kept in [marker]: sent again, Hermes returns the chat that create made, or
+ * makes it now. Null when there is none, or only a marker that names none (1.2.0's "unknown", which once blocked Beacon for good): a new create starts.
+ */
+internal fun beaconOpeningKept(marker: String?): String? =
+    marker?.takeIf { it.startsWith(BEACON_OPENING_REQUEST) }?.removePrefix(BEACON_OPENING_REQUEST)?.takeIf { it.matches(Regex("[A-Za-z0-9-]{8,64}")) }
+/**
+ * Hermes itself refused a kept create's id (its 4xxx refusal, not a lost answer), so that id can never open Beacon: the chat it made was deleted
+ * (`not_found`: Hermes never makes a deleted id again, hermes_state_local.py), the request changed (`invalid_params`: the assistant's model was changed
+ * meanwhile), or another refusal of it. One new create starts. Hermes restarting (`runtime_draining`) keeps the id: the same create works once it is back.
+ * A refusal of the connection itself (`permission_denied`, `profile_mismatch`: Hermes refuses before it reads the id, session_local.py) keeps it too:
+ * a new id is refused the same way, so keeping it costs nothing, and the chat the kept id may have made is not left behind (REVIEW-F6 P3-2).
+ */
+internal fun beaconOpeningRetryRefused(error: Throwable): Boolean =
+    error is ApiFailure && !error.plugin && error.status in 4000..4999 && error.detail !in BEACON_OPENING_KEEPS_ID
+/** Hermes' refusals that keep a kept create's id ([beaconOpeningRetryRefused]): a restart, and refusals of the connection itself. */
+private val BEACON_OPENING_KEEPS_ID = setOf("runtime_draining", "permission_denied", "profile_mismatch")
+/**
+ * Whether Hermes still has the Beacon chat a call is about to use (backlog 57; device round 3, F1). True when the plugin registers it as the
+ * account's assistant chat ([register], which needs Hermes' saved chat), or, when the plugin has no saved chat by that id (its 404, not a
+ * missing route), when [resume] still finds the live draft this phone made: Hermes saves a chat at its first message, and this phone keeps
+ * marking the chats it made, so a saved copy here does not tell the two apart. False when Hermes has neither (a chat deleted elsewhere, a
+ * draft Hermes no longer keeps): the call goes to the account's current Beacon chat instead. Each answer is waited for, whenever it comes,
+ * up to [reachMs]; null when Hermes did not answer in that time or said nothing about the chat (an older plugin, another failure): the call
+ * goes on and meets that failure as before.
+ */
+internal suspend fun beaconChatCallable(reachMs: Long, register: suspend () -> Unit, resume: suspend () -> Unit): Boolean? {
+    try {
+        return if (withTimeoutOrNull(reachMs) { register() } != null) true else null
+    } catch (e: CancellationException) { throw e } catch (e: Exception) {
+        if (!(e is ApiFailure && e.plugin && e.status == 404 && !e.message.contains("Not Found", ignoreCase = true))) return null
+    }
+    return try { if (withTimeoutOrNull(reachMs) { resume() } != null) true else null }
+    catch (e: CancellationException) { throw e } catch (e: Exception) { if (nativeSessionNotFound(e)) false else null }
+}
+/** A failure that came at once (refused, reset) is asked once more this much later, so a blink in the network is not reported ([hermesReachFailure]). */
+internal const val CALL_REACH_RETRY_MS = 1_000L
+
+/**
+ * Whether Hermes answers this phone at all, by the call's own reach rule ([dev.hermes.android.voice.reachHermes]): [read] is a status read that
+ * changes nothing. Null when Hermes answered (an error status is an answer too); otherwise the failure: no answer within [reachMs] (a black
+ * hole), or a connection that failed (refused, reset, no route, a proxy that could not reach it). A failure that came at once is asked once
+ * more [retryMs] later.
+ */
+internal suspend fun hermesReachFailure(reachMs: Long = dev.hermes.android.voice.GRANT_REACH_MS, retryMs: Long = CALL_REACH_RETRY_MS, read: suspend () -> Unit): Throwable? {
+    suspend fun once(): Throwable? = try { dev.hermes.android.voice.reachHermes(reachMs) { read(); JSONObject() }; null }
+        catch (e: CancellationException) { throw e }
+        catch (e: ApiFailure) { null }
+        catch (e: dev.hermes.android.voice.HermesUnreachable) { e }
+        catch (e: java.io.IOException) { e }
+        catch (e: Exception) { null }
+    val first = once() ?: return null
+    if (first is dev.hermes.android.voice.HermesUnreachable) return first
+    delay(retryMs)
+    return once()
+}
+
+/**
+ * Whether Hermes answers this phone: its status, read with no sign-in on a client of its own (as setup's probe reads it). Hermes' TLS
+ * handshake is already its answer, so a slow link (bytes late, not lost) is not taken for one that loses them: with every byte 1 s late
+ * the whole read took 4.4 s, past the reach budget, and the app still connected (device, fix 5).
+ * The read runs in [reads], where nothing waits for it to end, and only its answer is awaited: OkHttp looks Hermes' host up on the reading
+ * thread, and cancelling cannot stop a lookup that hangs (REVIEW-121B P3-1: a 6 s lookup held the 3 s reach budget for 6 s, and one past about
+ * 23 s let the overlay's give-up show "Couldn't start the call"). So the reach budget ends the wait on time; a stuck read ends with its lookup,
+ * its answer dropped. [gotSomewhere]: the read reached Hermes' host (its socket, or the proxy's tunnel to it, is up), so a slow link
+ * rather than a black hole. [dns] is for tests.
+ */
+internal suspend fun readHermesStatus(origin: String, reads: CoroutineScope, dns: okhttp3.Dns? = null, gotSomewhere: () -> Unit = {}) {
+    val answered = CompletableDeferred<Unit>()
+    val read = reads.launch(Dispatchers.IO) {
+        // Nothing here may throw past this job (no one awaits it): every failure, the client's own included, is the read's answer.
+        var status: BeaconClient? = null
+        try {
+            status = BeaconClient(AuthContext(origin, emptyList()), null, configureHttp = { http ->
+                dns?.let(http::dns)
+                http.eventListener(object : okhttp3.EventListener() {
+                    override fun secureConnectStart(call: okhttp3.Call) = gotSomewhere()
+                    override fun connectEnd(call: okhttp3.Call, inetSocketAddress: java.net.InetSocketAddress, proxy: java.net.Proxy, protocol: okhttp3.Protocol?) = gotSomewhere()
+                    override fun secureConnectEnd(call: okhttp3.Call, handshake: okhttp3.Handshake?) { gotSomewhere(); answered.complete(Unit) }
+                })
+            })
+            status.get("/api/status"); answered.complete(Unit)
+        } catch (e: Throwable) { answered.completeExceptionally(e) } finally { runCatching { status?.closeNative() } }
+    }
+    try { answered.await() } finally { read.cancel() }
+}
+
+/** How a Beacon call's wait for the app's connection to Hermes ended ([awaitCallConnection]). */
+internal sealed interface CallConnection {
+    data object Up : CallConnection
+    /** The call does not start; [line] is the call's own line for why (the overlay shows its short form). */
+    data class Failed(val line: String) : CallConnection
+}
+
+/** What [hermesReachFailure] said so far, for [callConnectionVerdict]. */
+internal enum class HermesReached { Asking, Yes, No }
+
+/**
+ * A model that can start a call: connected with a client, or with the client its last connection made while no new attempt runs (a later
+ * request failed and marked the app not connected; the call then meets Hermes itself, by its own reach rule and line).
+ */
+internal fun callCanStart(state: AppState, client: Boolean): Boolean = client && (state.connected || !state.loading)
+
+/**
+ * Where the wait stands for [state] (null: still waiting). A model that can start a call goes on ([callCanStart]); a sign-in that is gone ends
+ * it with the call's sign-in line; a Hermes that cannot be reached ends it with the call's line for that, at once; and a connection attempt
+ * that ended without connecting ([attemptSeen]: this wait saw it run) while Hermes answers ends it with the call's line for a Hermes that did
+ * not answer.
+ */
+internal fun callConnectionVerdict(state: AppState, client: Boolean, reached: HermesReached, attemptSeen: Boolean): CallConnection? = when {
+    callCanStart(state, client) -> CallConnection.Up
+    !state.authenticated && !state.restoringSession -> CallConnection.Failed(dev.hermes.android.voice.CALL_SIGN_IN_EXPIRED)
+    reached == HermesReached.No -> CallConnection.Failed(APP_CONNECTION_ERROR)
+    reached == HermesReached.Yes && attemptSeen && !state.loading && !state.restoringSession && !state.connected -> CallConnection.Failed(dev.hermes.android.voice.CALL_HERMES_NO_ANSWER)
+    else -> null
+}
+
+/**
+ * An attempt that showed Hermes no progress during the press ([awaitCallConnection]'s `progressed`: no connection reached Hermes, no answer came
+ * back) and is still loading this long after Hermes answered the call's reach read is started over, once. One that showed progress is never
+ * started over, however slow Hermes is (REVIEW-F7 P3-3: a connect Hermes served 10-15 s after its handshake was cut at 10 s and failed). So
+ * the bound can be short (REVIEW-F7 P3-1, 10 s before): the reach read has just made a whole TLS handshake on the same path within its 3 s
+ * budget, so a live attempt shows progress within this; the attempts it catches are stuck (a black hole that ended while the connect hung, a
+ * drop that lost the answer), or older than the press and waiting on a request Hermes may never answer, where a fresh connect does no worse.
+ * An attempt already known to be stuck (in flight while Hermes could not be reached, [callBeacon]) is started over as soon as Hermes answers.
+ */
+internal const val BEACON_CALL_STALL_MS = 3_000L
+/**
+ * Progress this long before a press counts as during it ([callBeacon]): a model whose request went just before the press (a warm or quick cold
+ * connect) and waits on a slow Hermes is live. Not for an attempt known to be stuck: its request went before the outage, and Call again can
+ * come within 2 s of that.
+ */
+internal const val BEACON_CALL_PROGRESS_LOOKBACK_MS = 2_000L
+/**
+ * After a press: the connection attempt ([attempt], connect()'s generation) it leaves marked as stuck in an outage, else [marked]. Marked:
+ * still in flight with no client when the press found Hermes unreachable and its reach read got nowhere (no socket or tunnel to Hermes'
+ * host), a black hole. A slow link whose read missed the reach budget mid-handshake (REVIEW-121B P3-2) is not marked: its connect may still
+ * end, and the 10 s bound covers it.
+ */
+internal fun stuckAttemptMark(connection: CallConnection, readGotSomewhere: Boolean, hasClient: Boolean, loading: Boolean, attempt: Int, marked: Int): Int =
+    if (connection == CallConnection.Failed(APP_CONNECTION_ERROR) && !readGotSomewhere && !hasClient && loading) attempt else marked
+/** Whether the attempt in flight is one an earlier press marked stuck ([stuckAttemptMark]): it is started over as soon as Hermes answers. */
+internal fun stuckAttemptMarked(marked: Int, attempt: Int, hasClient: Boolean, loading: Boolean): Boolean = !hasClient && loading && marked == attempt
+/**
+ * Before a start-over supersedes the attempt [client] (connect()'s, for the account [owner]), that attempt's sign-in rotation is kept, checked
+ * against the account as its own failure path checks it, then [persist]ed: its `/api/auth/me` may have rotated the refresh token (the
+ * answer's headers came, its body stalled), and the start-over reads the stored sign-in. Without this the replacement replays the spent
+ * token, and a provider with reuse detection signs the owner out (REVIEW-F7 P3-2; the attempt's own catch keeps it only at its read timeout,
+ * after the replacement). False when nothing was kept: no account to check against, another account's rotation, or a failure.
+ */
+internal suspend fun keepSupersededRotation(client: BeaconClient, owner: Scope?, persist: suspend (AuthContext) -> Unit): Boolean {
+    if (owner == null) return false
+    return try {
+        client.auth.requireCachedIdentity(owner)
+        client.retainCookieRotation()
+        persist(client.auth)
+        true
+    } catch (e: CancellationException) { throw e } catch (e: Throwable) { false }
+}
+/** A started-over attempt gets at least this long, past the wait's own limit if need be ([awaitCallConnection]). */
+internal const val BEACON_CALL_RESTARTED_MS = 6_000L
+/** ...but never this much past it: the overlay gives up 25 s after the ask, and the chat and the call's start still follow the wait. */
+internal const val BEACON_CALL_RESTART_EXTRA_MS = 3_000L
+
+/**
+ * A call asked for right after the app's process starts comes once the saved sign-in is restored from this phone (restoring is over, the account
+ * reads signed in) but before Hermes answered and the client exists. It waits for that connection: [CallConnection.Up] once [ui] reads
+ * connected with a client ([hasClient]), or at once for a model that keeps the client of its last connection ([callCanStart]).
+ * Device round 4 (F3, 16 Nov 2026): with Hermes unreachable the wait ran its whole 15 s and the overlay then gave up with only "Couldn't start
+ * the call". So Hermes is asked directly as well ([reach], [hermesReachFailure]): one that cannot be reached ends the wait at once with the
+ * call's line for that, after the call's reach budget at most. A Hermes that answers but is slow to connect is waited for within [limitMs]
+ * (then the call's line for no answer). [freshAttempt]: the caller has just asked for a new connection, so the state of the attempt before it
+ * (ended, not connected) is not this attempt's.
+ * With [restart] (a new connection attempt; false when it started none), an attempt Hermes' answer shows to be stuck is started over, once per
+ * wait (REVIEW-121B P2-1: after a black hole, "Call again" followed the press's own connect, still hung, and said "Hermes didn't answer" although
+ * Hermes was back): one this wait did not start that ends without connecting while Hermes answers, or any still loading [stallMs] after Hermes
+ * answered. The started-over attempt gets [restartedMs] at least, within [limitMs] + [BEACON_CALL_RESTART_EXTRA_MS].
+ * [progressed]: the attempt in flight has shown Hermes progress during this wait (a connection reached it, an answer came back); such an
+ * attempt is never started over by the time bound, however slow (REVIEW-F7 P3-3).
+ * When the wait gives up at its limit on an attempt still loading with no client, that attempt is started over through [restart] then, past
+ * the press, whether or not one was started over already (REVIEW-F8 P3-1). It may have reached Hermes and lost its answer: with a lapsed
+ * access token Hermes refreshed it, rotating the refresh token, and the rotated session is handed out again only within Hermes' 30 s
+ * refresh cache. The attempt itself replays the spent token only after OkHttp's 60 s read timeout, where a provider with reuse detection
+ * signs the owner out; the start-over replays it about 20 s after the refresh at most, inside the cache, and keeps any rotation that did
+ * arrive. Nothing inside the press is cut.
+ */
+internal suspend fun awaitCallConnection(ui: kotlinx.coroutines.flow.StateFlow<AppState>, hasClient: () -> Boolean, limitMs: Long,
+    freshAttempt: Boolean = false, reach: suspend () -> Throwable? = { null }, restart: (suspend () -> Boolean)? = null,
+    stallMs: Long = BEACON_CALL_STALL_MS, restartedMs: Long = BEACON_CALL_RESTARTED_MS, progressed: () -> Boolean = { false }): CallConnection = coroutineScope {
+    if (callCanStart(ui.value, hasClient())) return@coroutineScope CallConnection.Up
+    val reached = MutableStateFlow(HermesReached.Asking)
+    val asking = launch { reached.value = if (reach() == null) HermesReached.Yes else HermesReached.No }
+    // The wait's clock: its limit, and once an attempt is started over that attempt's own time, never past the extra margin.
+    val limitUp = MutableStateFlow(false); val restartedUp = MutableStateFlow(true); val capUp = MutableStateFlow(false); val stalled = MutableStateFlow(false)
+    val clocks = mutableListOf(launch { delay(limitMs); limitUp.value = true }, launch { delay(limitMs + BEACON_CALL_RESTART_EXTRA_MS); capUp.value = true },
+        launch { reached.first { it == HermesReached.Yes }; delay(stallMs); stalled.value = true })
+    val timeUp = combine(limitUp, restartedUp, capUp) { limit, restarted, cap -> limit && restarted || cap }
+    var attemptSeen = !freshAttempt
+    var restartable = restart != null
+    // The one start-over: when the caller starts none (its own rule declined), the wait goes on as it would have.
+    suspend fun startOver(otherwise: CallConnection?): CallConnection? {
+        restartable = false
+        if (restart?.invoke() != true) return otherwise
+        attemptSeen = false; restartedUp.value = false
+        clocks += launch { delay(restartedMs); restartedUp.value = true }
+        return null
+    }
+    try {
+        combine(ui, reached, stalled, timeUp) { state, r, stall, up ->
+            if (state.loading) attemptSeen = true
+            val verdict = callConnectionVerdict(state, hasClient(), r, attemptSeen)
+            when {
+                restartable && !freshAttempt && r == HermesReached.Yes && verdict == CallConnection.Failed(dev.hermes.android.voice.CALL_HERMES_NO_ANSWER) -> startOver(verdict)
+                restartable && verdict == null && stall && state.loading && !progressed() -> startOver(null)
+                verdict != null -> verdict
+                up -> {
+                    // The press gives up on an attempt still loading with no client (REVIEW-F8 P3-1): start it over now, past the press.
+                    if (restart != null && state.loading && !hasClient()) restart.invoke()
+                    CallConnection.Failed(dev.hermes.android.voice.CALL_HERMES_NO_ANSWER)
+                }
+                else -> null
+            }
+        }.filterNotNull().first()
+    } finally { asking.cancel(); clocks.forEach(Job::cancel) }
+}
+/**
+ * How the start a Beacon call asked for on [target] at [askedAt] (wall clock, before the request) went: its state when it ended before
+ * connecting with a failure (a refused grant or context, device round 3 F1), or null once it connected, or when nothing came within
+ * [limitMs]. A state from an earlier start on the same chat is not this one ([CallState.startedAt]).
+ */
+internal suspend fun beaconCallStartFailure(calls: kotlinx.coroutines.flow.StateFlow<CallState>, target: Scope, askedAt: Long, limitMs: Long): CallState? =
+    withTimeoutOrNull(limitMs) {
+        calls.first { it.conversationScope == target && it.startedAt >= askedAt && (it.active && it.state in setOf("listening", "thinking", "speaking") || !it.active && it.failureReason.isNotBlank()) }
+    }?.takeIf { !it.active }
+/** Where a Beacon call goes once its chat opened: [opened], or null (the account's current Beacon chat) when the plugin refused [kept]. */
+internal fun beaconCallChat(kept: String?, opened: String?, held: Boolean?): String? =
+    if (held == false && (opened == null || opened == kept)) null else opened
 internal fun registeredBeaconChat(response: JSONObject?): String? =
     response?.string("conversation_id")?.takeIf { streamIdPattern.matches(it) }
 internal fun chatApprovalReadQuery(chat: ChatState, passive: Boolean = chat.raw.string("runtime_session_id").isBlank()): Map<String, String> =
@@ -102,7 +353,9 @@ internal fun assistantConversationToSelect(openScope: Scope?, openSessionId: Str
 
 data class Message(val id: String, val role: String, val text: String, val reasoning: String = "", val tools: List<JSONObject> = emptyList(), val attachments: List<JSONObject> = emptyList(), val mediaSnapshots: Map<String, String> = emptyMap(), val sessionId: String = "", val interrupted: Boolean = false, val voice: Boolean = false, val recordedAt: Long = 0L, val displayKind: String = "",
     /** The photos and files the stored user row names (Hermes' note and the path are never part of [text]). */
-    val media: List<AttachedMedia> = emptyList()) {
+    val media: List<AttachedMedia> = emptyList(),
+    /** Hermes' `error_surface` of its failed_turn row (display_metadata, agent/conversation_loop.py), as JSON text: the reason the chat shows under the row. */
+    val failure: String = "") {
     companion object {
         fun from(o: JSONObject, index: Int, sessionId: String = ""): Message {
             val completionText = if (o.string("role") == "user" && o.string("display_kind") in setOf("async_delegation_complete", "process_complete"))
@@ -118,7 +371,8 @@ data class Message(val id: String, val role: String, val text: String, val reaso
             val text = typed?.text ?: shown
             val media = (typed?.media.orEmpty() + stored).distinctBy { it.path }
             val snapshots = o.optJSONObject("_media_snapshots")?.let { values -> values.keys().asSequence().take(256).mapNotNull { path -> values.optString(path).takeIf(::validMediaSnapshot)?.takeIf { path.length in 1..8192 && path.none { it.code < 32 || it.code == 127 } }?.let { path to it.lowercase() } }.toMap() }.orEmpty()
-            return Message(o.string("id", o.string("message_id", o.string("row_id", o.string("_row_id", o.string("tool_call_id", "${o.string("role")}:$index"))))), role, text, o.string("reasoning", o.string("reasoning_content")), o.rows("tool_calls"), o.rows("attachments") + parts.filter { it.string("type").contains("image") }, snapshots, sessionId, o.optBoolean("interrupted") || o.optJSONObject("display_metadata")?.optBoolean("interrupted") == true || o.string("finish_reason") == "cancelled", o.optJSONObject("display_metadata")?.optString("channel") == "voice", recordedAt = recordedMessageTime(o.opt("timestamp")), displayKind = o.string("display_kind"), media = media)
+            return Message(o.string("id", o.string("message_id", o.string("row_id", o.string("_row_id", o.string("tool_call_id", "${o.string("role")}:$index"))))), role, text, o.string("reasoning", o.string("reasoning_content")), o.rows("tool_calls"), o.rows("attachments") + parts.filter { it.string("type").contains("image") }, snapshots, sessionId, o.optBoolean("interrupted") || o.optJSONObject("display_metadata")?.optBoolean("interrupted") == true || o.string("finish_reason") == "cancelled", o.optJSONObject("display_metadata")?.optString("channel") == "voice", recordedAt = recordedMessageTime(o.opt("timestamp")), displayKind = o.string("display_kind"), media = media,
+                failure = o.optJSONObject("display_metadata")?.optJSONObject("error_surface")?.takeIf { o.string("display_kind") == "failed_turn" }?.toString().orEmpty())
         }
     }
 }
@@ -167,8 +421,35 @@ internal fun updatedHistoryRows(rows: List<JSONObject>, id: String, path: String
             else -> row
         }
     }
+/** The plain line under a reply Hermes' restart cut, when nothing waits behind it (no question; with messages waiting the chat asks instead, [lostChoiceShown]). */
+internal const val LOST_REPLY_STATUS = "Hermes restarted during this reply."
+/** Hermes holds this chat behind a reply its last run lost (a pending admission `unknown`): nothing runs and nothing queued starts until it is closed. */
+internal fun lostTurnHeld(session: JSONObject?): Boolean =
+    session != null && session.opt("running") != true && session.rows("pending").any { it.string("status") == "unknown" }
+/** The restart line's choice ("Send your next message?") shows while the owner's messages wait behind a lost reply and nothing runs. */
+/** A chat's box (open or saved) holds a message of the owner's still waiting to be answered: a look at its lost reply must not close it then. */
+/**
+ * The phone's box holds a message of the owner's that waits: one Hermes has not taken yet. An `accepted` one is Hermes' (its own snapshot
+ * counts what waits there), and is often the cut turn's own message until its saved row pairs: counting it kept every look from closing a
+ * lone lost reply (live, 17 Nov: the choice instead of the plain line).
+ */
+internal fun boxHoldsWaiting(queued: List<QueuedMessage>): Boolean = queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled", "accepted") }
+/**
+ * "Not sent yet" ends when the open chat [open] holds no waiting message and no other chat in the [outbox] still waits (CHATFIX-121 follow-up 1), and
+ * only from the account and profile it was raised for, [raisedFor] (follow-up 3, Root: the notice belongs to its profile).
+ */
+internal fun offlineNoticeEnds(raisedFor: Scope?, open: Scope, openWaits: Boolean, outbox: List<String>): Boolean =
+    raisedFor == open.copy(session = "") && !openWaits && outbox.all { it == open.session }
+internal fun lostChoiceShown(chat: ChatState): Boolean = chat.lostWaiting && chat.streamId.isBlank()
+/**
+ * A Bot Mode row shows "Reply cut off" when the bot's own Bot Chat holds a lost reply: [AppState.lostBotChats] names that chat and
+ * [AppState.lostChats] keeps it as "bot:chat" (so opening it, which lets the reply go, clears the row too). A bot whose profile has other
+ * lost chats is not marked for them.
+ */
+internal fun botCutOff(ui: AppState, bot: String): Boolean = ui.lostBotChats[bot]?.let { "$bot:$it" in ui.lostChats } == true
 internal fun renderedChatStatus(old: ChatState, active: String?, streamEnded: Boolean): String = when {
     old.uncertain.isNotBlank() && old.status == "Sending" -> old.status
+    active.isNullOrBlank() && old.streamId.isBlank() && old.status == LOST_REPLY_STATUS -> old.status
     !active.isNullOrBlank() -> if (active == old.streamId) old.status.ifBlank { "Working" } else "Working"
     streamEnded -> ""
     active.isNullOrBlank() && old.streamId.isNotBlank() -> old.status.ifBlank { "Reply status unknown" }
@@ -179,6 +460,33 @@ internal fun reconnectOnNetworkReturn(ui: AppState): Boolean = ui.authenticated 
 /** Only an actual native row identity can link a saved receipt to history. */
 internal fun sendArrived(rowId: String, messages: List<Message>): Boolean =
     rowId.isNotBlank() && messages.any { it.role == "user" && it.id == rowId }
+/**
+ * CHATQA-121 follow-up 5: Hermes' own user row for [submissionId] among history [rows]: the turn saves the client's submission id in the row's display
+ * metadata (gateway/session_display.py:65-82 submission_turn_scope). Null when no row carries it.
+ */
+internal fun submissionRowId(rows: List<JSONObject>, submissionId: String): String? = submissionId.takeIf(String::isNotBlank)?.let { id ->
+    rows.lastOrNull { row -> row.string("role") == "user" && (row.optJSONObject("display_metadata")
+        ?: (row.opt("display_metadata") as? String)?.let { runCatching { JSONObject(it) }.getOrNull() })?.opt("submission_id") == id }
+        ?.let { row -> row.string("row_id", row.string("_row_id", row.string("id"))).takeIf(String::isNotBlank) }
+}
+/** Follow-up 5: the request may have reached Hermes and only its answer was lost (the gateway cannot tell whether the bytes left). */
+internal fun answerLost(e: Throwable): Boolean = generateSequence(e) { it.cause }.take(8).any { it.message == NATIVE_OUTCOME_UNKNOWN }
+/**
+ * Follow-up 5: Hermes already holds a send under this submission id, with another payload. Only the refusal naming `request_id` proves that
+ * (hermes_state_runtime.py:35-38 ADMITTED_REQUEST_CONFLICT); any other admission_conflict (route, binding, lineage) proves nothing about the send.
+ */
+internal fun admissionConflict(e: Throwable): Boolean = generateSequence(e) { it.cause }.take(8)
+    .any { it is NativeRefusal && it.message == "admission_conflict" && it.field == "request_id" }
+/** Follow-up 5: a send whose answer was lost can be asked again only with exactly its first payload: text alone, or with the staged attachments that payload carried. */
+internal fun askableAgain(send: PendingSend): Boolean = send.submissionSaved && send.submissionId.isNotBlank() && (send.draft.attachments.isEmpty() || send.staged.isNotBlank())
+/**
+ * Follow-up 5: the request the first attempt made (send() and the outbox build it the same way), asked again under its submission id. Hermes
+ * answers with the admission it holds under that id, or admits it once if it never arrived (hermes_state_runtime.py admit_session_input).
+ */
+internal fun askAgainBody(scope: Scope, send: PendingSend): JSONObject = json("session_id" to scope.session, "message" to send.draft.text,
+    "attachments" to JSONArray(send.draft.attachments), "profile" to scope.profile, "client_request_id" to send.submissionId, "model" to send.model.ifBlank { null },
+    "model_provider" to send.provider.ifBlank { null }, "queued_model_snapshot" to send.queued, "resubmit" to true)
+    .apply { if (send.staged.isNotBlank()) put("staged_attachments", JSONArray(send.staged)) }
 /** The receipt lookup validates native scope/epoch/generation before publishing this proof. Linking never retires the draft. */
 internal fun linkedQueuedInputRow(item: QueuedMessage, receipt: JSONObject, rows: List<JSONObject>, queued: List<QueuedMessage>): String? {
     if (item.kind != "queue" || item.admissionId.isBlank() || item.submissionId.isBlank() ||
@@ -288,6 +596,10 @@ internal fun savedRowsReceipt(identity: TurnIdentity, knownUserRow: String, rows
     return settledReceipt(identity, stream, json("complete" to steers.isEmpty(), "submission_id" to identity.submission, "user_row_id" to user,
         "user_row_ids" to JSONArray(listOf(user) + steers), "final_assistant_row_id" to ids.last(), "row_ids" to JSONArray(ids)))
 }
+/** When the saved chat is read after the first frame of a turn whose copy has no saved row yet: at once, then again while the row is not there (12.4 s in all). */
+internal val ADMITTED_ROW_READS_MS = listOf(0L, 400L, 800L, 1_600L, 3_200L, 6_400L)
+/** While the copy still has no row after those reads (a cold or heavy profile builds its agent before Hermes saves the row), a later frame of the turn reads once more, at most this often. */
+internal const val ADMITTED_ROW_AGAIN_MS = 15_000L
 /** How long Hermes is asked for a receipt: each ask, and both together. The chat stays "Working" until the answer or the cap, so neither may be long. */
 internal const val RECEIPT_ASK_MS = 5_000L
 internal const val RECEIPT_TOTAL_MS = 8_000L
@@ -351,6 +663,41 @@ internal fun steerRowPairs(items: List<QueuedMessage>, proofUserRows: List<Long>
     return pairs
 }
 /**
+ * The phone's submission id Hermes stamped on a saved user row, or "". A session authority writes it on the row an admission's turn saves
+ * (`display_metadata.submission_id`: gateway/session_display.submission_turn_scope, gateway/response_filters.persisted_user_metadata_for_event;
+ * Hermes pins it in tests/gateway/test_submission_row_identity.py) so a client can tell its own send's row. An older Hermes writes none.
+ */
+internal fun rowSubmissionId(row: JSONObject): String {
+    val meta = row.opt("display_metadata")
+    val fields = meta as? JSONObject ?: (meta as? String)?.let { runCatching { JSONObject(it) }.getOrNull() }
+    return fields?.opt("submission_id") as? String ?: ""
+}
+/**
+ * The saved row of each phone copy Hermes accepted (copy id to row id), as Hermes names it: the one user row stamped with the copy's submission id.
+ * Hermes saves that row when the turn starts, before the model is asked (agent/turn_context._persist_turn_start), so it is the message's row from then on,
+ * whatever the turn does after. Nothing is guessed: no stamped row, two of them, a row another copy holds, or a submission id two copies share, and the
+ * copy is left as it is.
+ */
+internal fun submittedRowPairs(items: List<QueuedMessage>, rows: List<JSONObject>): Map<String, String> {
+    fun id(row: JSONObject) = row.string("row_id", row.string("_row_id"))
+    val claimed = items.map { it.rowId }.filter(String::isNotBlank).toMutableSet()
+    val pairs = linkedMapOf<String, String>()
+    for (item in items) {
+        if (item.kind != "queue" || item.rowId.isNotBlank() || item.submissionId.isBlank() || item.state !in setOf("accepted", "settled") ||
+            items.count { it.submissionId == item.submissionId } != 1) continue
+        val row = rows.filter { it.string("role") == "user" && rowSubmissionId(it) == item.submissionId }.singleOrNull()?.let(::id)
+            ?.takeIf { (it.toLongOrNull() ?: 0L) > 0 && it !in claimed } ?: continue
+        claimed += row; pairs[item.id] = row
+    }
+    return pairs
+}
+/**
+ * The copy once Hermes named its saved row: only the row is set. It keeps its state, so the turn's own receipt still settles it and retires it as before
+ * ([linkedQueuedInputRow], [completedQueuedInputRow]); meanwhile the chat shows Hermes' row in its place ([chatTimelineMessages]).
+ */
+internal fun namedCopy(q: QueuedMessage, row: String): QueuedMessage =
+    if (q.kind != "queue" || q.rowId.isNotBlank() || q.state !in setOf("accepted", "settled")) q else q.copy(rowId = row)
+/**
  * The saved row of each phone copy still waiting for one (copy id to row id). Hermes can accept a turn (a photo, whose note it writes first) without naming its
  * row, so the copy keeps none while the turn runs, and a history load then shows the copy beside the row. Hermes saves the phone's own row as the first user row
  * after the row the chat ended on when the message was sent, so only that row (the first no other copy holds, steering and hidden rows aside) can be the copy's:
@@ -358,6 +705,7 @@ internal fun steerRowPairs(items: List<QueuedMessage>, proofUserRows: List<Long>
  * message the copy is not looked for further down: it stays visible, and the completed turn's receipt ties it to its row later. A copy Hermes accepted, or one
  * whose turn was stopped, failed, interrupted or rejected (Hermes settles those only for a turn it started), can pair; a completed one is tied by its receipt, not by words. A copy whose outcome is unknown, one
  * with no known place to look from, and one nothing matches stay on screen: nothing is hidden on doubt, and nothing is sent again here. Each row pairs once.
+ * A row Hermes stamped with a submission id ([rowSubmissionId]) is that send's row: it pairs only by its stamp ([submittedRowPairs]), never by words.
  */
 internal fun acceptedRowPairs(items: List<QueuedMessage>, rows: List<JSONObject>): Map<String, String> {
     val open = items.filter { it.kind == "queue" && it.rowId.isBlank() && it.afterRowId != null &&
@@ -372,7 +720,7 @@ internal fun acceptedRowPairs(items: List<QueuedMessage>, rows: List<JSONObject>
         val from = if (item.afterRowId == "") 0 else rows.indexOfFirst { id(it) == item.afterRowId }.takeIf { it >= 0 }?.plus(1) ?: continue
         val row = rows.drop(from).firstOrNull { row ->
             row.string("role") == "user" && row.string("display_kind") !in setOf("steer", "hidden") && id(row).isNotBlank() && id(row) !in claimed &&
-                !isSteeringText(messageContentText("user", historyRowContent(row)))
+                rowSubmissionId(row).isBlank() && !isSteeringText(messageContentText("user", historyRowContent(row)))
         } ?: continue
         val content = messageContentText("user", historyRowContent(row))
         val shown = if (mentionsHermesNote(content)) splitAttachedMedia(content) else null
@@ -429,33 +777,28 @@ internal fun releasedAttachmentChat(state: ChatState, current: () -> Boolean, wr
         raw = state.raw.copy().put("messages", JSONArray(rawRows)))
 }
 /**
- * The button on the first-chat card: none while it opens; Turn on when Hermes does not serve Beacon for the profile (Retry cannot help until it is on);
- * Copy command when the plugin could not turn it on from the phone and the person has to run a command; Check again alone when there is nothing to run (the plugin
- * must be updated first, or Hermes is still working); else Retry.
+ * The button on the first-chat card: none while it opens; for a profile Hermes refused, the one its line names ([beaconOffAction]: Turn on when the profile turned Beacon off,
+ * Retry when turning it on did not work, nothing when Hermes no longer has the profile); else Retry.
  */
 internal fun newChatAction(error: String, opening: Boolean): String = when {
     error.isBlank() || opening -> ""
-    error == PROFILE_PLUGIN_OFF_ERROR -> "Turn on"
-    profileTurnOnCommand(error) != null -> "Copy command"
-    error == PROFILE_UPDATE_FIRST_ERROR || error == PROFILE_TURN_ON_BUSY_ERROR -> "Check again"
+    error in BeaconOffLines -> beaconOffAction(error)
     else -> "Retry"
 }
-/** The second button: Check again, beside Copy command, once the command has been run on the Hermes computer. */
-internal fun newChatSecondaryAction(error: String, opening: Boolean): String = if (!opening && profileTurnOnCommand(error) != null) "Check again" else ""
-/** The Attach tap on a first chat that has not opened: the notice names the button of the card on screen. */
+/** The Attach tap on a first chat that has not opened: the notice names the button of the card on screen (none for a profile Hermes no longer has). */
 internal fun newChatOpenNotice(error: String): String = when (newChatAction(error, false)) {
     "Turn on" -> OPEN_CHAT_NOTICE_TURN_ON
     "Retry" -> OPEN_CHAT_NOTICE_RETRY
-    // Copy command, Check again: the second button (or the only one) is the one that looks again.
-    else -> OPEN_CHAT_NOTICE_CHECK_AGAIN
+    else -> error
 }
 /** The status of the page of a chat whose open was refused (401/403): it stays that chat, and what was typed stays with it. */
 internal const val ACCESS_DENIED_RETAINED = "Not allowed · draft kept"
 /**
- * The two pages of a chat that cannot open now but stays that chat, told by [status]: Hermes does not serve Beacon for the profile (the page says so with Turn on), or the open
- * was refused ([ACCESS_DENIED_RETAINED]). Both keep the chat's draft in the composer; every other status belongs to a chat that is still open or to no chat.
+ * The two pages of a chat that cannot open now but stays that chat, told by [status]: Hermes refused Beacon for the profile and turning it on did not work (the page says so in
+ * one of [BeaconOffLines] with its button), or the open was refused ([ACCESS_DENIED_RETAINED]). Both keep the chat's draft in the composer; every other status belongs to a chat
+ * that is still open or to no chat.
  */
-internal fun isRetainedPage(status: String): Boolean = status == PROFILE_PLUGIN_OFF_ERROR || status == ACCESS_DENIED_RETAINED
+internal fun isRetainedPage(status: String): Boolean = status in BeaconOffLines || status == ACCESS_DENIED_RETAINED
 /**
  * The chat whose draft the composer holds while the page shows [chat] only because it cannot open now ([isRetainedPage]): that chat itself. The page has no source scope, so
  * without this what was typed there was kept nowhere and opening the chat again restored the older saved draft over it. Null for every other page.
@@ -503,12 +846,66 @@ internal fun shellRecoveryCurrent(selectionCurrent: Boolean, held: String?, reme
 internal fun newChatNeedsPreparing(authenticated: Boolean, tab: String, ready: Boolean, noConversation: Boolean, selecting: Boolean): Boolean =
     authenticated && tab == "Chat" && !ready && noConversation && !selecting
 /**
- * Whether the phone's queued follow-up may be sent now that a stream has ended: once the finished turn's reply is proven to be in the saved history, or when the
- * turn had already ended before this stream began and ended without an error. A turn nothing can prove (a gateway without session authority names no admission)
- * leaves the follow-up queued until the chat is opened again.
+ * Whether the phone's queued follow-up may be sent now that a stream has ended: once the finished turn's reply is proven to be in the saved history, when the
+ * turn had already ended before this stream began and ended without an error, or when Hermes ended the turn with a failure that trying again can fix (its
+ * error_surface says retryable and no reset lies ahead). Any other failure, a stop and a restart keep the follow-up in the box with its Send button: a person decides.
+ * A turn nothing can prove (a gateway without session authority names no admission) leaves the follow-up queued until the chat is opened again. The drain itself
+ * still asks Hermes that the chat is idle first.
  */
-internal fun drainsQueueAfterTerminal(replyConfirmed: Boolean, terminalAlreadyObserved: Boolean, terminalError: String): Boolean =
-    replyConfirmed || terminalAlreadyObserved && terminalError.isBlank()
+internal fun drainsQueueAfterTerminal(replyConfirmed: Boolean, terminalAlreadyObserved: Boolean, terminalError: String, nowMs: Long = System.currentTimeMillis()): Boolean =
+    replyConfirmed || terminalAlreadyObserved && terminalError.isBlank() || retryCanHelp(terminalError, nowMs)
+
+/** Every message still waiting in the box is held with [reason], the line the turn before it ended on; a message already held keeps its first reason. */
+internal fun holdFollowUps(queued: List<QueuedMessage>, reason: String): List<QueuedMessage> =
+    queued.map { if (it.kind == "queue" && it.state == "queued" && it.held.isBlank()) it.copy(held = reason) else it }
+/** A held message is never sent by a passive drain, only by the owner's Send. */
+internal fun passiveDrainSkips(item: QueuedMessage, explicit: Boolean): Boolean = item.held.isNotBlank() && !explicit
+/**
+ * TURN's drain rule for a chat that is not open (the outbox, P2-3; Root msg_333cceb80261): its last turn's line and end time when that turn
+ * failed and its error_surface says retrying does not help now; null when what waits behind it may go.
+ */
+internal fun failedTurnHold(rows: List<JSONObject>, nowMs: Long = System.currentTimeMillis()): Pair<String, Long>? {
+    val row = rows.lastOrNull() ?: return null
+    val last = Message.from(row, rows.lastIndex)
+    if (last.role != "assistant" || last.displayKind != "failed_turn" || last.failure.isBlank()) return null
+    val surface = runCatching { JSONObject(last.failure) }.getOrNull() ?: return null
+    val endedAt = dev.hermes.android.ui.epochMillis(last.recordedAt)
+    val line = dev.hermes.android.data.turnErrorText(json("error_surface" to surface), endedAt.takeIf { it > 0 } ?: nowMs)
+    return (line to endedAt).takeUnless { drainsQueueAfterTerminal(false, false, line, nowMs) }
+}
+/** The outbox's hold: each message that waited behind the failed turn (made before it ended; every one when Hermes gave no time) is held with its line. */
+internal fun holdBehindFailedTurn(queued: List<QueuedMessage>, line: String, endedAt: Long): List<QueuedMessage> =
+    queued.map { if (endedAt <= 0 || it.createdAt <= endedAt) holdFollowUps(listOf(it), line).single() else it }
+/** The owner's Send releases every hold at once: one tap decides what goes next (the head goes first, the rest follow as after any turn). */
+internal fun releaseHolds(queued: List<QueuedMessage>): List<QueuedMessage> = queued.map { if (it.held.isNotBlank()) it.copy(held = "") else it }
+/** The chat's line for a turn the owner stopped. */
+internal const val TURN_STOPPED = "Interrupted"
+/** The chat's line for a turn Hermes cut for its own restart or shutdown: WEDGE-121's line and string key, so a person decides what goes next. */
+internal const val TURN_RESTARTED = LOST_REPLY_STATUS
+/** The status is TURN's restart line (plain or encoded): WEDGE's choice row already says it with its Send, so the line is not drawn twice (R1). */
+internal fun isRestartLine(status: String): Boolean = dev.hermes.android.data.TurnLine.decode(status).phone == TURN_RESTARTED
+/**
+ * The line for a turn Hermes settled `interrupted`. Only a cancel this phone sent is the owner's Stop. Hermes names its own restart and shutdown interrupts in the frame's
+ * `warning` (gateway/session_settlement_recovery.py RESTART_INTERRUPT_NOTICE, SHUTDOWN_INTERRUPT_NOTICE); a turn stopped anywhere else is still "Interrupted".
+ */
+internal fun interruptedTurnLine(payload: JSONObject, stoppedHere: Boolean): String = when {
+    stoppedHere -> TURN_STOPPED
+    payload.string("warning").let { it.startsWith("Gateway restarting:") || it.startsWith("Gateway shutting down:") } -> TURN_RESTARTED
+    else -> TURN_STOPPED
+}
+/** The live status a saved frame keeps: Hermes' wait line, so a reconnect or reopen during a long wait does not look stuck. */
+internal fun savedWaitLine(status: String): String = status.takeIf(::hermesWaitLine).orEmpty()
+/** The status a restored frame brings back: its wait line while its turn still runs, else what the chat shows. */
+internal fun statusAfterRestore(current: String, frame: JSONObject?): String =
+    frame?.string("wait")?.takeIf { hermesWaitLine(it) && !frame.optBoolean("terminal") } ?: current
+/** The reason under Hermes' failed_turn row, from its own descriptor; none for a stopped turn's row, or when the phone has no line more telling than the generic one. */
+internal fun failedTurnReason(message: Message, nowMs: Long = System.currentTimeMillis()): String {
+    if (message.displayKind != "failed_turn" || message.failure.isBlank()) return ""
+    val surface = runCatching { JSONObject(message.failure) }.getOrNull() ?: return ""
+    // Judged at the moment the turn failed (the row's own time): a limit that has since reset is still why it failed; only its passed reset time is not drawn.
+    val line = dev.hermes.android.data.turnErrorText(json("error_surface" to surface), message.recordedAt.takeIf { it > 0 } ?: nowMs)
+    return line.takeIf { dev.hermes.android.data.turnErrorHeadline(it) != dev.hermes.android.data.apiFailureText(500, "") }.orEmpty()
+}
 /**
  * Whether a saved live frame says that the turn this chat follows has ended. A frame belongs to the runtime id, which is the same for every turn of that runtime, so a frame
  * marked terminal ends the attach only when it is provably this turn's: the chat has a submission of its own ([followedSubmission]) and the frame names it. A frame left by an
@@ -549,7 +946,7 @@ internal fun finishedTurnIdentity(queued: List<QueuedMessage>, completion: JSONO
 /** How long a running reply may stay silent before Hermes is asked whether it already ended, and how often that is checked. */
 internal const val STREAM_QUIET_START_MS = 20_000L
 internal const val STREAM_QUIET_CHECK_MS = 5_000L
-internal enum class SilentStream { Settle, Resubscribe, Wait }
+internal enum class SilentStream { Settle, Resubscribe, Wait, Lost }
 /** The longest a quiet running turn goes between checks with Hermes. */
 internal const val STREAM_QUIET_MAX_MS = 10 * 60_000L
 /** How long a stream may stay quiet before Hermes is asked about its turn. Only Hermes' own answer (working, waiting) stretches it; a probe that failed says nothing, and an event heard starts it over at [base]. */
@@ -565,6 +962,8 @@ internal class QuietWindow(private val base: Long, start: Long = base) {
 internal fun silentStreamAction(status: String?): SilentStream = when (status) {
     "idle" -> SilentStream.Settle
     "working" -> SilentStream.Resubscribe
+    // Hermes lost the followed reply (a restart, or a worker that died with the gateway up) and the owner's messages wait behind it: nothing will come.
+    "lost" -> SilentStream.Lost
     else -> SilentStream.Wait
 }
 /** A cold look at a chat (the process restarted, or the chat was left and reopened) asks Hermes about its reply only when Beacon delivered a prompt it never saw end and no stream is shown. Ordinary browsing never asks. */
@@ -573,19 +972,91 @@ internal fun shouldAskRunning(marked: Boolean, shownStream: String): Boolean = m
 internal fun streamFollows(alive: Boolean, started: ScopeSettlement?, scope: Scope?, client: Any?, origin: Int, generation: Int): Boolean =
     alive && started?.current(scope, client, origin, generation) == true
 internal enum class ColdRun { Keep, Follow, Settle }
+/** What a look at a chat's lost reply through Beacon's read-only route did: let a lone one go, left one held (the choice, Hermes' refusal, a reply now shown running), or found none (or could not read the route). */
+internal enum class LostOnOpen { Closed, Held, NotLost }
 /** Hermes' answer to that one question. A reply still working or waiting for the user is followed again; an ended one is settled from history, which also drops the marker; an unreadable answer changes nothing and keeps the marker. */
 internal fun coldRunAction(status: String?): ColdRun = when (status) {
     "working", "waiting" -> ColdRun.Follow
     "idle" -> ColdRun.Settle
     else -> ColdRun.Keep
 }
-data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val alerts: List<ChatAlert> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "", val waitingApprovals: List<JSONObject> = emptyList(), val waitingClarifications: List<JSONObject> = emptyList(), val lastAnswerAt: Long? = null, val endedPrompts: List<Pair<String, Long>> = emptyList(), val liveSealed: List<String> = emptyList())
+/**
+ * CHATQA-121 follow-up 3: the saved history stops inside a turn, by Hermes' own rule (agent/turn_failure_copy.py OPEN_TURN_TAIL_ROLES: the newest
+ * conversation row is the person's or a tool's), or on an assistant row whose tool calls are not answered yet. Only then can a reply still run there,
+ * so only then does the chat look at Hermes' live inventory; a chat that ends on a reply is never asked about.
+ */
+internal fun historyStopsInsideATurn(rows: List<JSONObject>): Boolean {
+    val last = rows.lastOrNull { it.string("role") in setOf("user", "assistant", "tool") } ?: return false
+    return when (last.string("role")) {
+        "user", "tool" -> true
+        else -> (last.optJSONArray("tool_calls")?.length() ?: 0) > 0
+    }
+}
+/**
+ * CHATQA-121 follow-up 3: the runtime of the reply Hermes runs in [storedSessionId], read from its live inventory (`session.active_list`, which never
+ * resumes, creates or sends). One row only may name the chat (as background activity reads it), and only "working" or "waiting" is followed: a started
+ * turn, which Delete also counts as running and Stop can interrupt. Idle, starting (admitted, not started: no row of the person's yet, nothing to stop),
+ * unknown or ambiguous rows give null.
+ */
+internal fun observedRunningTurn(inventory: JSONObject?, storedSessionId: String): String? {
+    val runtime = dev.hermes.android.ui.backgroundActivityRuntime(inventory, storedSessionId) ?: return null
+    val row = inventory?.rows("sessions")?.singleOrNull { it.opt("id") == runtime } ?: return null
+    return runtime.takeIf { row.opt("status") in setOf("working", "waiting") && it.matches(streamIdPattern) }
+}
+data class ChatState(val sessionId: String = "", val title: String = "New conversation", val messages: List<Message> = emptyList(), val raw: JSONObject = JSONObject(), val streamId: String = "", val liveText: String = "", val liveReasoning: String = "", val liveTools: List<JSONObject> = emptyList(), val status: String = "", val approval: JSONObject? = null, val clarification: JSONObject? = null, val uncertain: String = "", val queued: List<QueuedMessage> = emptyList(), val anchor: Int = 0, val anchorOffset: Int = 0, val anchorId: String = "", val callMessages: List<CallTranscript> = emptyList(), val alerts: List<ChatAlert> = emptyList(), val projectionReady: Boolean = true, val sessionReasoningEffort: String = "", val waitingApprovals: List<JSONObject> = emptyList(), val waitingClarifications: List<JSONObject> = emptyList(), val lastAnswerAt: Long? = null, val endedPrompts: List<Pair<String, Long>> = emptyList(), val liveSealed: List<String> = emptyList(), val liveSealedAt: List<Int> = emptyList(), val liveBase: Int = 0, val liveBasePrompt: String = "", val liveOrdinal: Int = 0,
+    /** Hermes lost this chat's reply in a restart and the owner's messages wait behind it: the chat offers to send them ([lostChoiceShown]). */
+    val lostWaiting: Boolean = false)
 internal fun sessionCanStillBeUnpersisted(clientCreated: Boolean, chat: ChatState): Boolean =
     clientCreated && chat.messages.isEmpty() && chat.callMessages.isEmpty() && chat.liveText.isBlank() && chat.streamId.isBlank() && chat.raw.optInt("message_count") == 0
 /** The open chat is a phone-created one that was never sent, so New conversation keeps it instead of adding another empty row.
  *  A chat opened with a title, workspace or model ([keptApart]) is not a plain one: a message typed there would land in it. */
 internal fun reusableEmptyChat(clientCreated: Boolean, chat: ChatState, sendInFlight: Boolean, keptApart: Boolean): Boolean =
     sessionCanStillBeUnpersisted(clientCreated, chat) && chat.projectionReady && chat.sessionId.isNotBlank() && chat.uncertain.isBlank() && !sendInFlight && !keptApart
+/** Android's photo picker keeps a photo's own file name private and names it by its media number ("753.png"); such a photo is called "Photo". */
+internal fun attachmentName(uri: String, shown: String): String {
+    val name = shown.trim()
+    val number = Regex("""\d+(\.[A-Za-z0-9]{1,8})?""").matchEntire(name)
+    return when {
+        name.isBlank() -> "Attachment"
+        number != null && "picker" in uri.removePrefix("content://").substringBefore('?') -> "Photo" + number.groupValues[1].lowercase()
+        else -> name
+    }
+}
+/** The send refusals that say their own reason; any other never-sent failure gets a generic line, or waits for Hermes when out of reach. */
+internal val SEND_REFUSALS = setOf(
+    "Couldn't save the message. Keep the draft open and try again.",
+    // The same refusal on a full phone (R2 #9), in words that say why.
+    DRAFT_STORE_FULL_ERROR,
+    "The model changed. Pick this message's model to send it.",
+)
+internal const val OFFLINE_SEND_NOTICE = "Not sent yet. It goes when Hermes is back."
+/** A send Hermes or the phone refused with its own words (the model, saving, a refused file by name): never "offline", never sent again by itself. */
+internal fun refusedWithItsOwnWords(e: Throwable): Boolean = waitsForOwner(e) || e is NativeTurnNotSent && e.message in SEND_REFUSALS
+/**
+ * CHAT-121 follow-up 11 (backlog 82, Root msg_ec3f92a4d60a): the send never left the phone because the link could not carry it now, while Hermes
+ * itself answers: its connection was not ready within the admission's 15 s (a call warm-up's 43 KB ahead of it in the phone's one upload queue,
+ * windows 3 and 4 of follow-up 10), or it dropped before the prompt went. Hermes' own refusals (an ApiFailure in the chain) and refusals with
+ * words of their own are not this.
+ */
+internal fun linkCouldNotCarry(e: Throwable): Boolean {
+    if (e !is NativeTurnNotSent || e is AttachmentStalled || refusedWithItsOwnWords(e)) return false
+    if (e.message == "Native connection changed before the request") return true
+    if (e.message != "Couldn't open the chat. Your message is kept.") return false
+    val chain = generateSequence(e.cause) { it.cause }.take(8).toList()
+    // Live (follow-up 11's first block): a ticket whose request waited behind 43 KB came back older than its 20 s by the phone's clock, the link's doing too.
+    return chain.any { it is java.io.IOException || it is IllegalStateException && it.message == "Canonical gateway ticket expired" } &&
+        chain.none { it is ApiFailure || it is NativeTurnNotSent || it is dev.hermes.android.data.CanonicalRouteMissing }
+}
+/** The pauses before a message the link could not carry goes again by itself: after the first and the second failed try. */
+internal val LINK_RETRY_PAUSES_MS = listOf(5_000L, 15_000L)
+/** The pause before the next try after [failedTries] tries the link could not carry, or null once they are spent (the file rule's limit): "Not sent" with Send. */
+internal fun nextLinkTryPause(failedTries: Int): Long? =
+    if (failedTries >= ATTACHMENT_STALL_TRIES) null else LINK_RETRY_PAUSES_MS[(failedTries - 1).coerceIn(0, LINK_RETRY_PAUSES_MS.lastIndex)]
+/** When this phone archived a chat (in its kept row); a list asked for more than [ARCHIVE_SETTLE_MS] later is trusted over it. */
+internal const val ARCHIVED_HERE_AT = "_archived_here_at"
+internal const val ARCHIVE_SETTLE_MS = 10_000L
+/** P2-3: how long a closed chat's next waiting message waits for that chat's reply to end before it is left for the next time Hermes answers. */
+internal const val OUTBOX_IDLE_WAIT_MS = 60 * 60_000L
 /** Only the automatic open and a bare New conversation ask for a plain chat; any option makes the chat its own. */
 internal fun plainChatRequest(body: JSONObject): Boolean = body.keys().asSequence().all { it == "worktree" && !body.optBoolean(it) }
 /** The chat while [id] is being selected. Re-selecting the open chat keeps its transcript, readiness and live output on screen
@@ -696,9 +1167,39 @@ internal fun promptGuarded(prompt: JSONObject?, now: Long): Boolean = now < prom
 internal fun visibleTranscriptMessages(messages: List<Message>): List<Message> =
     messages.filterNot { it.displayKind == "hidden" || isSteeringText(it.text) }
 
+private val runsOfWhitespace = Regex("\\s+")
+
+/**
+ * The transcript as Hermes' own view draws a reply whose final message only repeats the text said beside the last tool step (the housekeeping-tool reuse path: Hermes ends the turn on
+ * its earlier reply, agent/turn_empty_response.py:151-164, and saves it again as a closing row, agent/turn_finalizer.py:240-265). Hermes folds exactly that shape when it reads a chat back:
+ * `dedupeRepeatedTextInParts` (apps/desktop/src/lib/chat-messages/parts.ts:438, applied to each assistant message at hydration.ts:680). In a run of assistant rows (a question starts a new one),
+ * when the LAST text equals the text before it once whitespace is collapsed (`normalizeWs`, parts.ts:403), no tool call comes after the last text, and a tool call lies between the two,
+ * the earlier text goes and its tool cards stay. A final that only starts with the earlier sentence, an authored repeat in an earlier round, or two texts with no tool call between are left alone.
+ */
+internal fun foldRepeatedFinal(messages: List<Message>): List<Message> {
+    val result = messages.toMutableList()
+    var from = 0
+    for (end in 0..messages.size) {
+        if (end < messages.size && messages[end].role != "user") continue
+        val run = (from until end).filter { messages[it].role == "assistant" && messages[it].displayKind.isBlank() }
+        val texts = run.filter { messages[it].text.isNotBlank() }
+        if (texts.size >= 2) {
+            val last = texts.last()
+            val earlier = texts[texts.size - 2]
+            val key = messages[last].text.replace(runsOfWhitespace, " ").trim()
+            if (key.isNotEmpty() && key == messages[earlier].text.replace(runsOfWhitespace, " ").trim() && messages[last].tools.isEmpty() &&
+                run.none { it > last && messages[it].tools.isNotEmpty() } && run.any { it in earlier until last && messages[it].tools.isNotEmpty() }) {
+                result[earlier] = messages[earlier].copy(text = "")
+            }
+        }
+        from = end + 1
+    }
+    return result
+}
+
 internal fun pendingSendBoundary(messages: List<Message>): String = visibleTranscriptMessages(messages).lastOrNull()?.id.orEmpty()
 
-private const val UNCONFIRMED_REPLIES = "_unconfirmed_replies"
+internal const val UNCONFIRMED_REPLIES = "_unconfirmed_replies"
 
 /**
  * Whether [incoming] is a later snapshot of the chat [previous] holds: the same non-blank session id, and the same profile when both name one.
@@ -758,7 +1259,7 @@ internal fun mergeChatProjection(previous: JSONObject, incoming: JSONObject, all
                     currentRows.any { rowId(it) == id && it.string("role") == "assistant" }
                 } == true
         }
-        if (removeAll) remove(UNCONFIRMED_REPLIES) else if (retained.isNotEmpty()) put(UNCONFIRMED_REPLIES, JSONArray(unresolved))
+        if (removeAll) remove(UNCONFIRMED_REPLIES) else if (retained.isNotEmpty()) put(UNCONFIRMED_REPLIES, JSONArray(keptRowsNotSaved(currentRows, unresolved)))
         for (key in listOf("_display_submission_id", "_display_admission_id", "profile")) if (!has(key) && previous.has(key)) put(key, previous.opt(key))
     }
 }
@@ -772,17 +1273,193 @@ internal fun carryDisplayIdentity(next: JSONObject, current: JSONObject): JSONOb
     return next
 }
 
-/** Retained text has no live stream, tool capability or native message identity. */
+/** The id prefix of kept copies judged by Hermes' ids and the turn's order ([keptRowsNotSaved]), never by their words. */
+internal const val KEPT_IN_TURN = "unconfirmed:turn:"
+/** On a live tool card: how many word segments began after it. Counted from the end, so a saved front of the turn dropping out of the live lists never moves it. */
+internal const val WORDS_AFTER = "_words_after"
+
+/**
+ * The held prompt row of the running turn, or "" while this phone's own send is not a held row yet (the last held question is then an older turn's).
+ * A turn this phone did not send is the last held question's.
+ */
+internal fun runningPromptRow(chat: ChatState): String {
+    fun held(id: String) = (id.toLongOrNull() ?: 0L) > 0 && chat.messages.any { it.id == id && it.role == "user" }
+    val own = chat.raw.string("_display_submission_id").takeIf(String::isNotBlank)?.let { id -> chat.queued.firstOrNull { it.submissionId == id } }
+    if (own != null) return own.rowId.takeIf(::held).orEmpty()
+    return chat.messages.lastOrNull { it.role == "user" && it.displayKind != "steer" && !isSteeringText(it.text) }?.id?.takeIf { (it.toLongOrNull() ?: 0L) > 0 }.orEmpty()
+}
+
+/**
+ * The row that begins the turn a kept copy belongs to. This phone's own send is its held row; a turn it did not send is the newest question the rows hold. Blank while its own
+ * question is not a held row yet ([keptTurnPrompt] then finds it by its place after [lastPromptRow]).
+ */
+internal fun keptPromptRow(chat: ChatState): String {
+    if (ownSend(chat) != null) return runningPromptRow(chat)
+    // The rows the chat holds say it; the held messages stand in where a chat has no rows of its own.
+    return lastPromptRow(chat.raw.rows("messages")).ifBlank { runningPromptRow(chat) }
+}
+
+/** The id of the newest question in [rows] (a steer or Hermes' own note is not one), or "". */
+internal fun lastPromptRow(rows: List<JSONObject>): String =
+    rows.lastOrNull(::isPromptRow)?.let { it.string("row_id", it.string("_row_id", it.string("id"))) }.orEmpty()
+
+/**
+ * The question a kept copy's turn begins with, by ids: the row it was bound to, or, for a copy kept while its own question was not a held row yet (`_after_prompt`: the newest question
+ * the phone held then), the first question that comes after that one. "" while that question is not in [rows] yet.
+ */
+internal fun keptTurnPrompt(row: JSONObject, rows: List<JSONObject>): String {
+    row.string("_history_user_row_id").takeIf(String::isNotBlank)?.let { return it }
+    if (!row.has("_after_prompt")) return ""
+    val after = row.string("_after_prompt")
+    val start = if (after.isBlank()) 0 else rows.indexOfFirst { it.string("row_id", it.string("_row_id", it.string("id"))) == after }.let { if (it < 0) return "" else it + 1 }
+    return rows.drop(start).firstOrNull(::isPromptRow)?.let { it.string("row_id", it.string("_row_id", it.string("id"))) }.orEmpty()
+}
+
+/** The rows of the turn whose prompt is the held row [prompt]: after it, up to the next question (a steer continues the turn); null when [rows] do not hold it. */
+internal fun turnRowsAfter(rows: List<JSONObject>, prompt: String): List<JSONObject>? {
+    if (prompt.isBlank()) return null
+    val at = rows.indexOfFirst { it.string("role") == "user" && (it.string("row_id", it.string("_row_id", it.string("id"))) == prompt) }
+    if (at < 0) return null
+    return rows.drop(at + 1).takeWhile { !(it.string("role") == "user" && it.string("display_kind") != "steer" && !isSteeringText(messageContentText("user", historyRowContent(it)))) }
+}
+
+/** How many model messages with words Hermes holds in a turn's [rows]: it saves one per word segment the model said (Hermes' own notes never count). */
+internal fun savedWordRows(rows: List<JSONObject>): Int = savedWordMessages(rows).size
+
+/** The model messages with words in a turn's [rows], in order: segment n's own message is the n-th. */
+internal fun savedWordMessages(rows: List<JSONObject>): List<JSONObject> =
+    rows.filter { it.string("role") == "assistant" && it.string("display_kind").isBlank() && messageContentText("assistant", historyRowContent(it)).isNotBlank() }
+
+/** The place in a turn's [rows] of the words Hermes saved with (or just before) the tool call [callId]: its model messages with words up to that call; 0 when not held. */
+internal fun savedPlaceOfCall(rows: List<JSONObject>, callId: String): Int {
+    val at = if (callId.isBlank()) -1 else rows.indexOfFirst { row -> row.string("role") == "assistant" && row.rows("tool_calls").any { toolIdentity(it) == callId } }
+    return if (at < 0) 0 else savedWordRows(rows.take(at + 1))
+}
+
+/** The place in the turn of each sealed segment, one per sealed text; 0 where it is not known (a live frame of an older build). */
+internal fun ChatState.sealedPlaces(): List<Int> = List(liveSealed.size) { liveSealedAt.getOrElse(it) { 0 } }
+
+/** This phone's own send in flight (its queue entry), or null: a turn it did not send (another device, a hand-over) has none. */
+internal fun ownSend(chat: ChatState): QueuedMessage? =
+    chat.raw.string("_display_submission_id").takeIf(String::isNotBlank)?.let { id -> chat.queued.firstOrNull { it.submissionId == id } }
+
+/** A row that begins a turn: a question, not a steer or Hermes' own "[System: ...]" note. */
+private fun isPromptRow(row: JSONObject): Boolean =
+    row.string("role") == "user" && row.string("display_kind") != "steer" && !isSteeringText(messageContentText("user", historyRowContent(row)))
+
+/**
+ * A turn this phone did not send can start before its question is a held row; the words then count the last held turn's saved messages ([ChatState.liveBase]) into their places.
+ * When the question arrives (the newest question in [rows] is another row than the one counted against), that held part comes off every place, so the places are the turn's own again.
+ */
+internal fun rebasedForTurn(chat: ChatState, rows: List<JSONObject>): ChatState {
+    if (chat.liveBase <= 0 || ownSend(chat) != null) return chat
+    val now = rows.lastOrNull(::isPromptRow)?.let { it.string("row_id", it.string("_row_id", it.string("id"))) }.orEmpty()
+    if (now.isBlank() || now == chat.liveBasePrompt) return chat
+    return chat.copy(liveOrdinal = if (chat.liveOrdinal > 0) maxOf(1, chat.liveOrdinal - chat.liveBase) else 0,
+        liveSealedAt = chat.liveSealedAt.map { if (it > 0) maxOf(1, it - chat.liveBase) else 0 }, liveBase = 0, liveBasePrompt = now)
+}
+
+/**
+ * The saved rows of the turn the live stream belongs to: the turn of the held prompt, when it is the newest turn [rows] hold. Null when the phone cannot tell which turn that is
+ * (its own send is not a held row yet, or a newer question than the one it holds is already saved): nothing is then judged saved.
+ */
+internal fun runningTurnRows(chat: ChatState, rows: List<JSONObject>): List<JSONObject>? {
+    // A turn this phone did not send is the newest turn the rows hold, whether or not the phone's held messages have caught up with it.
+    if (ownSend(chat) == null) return rows.indexOfLast(::isPromptRow).takeIf { it >= 0 }?.let { rows.drop(it + 1) }
+    val prompt = runningPromptRow(chat)
+    val turn = turnRowsAfter(rows, prompt) ?: return null
+    val at = rows.indexOfFirst { it.string("role") == "user" && it.string("row_id", it.string("_row_id", it.string("id"))) == prompt }
+    return turn.takeIf { at + 1 + it.size == rows.size }
+}
+
+/**
+ * The sealed [words] (each with its place in the turn) Hermes' saved [turn] rows do not hold yet. Hermes saves one model message with words per segment, in order, so a segment of
+ * place n is held once the turn has n of them: judged by the place, never by the words, so words Hermes saved differently (think tags stripped, a rewrite) never show twice.
+ * A segment of unknown place (0) stays until the stream ends. Only the newest [MAX_SEALED_SEGMENTS] are kept.
+ */
+internal fun sealedNotSaved(words: List<String>, places: List<Int>, turn: List<JSONObject>?): Pair<List<String>, List<Int>> {
+    val saved = turn?.let(::savedWordRows) ?: 0
+    val kept = words.indices.filter { words[it].isNotBlank() && places[it] !in 1..saved }.takeLast(MAX_SEALED_SEGMENTS)
+    return kept.map { words[it] } to kept.map { places[it] }
+}
+
+/**
+ * The closed live segment [text], of place [place], is held by Hermes' saved [turn] rows: the turn's [place]-th model message with words is saved (by place, never by its words).
+ * A message that names tool calls is still told by them ([historyOwnsLiveBoundary]): when it names calls other than the ones this segment closed with, it is another message.
+ */
+internal fun liveWordsSaved(text: String, place: Int, boundary: LiveAssistantBoundary, turn: List<JSONObject>?): Boolean {
+    if (!boundary.closed || text.isBlank() || place <= 0 || turn == null) return false
+    val calls = savedWordMessages(turn).getOrNull(place - 1)?.rows("tool_calls") ?: return false
+    return calls.isEmpty() || calls.any { toolIdentity(it) in boundary.toolIds }
+}
+
+/**
+ * The chat when [text] starts a new word segment (after a tool step, or the first words of a segment): every tool card on screen gets one more segment after it,
+ * and the segment takes its place in the turn. Hermes cannot hold these words yet, so every model message with words it holds for the turn came before them.
+ */
+internal fun wordsBegan(s0: ChatState, text: String, previousClosed: Boolean): ChatState {
+    if (text.isBlank() || !(previousClosed || s0.liveText.isBlank())) return s0
+    val rows = s0.raw.rows("messages")
+    val s = rebasedForTurn(s0, rows)
+    val held = runningTurnRows(s, rows)?.let(::savedWordRows) ?: 0
+    val first = s.liveOrdinal == 0
+    val prompt = rows.lastOrNull(::isPromptRow)?.let { it.string("row_id", it.string("_row_id", it.string("id"))) }.orEmpty()
+    return s.copy(liveOrdinal = maxOf(s.liveOrdinal + 1, held + 1), liveBase = if (first) held else s.liveBase, liveBasePrompt = if (first) prompt else s.liveBasePrompt, liveTools = if (s.liveTools.isEmpty()) s.liveTools else s.liveTools.map { it.copy().put(WORDS_AFTER, it.optInt(WORDS_AFTER) + 1) })
+}
+
+/**
+ * The words of a reply a reset or an unconfirmed end cut, kept with the tool steps between them in the order said, until Hermes' saved rows hold them.
+ * One row per word segment (sealed ones first, then the live one), each with the tool cards said after it; cards said before any words go with the first.
+ * Kept rows have no live stream, tool capability or native message identity. Reasoning or tool steps alone are never kept: a reply that never came leaves no bubble.
+ */
 internal fun retainUnconfirmedReply(chat: ChatState): ChatState {
-    if (chat.liveText.isBlank() && chat.liveReasoning.isBlank()) return chat
-    val id = "unconfirmed:" + "${chat.sessionId}:${chat.streamId}:${chat.raw.string("replay_epoch")}:${chat.raw.string("_display_submission_id")}:${chat.raw.optLong("execution_generation")}".digest()
+    val sealed = chat.liveSealed.zip(chat.sealedPlaces()).filter { it.first.isNotBlank() }
+    val segments = sealed.map { it.first } + listOfNotNull(chat.liveText.takeIf(String::isNotBlank))
+    if (segments.isEmpty()) return chat
     // The prompt row of this turn (a steer is not a prompt), so the copy is judged against its own turn's saved rows and sits with that turn, never below a later one.
-    val prompt = chat.messages.lastOrNull { it.role == "user" && it.displayKind != "steer" && !isSteeringText(it.text) }?.id?.takeIf { (it.toLongOrNull() ?: 0L) > 0 }.orEmpty()
-    val row = json("id" to id, "text" to chat.liveText, "reasoning" to chat.liveReasoning, "role" to "assistant",
-        "session_id" to chat.sessionId, "actionable" to false, "display_kind" to "unconfirmed_reply", "_history_user_row_id" to prompt,
-        "submission_id" to chat.raw.string("_display_submission_id"), "admission_id" to chat.raw.string("_display_admission_id"))
+    // While this phone's own question is not a held row yet, the copy names the newest question it held (`_after_prompt`) and finds its own by ids when it arrives.
+    val prompt = keptPromptRow(chat)
+    val afterPrompt = lastPromptRow(chat.raw.rows("messages"))
+    // Each kept segment's place in the turn: the last one is the stream's latest; the ones before it follow on. Unknown (an older live frame) keeps the words-based rule.
+    val exact = sealed.isNotEmpty() && sealed.all { it.second > 0 }
+    val places = if (exact) sealed.map { it.second } + listOfNotNull(chat.liveOrdinal.takeIf { chat.liveText.isNotBlank() }) else emptyList()
+    // A copy this build keeps always has a place, so the words fallback can only meet one with none (an older live frame).
+    val placed = if (exact) places.size == segments.size && places.all { it > 0 } && places.zipWithNext().all { (a, b) -> a < b } else chat.liveOrdinal >= segments.size
+    val stem = "${chat.sessionId}:${chat.streamId}:${chat.raw.string("replay_epoch")}:${chat.raw.string("_display_submission_id")}:${chat.raw.optLong("execution_generation")}".digest() + ":"
+    val key = (if (placed) KEPT_IN_TURN else "unconfirmed:") + stem
+    val saved = historyToolIdentities(chat.raw.rows("messages"))
+    val after = chat.liveTools.filter { toolIdentity(it).isBlank() || toolIdentity(it) !in saved }.groupBy { (segments.lastIndex - it.optInt(WORDS_AFTER)).coerceAtLeast(-1) }
+    fun cards(at: Int) = JSONArray(after[at].orEmpty().map { it.copy().apply { remove(WORDS_AFTER) } })
+    val rows = segments.mapIndexed { j, words ->
+        json("id" to "$key$j", "text" to words, "reasoning" to if (j == segments.lastIndex) chat.liveReasoning else "", "role" to "assistant",
+            "session_id" to chat.sessionId, "actionable" to false, "display_kind" to "unconfirmed_reply", "_history_user_row_id" to prompt, "_after_prompt" to afterPrompt, "_segment" to if (!placed) 0 else if (exact) places[j] else chat.liveOrdinal - segments.lastIndex + j,
+            "live_tools_before" to if (j == 0) cards(-1) else JSONArray(), "live_tools" to cards(j),
+            "submission_id" to chat.raw.string("_display_submission_id"), "admission_id" to chat.raw.string("_display_admission_id"))
+    }
     return chat.copy(raw = chat.raw.copy().put(UNCONFIRMED_REPLIES,
-        JSONArray(chat.raw.rows(UNCONFIRMED_REPLIES).filterNot { it.string("id") == id } + row)))
+        // Judged at once against the rows the phone holds: a reply whose saved copy is already here is not kept twice (an end Hermes' receipt did not prove).
+        JSONArray(chat.raw.rows(UNCONFIRMED_REPLIES).filterNot { it.string("id").removePrefix(KEPT_IN_TURN).removePrefix("unconfirmed:").startsWith(stem) } +
+            keptRowsNotSaved(chat.raw.rows("messages"), rows))))
+}
+
+/**
+ * The kept copies Hermes' saved [rows] do not hold yet, judged by Hermes' ids and the turn's order, never by words. A kept copy of the turn's n-th word segment ([KEPT_IN_TURN],
+ * `_segment`) goes once Hermes holds n model messages with words after the turn's prompt (it saves one per segment, in order); its tool cards go once Hermes saved their calls.
+ * Kept rows of other kinds, and rows whose prompt the history does not hold, pass unchanged.
+ */
+internal fun keptRowsNotSaved(rows: List<JSONObject>, kept: List<JSONObject>): List<JSONObject> = kept.mapNotNull { row ->
+    val ordinal = row.optInt("_segment")
+    val turn = if (!row.string("id").startsWith(KEPT_IN_TURN) || ordinal <= 0) null else turnRowsAfter(rows, keptTurnPrompt(row, rows))
+    when {
+        turn == null -> row
+        savedWordRows(turn) >= ordinal -> null
+        else -> {
+            val saved = historyToolIdentities(turn)
+            fun unsaved(key: String) = row.rows(key).filterNot { toolIdentity(it).isNotBlank() && toolIdentity(it) in saved }
+            if (unsaved("live_tools_before").size == row.rows("live_tools_before").size && unsaved("live_tools").size == row.rows("live_tools").size) row
+            else row.copy().put("live_tools_before", JSONArray(unsaved("live_tools_before"))).put("live_tools", JSONArray(unsaved("live_tools")))
+        }
+    }
 }
 
 /** Local placement uses the captured send boundary, never content matching or a global timestamp sort. */
@@ -833,26 +1510,124 @@ internal fun withPrefetchedPreview(glances: dev.hermes.android.ui.ChatGlances, p
     return glances.viewed(profile, id, line, role, at, seen = 0L)
 }
 // The send receipt holds the draft as JSON inside JSON, so it is the largest local checkpoint of the attachments.
+
+/**
+ * Whether a queued message that failed with [error] waits for the owner instead of being sent again by itself. A file Hermes refused stays refused (each try
+ * would stage the files that did pass once more, and Hermes keeps no way to take them back); a file the plugin stalled on three times, each in smaller pieces,
+ * would only stall again (CHAT-121 follow-up 8); a message whose model changed needs its model picked.
+ */
+/**
+ * Chat join: why a failed queued send waits for the owner's Send (TURN-121's one saved hold), or "" for none. A file that could not get through is
+ * not held: CHAT-121's fileNotSent already keeps it from every drain and the outbox, and its row says "Not sent" with Send, so the chat says it once.
+ */
+internal fun queuedHoldReason(e: Throwable): String = if (e !is AttachmentStalled && waitsForOwner(e)) e.message.orEmpty() else ""
+internal fun waitsForOwner(error: Throwable): Boolean =
+    error is AttachmentRefused || error is AttachmentStalled || error is NativeTurnNotSent && error.message == "The model changed. Pick this message's model to send it."
+
+/**
+ * The first chat's create with its retry identity. A [kept] attempt (an earlier create whose answer was lost) is sent again by [create], so Hermes
+ * returns the chat that create made. When Hermes refuses that id ([beaconOpeningRetryRefused], the same rule as Beacon's chat), it is spent: [renew] saves a new id first, and
+ * [create] runs once more with it. A failure of the new id keeps it for the next try, so an open never makes more than two creates and a spent id
+ * never blocks the first chat for good (CHAT-121 follow-up 4).
+ */
+internal suspend fun createWithRetryIdentity(kept: Boolean, renew: suspend () -> Unit, create: suspend () -> JSONObject): JSONObject {
+    try { return create() }
+    catch (e: Exception) { if (!kept || e is CancellationException || !beaconOpeningRetryRefused(e)) throw e }
+    renew()
+    return create()
+}
+
+/**
+ * Chat join (TURN follow-up 4 with WEDGE follow-up 3): a stream left on a cut turn, released when the lost reply's choice comes up, lets go of its live
+ * words the way TURN releases an unproven end: they are kept ([retainUnconfirmedReply]) and the live fields and their place reset; never dropped.
+ * REVIEW-JOIN-121 P2-3: so does a live copy no stream is bound to (the "lost" answer to its reconcile names no stream), or it stays drawn as Working.
+ */
+internal fun releaseCutStream(chat: ChatState, stream: String): ChatState =
+    if ((stream.isNotBlank() && chat.streamId == stream) || liveCopyUnbound(chat))
+        retainUnconfirmedReply(chat).copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), liveSealedAt = emptyList(),
+            liveBase = 0, liveBasePrompt = "", liveOrdinal = 0)
+    else chat
 internal fun attachmentFitsLocalCheckpoint(send: PendingSend): Boolean =
     send.encode().toByteArray().size.toLong() + APP_CIPHER_OVERHEAD <= LOCAL_CHECKPOINT_LIMIT_BYTES
+/** rules24 (b): a live copy (words, reasoning, steps) no stream is bound to. The chat would draw it with Working beside an idle composer: it must not stay. */
+internal fun liveCopyUnbound(chat: ChatState): Boolean = chat.streamId.isBlank() &&
+    (chat.liveText.isNotBlank() || chat.liveReasoning.isNotBlank() || chat.liveTools.isNotEmpty() || chat.liveSealed.isNotEmpty())
+/** rules24 (b): the saved chat holds the end of its last turn: Hermes saved a reply for it, not only its own note on a failed or cut turn. */
+internal fun savedTurnHoldsReply(rows: List<JSONObject>): Boolean = runningTurnMessages(rows).any {
+    it.string("role") == "assistant" && it.string("display_kind") != "failed_turn" && messageContentText("assistant", historyRowContent(it)).isNotBlank()
+}
+/**
+ * rules24 (b): whether the idle reconcile's release of [chat]'s unbound live copy counts the turn's reply as saved. REVIEW-JOIN-121 P2-2: a placed copy is
+ * retired by its place, as TURN's own end does (words the saved chat does not hold at that place stay as a kept copy); only an unplaced one goes when the
+ * saved turn holds a reply (it would show twice).
+ */
+internal fun unboundReleaseConfirmed(chat: ChatState, savedHoldsReply: Boolean): Boolean =
+    if (chat.liveOrdinal > 0 || chat.liveSealed.isNotEmpty()) false else savedHoldsReply
+/**
+ * Sign-out, account change and a phone removed on the computer (Root, 18 Nov): the account's saved chats leave the phone, with its screens. For each of
+ * [profiles]: the transcripts of the chats it lists or last opened and the rows that name them (the chat that was open, the Beacon chat, the new-chat shell,
+ * the chat settings), then its chat glances and list. Drafts stay: they are the person's own unsent words. The view model's sweep and the push side's
+ * (REVIEW-JOIN-121 P3-6: no view model may be alive) both run this one. [found] keeps, per profile, the chats a sweep found: sign-out sweeps twice (a write
+ * that was already running can land after the first). The account row naming the profiles goes only when it was [recorded] (read) and every list went.
+ */
+internal suspend fun forgetAccountChats(cache: ProjectionCache, account: Scope, profiles: List<Scope>, removal: DeviceRemovalAuthority?, chats: Boolean = true,
+    recorded: Boolean = true, found: MutableMap<String, MutableSet<String>> = mutableMapOf()) {
+    suspend fun forget(scope: Scope, kind: String) { if (removal == null) cache.delete(scope, kind) else cache.deleteIfCurrent(scope, kind, removal) }
+    /** One failed delete never keeps the others; what cannot go expires after two days. */
+    suspend fun quietly(step: suspend () -> Unit): Boolean = try { step(); true } catch (e: CancellationException) { throw e } catch (_: Exception) { false }
+    var wiped = recorded
+    for (profile in profiles) {
+        if (chats) {
+            val listed = try {
+                savedChatIds(cache.read(profile, "conversation-index"), listOf(BEACON_SESSION_CACHE_KIND, LEGACY_BEACON_SESSION_CACHE_KIND, "selected-session", "new-chat-shell").map { cache.read(profile, it) })
+            } catch (e: CancellationException) { throw e } catch (_: Exception) { emptySet() }
+            for (id in found.getOrPut(profile.key) { linkedSetOf() }.also { it += listed }.toList()) {
+                quietly { cache.deleteUnprotected(profile.session(id), removal) }
+                for (kind in listOf("client-created-shell", "side-question")) quietly { forget(profile.session(id), kind) }
+            }
+            quietly { cache.deleteUnprotected(profile, removal) }
+            for (kind in listOf("session", "selected-session", "profile-settings", "new-chat-shell", "new-chat-attempt", "chat-preferences", "read-invalidated-at", "beacon-opening", LEGACY_BEACON_OPENING_CACHE_KIND, BEACON_SESSION_CACHE_KIND, LEGACY_BEACON_SESSION_CACHE_KIND))
+                quietly { forget(profile, kind) }
+        }
+        // A failed list delete keeps the account row, so the next sweep finds what is left.
+        for (kind in listOf("chat-glances", "conversation-index")) if (!quietly { forget(profile, kind) }) wiped = false
+    }
+    if (chats) quietly { forget(account, "thread-marks") }
+    if (wiped) quietly { forget(account, GLANCE_PROFILES_KIND) }
+}
+/** REVIEW-JOIN-121 P3-6: Hermes removed this phone, and no view model may be alive: the push side forgets the account's chats and received files, as forgetScreens does. */
+internal suspend fun forgetRemovedAccountData(app: BeaconApplication, scope: Scope, removal: DeviceRemovalAuthority) {
+    val account = scope.copy(profile = "", session = "")
+    val recorded = try { decodeGlanceProfiles(app.cache.read(account, GLANCE_PROFILES_KIND)) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+    try { forgetAccountChats(app.cache, account, glanceProfilesToForget(scope, emptyList(), emptyList(), recorded.orEmpty()), removal, recorded = recorded != null) }
+    finally { ReceivedFiles.store(app).forgetAccount(scope) }
+}
+/** The lines a followed stream shows while it cannot reach Hermes (REVIEW-JOIN-121 P3-1). */
+private val LINK_WAIT_LINES = setOf("Reconnecting…", "Couldn't check the reply · your messages are kept")
+/** UX-121 P3-17: the lines that are the only word on a cut or lost reply are read at body size, not as a small status. */
+internal fun lostReplyLine(status: String): Boolean = status in LINK_WAIT_LINES || isRestartLine(status)
 internal fun releaseTerminalChat(chat: ChatState, stream: String, replyConfirmed: Boolean, terminalStatus: String, submission: String? = null): ChatState {
-    if (chat.streamId != stream || submission != null && chat.raw.string("_display_submission_id") != submission) return chat
-    return if (replyConfirmed) chat.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), status = terminalStatus)
-    else retainUnconfirmedReply(chat).copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList())
+    // The turn's own end also releases what it painted after its stream id went blank (rules24 (b)); a chat that follows another stream keeps its own.
+    if (chat.streamId != stream && !liveCopyUnbound(chat) || submission != null && chat.raw.string("_display_submission_id") != submission) return chat
+    return if (replyConfirmed) chat.copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), liveSealedAt = emptyList(), liveBase = 0, liveBasePrompt = "", liveOrdinal = 0, status = terminalStatus)
+    else retainUnconfirmedReply(chat).copy(streamId = "", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), liveSealedAt = emptyList(), liveBase = 0, liveBasePrompt = "", liveOrdinal = 0)
 }
 
 /** The chat without the live segment and tool cards the saved [rows] already hold; the turn itself is not ended here. */
-internal fun withoutSavedLive(chat: ChatState, rows: List<JSONObject>, boundary: LiveAssistantBoundary): ChatState {
+internal fun withoutSavedLive(chat0: ChatState, rows: List<JSONObject>, boundary: LiveAssistantBoundary): ChatState {
+    val chat = rebasedForTurn(chat0, rows)
     val turn = runningTurnMessages(rows)
     val owned = historyToolIdentities(turn)
-    val wordsSaved = historyOwnsTextSegment(turn, chat.liveText, boundary.closed)
+    val mine = runningTurnRows(chat, rows)
+    val wordsSaved = liveWordsSaved(chat.liveText, chat.liveOrdinal, boundary, mine)
+    val sealed = sealedNotSaved(chat.liveSealed, chat.sealedPlaces(), mine)
     return chat.copy(liveText = if (wordsSaved) "" else chat.liveText, liveReasoning = if (wordsSaved) "" else chat.liveReasoning,
         liveTools = chat.liveTools.filterNot { toolIdentity(it).isNotBlank() && toolIdentity(it) in owned },
-        liveSealed = sealedWordsNotSaved(rows, chat.liveSealed))
+        liveSealed = sealed.first, liveSealedAt = sealed.second)
 }
 
 /** What the live view keeps once the saved [rows] are known: the segment they hold is dropped, and the turn is over when they hold its end. */
-internal data class LiveSettlement(val streamEnded: Boolean, val text: String, val reasoning: String, val tools: List<JSONObject>, val sealed: List<String> = emptyList())
+internal data class LiveSettlement(val streamEnded: Boolean, val text: String, val reasoning: String, val tools: List<JSONObject>, val sealed: List<String> = emptyList(), val sealedAt: List<Int> = emptyList(), val ordinal: Int = 0, val base: Int = 0, val basePrompt: String = "")
 internal fun settleLive(old: ChatState, rows: List<JSONObject>, active: String?, boundary: LiveAssistantBoundary, finalRow: String): LiveSettlement {
     val turn = runningTurnMessages(rows)
     val historyOwnsLive = (finalRow.isNotBlank() && rows.any { it.string("row_id", it.string("_row_id")) == finalRow }) ||
@@ -863,12 +1638,25 @@ internal fun settleLive(old: ChatState, rows: List<JSONObject>, active: String?,
         text = if (streamEnded) "" else kept.liveText,
         reasoning = if (streamEnded) "" else kept.liveReasoning,
         tools = if (streamEnded) emptyList() else kept.liveTools,
-        sealed = if (streamEnded) emptyList() else kept.liveSealed)
+        sealed = if (streamEnded) emptyList() else kept.liveSealed, sealedAt = if (streamEnded) emptyList() else kept.liveSealedAt,
+        ordinal = if (streamEnded) 0 else kept.liveOrdinal, base = if (streamEnded) 0 else kept.liveBase, basePrompt = if (streamEnded) "" else kept.liveBasePrompt)
 }
 
 /** The chat with its closed live words kept as a sealed segment when a new segment begins; the words the running turn's saved rows already hold are not kept (their row shows them). */
-internal fun sealClosedWords(s: ChatState, previousClosed: Boolean): ChatState =
-    if (!previousClosed || s.liveText.isBlank()) s else s.copy(liveSealed = sealedWordsNotSaved(s.raw.rows("messages"), s.liveSealed + s.liveText))
+internal fun sealClosedWords(s0: ChatState, previousClosed: Boolean): ChatState {
+    if (!previousClosed || s0.liveText.isBlank()) return s0
+    val s = rebasedForTurn(s0, s0.raw.rows("messages"))
+    val sealed = sealedNotSaved(s.liveSealed + s.liveText, s.sealedPlaces() + s.liveOrdinal, runningTurnRows(s, s.raw.rows("messages")))
+    return s.copy(liveSealed = sealed.first, liveSealedAt = sealed.second)
+}
+
+/** Hermes' explained waits lead with a status glyph (agent/turn_recovery.py, chat_completion_wait_notice.py, turn_truncation.py); its spinner faces never do. */
+internal fun hermesWaitLine(line: String): Boolean = line.firstOrNull() in setOf('⏳', '⏱', '⚠', '↻', '⚙')
+/** Hermes' wait line as the owner reads it: its plain first part, without the parenthesised mechanics at its end. */
+internal fun plainWaitLine(line: String): String {
+    var plain = line.trim()
+    while (true) { val next = plain.replace(Regex("""\s*\([^()]*\)\s*$"""), "").trim(); if (next == plain || next.isBlank()) return plain; plain = next }
+}
 
 /** The chat after one stream event that moves the live bubble, reasoning or tool cards; null for every other event. [previousClosed] is the boundary before the event, [next] the one it leaves. */
 internal fun liveAfterEvent(s: ChatState, type: String, o: JSONObject, previousClosed: Boolean, next: LiveAssistantBoundary): ChatState? = when (type) {
@@ -879,12 +1667,11 @@ internal fun liveAfterEvent(s: ChatState, type: String, o: JSONObject, previousC
         val merged = kept.raw.copy().apply { projection.keys().forEach { put(it, projection.opt(it)) } }
         val rows = projection.rows("messages")
         val active = projection.string("active_stream_id").takeIf(String::isNotBlank)
-        val pending = projection.rows("pending")
         val live = if (reset) LiveSettlement(true, "", "", emptyList()) else settleLive(s, rows, active, next, "")
         kept.copy(raw = merged, messages = if (projection.has("messages")) rows.mapIndexed { i, row -> Message.from(row, i, s.sessionId) } else s.messages,
             streamId = active ?: if (reset || live.streamEnded) "" else s.streamId,
-            liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools, liveSealed = live.sealed,
-            status = if (reset && active == null && pending.any { it.string("status") == "unknown" }) "Reply status unknown" else renderedChatStatus(s, active, live.streamEnded))
+            liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools, liveSealed = live.sealed, liveSealedAt = live.sealedAt, liveBase = live.base, liveBasePrompt = live.basePrompt, liveOrdinal = if (reset || live.streamEnded) 0 else live.ordinal,
+            status = if (active == null && lostTurnHeld(projection)) LOST_REPLY_STATUS else renderedChatStatus(s, active, live.streamEnded))
     }
     "done" -> {
         val projected = o.optJSONObject("session")?.let { session ->
@@ -892,32 +1679,48 @@ internal fun liveAfterEvent(s: ChatState, type: String, o: JSONObject, previousC
         } ?: s
         val finalText = messageContentText("assistant", o.opt("text") ?: o.opt("content"))
         val shownText = when {
+            // A stopped or failed turn's final text is Hermes' own stop or failure copy ("Operation interrupted: retrying…"), not words of the reply.
+            o.string("status") in setOf("interrupted", "error") -> projected.liveText
             o.optBoolean("response_transformed") && finalText.isNotBlank() -> finalText
             o.optBoolean("response_reused") -> projected.liveText
             finalText.isNotBlank() -> finalText
             else -> projected.liveText
         }
         // A final reply that comes whole after a closed segment does not take that segment's words off the screen.
-        (if (shownText != projected.liveText) sealClosedWords(projected, previousClosed) else projected)
+        (if (shownText != projected.liveText) wordsBegan(sealClosedWords(projected, previousClosed), shownText, previousClosed) else projected)
             .copy(liveText = shownText, liveReasoning = o.string("reasoning").ifBlank { projected.liveReasoning }, status = "Finishing")
     }
     // An empty chunk is Hermes' segment boundary, not words: it changes nothing. A new segment after a closed one seals the closed words (they stay on screen until the saved rows hold them).
-    "token" -> if (o.string("text").isEmpty()) s else sealClosedWords(s, previousClosed).let { b ->
+    "token" -> if (o.string("text").isEmpty()) s else wordsBegan(sealClosedWords(s, previousClosed), o.string("text"), previousClosed).let { b ->
         b.copy(liveText = (if (previousClosed) "" else b.liveText) + o.string("text"), liveReasoning = if (previousClosed) "" else b.liveReasoning, status = "Responding") }
     "reasoning" -> sealClosedWords(s, previousClosed).let { b ->
         b.copy(liveText = if (previousClosed) "" else b.liveText, liveReasoning = (if (previousClosed) "" else b.liveReasoning) + o.string("text"), status = "Thinking") }
+    // Hermes' live status line: its explained wait ("⏳ rate limited — resets in ~5m, retrying…") shows while it is current; a spinner face or an empty frame ends it.
+    "thinking" -> o.string("text").trim().let { line ->
+        when {
+            hermesWaitLine(line) -> s.copy(status = plainWaitLine(line))
+            line.isNotEmpty() || hermesWaitLine(s.status) -> s.copy(status = "Thinking")
+            else -> s
+        }
+    }
     "tool", "tool_complete" -> {
         val turn = runningTurnMessages(s.raw.rows("messages"))
-        val ownsBody = historyOwnsLiveBoundary(turn, emptyList(), next.closed, next.toolIds) || historyOwnsTextSegment(turn, s.liveText, next.closed)
-        s.copy(liveText = if (ownsBody) "" else s.liveText, liveReasoning = if (ownsBody) "" else s.liveReasoning,
+        // A step Hermes already holds tells the words' true place by its id: a segment shown again (a replay, or commentary sent after its save) did not move the turn on.
+        val place = if (type != "tool") 0 else turnRowsAfter(s.raw.rows("messages"), runningPromptRow(s))?.let { savedPlaceOfCall(it, toolIdentity(o)) } ?: 0
+        val ordinal = if (place > 0) place else s.liveOrdinal
+        val ownsBody = historyOwnsLiveBoundary(turn, emptyList(), next.closed, next.toolIds) || liveWordsSaved(s.liveText, ordinal, next, runningTurnRows(s, s.raw.rows("messages")))
+        s.copy(liveText = if (ownsBody) "" else s.liveText, liveReasoning = if (ownsBody) "" else s.liveReasoning, liveOrdinal = ordinal,
             liveTools = if (toolIdentity(o).isNotBlank() && toolIdentity(o) in historyToolIdentities(turn)) s.liveTools else mergeLiveTool(s.liveTools, o),
             status = if (type == "tool") "Using ${dev.hermes.android.ui.toolDisplayName(o)}" else "Working")
     }
     "interim_assistant" -> interimAssistantBody(s.liveText, s.liveReasoning, o).let { body ->
         val turn = runningTurnMessages(s.raw.rows("messages"))
-        val owned = historyOwnsLiveBoundary(turn, emptyList(), next.closed, next.toolIds) || historyOwnsTextSegment(turn, body.text, next.closed)
+        // Commentary already streamed closes the live segment, which Hermes holds once its place is saved; commentary that comes whole is a new segment, not yet held.
+        val owned = historyOwnsLiveBoundary(turn, emptyList(), next.closed, next.toolIds) ||
+            body.text == s.liveText && liveWordsSaved(body.text, s.liveOrdinal, next, runningTurnRows(s, s.raw.rows("messages")))
         // Commentary that comes whole (already_streamed false) after a closed segment is a new segment: the closed words stay.
-        (if (body.text != s.liveText) sealClosedWords(s, previousClosed) else s).copy(liveText = if (owned) "" else body.text, liveReasoning = if (owned) "" else body.reasoning)
+        (if (body.text != s.liveText) (if (owned) sealClosedWords(s, previousClosed) else wordsBegan(sealClosedWords(s, previousClosed), body.text, previousClosed)) else s)
+            .copy(liveText = if (owned) "" else body.text, liveReasoning = if (owned) "" else body.reasoning)
     }
     else -> null
 }
@@ -925,7 +1728,11 @@ data class EditorState(val scope: Scope? = null, val path: String = "", val text
 data class SideQuestion(val scope: Scope, val question: String, val sessionId: String, val streamId: String, val text: String = "", val status: String = "Responding", val cursor: String = "", val error: String = "")
 /** How often a phone that cannot reach Hermes asks again while Beacon is on screen. */
 internal const val REACH_CHECK_MS = 5_000L
-data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val beaconOpening: Boolean = false, val beaconError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "", val historyUnreadable: List<String> = emptyList())
+data class AppState(val origin: String = BuildConfig.DEFAULT_ORIGIN, val authenticated: Boolean = false, val profile: String = "default", val chatProfile: String = "", val owner: String = "", val tab: String = "Chat", val connected: Boolean = false, val loading: Boolean = false, val error: String = "", val notice: String = "", val bootstrap: JSONObject = JSONObject(), val sessions: List<JSONObject> = emptyList(), val query: String = "", val showSessions: Boolean = false, val morePage: String = "", val beaconOpening: Boolean = false, val beaconError: String = "", val newChatOpening: Boolean = false, val newChatError: String = "", val initialChatReady: Boolean = false, val restoringSession: Boolean = true, val botModeEnabled: Boolean = false, val botModeSwitching: Boolean = false, val setupWizard: Boolean = false, val setupComplete: Boolean = false, val setupStep: String = "connect", val setupPluginMessage: String = "", val setupOrigin: String = "", val historyLoading: Boolean = false, val assistantSessionId: String = "", val historyUnreadable: List<String> = emptyList(),
+    /** "profile:chat" for the listed chats whose reply Hermes lost in a restart (Beacon's read-only route). */
+    val lostChats: Set<String> = emptySet(),
+    /** Bot profile to its Bot Chat id, for the bots whose Bot Chat the same route last found holding a lost reply. */
+    val lostBotChats: Map<String, String> = emptyMap())
 internal fun voiceKeySetupPage(): String = "Beacon"
 internal data class VoiceCallRequest(val scope:Scope,val conversationId:String)
 
@@ -1011,6 +1818,41 @@ internal fun withKeptThumbnails(receipts: JSONArray, picked: List<JSONObject>, t
 internal suspend fun keptAttachmentReceipts(result: JSONObject, draft: Draft): JSONArray? =
     sentAttachmentReceipts(result, draft)?.let { receipts -> withContext(Dispatchers.Default) { withKeptThumbnails(receipts, draft.attachments, ::attachmentThumbnail) } }
 
+/**
+ * Follow-up 6: the files a send carried wait under the send's own submission id until Hermes' row for that submission is linked.
+ * They used to wait under the chat stream (`attachments-pending:<stream>`), which a send whose row never linked left behind for the next
+ * linked row of that chat. The cache is scoped per account, profile and chat (Scope.key), and Hermes' row ids are unique inside that.
+ */
+internal fun pendingAttachmentsKind(submissionId: String) = "attachments-pending:sub:$submissionId"
+/** The kind a 1.2.0 app saved under: the chat stream. Read only to move a record that provably belongs to the row being linked; never written. */
+internal fun legacyPendingAttachmentsKind(stream: String) = "attachments-pending:$stream"
+/** The saved files and display words of one send, with the submission they belong to (a record without it is a 1.2.0 record). */
+internal fun attachmentRecord(attachments: JSONArray, displayText: String, submissionId: String): String =
+    json("attachments" to attachments, "display_text" to displayText, "submission_id" to submissionId).toString()
+/**
+ * A saved attachment record may be shown on [row] only when it does not name another submission than the row's: a record that names its send and a row
+ * that names its own must agree. A side without a submission id (a record from 1.2.0, a row from a Hermes that does not save it) cannot contradict.
+ */
+internal fun attachmentRecordFitsRow(record: JSONObject, row: JSONObject): Boolean {
+    val mine = record.optString("submission_id"); val theirs = rowSubmissionId(row)
+    return mine.isBlank() || theirs.isBlank() || mine == theirs
+}
+/**
+ * The pending record that may be linked to the row [linked] of [item]'s send, or null. The record saved under the send's submission id is the send's own,
+ * if the row does not name another submission. A 1.2.0 record (chat stream key) is only moved when its words and files are exactly this send's.
+ */
+internal fun pendingRecordForRow(own: String?, legacy: String?, item: QueuedMessage, linked: JSONObject?): String? {
+    val row = linked ?: JSONObject()
+    // A row Hermes stamped with another submission is never this send's, whatever the record says.
+    rowSubmissionId(row).let { if (it.isNotBlank() && it != item.submissionId) return null }
+    own?.let { raw -> runCatching { JSONObject(raw) }.getOrNull()?.takeIf { it.optString("submission_id") == item.submissionId && attachmentRecordFitsRow(it, row) } }?.let { return own }
+    return legacy?.takeIf { raw ->
+        runCatching { JSONObject(raw) }.getOrNull()?.let { rec ->
+            val names = rec.rows("attachments").map { it.string("name") }
+            rec.string("display_text") == item.text && names.isNotEmpty() && names == item.attachments.map { it.string("name") } && attachmentRecordFitsRow(rec, row)
+        } == true
+    }
+}
 /** The cache kinds that hold the small pictures kept for the photos of a chat's user rows (`attachments:<row id>`). */
 internal fun keptAttachmentKinds(rows: List<JSONObject>): List<String> =
     rows.filter { it.string("role") == "user" }.map { it.string("row_id", it.string("_row_id")) }.filter { id -> (id.toLongOrNull() ?: 0L) > 0 }.map { "attachments:$it" }.distinct()
@@ -1084,7 +1926,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var settingsSelectionJob: Job? = null
     private var settingsRestoreJob: Job? = null
     val phoneSettings = NativePhoneSettings(viewModelScope, saved, draftChanged = ::checkpointPhoneSettings, screens = screens,
-        globalClient = { client }, authorizeProfile = ::authorizeSettingsProfile, profileFailure = ::profileSettingsFailure) { settingsProfileClient() }
+        globalClient = { client }, authorizeProfile = ::authorizeSettingsProfile, profileFailure = ::profileSettingsFailure,
+        cachedScope = { if (client == null) cachedOwnerScope else null }) { settingsProfileClient() }
+    /** The account the phone restored before its client exists: Skills and Memory show their saved copy under this scope while the app reconnects. */
+    internal val settingsRestoredScopeKey: String? get() = if (client == null) cachedOwnerScope?.key else null
     val botMode = NativeBotModeController(viewModelScope, saved, openChat = ::openBotChat, screens = screens) { client }
     /** The email draft cards of the open chats: each keeps its state while it is scrolled out of view. */
     internal val emailDrafts = dev.hermes.android.ui.EmailDraftStore(viewModelScope)
@@ -1122,7 +1967,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         saved.remove<String>(beaconSessionHandleKey(scope))
         saved.remove<String>("$LEGACY_BEACON_SESSION_HANDLE_PREFIX${scope.key}")
     }
-    private suspend fun readBeaconCache(scope: Scope): String? = app.cache.readMigrating(scope, "beacon-session", LEGACY_BEACON_SESSION_CACHE_KIND)
+    private suspend fun readBeaconCache(scope: Scope): String? = app.cache.readMigrating(scope, BEACON_SESSION_CACHE_KIND, LEGACY_BEACON_SESSION_CACHE_KIND)
     private suspend fun readBeaconOpening(scope: Scope): String? = app.cache.readMigrating(scope, "beacon-opening", LEGACY_BEACON_OPENING_CACHE_KIND)
     private suspend fun readBeaconSession(scope: Scope): String? = readBeaconSessionHandle(scope) ?: readBeaconCache(scope)
     private val _ui = MutableStateFlow(AppState(tab = restoredTab(), morePage = saved["more"] ?: ""))
@@ -1205,6 +2050,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     internal var profileSwitchClientFactoryForTest: ((AuthContext) -> BeaconClient)? = null
     @Volatile private var sourceScope: Scope? = null
     private var cachedOwnerScope: Scope? = null
+    /** The open chat whose selection a 404 let go while it held no words (REVIEW-FIXCHAT-121 P2): words saved into it make it the selection again. */
+    private var forgottenGone: Scope? = null
     private var checkpointJob: Job? = null
     private var selectionJob: Job? = null
     private var startupJob: Job? = null
@@ -1242,10 +2089,26 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private val pendingStored = mutableMapOf<String, Pair<PendingSend, String>>()
     private val sentComposerRevision = mutableMapOf<String, Pair<String, Long>>()
     private val queueDrains = mutableMapOf<String, Job>()
-    private val pausedQueueRetries = linkedMapOf<String, String>()
+    private val lostTurnRecoveries = mutableMapOf<String, Job>()
+    /** Chats whose lost reply was already looked at since they were opened and left as it is (waiting for the owner, or Hermes refused): no more passive looks. */
+    private val lostTurnLooked = mutableSetOf<String>()
+    /** The streams this phone asked to stop ("scope:stream"): only their interrupt is the owner's Stop. */
+    private val stopsSentHere = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    /** Chats whose lone lost reply a look just closed (nothing waited behind it): the settle that follows shows the plain restart line ([showQuietLostClose]). */
+    private val quietLostCloses: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+    private val lostReads = mutableMapOf<String, Job>()
     private val loads = mutableMapOf<String, Job>()
     private val loadRequests = mutableMapOf<String, String>()
     private val loadedAt = mutableMapOf<String, Long>()
+    /** Reads asked for while the sign-in was still reconnecting; they run once the client exists, so a saved page shown meanwhile is refreshed. */
+    private class AskedEarly(val scope: Scope, val path: String, val query: Map<String, String>, val force: Boolean, val quiet: Boolean)
+    private val askedEarly = LinkedHashMap<String, AskedEarly>()
+    /** The screens of the profiles this run left, by profile scope, so a hop out and back (the assistant's profile) shows them at once. Memory only, never another profile's or account's. */
+    private val dataByProfile = dev.hermes.android.data.KeptProfileData()
+    private fun forgetKeptData() { askedEarly.clear(); dataByProfile.clear() }
+    /** The chats a sign-out has found per profile scope, until the next sign-in. */
+    private val chatsToForget = mutableMapOf<String, MutableSet<String>>()
+    private fun swapProfileData(left: Scope, entered: Scope): Map<String, JSONObject> = dataByProfile.swap(left.copy(session = "").key, entered.copy(session = "").key, _data.value)
     private val readInvalidations = mutableMapOf<String, Long>()
     private val preloadJobs = mutableSetOf<Job>()
     private val confirmedSessions = mutableMapOf<String, JSONObject>()
@@ -1340,7 +2203,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             override fun onCapabilitiesChanged(network: android.net.Network, capabilities: android.net.NetworkCapabilities) {
                 val returned = !networkValidated && capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
                 networkValidated = capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                if (returned) viewModelScope.launch { if (reconnectOnNetworkReturn(_ui.value)) connect(_ui.value.origin) }
+                if (returned) viewModelScope.launch { if (reconnectOnNetworkReturn(_ui.value)) connect(_ui.value.origin) else { hermesAnsweredAgain(); followMutedReply(); drainOpenQueue(); drainOfflineOutbox() } }
             }
             override fun onLost(network: android.net.Network) { networkValidated = false }
         }
@@ -1371,7 +2234,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
 
     init {
         reconnectWhenNetworkReturns()
-        viewModelScope.launch { HermesReach.origins.collect { if (_ui.value.origin in it) checkHermesReach() } }
+        viewModelScope.launch { HermesReach.origins.collect {
+            if (_ui.value.origin in it) { hermesWasUnreachable = true; checkHermesReach() }
+            else { if (hermesWasUnreachable) { hermesWasUnreachable = false; hermesAnsweredAgain() }; followMutedReply(); drainOpenQueue(); drainOfflineOutbox() }
+        } }
         viewModelScope.launch {
             app.push.emailAlerts.collect { scope -> if (scope == sourceScope) client?.let { refreshChatAlerts(scope, it) } }
         }
@@ -1674,9 +2540,22 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (_ui.value.authenticated) { tab("More"); more("App updates") }
         app.updates.updateFromNotification(notificationToken, client)
     }
-    private fun ScopeSettlement.current() = current(sourceScope, client, originGeneration, sessionGeneration)
+    // Qualified: inside a member extension the bare names would read the receiver's own client and generations, and the fence would compare only the chat.
+    private fun ScopeSettlement.current() = current(sourceScope, this@BeaconViewModel.client, this@BeaconViewModel.originGeneration, this@BeaconViewModel.sessionGeneration)
     /** True when the stream job registered for [scope] still reports to the open chat; a job the chat was left with is muted by the next open and counts for nothing. */
     private fun followsHere(scope: Scope) = streamFollows(streams[scope.key]?.isActive == true, streamStarts[scope.key], sourceScope, client, originGeneration, sessionGeneration)
+    /**
+     * P2-1: a profile switch or a notification bumps the sign-in generation before it leaves the open chat. When its next step fails, the
+     * chat stays on screen with its own client and the stricter fence (D8) mutes its reply: follow it again, as returning to the app does.
+     */
+    private fun followKeptChat(generation: Int, keptScope: Scope?) {
+        if (generation == originGeneration && client != null && client?.scope == keptScope && sourceScope != null) recoverForeground()
+    }
+    /** P2-1: Hermes answers again; a reply the open chat no longer follows (the step that failed could not reach Hermes either) is followed again. */
+    private fun followMutedReply() {
+        val scope = sourceScope ?: return
+        if (client != null && _chat.value.streamId.isNotBlank() && !followsHere(scope)) recoverForeground()
+    }
     private fun recoverForeground() {
         recoveryJob?.cancel()
         recoveryJob = viewModelScope.launch {
@@ -1695,7 +2574,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 reconcile(scope, c)
                 if (!request.current() || !foreground) return@launch
                 val stream = _chat.value.streamId
-                if (stream.isNotBlank() && streams[scope.key]?.isActive != true && !followRunningTurn(c, scope, stream, request)) return@launch
+                if (stream.isNotBlank() && !followsHere(scope) && !followRunningTurn(c, scope, stream, request)) return@launch
                 if (!reattachMarkedRun(c.detached(), scope, request)) return@launch
                 watchSession(c, scope)
                 if (_chat.value.streamId.isBlank()) drainQueued(scope, active, request.sessionGeneration, request.originGeneration)
@@ -1712,14 +2591,250 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
      * Hermes says whether the turn ended, which is settled from its saved history, or still runs, which is subscribed to again.
      * False when the chat moved on meanwhile.
      */
+    /** rules24 (b): the submission each chat's stream job follows (its owned end is the one for the submission the chat displays). */
+    private val streamSubmissions = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** rules24 (b): the check of a live copy left with no stream bound, one per chat at a time. */
+    private val unboundLiveChecks = mutableMapOf<String, Job>()
+    init { viewModelScope.launch { _chat.map { it.sessionId to liveCopyUnbound(it) }.distinctUntilChanged().collect { (_, unbound) -> if (unbound) reconcileUnboundLive() } } }
+    private fun ownedEndInFlight(scope: Scope) = followsHere(scope) && streamSubmissions[scope.key] == _chat.value.raw.string("_display_submission_id")
+    /**
+     * rules24 (b), G6b restart 17: a live copy with no stream bound and no owned end in flight is reconciled at once, by state and not by a timer. Hermes says
+     * where the turn is: one still running is followed again (Stop comes back); an ended one is settled from the saved chat, which drops the live copy when
+     * the saved chat holds the turn's end (words it does not hold stay as a kept copy, as for any unproven end); a lost one offers the choice.
+     */
+    private fun reconcileUnboundLive() {
+        val scope = sourceScope ?: return
+        val active = client ?: return
+        if (!foreground || _chat.value.sessionId != scope.session || ownedEndInFlight(scope) || unboundLiveChecks[scope.key]?.isActive == true) return
+        val request = ScopeSettlement(scope, active, originGeneration, sessionGeneration)
+        val job = viewModelScope.launch {
+            val c = active.detached()
+            var handed = false
+            try {
+                val answer = c.lookAtTurn(scope, lostCloseFor(scope))
+                if (!request.current() || !foreground || ownedEndInFlight(scope) || !liveCopyUnbound(_chat.value)) return@launch
+                val runtime = answer?.first.orEmpty()
+                when (answer?.second) {
+                    "working", "waiting" -> {
+                        _chat.update { if (liveCopyUnbound(it)) it.copy(streamId = runtime, status = "Working") else it }
+                        handed = attachStream(c, scope, runtime)
+                        if (!handed) _chat.update { if (it.streamId == runtime) it.copy(streamId = "") else it }
+                    }
+                    "idle" -> {
+                        val response = c.get("/api/session", mapOf("session_id" to scope.session))
+                        if (!request.current() || !foreground || ownedEndInFlight(scope) || !liveCopyUnbound(_chat.value)) return@launch
+                        renderSession(response, scope)
+                        val held = savedTurnHoldsReply((response.optJSONObject("session") ?: response).rows("messages"))
+                        _chat.update { if (liveCopyUnbound(it)) releaseTerminalChat(it, "", replyConfirmed = unboundReleaseConfirmed(it, held), terminalStatus = "") else it }
+                        if (_chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, _chat.value.raw.toString())
+                    }
+                    "lost" -> showLostChoice(scope)
+                }
+            } catch (e: Throwable) {
+                // REVIEW-JOIN-121 P2-1: a refused sign-in is shown, not rethrown from a coroutine nothing catches (that would end the app); only for the account
+                // still in use (follow-up 1: an answer that lands after a sign-out or an account change never fails the account now open).
+                if (e is CancellationException) throw e
+                if (e is ApiFailure && e.status in setOf(401, 403) && request.current()) fail(e)
+            }
+            finally { if (!handed) c.closeNative() }
+        }
+        unboundLiveChecks[scope.key] = job
+        job.invokeOnCompletion { if (unboundLiveChecks[scope.key] === job) unboundLiveChecks.remove(scope.key) }
+    }
     private suspend fun followRunningTurn(c: BeaconClient, scope: Scope, stream: String, request: ScopeSettlement): Boolean {
-        val status = try { c.recoveredNativeSessionStatus(scope.session) }
+        val status = try { c.lookAtTurn(scope, lostCloseFor(scope))?.second }
         catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403) || missingNativeConversation(e)) { c.closeNative(); throw e }; null }
         val current = request.current() && foreground
+        // The shown reply was lost in a restart and the owner's messages wait behind it: no stream to follow, the chat offers the choice.
+        if (status == "lost") { c.closeNative(); if (current && _chat.value.streamId == stream) showLostChoice(scope, stream); return current }
         // Settled or followed by another path while Hermes was asked: nothing is left to do here.
         val stale = !current || _chat.value.streamId != stream || followsHere(scope)
         if (stale) c.closeNative() else if (!attachStream(c, scope, stream, terminalAlreadyObserved = status == "idle")) c.closeNative()
         return current
+    }
+    /**
+     * Hermes lost this chat's reply in a restart and holds the chat until that turn is let go. Hermes keeps what waits behind it for the owner's
+     * decision, as its own clients do (Desktop's Discard, /discard): a look closes the turn only when nothing waits ([LostTurnClose.WhenAlone]; never
+     * while the phone holds a waiting message), and otherwise the chat offers the choice ([lostChoiceShown]). The owner's Send on it is [decided].
+     * A closed turn shows Hermes' note on the cut reply, then the chat follows the next message Hermes starts, or rests idle. Looks are made once
+     * per chat open ([lostTurnLooked]); [fresh] is new evidence (Hermes' reconnect projection names the lost turn) and looks again.
+     */
+    private fun recoverLostTurn(scope: Scope, known: Boolean = true, decided: Boolean = false, fresh: Boolean = false) {
+        if (!decided && !fresh && scope.key in lostTurnLooked) return
+        if (decided) lostTurnRecoveries[scope.key]?.cancel() else if (lostTurnRecoveries[scope.key]?.isActive == true) return
+        val active = client ?: return
+        val request = ScopeSettlement(scope, active, originGeneration, sessionGeneration)
+        if (!foreground || !request.current()) return
+        val job = viewModelScope.launch {
+            val mode = lostCloseFor(scope, decided)
+            if (sourceScope == scope) _chat.update {
+                if (decided) it.copy(lostWaiting = false) else if (known && it.streamId.isBlank() && !it.lostWaiting) it.copy(status = LOST_REPLY_STATUS) else it
+            }
+            val probe = active.detached()
+            val answer = try { probe.lookAtTurn(scope, mode) }
+            catch (e: Throwable) { if (e is CancellationException) throw e; if (e is ApiFailure && e.status in setOf(401, 403) && request.current()) fail(e); null }
+            finally { probe.closeNative() }
+            if (!request.current() || !foreground) return@launch
+            val runtime = answer?.first.orEmpty()
+            // Both closed answers go through a fresh stream: it replaces the job still subscribed to the cut turn, which would otherwise paint the
+            // next turn on this runtime and never settle it (it follows the cut turn's submission). Live run 16 Nov: a stale "OK" and "Working".
+            when (answer?.second) {
+                // The message queued behind the lost reply runs now: follow it (Stop comes back).
+                "working", "waiting" -> {
+                    _chat.update { it.copy(streamId = runtime, status = "Working", lostWaiting = false) }
+                    if (!attachStream(active, scope, runtime)) _chat.update { if (it.streamId == runtime) it.copy(streamId = "", status = "") else it }
+                }
+                // Nothing runs: the turn is settled from the saved chat (Hermes' note on the cut turn), then the phone's queue moves on, as for any ended turn.
+                "idle" -> {
+                    _chat.update { it.copy(status = if (it.status == LOST_REPLY_STATUS) "" else it.status, lostWaiting = false) }
+                    // A look that closed a lone lost reply gets the plain line when this settle ends ([showQuietLostClose]); after the owner's Send nothing more is said.
+                    if (!attachStream(active, scope, runtime, terminalAlreadyObserved = true)) showQuietLostClose(scope)
+                }
+                // The owner's messages wait behind the lost reply: they are sent only when the owner says so.
+                "lost" -> { lostTurnLooked += scope.key; showLostChoice(scope) }
+                // Hermes could not be asked, or would not let the turn go: say so plainly. The next open (or Delete) tries again.
+                else -> {
+                    lostTurnLooked += scope.key
+                    if (known || decided) _chat.update { if (it.streamId.isBlank()) it.copy(status = LOST_REPLY_STATUS, lostWaiting = false) else it }
+                }
+            }
+        }
+        lostTurnRecoveries[scope.key] = job
+        job.invokeOnCompletion { if (lostTurnRecoveries[scope.key] === job) lostTurnRecoveries.remove(scope.key) }
+    }
+    /** How a look at [scope]'s lost reply may close it: the owner's act decides; a waiting message on the phone means a look never closes. */
+    private suspend fun lostCloseFor(scope: Scope, decided: Boolean = false): LostTurnClose = when {
+        decided -> LostTurnClose.Decided
+        phoneHoldsWaiting(scope) -> LostTurnClose.Never
+        else -> LostTurnClose.WhenAlone
+    }
+    /**
+     * Hermes' answer for [scope]'s turn, closing a lost reply as [mode] lets a look do. Every path that looks (open, foreground, the stream's retry and
+     * silence checks, a cold run marker) comes through here, so a lone lost reply a look closed is marked whichever path won ([quietLostCloses]).
+     * REVIEW-JOIN-121 P1: so is the one rule that brings a card back. Hermes says the turn waits on the owner and no card shows (a replay that could not
+     * carry the request, a reconnect that emptied the chat, a cold start): its pending prompts are read. A card on screen asks nothing more.
+     */
+    private suspend fun BeaconClient.lookAtTurn(scope: Scope, mode: LostTurnClose): Pair<String, String?>? {
+        var closed = false
+        return recoveredNativeSession(scope.session, mode) { closed = true; markLostChats(scope.profile, listOf(scope.session), emptySet()) }
+            .also { if (closed && mode == LostTurnClose.WhenAlone && it?.second == "idle") quietLostCloses += scope.key }
+            .also { if (it?.second == "waiting" && sourceScope == scope && _chat.value.approval == null && _chat.value.clarification == null) pollPrompts(this, scope) }
+    }
+    /**
+     * Opening a chat asks Beacon's read-only route whether Hermes holds a reply its restart cut; nothing is resumed. With messages waiting
+     * behind it (in Hermes' queue or the phone's box) the choice shows, as before. A lone one is let go at once, the way Hermes' own Discard
+     * does (follow-up 4: prompt.resolve_unknown, no agent runs, nothing is resumed): the chat shows Hermes' note and the plain line, and the
+     * person's next Send is one tap. If Hermes refuses that, the plain line stays on the held reply, as in follow-up 3. A plugin that is
+     * missing or failing says nothing.
+     */
+    private fun showLostOnOpen(source: BeaconClient, scope: Scope, request: ScopeSettlement) {
+        viewModelScope.launch { closeLostOnOpen(source, scope, request) }
+    }
+    /** [showLostOnOpen]'s look, also the first question of a cold run marker ([reattachMarkedRun]); it says what it did. */
+    private suspend fun closeLostOnOpen(source: BeaconClient, scope: Scope, request: ScopeSettlement): LostOnOpen {
+        val probe = source.detached()
+        try {
+            val lost = try { probe.lostTurnChats(listOf(scope.session)) } catch (e: Throwable) { if (e is CancellationException) throw e; null }
+            if (lost == null || !request.current() || !foreground) return LostOnOpen.NotLost
+            markLostChats(scope.profile, listOf(scope.session), lost.keys)
+            val held = lost[scope.session] ?: return LostOnOpen.NotLost
+            // REVIEW-CHATQA rule 1 (chat join): a stream job the chat was left with is alive but muted (D8); only one that reports here follows.
+            fun idle() = _chat.value.streamId.isBlank() && !followsHere(scope)
+            if (!idle()) return LostOnOpen.Held
+            if (held.waiting > 0 || phoneHoldsWaiting(scope)) { showLostChoice(scope); return LostOnOpen.Held }
+            val gone = try { probe.discardLostTurns(scope.session, held.unknown) } catch (e: Throwable) { if (e is CancellationException) throw e; false }
+            if (gone) {
+                markLostChats(scope.profile, listOf(scope.session), emptySet())
+                // The person's own copy of the cut message ends as its admission just did (interrupted), so no receipt check resumes the chat to ask.
+                val closed = held.unknown.map { it.admissionId }.toSet()
+                fun cutCopy(q: QueuedMessage) = q.admissionId in closed && q.state in setOf("accepted", "unknown")
+                if (sourceScope == scope) _chat.value.queued.filter(::cutCopy).forEach { item ->
+                    updateQueued(scope, item.id) { q -> if (cutCopy(q)) q.afterReceipt("settled", "interrupted", "terminal") else q }
+                }
+                // Hermes wrote its note on the cut turn: the chat is read again (the same passive read the open made).
+                val response = try { probe.get("/api/session", mapOf("session_id" to scope.session)) } catch (e: Throwable) { if (e is CancellationException) throw e; null }
+                if (response != null && request.current() && idle()) { renderSession(response, scope); app.cache.writeSession(scope, response.toString()) }
+            }
+            if (request.current() && idle()) _chat.update { if (it.streamId.isBlank() && it.status.isBlank() && !it.lostWaiting) it.copy(status = LOST_REPLY_STATUS) else it }
+            return if (gone) LostOnOpen.Closed else LostOnOpen.Held
+        } finally { probe.closeNative() }
+    }
+    /** A list outside the drawer (a project's chats) marks its rows of the open profile from the same read-only route. */
+    fun refreshLostChats(ids: List<String>) {
+        val active = client ?: return
+        readLostChats(active, active.scope, ids.filter(String::isNotBlank).distinct().take(LOST_TURN_READ_MAX), "ids")
+    }
+    /** Bot Mode marks each bot whose Bot Chat holds a lost reply; the plugin finds the chat, so nothing is opened or created here. */
+    fun refreshLostBots(bots: List<String>) {
+        val active = client ?: return
+        val asked = bots.filter(String::isNotBlank).distinct().take(64)
+        if (asked.isEmpty()) return
+        lostReads["bots"]?.cancel()
+        lostReads["bots"] = viewModelScope.launch {
+            val probe = active.detached()
+            val found = try { probe.lostTurnBots(asked) } catch (e: Throwable) { if (e is CancellationException) throw e; emptyMap() }
+            finally { probe.closeNative() }
+            if (client !== active) return@launch
+            // Only the asked bots' Bot Chat marks are replaced: other marks of the same profile (its chat list's) stay.
+            _ui.update { ui ->
+                val before = asked.mapNotNull { bot -> ui.lostBotChats[bot]?.let { "$bot:$it" } }.toSet()
+                ui.copy(lostChats = ui.lostChats - before + found.map { (bot, lost) -> "$bot:${lost.chat}" },
+                    lostBotChats = ui.lostBotChats - asked.toSet() + found.mapValues { it.value.chat })
+            }
+        }
+    }
+    /** The chat list marks the rows of [scope]'s profile whose reply Hermes lost in a restart (the same read-only route); an unread answer marks none. */
+    private fun refreshLostChats(active: BeaconClient, scope: Scope, rows: List<JSONObject>) =
+        readLostChats(active, scope, rows.filter { it.string("profile", scope.profile) == scope.profile }.map(::sessionRowId).filter(String::isNotBlank).distinct().take(LOST_TURN_READ_MAX), "list")
+    private fun readLostChats(active: BeaconClient, scope: Scope, ids: List<String>, kind: String) {
+        if (ids.isEmpty()) return
+        lostReads[kind]?.cancel()
+        lostReads[kind] = viewModelScope.launch {
+            val probe = active.detached()
+            val lost = try { probe.lostTurnChats(ids).keys } catch (e: Throwable) { if (e is CancellationException) throw e; emptySet() }
+            finally { probe.closeNative() }
+            if (client === active) markLostChats(scope.profile, ids, lost)
+        }
+    }
+    private fun markLostChats(profile: String, asked: Collection<String>, lost: Set<String>) {
+        _ui.update { ui -> ui.copy(lostChats = ui.lostChats - asked.map { "$profile:$it" }.toSet() + lost.map { "$profile:$it" }) }
+    }
+    /** The settle after a look closed [scope]'s lone lost reply: one plain line under Hermes' note, no question (Root, follow-up 2). The mark is used once. */
+    private fun showQuietLostClose(scope: Scope) {
+        if (!quietLostCloses.remove(scope.key) || sourceScope != scope) return
+        _chat.update { if (it.streamId.isBlank() && it.status.isBlank() && !it.lostWaiting) it.copy(status = LOST_REPLY_STATUS) else it }
+    }
+    /** The phone holds a message waiting in [scope]'s box: the open chat's, or the saved draft of a chat not on screen (an unreadable one counts as holding). */
+    private suspend fun phoneHoldsWaiting(scope: Scope): Boolean {
+        if (sourceScope == scope) return boxHoldsWaiting(_chat.value.queued)
+        val saved = drafts[scope.key] ?: try { app.cache.read(scope, draftKind(scope))?.let(Draft::decode) ?: Draft() }
+            catch (e: Exception) { if (e is CancellationException) throw e; return true }
+        return boxHoldsWaiting(saved.queued)
+    }
+    /** The owner's box no longer holds anything for the lost reply's choice: look again; a lost reply nothing waits behind is simply closed (WhenAlone). */
+    private fun afterBoxShrank(scope: Scope) {
+        if (sourceScope == scope && _chat.value.lostWaiting && !boxHoldsWaiting(_chat.value.queued)) recoverLostTurn(scope, known = true, fresh = true)
+    }
+    /** The open chat offers to send what waits behind its lost reply; a stream left on the cut turn ([stream]) is released (it never ends). */
+    private fun showLostChoice(scope: Scope, stream: String = "") {
+        if (sourceScope != scope) return
+        _chat.update {
+            val released = releaseCutStream(it, stream)
+            released.copy(lostWaiting = true, status = if (released.status == LOST_REPLY_STATUS || released.streamId.isBlank()) "" else released.status)
+        }
+        // REVIEW-JOIN-121 P3-3: a card from the lost turn can no longer be answered; Hermes says what it still waits on, and its list replaces the cards.
+        if (_chat.value.approval != null || _chat.value.clarification != null)
+            client?.takeIf { it.scope == scope.copy(session = "") }?.let { active -> viewModelScope.launch { pollPrompts(active, scope) } }
+    }
+    /** The owner's Send on the restart line: the lost reply is let go (Hermes' Discard) and what waited behind it is sent. */
+    fun sendAfterLostReply() {
+        val scope = sourceScope ?: return
+        // One tap releases everything (R2): TURN's holds on the waiting messages go first, as the drain after the decided close is passive.
+        viewModelScope.launch {
+            try { for (held in _chat.value.queued.filter { it.held.isNotBlank() }) updateQueued(scope, held.id) { releaseHolds(listOf(it)).single() } }
+            catch (e: Throwable) { if (e is CancellationException) throw e; android.util.Log.w("Beacon", "Couldn't release the held messages", e) }
+            if (sourceScope == scope) recoverLostTurn(scope, known = true, decided = true)
+        }
     }
     /**
      * Beacon delivered a prompt here and never saw its reply end, yet the chat shows no stream: the process was killed, or the chat was left and reopened.
@@ -1729,19 +2844,57 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun reattachMarkedRun(c: BeaconClient, scope: Scope, request: ScopeSettlement): Boolean {
         var handedOver = false
         try {
-            val marked = try { app.cache.read(scope, RUN_MARKER) != null } catch (e: Exception) { if (e is CancellationException) throw e; false }
+            val marker = try { app.cache.read(scope, RUN_MARKER) } catch (e: Exception) { if (e is CancellationException) throw e; null }
             if (!request.current() || !foreground) return false
-            if (!shouldAskRunning(marked, _chat.value.streamId) || followsHere(scope)) return true
-            val answer = try { c.recoveredNativeSession(scope.session) }
+            if (_chat.value.streamId.isNotBlank() || followsHere(scope)) return true
+            // Follow-up 3: no run of this phone's is marked here, yet a reply sent from elsewhere still shows (one read-only look, never a resume).
+            if (!shouldAskRunning(marker != null, _chat.value.streamId)) return followUnseenTurn(c, scope, request)
+            // Follow-up 4 (Root): a reply Hermes lost is let go from Beacon's read-only route first, as on open (prompt.resolve_unknown: no resume, no
+            // agent built), and the marker goes with it. Only a reply the route does not hold as lost is asked about below; only a running one is followed.
+            val lostLook = closeLostOnOpen(c, scope, request)
+            if (!request.current() || !foreground) return false
+            if (lostLook != LostOnOpen.NotLost) {
+                if (lostLook == LostOnOpen.Closed && marker != null) optionalLocalSave { app.cache.delete(scope, RUN_MARKER, marker) }
+                return true
+            }
+            val answer = try { c.lookAtTurn(scope, lostCloseFor(scope)) }
             catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403) || missingNativeConversation(e)) throw e; null }
             // Another account, profile or chat was opened while Hermes was asked, or a send already follows its own stream.
             if (!request.current() || !foreground) return false
             if (_chat.value.streamId.isNotBlank()) return true
+            if (answer?.second == "lost") showLostChoice(scope)
             val action = coldRunAction(answer?.second)
             if (action == ColdRun.Keep) return true
             val runtime = answer?.first.orEmpty()
             if (action == ColdRun.Follow) _chat.update { it.copy(streamId = runtime, status = "Working") }
             handedOver = attachStream(c, scope, runtime, terminalAlreadyObserved = action == ColdRun.Settle)
+            return true
+        } finally { if (!handedOver) c.closeNative() }
+    }
+    /**
+     * CHATQA-121 follow-up 3: Hermes runs a reply in the open chat that no stream on this phone follows and no run marker names (the background outbox,
+     * another device or a schedule sent it). Only when the saved history stops inside a turn, one read-only look at Hermes' live inventory: a running
+     * reply then shows in progress with Stop, and its stream is followed. Nothing is resumed or sent by the look. False when the chat moved on meanwhile.
+     */
+    private suspend fun followUnseenTurn(source: BeaconClient, scope: Scope, request: ScopeSettlement): Boolean {
+        val shown = _chat.value
+        if (shown.sessionId != scope.session || shown.streamId.isNotBlank() || followsHere(scope) || !historyStopsInsideATurn(shown.raw.rows("messages"))) return true
+        val c = source.detached()
+        var handedOver = false
+        try {
+            // Chat join (Root msg_b0eda5e7404d): WEDGE's lost-turn route goes first. A reply Hermes lost in a restart shows the line or the choice
+            // (showLostOnOpen), never Stop; a plugin without the route answers nothing, and the look goes on.
+            if (_chat.value.lostWaiting || _chat.value.status == LOST_REPLY_STATUS) return true
+            val lostHere = try { c.lostTurnChats(listOf(scope.session)).containsKey(scope.session) } catch (e: Throwable) { if (e is CancellationException) throw e; false }
+            if (lostHere) return true
+            if (!request.current() || !foreground) return false
+            val inventory = try { c.nativeRpc("session.active_list", JSONObject()) }
+            catch (e: Throwable) { if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e; return true }
+            if (!request.current() || !foreground) return false
+            if (_chat.value.streamId.isNotBlank() || followsHere(scope) || _chat.value.lostWaiting || _chat.value.status == LOST_REPLY_STATUS) return true
+            val runtime = observedRunningTurn(inventory, scope.session) ?: return true
+            _chat.update { it.copy(streamId = runtime, status = "Working") }
+            handedOver = attachStream(c, scope, runtime)
             return true
         } finally { if (!handedOver) c.closeNative() }
     }
@@ -1751,6 +2904,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     internal fun settingsProfileCurrent(active: BeaconClient) = settingsProfileClient() === active && client?.scope?.sameAccount(active.scope) == true
     internal fun settingsProfileVersion() = settingsAuthority
+    /** The restored sign-in's scope while there is no client yet (a cold start, or offline with saved screens): what a page may show its saved copy under, read-only. */
+    internal fun restoredScope(): Scope? = if (client == null && _ui.value.authenticated) cachedOwnerScope else null
     internal fun settingsProfileCurrent(active: BeaconClient, version: Long) = settingsAuthority == version && settingsProfileCurrent(active)
     internal fun profileSettingsFailure(error: Throwable) { if (error is NativeAuthExpiredException || endsSignIn(error)) fail(error) }
 
@@ -1864,7 +3019,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
         }
     }
-    private fun clearSettingsProfile(forget: Boolean = true) {
+    /** [keepLists]: leaving or entering Settings, not changing who is signed in or which profile is edited, so the pages keep the lists they hold. */
+    private fun clearSettingsProfile(forget: Boolean = true, keepLists: Boolean = false) {
         ++settingsSelection; ++settingsNavigation; settingsSelectionJob?.cancel(); _settingsProfileSelecting.value = false
         settingsRestoreJob?.cancel()
         if (forget) { saved.remove<String>("settings-edit-profile"); _settingsProfileRestoring.value = false; _settingsProfileRestoreError.value = "" }
@@ -1873,7 +3029,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         ++settingsAuthority
         settingsOwner = null; settingsClient = null; settingsEpoch = -1; _settingsProfile.value = ""
         if (previous != null && previous !== client) previous.closeNative()
-        phoneSettings.bind(force = true)
+        phoneSettings.bind(force = true, keepLists = keepLists)
     }
 
     private fun checkpointPhoneSettings() {
@@ -1916,7 +3072,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private fun retireSavedDrafts(active: Scope? = draftScope()) = pruneSavedDrafts(drafts, persistedDrafts, active?.key)
     private fun savedDraft(scope: Scope, encoded: String) { persistedDrafts[scope.key] = encoded; retireSavedDrafts() }
     private fun cancelNewChatWork() { newChatJobs.values.toList().forEach(Job::cancel); _ui.update { it.copy(newChatOpening = false, newChatError = if (sourceScope == null && initialCreateAttempts.containsKey((client?.scope ?: cachedOwnerScope)?.key)) initialCreateError else it.newChatError) } }
-    private fun clearDetails() { cancelSecurePrompt(); loadedAt.clear(); _data.update { it - "picker:reasoning" - "picker:approvals" - "profile-defaults" }; reasoningChange = null; _reasoningSaving.value = false; modelChange = null; _modelSaving.value = ""; recoveryJob?.cancel(); stopReadAloud(); pasteJob?.cancel(); uploadJobs.values.toList().forEach(Job::cancel); uploadJobs.clear(); _attachmentPreparation.value = emptyList(); sideCheckpointJob?.cancel(); _editor.value = EditorState(); _form.value = null; _side.value = null; _commandReport.value = null; _catalog.value = ""; sideJob?.cancel() }
+    private fun clearDetails() { cancelSecurePrompt(); loadedAt.clear(); _data.update { withoutOtherChatKeys(it - "picker:reasoning" - "picker:approvals" - "profile-defaults", sourceScope?.session.orEmpty()) }; reasoningChange = null; _reasoningSaving.value = false; modelChange = null; _modelSaving.value = ""; recoveryJob?.cancel(); stopReadAloud(); pasteJob?.cancel(); uploadJobs.values.toList().forEach(Job::cancel); uploadJobs.clear(); _attachmentPreparation.value = emptyList(); sideCheckpointJob?.cancel(); _editor.value = EditorState(); _form.value = null; _side.value = null; _commandReport.value = null; _catalog.value = ""; sideJob?.cancel() }
     fun loadChatApprovals(passive: Boolean = _chat.value.raw.string("runtime_session_id").isBlank()): Job {
         sourceScope?.takeIf { it.session == _chat.value.sessionId && it.copy(session = "") == client?.scope }
             ?: return viewModelScope.launch {}
@@ -2061,7 +3217,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val previousAccount = client?.scope ?: cachedOwnerScope ?: lapsedAccount
         // The page asks to restore as soon as it is marked restoring, while this sign-in still reads connected; a restore that attached to the client dropped below must not outlive it.
         if (settingsOwner != null) clearSettingsProfile(forget = !restoreSettings)
-        _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); clearDetails(); sourceScope = null; cachedOwnerScope = null; client = null
+        _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); _data.value = emptyMap(); forgetKeptData(); chatsToForget.clear(); clearDetails(); sourceScope = null; cachedOwnerScope = null; client = null
         var restoringClient: BeaconClient? = null
         var restoringScope: Scope? = null
         val credentialVersion = app.auth.authorityEpoch.readVersion()
@@ -2077,6 +3233,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (!keepsRestoredCall(app.calls.state.value.conversationScope, trustedCache, false)) app.calls.hangup()
             restoringClient = next.takeIf { trustedCache != null }
             restoringScope = trustedCache
+            // A call press's start-over keeps this attempt's sign-in rotation before it supersedes it (REVIEW-F7 P3-2), and reads its progress (P3-3).
+            connectAttempt = ConnectAttempt(generation, next, trustedCache, credentialVersion)
             if (trustedCache != null) restoreCachedOwner(trustedCache, generation)
             if (generation != originGeneration) return@launch
             // Local encrypted recovery settles the splash; the network may still be offline.
@@ -2099,7 +3257,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             app.preferences.edit { it[stringPreferencesKey("origin")] = origin }
             if (generation != originGeneration) return@launch
             client = next; cachedOwnerScope = null; retireSavedDrafts(null)
-            previousAccount?.takeIf { !it.sameAccount(next.scope) }?.let { forgetScreens(it) }
+            // Follow-up 5: connected again; a lost answer is asked once more (by the chat's selection, or below).
+            bumpReachEpoch()
+            // Another account (R2 #8): the first account's message cannot go from this one, so its "Not sent yet" goes; the same account's reconnect keeps it.
+            previousAccount?.takeIf { !it.sameAccount(next.scope) }?.let { dropNotSentYet(); forgetScreens(it, chats = true) }
             lapsedAccount = null
             hydrateScreens(next.scope)
             restoreBotMode(next.scope)
@@ -2119,9 +3280,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
             if (setupFlow && initialAuth != null) linkOnNextStartup = true
             if (setupFlow) saveSetupProgress(wizardStep, setupOrigin = origin)
+            val selectionAtConnect = sessionGeneration
             _ui.update { it.copy(origin = origin, owner = next.auth.owner, profile = next.auth.profile, authenticated = true, connected = true, bootstrap = bootstrap, loading = false, setupWizard = setupFlow || it.setupWizard, setupStep = if (setupFlow) wizardStep else it.setupStep) }
             dev.hermes.android.push.KeepConnectedService.startIfEnabled(app)
             prepareStartup()
+            replayEarlyReads(next)
             if (_ui.value.tab == "Beacon") openBeacon() else if (assistantReturn() != null) returnFromAssistant() else {
                 val selected = saved.get<String>("session:${next.scope.key}") ?: sourceScope?.takeIf { it.copy(session = "") == next.scope }?.session ?:
                     try { app.cache.authorizedLegacySelection(next) } catch (error: Throwable) {
@@ -2132,9 +3295,20 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 val shell = app.cache.read(next.scope, "new-chat-shell")
                 if (generation != originGeneration || client !== next) return@launch
                 shell?.let { initialShells[next.scope.key] = it }
-                if (!selected.isNullOrBlank()) selectSession(selected) else restoreInitialDraft(next.scope, generation)
+                if (!selected.isNullOrBlank()) {
+                    // A new chat asked for once the app read connected goes first, and a chat opened since (that new chat or another) is newer
+                    // than the one this start reopens. Selecting the restored chat over it made the new chat on Hermes and never opened it
+                    // (CHAT-121, a New chat within about half a second). A new chat that did not open leaves the restored chat to reopen here.
+                    newChatJobs[next.scope.key]?.takeIf { it.isActive }?.join()
+                    if (generation == originGeneration && client === next && sessionGeneration == selectionAtConnect) selectSession(selected, reopen = true)
+                } else restoreInitialDraft(next.scope, generation)
             }
+            // P2-3: connected again; the waiting messages of every chat go.
+            askAgainUnconfirmed()
+            drainOfflineOutbox()
         } catch (e: Throwable) {
+            // Ended: from here only this catch keeps its rotation, never a call press's start-over (it may run inline with the update below).
+            connectAttempt?.takeIf { it.generation == generation }?.ended = true
             if (generation == originGeneration) {
                 // /auth/me may rotate cookies before plugin bootstrap fails. Keep that rotation,
                 // never rejected authority, so the next retry does not reuse a spent refresh token.
@@ -2160,6 +3334,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 fail(e)
             }
         } finally {
+            connectAttempt?.takeIf { it.generation == generation }?.ended = true
             if (generation == originGeneration) _ui.update { it.copy(restoringSession = false) }
         }
     }
@@ -2349,7 +3524,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             app.preferences.edit { it[stringPreferencesKey("setup_origin")] = dev.hermes.android.ui.parseBeaconConnectInput(origin); it[booleanPreferencesKey("setup_active")] = true; it[stringPreferencesKey("setup_step")] = "signin" }
             connect(origin, signedIn).join()
         } catch (error: CancellationException) { throw error }
-        catch (error: Throwable) { _ui.update { it.copy(loading = false, error = appErrorText(error)) } }
+        catch (error: Throwable) { _ui.update { it.copy(loading = false, error = signInErrorText(error)) } }
     }
     private suspend fun restoreCachedOwner(scope: Scope, generation: Int) {
         val index = app.cache.read(scope, "conversation-index")?.let(::JSONObject)
@@ -2366,6 +3541,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (beacon != null) writeBeaconSessionHandle(scope, beacon)
         shell?.let { initialShells[scope.key] = it }
         _data.update { screenData + it }
+        // Skills, Memory and the Server pages open from their saved copy while the app reconnects, so they are pointed at the restored account now.
+        phoneSettings.bind(); phoneSettings.seedSaved()
         settings?.let { _data.update { data -> data + ("profile-settings" to it) } }
         _ui.update { it.copy(origin = scope.origin, owner = scope.owner, profile = scope.profile, authenticated = true, connected = false, sessions = index?.rows("sessions").orEmpty()) }
         val id = if (_ui.value.tab == "Beacon") beacon else selected
@@ -2408,6 +3585,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         preparingInitialChat = true
         try { restoreInitialDraft(owner, generation) } finally { preparingInitialChat = false }
     }
+    /** The saved selection (this run's and the saved row) stops naming chat [id], so the next start does not reopen it; false when the row could not be cleared. */
+    private suspend fun forgetSelection(owner: Scope, id: String): Boolean {
+        if (saved.get<String>("session:${owner.key}") == id) saved.remove<String>("session:${owner.key}")
+        return try { if (app.cache.read(owner, "selected-session") == id) app.cache.delete(owner, "selected-session"); true }
+        catch (error: Throwable) { if (error is CancellationException) throw error; false }
+    }
     private suspend fun recoverMissingInitialShell(owner: Scope, id: String, current: () -> Boolean) {
         if (!current()) return
         val active = client ?: return
@@ -2420,7 +3603,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (pinned) {
             clearBeaconSessionHandle(owner)
             if (preparedBeacon?.second == id) preparedBeacon = null
-            try { app.cache.delete(owner, "beacon-session"); app.cache.delete(owner, LEGACY_BEACON_SESSION_CACHE_KIND); app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
+            try { app.cache.delete(owner, BEACON_SESSION_CACHE_KIND); app.cache.delete(owner, LEGACY_BEACON_SESSION_CACHE_KIND); app.cache.delete(scope, "client-created-shell"); app.cache.delete(scope, "session") }
             catch (error: Throwable) { if (error is CancellationException) throw error; notice("Your draft is safe. Refresh to finish.") }
             if (!current()) return
             if (_ui.value.tab == "Beacon") {
@@ -2441,10 +3624,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             return
         }
         if (!current()) return
-        if (saved.get<String>("session:${owner.key}") == id) saved.remove<String>("session:${owner.key}")
-        var cleanupFailed = false
-        try { if (app.cache.read(owner, "selected-session") == id) app.cache.delete(owner, "selected-session") }
-        catch (error: Throwable) { if (error is CancellationException) throw error; cleanupFailed = true }
+        var cleanupFailed = !forgetSelection(owner, id)
         if (!current()) return
         if (initialShells[owner.key] == id) {
             // Hermes confirmed this shell is gone, so the create attempt that produced it is settled even when only memory held the pointer.
@@ -2507,10 +3687,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             retirement = retired?.authority
         } catch (e: Throwable) { fail(e); return@launch }
         if (generation != originGeneration) return@launch
-        (current?.scope ?: cached)?.let { owner -> retirement?.let { forgetScreens(owner, it) } }
+        (current?.scope ?: cached)?.let { owner -> retirement?.let { forgetScreens(owner, it, chats = true) } }
         if (generation != originGeneration || retirement?.ifCurrent {} == false) return@launch
         // Pictures and files shown for this account stay in memory only while it is signed in.
         dev.hermes.android.ui.MediaCache.clear()
+        dev.hermes.android.ui.CallHistoryMemory.clear()
+        withContext(Dispatchers.IO) { ChatAttachmentStore.clear() }
         val pushRevocations = runCatching { current?.let { active -> retirement?.let { app.push.prepareOwnerRevocation(active.scope, it) } }.orEmpty() }
             .getOrElse {
                 notice("Signed out. Notifications may still arrive for a while.")
@@ -2532,17 +3714,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     .onFailure { if (generation == originGeneration) notice("Signed out. Notifications may still arrive for a while.") }
             }
         }
-        client = null; cachedOwnerScope = null; sourceScope = null; retireSavedDrafts(null); _chat.value = ChatState(); _composer.value = TextFieldValue(); _data.value = emptyMap(); _attachments.value = emptyList(); clearDetails()
+        client = null; cachedOwnerScope = null; sourceScope = null; retireSavedDrafts(null); _chat.value = ChatState(); _composer.value = TextFieldValue(); _data.value = emptyMap(); forgetKeptData(); _attachments.value = emptyList(); clearDetails()
+        // REVIEW-JOIN-121 P3-5: the live reply words held in memory go with the account too.
+        liveFrames.clear(); liveBoundaries.clear(); persistedTurns.clear()
         val setupStep = if (loopback) "connect" else "signin"
         _ui.update { it.copy(authenticated = false, connected = false, loading = false, restoringSession = false, setupWizard = true, setupComplete = false, setupStep = setupStep, setupOrigin = if (loopback) origin.orEmpty() else it.setupOrigin, beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, sessions = emptyList(), query = "", owner = "", bootstrap = JSONObject()) }
         saveSetupProgress(setupStep, complete = false, setupOrigin = if (loopback) origin else null)
         // A load that began between the generation bump and here may have reopened the account; nothing can reopen it now.
-        (current?.scope ?: cached)?.let { owner -> retirement?.let { forgetScreens(owner, it) } }
+        (current?.scope ?: cached)?.let { owner -> retirement?.let { forgetScreens(owner, it, chats = true) } }
     }
     fun tab(value: String) { if (_ui.value.botModeSwitching) return; botMode.back(); tab(value, resumeDraft = true) }
     private fun tab(value: String, resumeDraft: Boolean): Job? {
         val previous = _ui.value.tab
-        if (previous == "More") clearSettingsProfile()
+        if (previous == "More") clearSettingsProfile(keepLists = true)
         if (value == "Beacon" && previous != "Beacon") noteAssistantReturn(previous)
         saved.remove<String>("settings-navigation")
         ++navigationGeneration
@@ -2580,36 +3764,196 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         return load("native-project:$projectId", "/api/projects/detail", mapOf("id" to projectId), force = force, quiet = true)
     }
     private var beaconCall: Job? = null
-    /** One tap from the drawer: open the Beacon chat, then hand it the request its own call button makes, so permission, voice key and errors are handled in one place. */
+    private val _beaconCallFailures = MutableSharedFlow<String>(extraBufferCapacity = 1)
+    /** The line of a Beacon call that ended before a call could start ([callBeacon]): the overlay shows its short form, the app a notice. */
+    internal val beaconCallFailures: SharedFlow<String> = _beaconCallFailures.asSharedFlow()
+    private fun beaconCallFailed(line: String) {
+        if (_ui.value.authenticated) notice(line)
+        _beaconCallFailures.tryEmit(line)
+    }
+    /**
+     * One tap from the drawer, the side button or the Beacon tab's own call button: open the Beacon chat, then hand it the request its
+     * call button makes, so permission, voice key and errors are handled in one place.
+     * The Beacon chat this phone keeps may be one Hermes' plugin no longer holds (gone, or not linked to this sign-in), where a call never
+     * starts (backlog 57; device round 1, 14 Nov 2026: the side button showed "Couldn't start the call"). It is checked while it opens,
+     * and a refused one gives way to the account's current Beacon chat, found as a fresh start finds it (or a new one), in this same
+     * press and with no message.
+     */
     fun callBeacon() {
-        if (beaconCall?.isActive == true) return  // a second tap while Beacon opens is the same call
-        beaconCall = viewModelScope.launch {
-            navigate("Beacon")
-            // Ready by the same rule the chat uses before sending; leaving the tab while it opens cancels the call.
-            val opened = withTimeoutOrNull(10_000L) {
-                while (true) {
-                    if (_ui.value.tab != "Beacon" || !_ui.value.authenticated) return@withTimeoutOrNull ""
-                    if (!_ui.value.beaconOpening && _chat.value.sessionId.isNotBlank() && _chat.value.streamId.isBlank() && isBeaconConversation()) return@withTimeoutOrNull _chat.value.sessionId
-                    delay(100)
-                }
-                @Suppress("UNREACHABLE_CODE") ""
+        if (beaconCall?.isActive == true) {
+            // Asked again while a refused start is being checked (the overlay's own retry): that check calls again. While a start is only
+            // watched, a new ask starts afresh, as it did once the request had gone out. A second tap while Beacon opens is the same call.
+            when (beaconCallPhase) {
+                BeaconCallPhase.Deciding -> { beaconCallAskedAgain = true; return }
+                BeaconCallPhase.Watching -> beaconCall?.cancel()
+                BeaconCallPhase.Opening -> return
             }
-            val active = client
-            if (opened == "") return@launch
-            if (opened == null || active == null) { notice("${dev.hermes.android.data.currentAssistantName} didn't open in time. Try again."); return@launch }
-            _voiceCallRequest.value = VoiceCallRequest(active.scope, opened)
         }
+        beaconCallAskedAgain = false
+        beaconCallPhase = BeaconCallPhase.Opening
+        beaconCall = viewModelScope.launch {
+            // A press right after the app's process starts (the side button's own model, or this one) comes once the saved sign-in is restored
+            // but before Hermes answered: it waits for the connection, the owner seeing the call connect meanwhile, and only a link that does
+            // not come up in time fails it (device round 2, 15 Nov 2026: every first side-button press failed at once, "Couldn't start the call").
+            // A model with no client whose attempt already failed is not waited for: the press asks for a new one (Call again once Hermes is
+            // back), and Hermes is asked directly too, so one that cannot be reached is said at once (device round 4, F3: 15 s, then only
+            // "Couldn't start the call"). A model that has its client goes straight on: the call meets Hermes itself.
+            val before = _ui.value
+            val fresh = client == null && reconnectOnNetworkReturn(before)
+            if (fresh) connect(before.origin)
+            val origin = before.origin
+            // An attempt Hermes' answer shows to be stuck (a black hole that ended while its connect hung) is started over once, so Call again
+            // works once Hermes is back (REVIEW-121B P2-1); only by the reconnect rule, never past a sign-in or setup. One that was in flight
+            // while an earlier press found Hermes unreachable (and could not reach its host at all) is stuck in that outage: it is started over
+            // as soon as Hermes answers.
+            val stuck = stuckAttemptMarked(unreachableAttempt, originGeneration, client != null, before.loading)
+            val readGotSomewhere = java.util.concurrent.atomic.AtomicBoolean(false)
+            val waitFrom = progressClockMs() - if (stuck) 0L else BEACON_CALL_PROGRESS_LOOKBACK_MS
+            val connection = awaitCallConnection(_ui, { client != null }, BEACON_CALL_CONNECT_MS, freshAttempt = fresh,
+                reach = { if (origin.isBlank()) null else hermesReachFailure { readHermesStatus(origin, viewModelScope) { readGotSomewhere.set(true) } } },
+                restart = { startOverAttempt(origin) },
+                stallMs = if (stuck) 0L else BEACON_CALL_STALL_MS,
+                progressed = { connectAttempt?.takeIf { it.generation == originGeneration }?.client?.hermesProgressAt?.let { it >= waitFrom } == true })
+            if (connection is CallConnection.Failed) {
+                unreachableAttempt = stuckAttemptMark(connection, readGotSomewhere.get(), client != null, _ui.value.loading, originGeneration, unreachableAttempt)
+                beaconCallFailed(connection.line); return@launch
+            }
+            val kept = keptBeaconChat()
+            var refusedEarly = false
+            val held = kept?.let { (c, id) -> async { beaconChatHeld(c, id).also { if (it == false) refusedEarly = true } } }
+            // The Beacon chat already on screen is not opened again.
+            if (_ui.value.tab != "Beacon" || !isBeaconConversation()) navigate("Beacon")
+            var opened = beaconChatOpened { refusedEarly }
+            // Hermes' own answer, whenever it comes (bounded inside the check by the call's reach budget). Device round 3 (F1): cut at
+            // 1.5 s, a cold process called a chat Hermes no longer had, and its grant was refused (404) on every try.
+            val verdict = if (held == null || opened == "") null else held.await()
+            if (opened != "" && kept != null && verdict == false && beaconCallChat(kept.second, opened, verdict) == null) opened = replaceGoneBeaconChat(kept)
+            held?.cancel()
+            val first = client
+            if (opened == "") return@launch
+            if (opened == null || first == null) { notice("${dev.hermes.android.data.currentAssistantName} didn't open in time. Try again."); return@launch }
+            var active: BeaconClient = first
+            // A chat Hermes no longer has can still pass the quick check (a context read before it went, a registration earlier in this run):
+            // its grant or its context is then refused before the call connects. That refusal is Hermes' answer too: the chat is checked
+            // again, and a gone one is forgotten, its failure line cleared, and the call goes to the account's current Beacon chat in the
+            // same press (device round 3, F1). Any other failure stays; a retry the overlay asked for meanwhile goes to the same chat.
+            val job = coroutineContext[Job]
+            var chat: String = opened
+            var replaced = false
+            try {
+                while (true) {
+                    val askedAt = System.currentTimeMillis()
+                    beaconCallPhase = BeaconCallPhase.Watching
+                    _voiceCallRequest.value = VoiceCallRequest(active.scope, chat)
+                    val failed = beaconCallStartFailure(app.calls.state, active.scope.session(chat), askedAt, BEACON_CALL_START_WATCH_MS) ?: return@launch
+                    beaconCallPhase = BeaconCallPhase.Deciding
+                    beaconCallAskedAgain = false
+                    if (!replaced && kept != null && kept.second == chat && beaconChatHeld(kept.first, chat, quick = false) == false) {
+                        replaced = true
+                        app.calls.dismissFailure(failed.callId)
+                        chat = replaceGoneBeaconChat(kept).takeUnless { it.isNullOrEmpty() } ?: return@launch
+                        active = client ?: return@launch
+                    } else if (!beaconCallAskedAgain) return@launch
+                }
+            } finally { if (beaconCall === job || beaconCall == null) beaconCallPhase = BeaconCallPhase.Opening }
+        }
+    }
+    /**
+     * The latest connection attempt (connect()): its generation, its client, the account it restores and the sign-in version it read.
+     * [ended] once its own catch or finally began: an ended attempt's rotation is its catch's to keep (an IOException), or never (a refused
+     * sign-in), so a start-over keeps nothing for it.
+     */
+    private class ConnectAttempt(val generation: Int, val client: BeaconClient, val owner: Scope?, val credentialVersion: Long?) {
+        @Volatile var ended = false
+    }
+    @Volatile private var connectAttempt: ConnectAttempt? = null
+    /** The connection attempt ([originGeneration]) that was still in flight when a press found Hermes unreachable: stuck in that outage. */
+    private var unreachableAttempt = -1
+    /**
+     * A call press's start-over ([awaitCallConnection]): only where the app would reconnect by itself (signed in, not in setup, no client).
+     * The superseded attempt's sign-in rotation is kept first (REVIEW-F7 P3-2), only while that attempt is still in flight; if it connected
+     * meanwhile, nothing starts over.
+     */
+    private suspend fun startOverAttempt(origin: String): Boolean {
+        if (client != null || !reconnectOnNetworkReturn(_ui.value.copy(loading = false))) return false
+        val superseded = connectAttempt?.takeIf { it.generation == originGeneration && !it.ended }
+        superseded?.let { a -> keepSupersededRotation(a.client, a.owner) { auth -> persistAuthIfCurrent(auth, a.credentialVersion, snapshot = true) } }
+        if (client != null || superseded != null && superseded.generation != originGeneration) return false
+        connect(origin)
+        return true
+    }
+    /** Where a Beacon call is: opening its chat, watching the start it asked for, or deciding after that start was refused ([callBeacon]). */
+    private enum class BeaconCallPhase { Opening, Watching, Deciding }
+    @Volatile private var beaconCallPhase = BeaconCallPhase.Opening
+    @Volatile private var beaconCallAskedAgain = false
+    /**
+     * [kept] is gone from Hermes: this phone stops keeping it and the Beacon tab opens the account's current Beacon chat (resolveBeacon: the
+     * registered one, else a new one), as when Hermes forgets the Beacon chat before its first turn (recoverMissingInitialShell). Returns that
+     * chat once open ([beaconChatOpened]).
+     */
+    private suspend fun replaceGoneBeaconChat(kept: Pair<BeaconClient, String>): String? {
+        forgetBeaconChat(kept.first.scope, kept.second)
+        if (_ui.value.tab == "Beacon" && (client?.scope ?: cachedOwnerScope) == kept.first.scope && _chat.value.sessionId in setOf(kept.second, "")) {
+            val retained = draft()
+            sessionWatch?.cancel(); ++sessionGeneration; sourceScope = null; clearDetails(); _chat.value = ChatState()
+            openBeacon(editorDraft = retained.text.takeIf { it.isNotBlank() })
+        }
+        return beaconChatOpened()
+    }
+    /**
+     * The Beacon chat once it is open, by the same rule the chat uses before sending; "" when the owner left the tab (that cancels the call),
+     * null when it did not open in time or [stop] says the chat it is opening was refused.
+     */
+    private suspend fun beaconChatOpened(stop: () -> Boolean = { false }): String? = withTimeoutOrNull(10_000L) {
+        while (true) {
+            if (_ui.value.tab != "Beacon" || !_ui.value.authenticated) return@withTimeoutOrNull ""
+            if (!_ui.value.beaconOpening && _chat.value.sessionId.isNotBlank() && _chat.value.streamId.isBlank() && isBeaconConversation()) return@withTimeoutOrNull _chat.value.sessionId
+            if (stop()) return@withTimeoutOrNull null
+            delay(100)
+        }
+        @Suppress("UNREACHABLE_CODE") ""
+    }
+    /** The Beacon chat this phone keeps for the signed-in account, with its client; null when it has none yet or the assistant uses another profile (opening switches first). */
+    private suspend fun keptBeaconChat(): Pair<BeaconClient, String>? {
+        val c = client ?: return null
+        if (c.scope.profile != preferences.value.assistantProfile) return null
+        val id = preparedBeacon?.takeIf { it.first == c.scope }?.second ?: try { readBeaconSession(c.scope) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+        return id?.takeIf { it.isNotBlank() }?.let { c.detached() to it }
+    }
+    /**
+     * Whether Hermes still has [id] for a call ([beaconChatCallable]). Registered this run, or its call context read by the prewarm just now:
+     * held, with no request ([quick]). Otherwise the registration the app makes anyway, and, when Hermes has no saved chat by that id, the
+     * live draft asked of Hermes on a client of its own: this model's own client may still hold the chat open from earlier in the run and
+     * would answer from that (device, fix4: a chat deleted elsewhere read as live). The resume keeps a real draft open when that client goes.
+     */
+    private suspend fun beaconChatHeld(c: BeaconClient, id: String, quick: Boolean = true): Boolean? {
+        val scope = c.scope.session(id)
+        if (quick && (registeredAssistantChats.contains(scope.key) || app.calls.prewarm.context(scope, preferences.value.ownerName) != null)) return true
+        val probe = c.detached()
+        return try {
+            beaconChatCallable(dev.hermes.android.voice.callStartReachMs(callbackAnswer = false),
+                register = { c.nativeRequest("/api/plugins/beacon/mobile/assistant-conversation", "PUT", json("profile" to c.scope.profile, "session_id" to id)); registeredAssistantChats.add(scope.key) },
+                resume = { probe.nativeSession(id, lazy = true) })
+        } finally { probe.closeNative() }
+    }
+    /** This phone stops keeping [id] as [owner]'s Beacon chat (its saved copy stays), so the next opening finds the current one as a fresh start does. */
+    private suspend fun forgetBeaconChat(owner: Scope, id: String) {
+        if (readBeaconSessionHandle(owner) == id) clearBeaconSessionHandle(owner)
+        if (preparedBeacon?.let { it.first == owner && it.second == id } == true) preparedBeacon = null
+        registeredAssistantChats.remove(owner.session(id).key)
+        try { if (readBeaconCache(owner) == id) { app.cache.delete(owner, BEACON_SESSION_CACHE_KIND); app.cache.delete(owner, LEGACY_BEACON_SESSION_CACHE_KIND) } }
+        catch (e: Throwable) { if (e is CancellationException) throw e }
     }
     fun navigate(destination: String) {
         if (destination == "Bots") { toggleBotMode(); return }
-        if (destination == "Vault" && _ui.value.tab == "More") clearSettingsProfile()
+        if (destination == "Vault" && _ui.value.tab == "More") clearSettingsProfile(keepLists = true)
         val route = dev.hermes.android.ui.navigationRoute(destination)
         if (route.tab == "More") more(route.page) else tab(route.tab)
     }
     fun more(value: String) {
         if (_ui.value.botModeSwitching) return
         if (_ui.value.tab == "More" && _ui.value.morePage == value) { toggleSessions(false); return }
-        if (_ui.value.tab != "More" || value == "Bots") clearSettingsProfile()
+        if (_ui.value.tab != "More" || value == "Bots") clearSettingsProfile(keepLists = true)
         ++settingsNavigation
         val owner = (client?.scope ?: cachedOwnerScope)?.key.orEmpty()
         val history = saved.get<String>("settings-navigation")?.let { runCatching { JSONObject(it) }.getOrNull() }
@@ -2633,7 +3977,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val previous = if (routes.length() > 0) routes.remove(routes.length() - 1) as? JSONObject else null
         val targetTab = previous?.string("tab")?.let(::migratedTab) ?: if (_ui.value.morePage.isBlank()) "Chat" else "More"
         val targetPage = previous?.string("page") ?: dev.hermes.android.ui.settingsParent(_ui.value.morePage)
-        if (targetTab != "More" || targetPage == "Bots") clearSettingsProfile()
+        if (targetTab != "More" || targetPage == "Bots") clearSettingsProfile(keepLists = true)
         saved["settings-navigation"] = json("scope" to owner, "routes" to routes).toString()
         ++navigationGeneration
         clearPendingVoiceKeyRequestsIfLeavingVoiceKeyPage(targetTab, targetPage)
@@ -2687,6 +4031,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     sessionWatch?.cancel(); ++sessionGeneration; sourceScope = null; clearDetails()
                     _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList()
                 }
+                // TRACE-COLD-121 fix 1: connect() ran this return instead of opening the chat it restored; that chat is opened as connect() opens it.
+                else if (sourceScope != null && _chat.value.sessionId.isNotBlank()) { selectSession(_chat.value.sessionId, reopen = true); return@launch }
                 // The chat may already be ready (its create failed or Hermes was unreachable while the person typed): the draft saved for it comes back all the same.
                 prepareInitialChatIfNone(restoreDraft = true)
             }
@@ -2722,15 +4068,20 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         switchProfile(name, false).join()
     }
     private fun switchProfile(name: String, retainBotMode: Boolean) = viewModelScope.launch {
+        // No client (a cache-first start can show the profile list offline): say so, and leave everything as it is.
+        val active = client ?: run { notice("Reconnect before switching profiles. Your drafts are kept."); return@launch }
         clearPendingVoiceKeyRequests()
         checkpointPhoneSettingsNow()
         clearSettingsProfile()
-        val c = client?.detached() ?: return@launch; val oldScope = c.scope; val generation = ++originGeneration
+        val c = active.detached(); val oldScope = c.scope; val generation = ++originGeneration
+        var left = false
         val credentialVersion = app.auth.authorityEpoch.readVersion()
         val navigation = navigationGeneration
         if (!retainBotMode) botMode.clear()
         cancelStartup()
         cancelNewChatWork()
+        // Said only while this switch is still the current one; a switch another tap replaced says nothing.
+        fun signInChanged() { if (generation == originGeneration && client?.scope == oldScope) notice("Sign-in changed while switching profiles. Reconnect and try again.") }
         try {
             checkpointVisible()
             if (generation != originGeneration || client?.scope != oldScope) return@launch
@@ -2739,19 +4090,22 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             require(c.scope.sameAccount(oldScope)) { "Profile switch changed account identity. Sign in again." }
             if (generation != originGeneration || client?.scope != oldScope) return@launch
             if (!persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true, selectProfileIf = { generation == originGeneration })) {
-                if (generation == originGeneration && client?.scope == oldScope) notice("Sign-in changed while switching profiles. Reconnect and try again.")
+                signInChanged()
                 return@launch
             }
             if (generation != originGeneration || client?.scope != oldScope) return@launch
-            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }.takeIf { it.scope() == c.scope } ?: return@launch
+            val switchedAuth = withContext(Dispatchers.IO) { app.auth.read(c.auth.origin) }.takeIf { it.scope() == c.scope }
+            if (switchedAuth == null) { signInChanged(); return@launch }
             if (generation != originGeneration || client?.scope != oldScope) return@launch
+            left = true
             sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
+            dropNotSentYet()
             client = profileSwitchClientFactoryForTest?.invoke(switchedAuth) ?: BeaconClient(switchedAuth, app.auth, persistContext = false)
             cachedOwnerScope = null; retireSavedDrafts(null)
             val restoredClient = client ?: return@launch
             restorePhoneSettings(restoredClient)
             if (generation != originGeneration || client !== restoredClient) return@launch
-            _data.value = emptyMap(); _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); clearDetails()
+            _data.value = swapProfileData(oldScope, restoredClient.scope); _chat.value = ChatState(); _composer.value = TextFieldValue(); _attachments.value = emptyList(); clearDetails()
             _ui.update { it.copy(profile = c.auth.profile, owner = c.auth.owner, bootstrap = bootstrap, beaconOpening = false, beaconError = "", newChatOpening = false, newChatError = "", initialChatReady = false, morePage = if (retainBotMode && navigation == navigationGeneration) "Bots" else if (retainBotMode) it.morePage else "", query = "", sessions = emptyList()) }
             hydrateScreens(restoredClient.scope)
             viewModelScope.launch {
@@ -2771,7 +4125,23 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 else if (!selected.isNullOrBlank()) selectSession(selected, closeMenu = false)
                 else restoreInitialDraft(next.scope, generation)
             }
+            reloadCommandsAfterSwitch(next, generation)
+            drainOfflineOutbox()
         } catch (e: Throwable) { if (generation == originGeneration && client?.scope == oldScope) { fail(e) } }
+        finally { if (!left) followKeptChat(generation, oldScope) }
+    }
+    /**
+     * The command list of the profile just switched to loads again by itself, a few tries while Hermes settles, until its record is clean: the chat's own load can land
+     * while the switch is still finishing, and a failed one leaves "Retry commands" and a blocked first command (G5 check on F10, backlog 54).
+     */
+    private fun reloadCommandsAfterSwitch(next: BeaconClient, generation: Int) = viewModelScope.launch {
+        for (attempt in 0 until COMMAND_RELOAD_TRIES) {
+            if (attempt > 0) delay(COMMAND_RELOAD_DELAY_MS)
+            if (client !== next || generation != originGeneration) return@launch
+            // Quiet: a failed try shows no app-wide error (a background read), and the next try follows.
+            load("slash:catalog", "/api/commands/catalog", force = true, quiet = true).join()
+            if (dev.hermes.android.ui.recordError(_data.value["slash:catalog"]).isBlank()) return@launch
+        }
     }
     private suspend fun openBotChat(profile: String, storedId: String) {
         val owner = client?.auth ?: error("Reconnect before opening Bot Mode")
@@ -2962,37 +4332,59 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                             if (!current()) return@launch
                             val job = ensureLoaded(read.key, read.path)
                             preloadJobs.add(job)
-                            try { job.join() } finally { preloadJobs.remove(job); if (!currentCoroutineContext().isActive) job.cancel() }
+                            // A read that runs past the budget is not cancelled: the warm-up shares its job, and cancelStartup() still ends it. Only a finished wait leaves the set.
+                            try { job.join() } finally { if (currentCoroutineContext().isActive) preloadJobs.remove(job) }
                         } finally { slots.release() }
                     } }
                 }
             }
         }
         startupJob = viewModelScope.launch {
-            // Extra history work is sequential and expires; navigation owns its own live requests.
-            withTimeoutOrNull(8_000) {
-                var beacon = ""
-                if (owner.profile == preferences.value.assistantProfile) {
-                    try {
-                        beacon = preparedBeacon?.takeIf { it.first == owner }?.second ?: readBeaconSession(owner).orEmpty()
+            // Extra history work expires; navigation owns its own live requests. The phone's limits are read now, in the foreground, and nothing here runs in the background.
+            val conditions = readWarmConditions(app)
+            val savedAt: suspend (Scope) -> Long = { session -> try { app.cache.updatedAt(session, "session") ?: 0L } catch (e: CancellationException) { throw e } catch (_: Exception) { 0L } }
+            // Each read has its own short-lived client: two chats read at once must not share one connection's state.
+            suspend fun warm(id: String, activityMs: Long) {
+                // Not worth a read: this is not the current account, the chat is open (and live), or its saved copy is already newer than its last activity.
+                if (!current() || sourceScope == owner.session(id) || transcriptFresh(savedAt(owner.session(id)), activityMs, System.currentTimeMillis())) return
+                val reader = active.detached()
+                try {
+                    val response = reader.get("/api/session", mapOf("session_id" to id), maxBytes = 1024 * 1024)
+                    if (current() && sourceScope != owner.session(id)) app.cache.writeSession(owner.session(id), response.toString())
+                } catch (e: Throwable) { if (e is CancellationException) throw e; if (current() && e is ApiFailure && e.status == 401) fail(e) }
+                finally { reader.closeNative() }
+            }
+            fun activityOf(id: String) = _ui.value.sessions.firstOrNull { it.string("session_id", it.string("id")) == id }?.let { dev.hermes.android.ui.rowActivityMillis(it) } ?: 0L
+            var beacon = ""
+            if (owner.profile == preferences.value.assistantProfile) {
+                try {
+                    beacon = preparedBeacon?.takeIf { it.first == owner }?.second ?: readBeaconSession(owner).orEmpty()
+                    if (beacon.isNotBlank() && current()) {
+                        preparedBeacon = owner to beacon
+                        // The Beacon screen trusts only the saved handle; a cached chat restores it as connect() does.
+                        writeBeaconSessionHandle(owner, beacon)
+                    }
+                } catch (e: Throwable) { if (e is CancellationException) throw e; if (current() && e is ApiFailure && e.status == 401) fail(e) }
+            }
+            if (!current()) return@launch
+            coroutineScope {
+                // The Beacon chat has its own short budget and runs beside the others, so a slow answer there cannot use up the time the recent chats need.
+                if (beacon.isNotBlank()) launch { withTimeoutOrNull(WARM_BEACON_BUDGET) { warm(beacon, activityOf(beacon)) } }
+                // The recent chats, two at a time under their own budget: the top few the list shows, less the ones whose saved copy is already current.
+                launch {
+                    // The list is waited for on its own, so a slow list does not use up the time the reads have.
+                    withTimeoutOrNull(WARM_INDEX_WAIT) { index.join() }
+                    withTimeoutOrNull(WARM_CHAT_BUDGET) {
                         if (!current()) return@withTimeoutOrNull
-                        if (beacon.isNotBlank()) {
-                            preparedBeacon = owner to beacon
-                            // The Beacon screen trusts only the saved handle; a cached chat restores it as connect() does.
-                            writeBeaconSessionHandle(owner, beacon)
-                            val response = c.get("/api/session", mapOf("session_id" to beacon), maxBytes = 1024 * 1024)
-                            if (current() && sourceScope != owner.session(beacon)) app.cache.writeSession(owner.session(beacon), response.toString())
+                        val rows = _ui.value.sessions.map { row -> WarmRow(row.string("session_id", row.string("id")), dev.hermes.android.ui.rowActivityMillis(row)) }
+                        val limit = warmChatLimit(conditions)
+                        val saved = startupWarmCandidates(rows, beacon, limit).associate { it.id to savedAt(owner.session(it.id)) }
+                        val targets = startupWarmTargets(rows, beacon, limit, { saved[it] ?: 0L }, System.currentTimeMillis())
+                        val slots = kotlinx.coroutines.sync.Semaphore(WARM_CHAT_PARALLELISM)
+                        coroutineScope {
+                            targets.forEach { row -> launch { slots.acquire(); try { warm(row.id, row.activityMs) } finally { slots.release() } } }
                         }
-                    } catch (e: Throwable) { if (e is CancellationException) throw e; if (current() && e is ApiFailure && e.status == 401) fail(e) }
-                }
-                index.join()
-                if (!current()) return@withTimeoutOrNull
-                for (id in startupRecentSessions(_ui.value.sessions.map { it.string("session_id", it.string("id")) }, beacon)) {
-                    if (!current()) break
-                    try {
-                        val response = c.get("/api/session", mapOf("session_id" to id), maxBytes = 1024 * 1024)
-                        if (current() && sourceScope != owner.session(id)) app.cache.writeSession(owner.session(id), response.toString())
-                    } catch (e: Throwable) { if (e is CancellationException) throw e; if (current() && e is ApiFailure && e.status == 401) fail(e) }
+                    }
                 }
             }
         }
@@ -3013,7 +4405,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
             assistantConversationToAdopt(id, response.string("conversation_id"))?.let { shared ->
                 writeBeaconSessionHandle(c.scope, shared)
-                optionalLocalSave { app.cache.write(c.scope, "beacon-session", shared, protected = true) }
+                optionalLocalSave { app.cache.write(c.scope, BEACON_SESSION_CACHE_KIND, shared, protected = true) }
                 if (client?.scope == c.scope) preparedBeacon = c.scope to shared
                 registeredAssistantChats.add(c.scope.session(shared).key)
                 val openChat = _chat.value
@@ -3034,16 +4426,27 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         accountBeaconChat(c)?.let { shared ->
             require(current()) { "Account changed while preparing ${dev.hermes.android.data.currentAssistantName}" }
             writeBeaconSessionHandle(c.scope, shared)
-            optionalLocalSave { app.cache.write(c.scope, "beacon-session", shared, protected = true) }
+            optionalLocalSave { app.cache.write(c.scope, BEACON_SESSION_CACHE_KIND, shared, protected = true) }
             preparedBeacon = c.scope to shared
             registerAssistantChat(c, shared)
             return@withLock shared
         }
-        require(readBeaconOpening(c.scope) == null) { "${dev.hermes.android.data.currentAssistantName} opening outcome is unknown. Review history before creating another conversation." }
+        // A create whose answer never came (cut off, the app stopped) leaves its marker with its request id: Hermes' retry identity, so the same create returns
+        // the chat that one made, or makes it now, and no second Beacon chat starts. A marker without one (1.2.0's "unknown") can't be retried: it no longer
+        // blocks Beacon for good (demo, fix 6: "Can't open Beacon · Hermes couldn't do that" after a create was cut off, Retry useless); a new create starts.
+        val kept = beaconOpeningKept(readBeaconOpening(c.scope))
+        var request = kept ?: java.util.UUID.randomUUID().toString()
         currentCoroutineContext().ensureActive()
         require(current()) { "Account changed while preparing ${dev.hermes.android.data.currentAssistantName}" }
-        app.cache.write(c.scope, "beacon-opening", "unknown", true)
-        val result = c.post("/api/beacon/open", JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) } })
+        app.cache.write(c.scope, "beacon-opening", BEACON_OPENING_REQUEST + request, true)
+        fun open(request: String) = JSONObject().apply { if (fixed.assistantModel.isNotBlank()) { put("model", fixed.assistantModel); if (fixed.assistantProvider.isNotBlank()) put("model_provider", fixed.assistantProvider) }; put("request_id", request) }
+        val result = try { c.post("/api/beacon/open", open(request)) } catch (e: ApiFailure) {
+            // Hermes refused the kept id itself (its chat was deleted meanwhile, or the request changed): it can't open Beacon any more, so a new create starts once.
+            if (kept == null || !beaconOpeningRetryRefused(e)) throw e
+            request = java.util.UUID.randomUUID().toString()
+            app.cache.write(c.scope, "beacon-opening", BEACON_OPENING_REQUEST + request, true)
+            c.post("/api/beacon/open", open(request))
+        }
         val id = result.string("session_id", result.string("conversation_id", result.optJSONObject("session")?.string("session_id").orEmpty()))
         require(id.isNotBlank()) { "${dev.hermes.android.data.currentAssistantName} did not return a conversation" }
         val sessionScope = c.scope.session(id)
@@ -3051,7 +4454,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         // The owned creation already happened; a newer navigation must not discard its identity.
         writeBeaconSessionHandle(c.scope, id)
         if (client?.scope == c.scope) preparedBeacon = c.scope to id
-        runCatching { app.cache.write(c.scope, "beacon-session", id, protected = true); app.cache.delete(c.scope, "beacon-opening"); app.cache.delete(c.scope, LEGACY_BEACON_OPENING_CACHE_KIND); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("${dev.hermes.android.data.currentAssistantName} opened; recovery checkpoint failed") }
+        runCatching { app.cache.write(c.scope, BEACON_SESSION_CACHE_KIND, id, protected = true); app.cache.delete(c.scope, "beacon-opening"); app.cache.delete(c.scope, LEGACY_BEACON_OPENING_CACHE_KIND); app.cache.write(sessionScope, "client-created-shell", "1", protected = true) }.onFailure { if (it is CancellationException) throw it; if (client?.scope == c.scope) notice("${dev.hermes.android.data.currentAssistantName} opened; recovery checkpoint failed") }
         id
     }
     // What the chat list shows beside each chat (its latest line, when the owner last looked): kept encrypted per profile on this phone, never sent to Hermes.
@@ -3106,7 +4509,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     /** Sign-out and device removal: the account's chat lists, previews and read marks leave the phone with its screens,
      *  for every profile the account row, the profile list or this run names, and a pending write cannot bring them back. */
-    private suspend fun forgetGlances(scope: Scope, removal: DeviceRemovalAuthority? = null) {
+    private suspend fun forgetGlances(scope: Scope, removal: DeviceRemovalAuthority? = null, chats: Boolean = true) {
         fun mutate(action: () -> Unit): Boolean = removal?.ifCurrent(action) ?: run { action(); true }
         val account = scope.copy(profile = "", session = "")
         val listed = _data.value["navigation-profiles"]?.rows("profiles").orEmpty().map { it.string("name") }
@@ -3129,11 +4532,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }) return@withLock emptyList<Scope>()
             profiles
         }
-        for (profile in stored) for (kind in listOf("chat-glances", "conversation-index")) {
-            // One failed delete never keeps the others, but it keeps the account row, so the next sign-out finds what is left.
-            try { deleteForgotten(profile, kind, removal) } catch (e: CancellationException) { throw e } catch (_: Exception) { wiped = false }
-        }
-        if (wiped) try { deleteForgotten(account, GLANCE_PROFILES_KIND, removal) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* the next write rewrites it */ }
+        forgetAccountChats(app.cache, account, stored, removal, chats, recorded = wiped, found = chatsToForget)
         // A profile opened while the rows were going was recorded in a row that is now gone.
         mutate { glanceRecorded.clear() }
     }
@@ -3211,7 +4610,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private var indexFetchKey = ""
     private var indexReadAt = 0L
     /** Defaults keep the drawer's current view (archived/threads), so a background refresh never swaps the list under it. */
-    fun refreshSessions(query: String = _ui.value.query, archived: Boolean = sessionIndexArchived, force: Boolean = true, threads: Boolean = sessionIndexThreads, allProfiles: Boolean = sessionIndexAllProfiles): Job {
+    /** [joinActive]: a read of the same list already on its way is the answer (its loading row stays), as the drawer opening asks (D4). */
+    fun refreshSessions(query: String = _ui.value.query, archived: Boolean = sessionIndexArchived, force: Boolean = true, threads: Boolean = sessionIndexThreads, allProfiles: Boolean = sessionIndexAllProfiles, joinActive: Boolean = false): Job {
         val active = client ?: return viewModelScope.launch {}
         val c = active.detached()
         val scope = c.scope
@@ -3221,7 +4621,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val order = preferences.value.historyOrder
         val fetchKey = "${scope.key}:$generation:$query:$archived:$threads:$allProfiles:$hidden:$order"
         if (indexFetchKey == fetchKey) {
-            if (!force) indexFetch?.takeIf { it.isActive }?.let { return it }
+            if (!force || joinActive) indexFetch?.takeIf { it.isActive }?.let { return it }
             if (!allProfiles && !force && startupReadFresh(indexReadAt, System.currentTimeMillis())) return viewModelScope.launch {}
         }
         indexFetchKey = fetchKey
@@ -3234,6 +4634,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         fun current() = client === active && generation == originGeneration && _ui.value.authenticated && sessionIndexCurrent(request, sessionIndexRequest, revision, sessionIndexRevision)
         return viewModelScope.launch {
           try { supervisorScope {
+            val listedAfter = System.currentTimeMillis()
             val assistantScope = scope.copy(profile = preferences.value.assistantProfile)
             val assistantSessionId = readBeaconSession(assistantScope).orEmpty()
             val params = mutableMapOf("profile" to scope.profile, "include_archived" to if (archived) "1" else "0", "hidden_sources" to hidden, "order" to order)
@@ -3271,11 +4672,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val confirmed = (if (allProfiles) profileIds.flatMap { profile -> confirmedSessions.filterKeys { it.startsWith("${scope.copy(profile = profile).key}:") }.values.toList().asReversed() }
                 else confirmedSessions.filterKeys { it.startsWith("${scope.key}:") }.values.toList().asReversed())
                 .filter { !threads || dev.hermes.android.ui.isThreadSource(it.string("source")) }
-            val rows = visibleSessionRows(serverRows, confirmed, query, archived)
+            if (!archived) forgetUnarchivedElsewhere(serverRows, scope, listedAfter)
+            val rows = withArchivedHere(visibleSessionRows(serverRows, confirmed, query, archived), scope, profileIds, query, archived)
             indexReadAt = System.currentTimeMillis()
             storeData("history:search", json("query" to query, "scope_key" to scope.key, "archived" to archived, "threads" to threads,
                 "all_profiles" to allProfiles, "hidden_sources" to hidden, "order" to order, "sessions" to JSONArray(rows)))
             _ui.update { it.copy(sessions = if (query.isBlank()) rows else it.sessions, connected = true, assistantSessionId = assistantSessionId, historyUnreadable = unreadable) }
+            if (query.isBlank() && !archived) refreshLostChats(active, scope, rows)
             if (current()) {
                 if (!persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true) || !current()) return@supervisorScope
                 if (!allProfiles && query.isBlank() && !archived && !threads) {
@@ -3288,6 +4691,37 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
           } } catch (e: Throwable) { if (e is CancellationException) throw e; if (current()) fail(conversationActionFailure("/api/sessions", e)) }
           finally { if (request == sessionIndexRequest) _ui.update { it.copy(historyLoading = false) } }
         }.also { indexFetch = it }
+    }
+    /** D5: chats archived from this phone (its account and profile, the row as listed). Hermes' hidden-chat scan is bounded and can lag, so they show under Archived at once and stay out of All; Unarchive drops them. */
+    private val archivedHere = LinkedHashMap<String, Pair<Scope, JSONObject>>()
+    private fun rememberArchived(target: Scope, id: String, archived: Boolean) {
+        val key = target.session(id).key
+        if (!archived) { archivedHere.remove(key); return }
+        val known = _ui.value.sessions.firstOrNull { sessionRowId(it) == id && it.string("profile", target.profile) == target.profile }
+            ?: _data.value["history:search"]?.rows("sessions")?.firstOrNull { sessionRowId(it) == id && it.string("profile", target.profile) == target.profile }
+        val row = (known?.copy() ?: json("title" to (_chat.value.title.takeIf { _chat.value.sessionId == id }.orEmpty()))).put("session_id", id).put("profile", target.profile).put("archived", true)
+            .put(ARCHIVED_HERE_AT, System.currentTimeMillis())
+        archivedHere.remove(key); archivedHere[key] = target.copy(session = "") to row
+        while (archivedHere.size > 50) archivedHere.remove(archivedHere.keys.first())
+    }
+    /**
+     * P3-3: Hermes lists a chat this phone archived as not archived again, in a list asked for well after the archive: it was unarchived
+     * elsewhere (the Hermes desktop), so this phone forgets it.
+     */
+    private fun forgetUnarchivedElsewhere(serverRows: List<JSONObject>, scope: Scope, listedAfter: Long) {
+        val listed = serverRows.filter { !it.optBoolean("archived") }.map { sessionRowKey(it, scope.profile) }.toSet()
+        archivedHere.entries.removeAll { (_, entry) ->
+            entry.first.copy(profile = scope.profile) == scope.copy(session = "") && sessionRowKey(entry.second) in listed &&
+                listedAfter - entry.second.optLong(ARCHIVED_HERE_AT) > ARCHIVE_SETTLE_MS
+        }
+    }
+    private fun withArchivedHere(rows: List<JSONObject>, scope: Scope, profiles: List<String>, query: String, archived: Boolean): List<JSONObject> {
+        val mine = archivedHere.values.filter { (owner, _) -> owner.copy(profile = scope.profile) == scope.copy(session = "") && owner.profile in profiles }.map { it.second }
+        if (mine.isEmpty()) return rows
+        val keys = mine.map { sessionRowKey(it) }.toSet()
+        if (!archived) return rows.mapNotNull { row -> if (sessionRowKey(row, scope.profile) !in keys) row else if (query.isBlank()) null else row.copy().put("archived", true) }
+        val listed = rows.map { sessionRowKey(it, scope.profile) }.toSet()
+        return mine.filter { sessionRowKey(it) !in listed && (query.isBlank() || it.string("title").contains(query.trim(), ignoreCase = true)) }.map { it.copy() } + rows
     }
     private fun publishConfirmedSession(owner: Scope, id: String, response: JSONObject, accepted: Boolean = false) {
         if (client?.scope != owner || !_ui.value.authenticated) return
@@ -3365,7 +4799,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         resumeInitialChat().join()
                         if (!current()) return@launch
                     }
-                    if (initialCreateAttempts.containsKey(owner.key)) { _ui.update { it.copy(newChatError = initialCreateError) }; notice("Tap Retry to open the chat. Your draft is kept."); return@launch }
+                    if (initialCreateAttempts.containsKey(owner.key)) {
+                        // A create whose answer never came back (the app was killed, or Hermes did not answer in time) left its attempt id on this phone. The tap asks Hermes again with
+                        // that id, its own retry identity: Hermes returns the chat the first create made, or makes one, so the tap is never a dead end. The marker keeps the plain
+                        // request's id only, so that request settles first; a thread or workspace chat the tap asked for follows.
+                        createNewChat(json("worktree" to false), initial = true).join()
+                        if (initialCreateAttempts.containsKey(owner.key) || options.length() == 0 || client !== active || originGeneration != origin) return@launch
+                        newChat(options).join()
+                        return@launch
+                    }
                     // A legitimate New intent from Tasks/Spaces keeps the owner's unsent
                     // draft; explicit workspace/worktree/model options pass through intact.
                     if (options.length() > 0 || !initialShells.containsKey(owner.key)) createNewChat(options, initial = true).join()
@@ -3444,6 +4886,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     else -> chat
                 }
             }
+            if (path == "/api/session/archive") rememberArchived(target, id, result.optBoolean("hidden", body.optBoolean("archived")))
             _ui.update { state -> state.copy(sessions = updatedHistoryRows(state.sessions, id, path, body, result, sessionIndexArchived, "", target.profile)) }
             _data.update { it - "history:search" }
             if (path == "/api/session/archive") confirmedSessions.remove(target.key)
@@ -3453,14 +4896,18 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (sourceScope == target) c.get("/api/session", mapOf("session_id" to id)).let { if (sourceScope == target && client === active) renderSession(it, target) }
             }
             if (path == "/api/session/delete") {
-                confirmedSessions.remove(target.key); clientCreatedSessions.remove(target.key)
+                confirmedSessions.remove(target.key); clientCreatedSessions.remove(target.key); archivedHere.remove(target.key)
                 val keptRows = if (sourceScope == target) _chat.value.raw.rows("messages") else null
                 optionalLocalSave { app.cache.delete(target, "client-created-shell"); forgetKeptAttachments(target, keptRows) }
             }
             notice(done)
             if (path == "/api/session/archive" && body.optBoolean("archived")) _archiveUndo.value = target
             refreshSessions()
-        } catch (e: Throwable) { if (e is CancellationException) throw e; if (client === active) fail(conversationActionFailure(path, e)) } finally { c.closeNative() }
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            if (e is DeleteKeptWaiting) restoreWithdrawn(target, e.withdrawn)
+            if (client === active) fail(conversationActionFailure(path, e))
+        } finally { c.closeNative() }
         }
         conversationChanges[pendingKey] = job
         _conversationPending.update { it + pendingKey }
@@ -3471,12 +4918,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun setHistoryFilters(hidden: Set<String>, order: String) = viewModelScope.launch {
         app.preferences.edit { it[stringPreferencesKey("history_hidden_sources")] = hidden.sorted().joinToString(","); it[stringPreferencesKey("history_order")] = order }
     }
-    /** The chat the page shows only because Hermes does not serve Beacon for this profile (it is not the first-chat card): the id to open again once it does. */
-    internal fun beaconOffChatId(): String? = _chat.value.takeIf { it.sessionId.isNotBlank() && it.status == PROFILE_PLUGIN_OFF_ERROR && sourceScope == null }?.sessionId
+    /** The chat the page shows only because Hermes refused Beacon for this profile (it is not the first-chat card): the id to open again once it is on. */
+    internal fun beaconOffChatId(): String? = _chat.value.takeIf { it.sessionId.isNotBlank() && it.status in BeaconOffLines && sourceScope == null }?.sessionId
     /** True while the page shows a chat only because it cannot open now (Beacon off for the profile, or the open was refused): the composer keeps typing but Send is off there ([composerSendEnabled]). */
     internal fun onRetainedPage(): Boolean = retainedDraftScope(_chat.value, sourceScope, client?.scope ?: cachedOwnerScope) != null
     fun retryInitialChat(): Job {
-        // Turn on and Check again on such a chat open that chat again, never a new one.
+        // Turn on and Retry on such a chat open that chat again, never a new one.
         beaconOffChatId()?.let { id ->
             _ui.update { it.copy(newChatError = "", notice = "") }
             selectSession(id)
@@ -3489,36 +4936,41 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         return if (initialShells.containsKey((client?.scope ?: cachedOwnerScope)?.key)) resumeInitialChat() else createNewChat(json("worktree" to false), true)
     }
     /**
-     * The owner confirmed: the plugin turns Beacon on for this profile through Hermes' own activation, then the chat that was waiting (the first chat, or the chat the owner opened)
-     * opens by itself. A missing route, a Beacon that needs installing or updating, or a Hermes that could not turn it on shows the pinned command to run; a busy, updating or slow
-     * Hermes says it is still working; a profile Hermes no longer has says so ([profileTurnOnFailure]).
+     * The button beside a refused profile's line: the plugin turns Beacon on for this profile through Hermes' own activation, then the chat that was waiting (the first chat, or
+     * the chat the owner opened) opens by itself. [auto] false is the owner's own Turn on for a profile that turned Beacon off on Hermes; true is Retry after the phone's own
+     * turn-on failed. A failure shows the one line again ([beaconOffLine]); no connection keeps the line and says so.
      */
-    fun turnOnBeaconForProfile(): Job {
+    fun turnOnBeaconForProfile(auto: Boolean = false): Job {
         val active = client ?: return viewModelScope.launch {}
         if (_profileTurningOn.value) return viewModelScope.launch {}
         val owner = active.scope
         val origin = originGeneration
         fun current() = client === active && active.scope == owner && originGeneration == origin
         _profileTurningOn.value = true
+        // The message bar's line goes while Hermes works; a failure shows it again.
+        if (_ui.value.error in BeaconOffLines) clearMessage()
         return viewModelScope.launch {
             var failure: Throwable? = null
-            try { active.turnOnBeaconForProfile() } catch (e: Throwable) { failure = e }
+            try { if (active.turnOnBeaconForProfile(auto).opt("enabled") != true) failure = BeaconOffFailure(null) } catch (e: Throwable) { failure = e }
             _profileTurningOn.value = false
             if (failure is CancellationException || !current()) return@launch
             when {
                 failure == null -> retryInitialChat()
-                failure is NativeAuthExpiredException -> fail(failure)
-                // No connection is not a refusal: the card keeps its Turn on and the person is told.
+                failure is NativeAuthExpiredException || failure is DeviceRemovedFailure || failure is LoopbackSessionRefreshFailed -> fail(failure)
+                // No connection is not a refusal: the line keeps its button and the person is told.
                 failure is java.io.IOException && failure !is ApiFailure -> notice(appErrorText(failure))
-                else -> {
-                    val text = profileTurnOnFailure(owner.profile, releaseCommitForTurnOn(), failure)
-                    _ui.update { it.copy(newChatError = text) }
-                }
+                else -> showBeaconOff(beaconOffLine(failure as? BeaconOffFailure ?: BeaconOffFailure(failure)))
             }
         }
     }
-    /** The latest release's commit as the update check found it (what the plugin install and repair pin to); null until one is known. Tests replace it. */
-    internal var releaseCommitForTurnOn: () -> String? = { app.updates.state.value.latest?.commit }
+    /** The refused profile's line where the person is: the first-chat card or the page of the chat that waits for it, else the message bar with the same button. */
+    private fun showBeaconOff(line: String) {
+        when {
+            beaconOffChatId() != null -> _chat.update { it.copy(status = line) }
+            _chat.value.sessionId.isBlank() && sourceScope == null -> _ui.update { it.copy(newChatError = line) }
+            else -> _ui.update { it.copy(error = line) }
+        }
+    }
     private fun clientShellMarker(key: String) = if (key in keptApartShells) KEPT_APART_SHELL else "1"
     /** True when [scope] carries the phone-created marker; a kept-apart one is remembered here so it survives an app restart. */
     private suspend fun readClientShell(scope: Scope): Boolean {
@@ -3540,7 +4992,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         fun current() = client === active && active.scope == owner && originGeneration == origin && sessionGeneration == selection && navigationGeneration == navigation && sourceScope == selected && _ui.value.tab == tab
         // The first chat's create carries its attempt as Hermes' retry identity: a Retry after a lost answer reuses the pending attempt, so Hermes returns the chat the first
         // create made instead of making another. A finished or cleared attempt has no marker, so the next first chat starts a new one.
-        val attempt = if (initial) (initialCreateAttempts[owner.key] ?: java.util.UUID.randomUUID().toString()).also { initialCreateAttempts[owner.key] = it } else null
+        val keptAttempt = initial && initialCreateAttempts[owner.key] != null
+        var attempt = if (initial) (initialCreateAttempts[owner.key] ?: java.util.UUID.randomUUID().toString()).also { initialCreateAttempts[owner.key] = it } else null
         val request = JSONObject(body.toString()).apply { put("profile", owner.profile); selected?.session?.let { put("prev_session_id", it) }; attempt?.let { put("request_id", it) } }
         val job = viewModelScope.launch {
             val running = currentCoroutineContext()[Job]
@@ -3548,7 +5001,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             try {
                 // A durable owner-bound marker precedes the non-idempotent POST.
                 // Leaving Chat, process death or cancellation cannot silently retry it.
-                if (attempt != null) app.cache.write(owner, "new-chat-attempt", attempt, protected = true)
+                attempt?.let { app.cache.write(owner, "new-chat-attempt", it, protected = true) }
                 checkpointNow()
                 if (!current()) return@launch
                 // A plain New chat opens the empty chat this phone already made for the account and profile, so Hermes does not collect one empty session per tap.
@@ -3570,7 +5023,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     // Gone, or used from somewhere else: it is no longer the empty chat to open.
                     if (initialShells[owner.key] == standing) { initialShells.remove(owner.key); optionalLocalSave { app.cache.delete(owner, "new-chat-shell") } }
                 }
-                val response = c.post("/api/session/new", request)
+                // A kept attempt Hermes refused (its chat deleted after a lost answer, or a changed request) is spent: one fresh create, with its id saved first.
+                val response = if (attempt == null) c.post("/api/session/new", request) else createWithRetryIdentity(keptAttempt, renew = {
+                    val fresh = java.util.UUID.randomUUID().toString()
+                    attempt = fresh; initialCreateAttempts[owner.key] = fresh
+                    app.cache.write(owner, "new-chat-attempt", fresh, protected = true)
+                    request.put("request_id", fresh)
+                }) { c.post("/api/session/new", request) }
                 val id = (response.optJSONObject("session") ?: response).getString("session_id")
                 require(id.isNotBlank()) { "The server did not return a conversation ID" }
                 val createdScope = owner.session(id)
@@ -3600,7 +5059,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 selectSession(id, preserveInitialDraft = initial, initialResponse = response, closeMenu = !initial)
             } catch (e: Throwable) {
                 // A create that never left the phone cannot have made a chat, so nothing needs the unconfirmed-attempt marker or its Retry.
-                // Hermes refusing the plugin for this profile is a definite "not sent" too, but not an unreachable Hermes: the card says so and waits for Check again.
+                // Hermes refusing the plugin for this profile is a definite "not sent" too, but not an unreachable Hermes: the card says so with its button.
                 val off = e !is CancellationException && beaconOffForProfile(e)
                 val neverSent = off || e !is CancellationException && requestNeverSent(e)
                 // Settle only the original owner's marker, even after navigation.
@@ -3609,11 +5068,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     if (neverSent) {
                         initialCreateAttempts.remove(owner.key)
                         runCatching { app.cache.delete(owner, "new-chat-attempt") }
-                    } else runCatching { app.cache.write(owner, "new-chat-attempt", attempt, protected = true) }
+                    } else runCatching { attempt?.let { app.cache.write(owner, "new-chat-attempt", it, protected = true) } }
                         .onFailure { if (current()) notice("Couldn't save on this phone.") }
                 }
                 if (neverSent && !off) unreachableCreateOwner = owner.key
-                if (current() && e !is CancellationException) { _ui.update { it.copy(newChatError = if (off && attempt != null) PROFILE_PLUGIN_OFF_ERROR else if (neverSent) "" else initialCreateError, connected = it.connected && (!neverSent || off)) }; if (!(off && attempt != null)) fail(e) }
+                if (current() && e !is CancellationException) { _ui.update { it.copy(newChatError = if (off && attempt != null) beaconOffLine(e) else if (neverSent) "" else initialCreateError, connected = it.connected && (!neverSent || off)) }; if (!(off && attempt != null)) fail(e) }
             } finally {
                 if (newChatJobs[owner.key] === running) {
                     newChatJobs.remove(owner.key)
@@ -3720,7 +5179,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         recoverMissingInitialShell(owner, id) { recoveryCurrent() }
                         return@launch
                     }
-                    if (beaconOffForProfile(e)) { if (current()) _ui.update { it.copy(newChatError = PROFILE_PLUGIN_OFF_ERROR) }; return@launch }
+                    if (beaconOffForProfile(e)) { if (current()) _ui.update { it.copy(newChatError = beaconOffLine(e)) }; return@launch }
                     val attempt = java.util.UUID.randomUUID().toString()
                     initialCreateAttempts[owner.key] = attempt
                     runCatching {
@@ -3829,9 +5288,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             } catch (e: Throwable) { if (current() && e !is CancellationException) { _ui.update { it.copy(beaconOpening = false, beaconError = appErrorText(e)) }; fail(e) } }
         }
     }
-    fun isBeaconConversation(): Boolean {
+    /** [whileOpening]: the chat on screen is already the account's Beacon chat, though an open of it is running (UX-121 P3-10: a re-open keeps it shown). */
+    fun isBeaconConversation(whileOpening: Boolean = false): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
-        return canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, true, owner?.let(::readBeaconSessionHandle), _ui.value.beaconOpening, _ui.value.beaconError.isNotBlank(), preferences.value.assistantProfile)
+        return canonicalConversationReady(owner, sourceScope, _chat.value.sessionId, true, owner?.let(::readBeaconSessionHandle), _ui.value.beaconOpening && !whileOpening, _ui.value.beaconError.isNotBlank(), preferences.value.assistantProfile)
     }
     private fun admitConversation(): Boolean {
         val owner = client?.scope ?: cachedOwnerScope
@@ -3841,7 +5301,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     /** Returns once the chat just selected has finished loading (its saved draft restored); the share hand-off adds to it only then. */
     internal suspend fun awaitSelection() { selectionJob?.join() }
-    fun selectSession(id: String, editorDraft: String? = null, preserveInitialDraft: Boolean = false, initialResponse: JSONObject? = null, closeMenu: Boolean = true, onCachedReady: (() -> Unit)? = null, titleHint: String = "", dropQuestion: Boolean = false) {
+    fun selectSession(id: String, editorDraft: String? = null, preserveInitialDraft: Boolean = false, initialResponse: JSONObject? = null, closeMenu: Boolean = true, onCachedReady: (() -> Unit)? = null, titleHint: String = "", dropQuestion: Boolean = false, reopen: Boolean = false) {
         selectionJob?.cancel()
         val navigation = ++navigationGeneration
         val generation = ++sessionGeneration
@@ -3862,6 +5322,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val initialDraft = if (preserveInitialDraft) draft() else null
             initialDraft?.let { drafts[scope.key] = it }
             sourceScope = scope; clearDetails()
+            // P2-3: the chat just left may still hold waiting messages; they go from the background now.
+            drainOfflineOutbox(openQueue = false)
             saved["session:${ownerScope.key}"] = id
             _ui.update { it.copy(showSessions = if (closeMenu) false else it.showSessions, newChatError = "") }
             heldTitle = titleHint.takeIf { it.isNotBlank() }?.let { Triple(scope, it, _chat.value.title) }
@@ -3872,7 +5334,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             _chat.value = chatOnSelection(_chat.value, id, titleHint, previousEffort)
             if (!preserveInitialDraft && !sameSession) { _composer.value = TextFieldValue(); _attachments.value = emptyList() }
             else initialDraft?.let { restoreDraft(it, preserveActiveInput = true) }
-            initialResponse?.let { renderSession(it, scope) }
+            // A transcript this process saved a moment ago draws in this frame, not after the disk reads below.
+            if (initialResponse != null) renderSession(initialResponse, scope)
+            else if (!sameSession) app.cache.recentSession(scope)?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }?.let { renderSession(it, scope) }
             try {
                 // Always read the marker: a known shell may still be one kept apart, and the write below must not turn it into a plain one.
                 val marked = readClientShell(scope)
@@ -3938,26 +5402,35 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     clientCreatedSessions.remove(scope.key)
                     optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
                 }
-                if (asksPromptsAfterRead(dropQuestion, _chat.value.streamId)) pollPrompts(c.detached(), scope)
+                if (asksPromptsAfterRead(dropQuestion, _chat.value.streamId)) pollPrompts(c, scope)
                 if (pending.containsKey(scope.key)) {
+                    // Follow-up 5: a send this chat can ask about again is checked quietly; the ask below settles it.
+                    val asking = pending[scope.key]?.let { askableAgain(it) && askedAgain[it.id] != reachEpoch && (_chat.value.uncertain == it.id || askedAgain.containsKey(it.id)) } == true &&
+                        runCatching { c.nativeSessionAuthority() }.getOrDefault(false)
                     val receiptClient = c.detached()
-                    try { reconcile(scope, receiptClient) } finally { if (streamClients.values.none { it === receiptClient }) receiptClient.closeNative() }
+                    try { reconcile(scope, receiptClient, quiet = asking) } finally { if (streamClients.values.none { it === receiptClient }) receiptClient.closeNative() }
+                    askAgainUnconfirmed()
                 }
                 val active = (response.optJSONObject("session") ?: response).string("active_stream_id")
-                if (active.isNotBlank() && streams[scope.key]?.isActive != true) attachStream(c.detached(), scope, active)
+                if (active.isNotBlank() && !followsHere(scope)) attachStream(c.detached(), scope, active)
                 else if (active.isBlank() && !reattachMarkedRun(c.detached(), scope, ScopeSettlement(scope, client ?: return@launch, origin, generation))) return@launch
                 watchSession(c.detached(), scope)
+                // Browsing never resumes an agent: a reply Hermes lost in a restart is looked at only on evidence (the phone's run marker or receipt,
+                // the stream, Hermes' reconnect projection) or on the person's Send or Stop. Each open starts those looks afresh.
+                lostTurnLooked.remove(scope.key)
+                if (_chat.value.streamId.isBlank()) showLostOnOpen(c, scope, ScopeSettlement(scope, client ?: return@launch, origin, generation))
                 if (_chat.value.streamId.isBlank()) client?.let { drainQueued(scope, it, generation, origin) }
             } catch (e: Throwable) {
                 if (e is CancellationException) throw e
                 if (current()) {
-                    // Hermes does not serve Beacon for this profile (its ticket is refused). The first chat the phone made for the profile is the profile's own card with Turn on. Any other
-                    // chat stays that chat: its draft and attachments stay with it, it says so in one line with Turn on, and Turn on opens it again (never a new chat, never its words in another).
+                    // Hermes refused Beacon for this profile and the client could not turn it on (its ticket is refused). The first chat the phone made for the profile is the profile's
+                    // own card with the line. Any other chat stays that chat: its draft and attachments stay with it, it says so in one line with its button, and the button opens it
+                    // again (never a new chat, never its words in another).
                     if (beaconOffForProfile(e)) {
-                        if (initialShells[ownerScope.key] != id) { retainDraftAndLeave(scope, id, generation, PROFILE_PLUGIN_OFF_ERROR); return@launch }
+                        if (initialShells[ownerScope.key] != id) { retainDraftAndLeave(scope, id, generation, beaconOffLine(e)); return@launch }
                         sourceScope = null
                         _chat.value = ChatState()
-                        _ui.update { it.copy(newChatError = PROFILE_PLUGIN_OFF_ERROR, newChatOpening = false, initialChatReady = true) }
+                        _ui.update { it.copy(newChatError = beaconOffLine(e), newChatOpening = false, initialChatReady = true) }
                         return@launch
                     }
                     if (e is ApiFailure && !e.plugin && e.status in setOf(401, 403)) {
@@ -3968,7 +5441,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     val cached = _chat.value.raw.length() > 0
                     val pendingFirstTurn = !nativeResumeAttempted && e is ApiFailure && e.status == 404 && sessionCanStillBeUnpersisted(clientCreated, _chat.value)
                     _chat.update { it.copy(projectionReady = true, status = if (pendingFirstTurn) "" else when { missingNativeConversation(e) -> "Chat unavailable · draft kept"; e is ApiFailure && e.status in setOf(401, 403) -> ACCESS_DENIED_RETAINED; cached -> "Saved copy · couldn't refresh"; else -> "Couldn't load this chat · retry" }) }
-                    if (!pendingFirstTurn) fail(e)
+                    val gone = !pendingFirstTurn && missingNativeConversation(e)
+                    // TRACE-COLD-121 fix 2: a chat Hermes no longer has stops being the saved selection, unless it holds the owner's unsent words or a send not
+                    // yet settled: then it stays (on screen with its line) so they are never lost.
+                    // Fix 3a (Root): the start-up reopen nobody asked for raises no app-wide error for a gone chat; its own line says so. An open the owner
+                    // asked for keeps the rule (NativeOperationPolicy). Shown before the selection is forgotten below, while this open is still current().
+                    if (!pendingFirstTurn && !(gone && reopen)) fail(e)
+                    if (gone && draft().let { it.text.isBlank() && it.attachments.isEmpty() && it.queued.isEmpty() } && pending[scope.key] == null && forgetSelection(ownerScope, id)) forgottenGone = scope
                 }
             }
         }
@@ -3986,12 +5465,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     val encoded = current.encode(); app.cache.write(scope, "draft", encoded, current.text.isNotBlank() || current.attachments.isNotEmpty() || current.queued.isNotEmpty()); savedDraft(scope, encoded)
                 }
                 retainEditor(retainedEditor)
-            }.onFailure { if (generation == sessionGeneration) notice("Couldn't save the latest change. Your draft stays on this phone.") }
+            }.onFailure { if (generation == sessionGeneration) notice(if (draftStoreFull(it)) DRAFT_STORE_FULL_ERROR else "Couldn't save the latest change. Your draft stays on this phone.") }
         }
         _chat.value = retainedChatState(id, status, retainedDraft)
         // The draft stays in the composer on both pages: the person may keep typing, it is saved with this chat (see [retainedDraftScope]) and is what the composer holds when the chat
         // opens again (Turn on, or the chat opened from History once access is back).
-        _data.value = emptyMap(); clearDetails()
+        _data.update { it.filterKeys { key -> !isChatScreenKey(key) } }; clearDetails()
         sourceScope = null
     }
     private suspend fun restoreCachedConversation(scope: Scope, generation: Int, preserveActiveInput: Boolean = false): Boolean {
@@ -4060,7 +5539,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val receipts = app.cache.readMany(scope, userRows.map { "attachments:${it.string("row_id", it.string("_row_id"))}" })
         for (row in userRows) {
             val id = row.string("row_id", row.string("_row_id"))
-            receipts["attachments:$id"]?.let(::JSONObject)?.let { receipt ->
+            receipts["attachments:$id"]?.let(::JSONObject)?.takeIf { attachmentRecordFitsRow(it, row) }?.let { receipt ->
                 row.put("attachments", mergedRowAttachments(row, receipt, scope.key))
                 row.put("display_text", receipt.string("display_text"))
             }
@@ -4084,13 +5563,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 raw = if (old.sessionId == scope.session) carryDisplayIdentity(o, old.raw) else o,
                 status = renderedChatStatus(old, active, live.streamEnded),
                 streamId = active?.takeIf { it.isNotBlank() } ?: if (live.streamEnded) "" else old.streamId,
-                liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools, liveSealed = live.sealed)
+                liveText = live.text, liveReasoning = live.reasoning, liveTools = live.tools, liveSealed = live.sealed, liveSealedAt = live.sealedAt, liveBase = live.base, liveBasePrompt = live.basePrompt,
+                liveOrdinal = if (live.streamEnded || old.sessionId != scope.session) 0 else live.ordinal)
         }
         projectCallTranscripts()
         // A steer Hermes already saved is not shown a second time while the turn still runs.
         if (_chat.value.queued.any { it.kind == "steer" && it.rowId.isBlank() && it.state in setOf("accepted", "unknown") }) pairSteerCopies(scope, emptyList(), o.rows("messages")) { sourceScope == scope }
         // The same for a message (a photo) Hermes accepted without naming its row: the saved row replaces the phone's copy instead of showing beside it.
         if (_chat.value.queued.any { it.kind == "queue" && it.rowId.isBlank() && it.state in setOf("accepted", "settled") }) pairAcceptedCopies(scope, o.rows("messages")) { sourceScope == scope }
+        val shown = _chat.value
+        val followsProfile = shown.raw.string("model").isBlank() || shown.raw.string("reasoning_effort", shown.raw.string("reasoning")).isBlank() && shown.sessionReasoningEffort.isBlank()
+        val defaults = _data.value["profile-defaults"]
+        if (followsProfile && (defaults == null || defaults.string("session_id") != scope.session || defaults.string("scope_key") != client?.scope?.key))
+            load("profile-defaults", PROFILE_DEFAULTS_PATH, mapOf("session_id" to scope.session))
         val cached = response.optJSONObject("session") ?: response
         for (key in listOf("voice_transcripts", UNCONFIRMED_REPLIES, "_display_submission_id", "_display_admission_id")) if (o.has(key)) cached.put(key, o.opt(key))
     }
@@ -4136,6 +5621,24 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             } catch (e: Throwable) { if (e is CancellationException) throw e }
         }
     }
+    /** The titles this phone gave call chats, per account and profile: an empty chat joins the listed History only with its first message, so the list may not hold the last call's title yet. */
+    private val callChatTitles = mutableMapOf<String, MutableSet<String>>()
+    /**
+     * The words of a call's chat title: "Call with {name}" in the phone's language with the assistant's name as it is now (the owner can rename it), and the call's start in the
+     * app's own day and clock style for the phone's locale and 12/24-hour setting.
+     */
+    private suspend fun callTitleWords(): Pair<String, (Long) -> String> {
+        val locale = java.util.Locale.getDefault()
+        val language = dev.hermes.android.ui.nativeLanguageFor(locale)
+        val dictionary = if (language == "en") null else withContext(Dispatchers.IO) { app.readTranslations().optJSONObject(language) }
+        val phrase = if (dictionary == null) "Call with Beacon" else dev.hermes.android.ui.translateUi(dictionary, "Call with Beacon")
+        val pattern = dev.hermes.android.ui.nativeDayPattern(locale, withYear = false, withWeekday = false) + ", " +
+            dev.hermes.android.ui.nativeClockPattern(locale, android.text.format.DateFormat.is24HourFormat(app))
+        val zone = java.time.ZoneId.systemDefault()
+        return dev.hermes.android.ui.assistantName(phrase, dev.hermes.android.data.currentAssistantName) to { millis ->
+            runCatching { java.time.format.DateTimeFormatter.ofPattern(pattern, locale).withZone(zone).format(java.time.Instant.ofEpochMilli(millis)) }.getOrDefault("")
+        }
+    }
     private fun reconcileCallConversation(call: CallState) {
         val scope = sourceScope ?: return
         val active = client ?: return
@@ -4150,13 +5653,17 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (!foreground || !request.current()) return@launch
                 if (!call.active) {
                     val session = response.optJSONObject("session") ?: response
-                    val title = deriveCallEndTitle(session.string("title"), call.transcripts, dev.hermes.android.data.currentAssistantName)
-                    if (title != null) {
-                        val body = json("session_id" to scope.session, "title" to title)
-                        client.post("/api/session/rename", body)
+                    val ownerKey = scope.copy(session = "").key
+                    val (callWith, startedLabel) = callTitleWords()
+                    val title = deriveCallEndTitle(session.string("title"), call.transcripts, dev.hermes.android.data.currentAssistantName,
+                        takenTitles = _ui.value.sessions.map { it.string("title") } + callChatTitles[ownerKey].orEmpty(), startedAt = call.startedAt,
+                        callWith = callWith, startedLabel = startedLabel)
+                    // A rename Hermes refuses must not stop the chat from rendering and saving below.
+                    if (renameCallChat(title) { client.post("/api/session/rename", json("session_id" to scope.session, "title" to it)) }) {
+                        title?.let { callChatTitles.getOrPut(ownerKey) { mutableSetOf() }.add(it) }
                         if (!foreground || !request.current()) return@launch
                         refreshSessions()
-                        response = client.get("/api/session", mapOf("session_id" to scope.session))
+                        response = try { client.get("/api/session", mapOf("session_id" to scope.session)) } catch (e: CancellationException) { throw e } catch (_: Exception) { response }
                     }
                 }
                 if (!foreground || !request.current()) return@launch
@@ -4169,7 +5676,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     /** Relay's "Quote in reply": the message's excerpt goes above the draft as a Markdown quote, cursor at the end. */
     fun quoteInReply(text: String) {
         val excerpt = dev.hermes.android.ui.quoteExcerpt(text).takeIf(String::isNotBlank) ?: return
-        val quoted = dev.hermes.android.ui.quotedDraft(excerpt, _composer.value.text)
+        val quoted = dev.hermes.android.ui.quotedDraft(excerpt, composerBase())
         composer(TextFieldValue(quoted, TextRange(quoted.length)))
     }
     /** A draft card's Send, when Hermes has to send the email itself, says so in the chat as the owner's own message: possible while the composer is free. */
@@ -4181,6 +5688,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     fun composer(value: TextFieldValue, fromEditor: Boolean = false) {
         if (value.text.length > 50_000) { notice("This message is too long. Shorten it."); return }
+        // A new message replaces the words a send is taking, files included (those stay with the send).
+        if (heldBySend()) _attachments.value = emptyList()
         val previous = _composer.value.text
         composerRevision++
         _composer.value = value; checkpoint()
@@ -4222,6 +5731,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 val encoded = current.encode()
                 app.cache.write(scope, draftKind(scope), encoded, protected = current.text.isNotBlank() || current.attachments.isNotEmpty() || current.queued.isNotEmpty())
                 savedDraft(scope, encoded)
+                keepGoneChatWithWords(scope, current)
             } } catch (e: Throwable) { if (e is CancellationException) throw e; if (draftScope() == scope) fail(e) }
         }
     }
@@ -4232,8 +5742,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val current = if (draftScope() == scope) draft() else drafts[scope.key] ?: return@withLock
             drafts[scope.key] = current
             val encoded = current.encode(); app.cache.write(scope, draftKind(scope), encoded, current.text.isNotBlank() || current.attachments.isNotEmpty() || current.queued.isNotEmpty()); savedDraft(scope, encoded)
+            keepGoneChatWithWords(scope, current)
         }
         if (sourceScope == scope && _chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, _chat.value.raw.toString())
+    }
+    /** REVIEW-FIXCHAT-121 P2: the next start reopens a gone chat that holds the owner's words again (the 404 let its selection go while it was empty). */
+    private suspend fun keepGoneChatWithWords(scope: Scope, current: Draft) {
+        if (forgottenGone != scope || current.text.isBlank() && current.attachments.isEmpty() && current.queued.isEmpty()) return
+        val owner = scope.copy(session = "")
+        app.cache.write(owner, "selected-session", scope.session, protected = true); saved["session:${owner.key}"] = scope.session; forgottenGone = null
     }
     private suspend fun savePending(send: PendingSend) {
         val encoded = send.encode()
@@ -4250,8 +5767,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun send(queued: QueuedMessage? = null) = viewModelScope.launch {
         if (_attachmentPreparation.value.isNotEmpty()) { notice("Finish or remove attachments before sending"); return@launch }
         if (!admitConversation()) return@launch
-        val active = client ?: run { notice("Reconnect before sending. Your draft is kept."); return@launch }
-        val scope = sourceScope ?: return@launch
+        // P2-2: with no connection (an app started offline has no client) Send still works: the words wait as "Not sent" and go once Hermes is back.
+        val active = client ?: run { if (queued == null) queueOffline(); return@launch }
+        val scope = sourceScope ?: run { notice("Open a chat first."); return@launch }
         val c = if (clientCreatedSessions.contains(scope.key)) active else active.detached()
         val d = queued?.let { Draft(it.text, attachments = it.attachments) } ?: draft().copy(queued = emptyList())
         var generation = sessionGeneration
@@ -4287,13 +5805,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (e is CancellationException) throw e
                 pending.remove(scope.key, send)
                 if (sourceScope == scope && _chat.value.uncertain == send.id) _chat.update { it.copy(uncertain = "", status = "") }
-                throw NativeTurnNotSent("Couldn't save the message. Keep the draft open and try again.", e)
+                throw NativeTurnNotSent(if (draftStoreFull(e)) DRAFT_STORE_FULL_ERROR else "Couldn't save the message. Keep the draft open and try again.", e)
             }
             if (queued != null) {
                 var marked = false
                 val saved = updateQueued(scope, queued.id, { request.current() && phoneQueueHead()
                     ?.let { it.id == queued.id && it.submissionId == queued.submissionId && it.state == "queued" } == true }) {
-                    if (it.submissionId == queued.submissionId && it.state == "queued") { marked = true; it.copy(state = "sending") } else it
+                    if (it.submissionId == queued.submissionId && it.state == "queued") { marked = true; it.copy(state = "sending", outcome = "") } else it
                 }
                 if (!saved || !marked) {
                     pending.remove(scope.key, send); deletePending(send)
@@ -4312,8 +5830,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
             val model = queued?.model ?: _chat.value.raw.string("model")
             val provider = queued?.provider ?: _chat.value.raw.string("model_provider")
+            if (queued == null) releaseSentComposer(scope, send, request)
             attempted = true
+            sendsOnTheirWay += send.submissionId
             val o = c.post("/api/chat/start", json("session_id" to scope.session, "message" to d.text, "attachments" to JSONArray(d.attachments), "profile" to scope.profile, "client_request_id" to send.submissionId, "model" to model.ifBlank { null }, "model_provider" to provider.ifBlank { null }, "queued_model_snapshot" to (queued != null), "explicit_model_pick" to (saved.get<Boolean>("model_pick:${scope.key}") == true)))
+            sendsOnTheirWay -= send.submissionId
+            linkFailures.remove(send.submissionId)
+            // Follow-up 11: the creating socket owns only the first prompt Hermes took. That is a fact about the chat, not the screen: a screen change
+            // between the tap and the answer (which skips accepted() below) must not leave the chat "created here", or its next send rides the chat's own
+            // client and a failure there closed the chat's socket (the follow-up 10 cut, window 4).
+            if (c === active && o.string("status") != "unknown") { clientCreatedSessions.remove(scope.key); optionalLocalSave { app.cache.delete(scope, "client-created-shell") } }
             // Hermes took the prompt and runs the turn whatever the screen did meanwhile: the same chat opened again (a new selection of it) still learns the outcome of its own send.
             // Opening the chat again also restores its stored send as a new object, so the send is matched by its identity, not by reference.
             val restored = pending[scope.key]
@@ -4338,10 +5864,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     savePending(unknown); pending[scope.key] = unknown
                     if (send.draft.attachments.isNotEmpty() || o.rows("attachment_receipts").isNotEmpty()) {
                         val attachments = keptAttachmentReceipts(o, send.draft) ?: JSONArray()
-                        val payload = json("attachments" to attachments, "display_text" to send.draft.text).toString()
-                        o.string("stream_id").takeIf(String::isNotBlank)?.let { stream ->
-                            optionalLocalSave { app.cache.write(scope, "attachments-pending:$stream", payload, true) }
-                        }
+                        val payload = attachmentRecord(attachments, send.draft.text, send.submissionId)
+                        optionalLocalSave { app.cache.write(scope, pendingAttachmentsKind(send.submissionId), payload) }
                         if (o.string("user_row_id").isNotBlank()) {
                             optionalLocalSave { app.cache.write(scope, "attachments:${o.optLong("user_row_id")}", payload) }
                         }
@@ -4351,28 +5875,62 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 else -> accepted(scope, c, o, send, request)
             }
         } catch (e: Throwable) {
+            sendsOnTheirWay -= send.submissionId
             if (e is CancellationException) throw e
-            // A send that could not reach Hermes says so in the app's banner too, not only by giving the draft back.
-            HermesReach.failed(scope.origin, e)
-            if (sourceScope != scope || sessionGeneration != generation || originGeneration != origin || client !== active) return@launch
-            if (attempted && pending[scope.key] !== send) return@launch
+            // A send that could not reach Hermes says so in the app's banner too, not only by giving the draft back. A file that could not get through on its
+            // own connection says nothing about Hermes being reachable (CHAT-121 follow-up 9).
+            if (e !is AttachmentStalled) HermesReach.failed(scope.origin, e)
+            // Follow-up 5: the answer was lost. Its staged attachments are saved with it (asking again re-sends them unchanged), the chat is listed so the
+            // send is asked again even once the chat is left, and it is asked the next time Hermes answers (not before).
+            // (Matched by identity: opening the chat again meanwhile restores the same send as a new object.)
+            // Chat join (Root): a file that could not get through is never asked again, even when its one frame's answer was lost (AttachmentStalled
+            // then wraps NATIVE_OUTCOME_UNKNOWN); it stays "Not sent" with its Send (fileNotSent).
+            val lostAnswer = attempted && answerLost(e) && e !is AttachmentStalled && pending[scope.key]?.id == send.id
+            if (lostAnswer) {
+                askedAgain[send.id] = reachEpoch
+                generateSequence(e) { it.cause }.take(8).filterIsInstance<NativeSubmitUnknown>().firstOrNull()?.takeIf { it.staged.length() > 0 }?.let { lost ->
+                    val kept = send.copy(staged = lost.staged.toString())
+                    try { savePending(kept); pending[scope.key] = kept } catch (save: Throwable) { if (save is CancellationException) throw save }
+                }
+                optionalLocalSave { rememberOutbox(scope) }
+            }
+            if (sourceScope != scope || sessionGeneration != generation || originGeneration != origin || client !== active) { if (lostAnswer) lookForHermesAfterLostAnswer(scope.origin); return@launch }
+            if (attempted && pending[scope.key] !== send && !lostAnswer) return@launch
             val notSent = e is NativeTurnNotSent || requestNeverSent(e)
-            if (queued != null && e is NativeTurnNotSent && e.message in setOf(
-                    "The model changed. Pick this message's model to send it.",
-                    "This Hermes can't take this attachment. The message stays on this phone.",
-                )) pauseQueueRetry(scope, queued.id)
+            // A file Hermes refused stays refused: a queued message with it waits for the owner instead of being asked again (each try would stage the
+            // files that did pass once more, and Hermes keeps no way to take them back).
+            // Out of reach: the native gateway reports a send that never left the phone as NativeTurnNotSent, often with no connect error in its chain,
+            // so Hermes' reach state and the network count too. A refusal with its own words (model, attachment, saving) is never "offline".
+            val refusal = refusedWithItsOwnWords(e)
+            val unreachable = requestNeverSent(e) || scope.origin in HermesReach.origins.value || !networkValidated
+            // Follow-up 11 (Root msg_ec3f92a4d60a): Hermes answers but the link could not carry this send now. It waits in the box with the outbox's look and
+            // words, never back in the composer, and goes again by itself under the same submission id, at most ATTACHMENT_STALL_TRIES tries in all; then
+            // it is "Not sent" with its Send, and nothing sends it again by itself.
+            val carried = notSent && !refusal && !unreachable && linkCouldNotCarry(e)
+            val linkPause = if (carried) nextLinkTryPause(linkFailures.merge(send.submissionId, 1, Int::plus) ?: 1) else null
+            val linkSpent = carried && linkPause == null
+            val offline = notSent && !refusal && (unreachable || linkPause != null)
+            // TURN-121's one hold (QueuedMessage.held, saved with the draft): the refusal's own line is why it waits for the owner's Send.
+            // CHAT-121 follow-up 8: waitsForOwner adds a file that stalled three times (a retry would only stall again).
+            val holdReason = if (queued != null) queuedHoldReason(e) else ""
+            // CHAT-121 follow-up 9 (chat join): a file that could not get through is saved as "Not sent" (fileNotSent), never as offline, so neither the
+            // outbox nor a drain sends it again by itself; only its row's Send does. One helper keeps the save and its in-memory fallback the same.
+            fun failed(item: QueuedMessage) = item.copy(state = if (notSent) "queued" else "unknown",
+                outcome = if (e is AttachmentStalled || linkSpent) FILE_NOT_SENT_OUTCOME else if (notSent && offline) OFFLINE_OUTCOME else item.outcome, held = holdReason.ifBlank { item.held })
             if (queued != null) {
-                try { updateQueued(scope, queued.id) { it.copy(state = if (notSent) "queued" else "unknown") } }
+                try { updateQueued(scope, queued.id) { failed(it) } }
                 catch (save: Throwable) {
                     if (save is CancellationException) throw save
                     if (request.current()) {
-                        _chat.update { current -> current.copy(status = "", queued = current.queued.map { if (it.id == queued.id) it.copy(state = if (notSent) "queued" else "unknown") else it }) }
-                        notice("Couldn't save this change. Keep the chat open and check the message.")
+                        _chat.update { current -> current.copy(status = "", queued = current.queued.map { if (it.id == queued.id) failed(it) else it }) }
+                        notice(if (draftStoreFull(save)) DRAFT_STORE_FULL_ERROR else "Couldn't save this change. Keep the chat open and check the message.")
                     }
                     return@launch
                 }
             }
             if (notSent) {
+                // The words go back first: if that cannot be saved, the receipt keeps them and the chat asks to check the message.
+                if (queued == null) try { returnUnsentWords(scope, send, offline) } catch (save: Throwable) { if (save is CancellationException) throw save; if (sourceScope == scope) fail(save); return@launch }
                 try {
                     if (deletePending(send)) { pending.remove(scope.key, send); sentComposerRevision.remove(scope.key) }
                 } catch (save: Throwable) { if (save is CancellationException) throw save; if (sourceScope == scope) fail(save); return@launch }
@@ -4381,15 +5939,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (sourceScope == scope && _chat.value.uncertain == send.id) _chat.update { it.copy(status = "") }
             if (sourceScope == scope && sessionGeneration == generation && originGeneration == origin && client === active) {
                 when (sendFailureView(e)) {
-                    // Nothing was sent and its receipt is gone: the chat stays this chat, its words stay in the composer and the draft, and the page says why with Turn on (as for a chat that could not
-                    // be opened for the same reason); Turn on opens this chat again.
-                    SendFailureView.BeaconOffPage -> retainDraftAndLeave(scope, scope.session, generation, PROFILE_PLUGIN_OFF_ERROR)
-                    SendFailureView.Notice -> notice(e.message?.takeIf { it in setOf(
-                        "Couldn't save the message. Keep the draft open and try again.",
-                        "The model changed. Pick this message's model to send it.",
-                        "This Hermes can't take this attachment. The message stays on this phone.",
-                    ) } ?: "Couldn't send the message. Review it and try again.")
-                    SendFailureView.Error -> fail(e)
+                    // Nothing was sent and its receipt is gone: the chat stays this chat, its words stay in the composer and the draft, and the page says why with its button (as for a chat that
+                    // could not be opened for the same reason); the button opens this chat again.
+                    SendFailureView.BeaconOffPage -> retainDraftAndLeave(scope, scope.session, generation, beaconOffLine(e))
+                    // D6: the words wait in the queue box and go by themselves.
+                    SendFailureView.Notice, SendFailureView.Error -> if (offline && queued == null) noticeNotSentYet(scope)
+                        // Follow-up 11: a message the link could not carry that waits again in its row says nothing more.
+                        else if (linkPause != null) Unit
+                        else if (sendFailureView(e) == SendFailureView.Error) fail(e)
+                        // A refused file is named: its line is translated here (the name stays as it is) and shown as it comes.
+                        else if (e is AttachmentRefused) notice(dev.hermes.android.push.serviceText(app, e.line).replace("{0}", e.file).replace("{1}", e.limitMb))
+                        // CHAT-7: the plugin could not take a large file now (every phone's files at its memory budget, or this phone's other file in flight): the busy line.
+                        else if (nativeGatewayBusy(e)) notice(appErrorText(e))
+                        else notice(e.message?.takeIf { it in SEND_REFUSALS } ?: "Couldn't send the message. Review it and try again.")
                 }
             }
             if (!notSent && request.current()) {
@@ -4398,7 +5960,298 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 catch (read: Throwable) { if (read is CancellationException) throw read }
                 finally { receiptClient.closeNative() }
             }
+            if (linkPause != null) retryAfterLink(scope, active, send.submissionId, linkPause)
+            if (lostAnswer) lookForHermesAfterLostAnswer(scope.origin)
         }
+    }
+    /** Follow-up 11: the tries the link could not carry, by submission id (main thread; a restart starts again, as the outbox does when Hermes answers). */
+    private val linkFailures = mutableMapOf<String, Int>()
+    /** The chat's next try of a message the link could not carry, by scope key. */
+    private val linkRetries = mutableMapOf<String, Job>()
+    /** After [pauseMs], the open chat's queue goes again if [submission] still waits at its head (the drain checks Hermes' turn first, as always). */
+    private fun retryAfterLink(scope: Scope, active: BeaconClient, submission: String, pauseMs: Long) {
+        linkRetries[scope.key]?.cancel()
+        val job = viewModelScope.launch {
+            delay(pauseMs)
+            // Away from the app meanwhile: it goes once the app is back (leaving the chat instead is fine: opening a chat drains its box).
+            while (!foreground && sourceScope == scope && client === active) delay(1_000)
+            if (sourceScope != scope || client !== active) return@launch
+            val head = phoneQueueHead()?.takeIf { it.submissionId == submission && it.waitingForConnection() } ?: return@launch
+            if (head.held.isBlank()) drainQueued(scope, active)
+        }
+        linkRetries[scope.key] = job
+        job.invokeOnCompletion { if (linkRetries[scope.key] === job) linkRetries.remove(scope.key) }
+    }
+    /** A try of [item] whose drain could not even ask Hermes (the link): it counts, and the next one is planned or the message is "Not sent" with Send. */
+    private suspend fun linkTryFailed(scope: Scope, active: BeaconClient, item: QueuedMessage) {
+        val pause = nextLinkTryPause(linkFailures.merge(item.submissionId, 1, Int::plus) ?: 1)
+        if (pause != null) retryAfterLink(scope, active, item.submissionId, pause)
+        else updateQueued(scope, item.id) { if (it.submissionId == item.submissionId && it.waitingForConnection()) it.copy(outcome = FILE_NOT_SENT_OUTCOME) else it }
+    }
+    /** D10: the composer lets go of the words being sent (they stay in [send]); edits made since the tap are the next message and are kept. */
+    private suspend fun releaseSentComposer(scope: Scope, send: PendingSend, request: ScopeSettlement) {
+        val revision = sentComposerRevision[scope.key]?.takeIf { it.first == send.id }?.second ?: return
+        if (!request.current() || composerRevision != revision || _composer.value.text != send.draft.text ||
+            _attachments.value.map { it.toString() } != send.draft.attachments.map { it.toString() }) return
+        _composer.value = TextFieldValue(); _attachments.value = emptyList(); composerRevision++
+        checkpointNow()
+    }
+    /**
+     * D6, D10: a direct send that never reached Hermes gets its words back, never lost. They are saved with that chat whether or not it is still
+     * open, before the receipt that holds them is deleted. Still in the composer: nothing to do. The composer empty and Hermes refused it: back into
+     * the composer, as before. Otherwise (the owner typed since, or Hermes was out of reach) it waits in the queue box as "Not sent"; one that never
+     * left the phone ([offline]) keeps its submission id and goes by itself once Hermes answers again, so it is never sent twice.
+     */
+    private suspend fun returnUnsentWords(scope: Scope, send: PendingSend, offline: Boolean) {
+        val words = send.draft
+        fun same(text: String, files: List<JSONObject>) = text == words.text && files.map { it.toString() } == words.attachments.map { it.toString() }
+        val item = QueuedMessage(words.text, words.attachments, send.model, send.provider, id = send.id, createdAt = send.createdAt,
+            state = if (offline) "queued" else "settled", outcome = if (offline) OFFLINE_OUTCOME else NOT_SENT_OUTCOMES.first(),
+            submissionId = send.submissionId, afterRowId = send.afterRowId)
+        if (sourceScope == scope) checkpointJob?.cancelAndJoin()
+        draftWriteLock.withLock {
+            val saved = if (sourceScope == scope) draft() else drafts[scope.key] ?: app.cache.read(scope, draftKind(scope))?.let(Draft::decode) ?: Draft()
+            if (same(saved.text, saved.attachments) || saved.queued.any { it.id == item.id }) return@withLock
+            val toComposer = !offline && saved.text.isBlank() && saved.attachments.isEmpty()
+            val end = words.text.length
+            val next = if (toComposer) saved.copy(text = words.text, selectionStart = end, selectionEnd = end, attachments = words.attachments) else saved.copy(queued = saved.queued + item)
+            // The open chat shows them at once (nothing runs between reading its composer and this); the saved copy follows.
+            if (sourceScope == scope) {
+                if (toComposer) { _composer.value = TextFieldValue(words.text, TextRange(end)); _attachments.value = words.attachments; composerRevision++ }
+                else _chat.update { state -> if (state.queued.any { it.id == item.id }) state else state.copy(queued = state.queued + item) }
+            }
+            val encoded = next.encode(); app.cache.write(scope, draftKind(scope), encoded, true); drafts[scope.key] = next; savedDraft(scope, encoded)
+        }
+        if (offline) rememberOutbox(scope)
+    }
+    /**
+     * P2-2: Send with no connection. The composer's words wait in the queue box as "Not sent" (a new submission id, so Hermes takes them
+     * once) and go by themselves when Hermes answers again; [payload] is a Queue tap's own words.
+     */
+    private suspend fun queueOffline(payload: String? = null) {
+        val scope = sourceScope ?: run { notice("Open a chat first."); return }
+        val state = _chat.value
+        if (state.raw.length() == 0) { notice("Wait for this chat to load."); return }
+        if (state.raw.optBoolean("read_only") || state.raw.optBoolean("is_read_only")) { notice("This chat is read-only. Branch it to continue."); return }
+        val before = draft()
+        val words = if (payload != null) Draft(payload) else before.copy(queued = emptyList())
+        if (words.text.isBlank() && words.attachments.isEmpty()) return
+        val send = PendingSend.create(scope, words).copy(model = state.raw.string("model"), provider = state.raw.string("model_provider"), afterRowId = pendingSendBoundary(state.messages))
+        // The composer lets go first, so the words go to the queue box (returnUnsentWords leaves words that are still in the composer there).
+        if (payload == null) { _composer.value = TextFieldValue(); _attachments.value = emptyList(); composerRevision++ }
+        try { returnUnsentWords(scope, send, offline = true) }
+        catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            if (payload == null && _composer.value.text.isEmpty() && _attachments.value.isEmpty()) {
+                _composer.value = TextFieldValue(words.text, TextRange(words.text.length)); _attachments.value = words.attachments; composerRevision++
+            }
+            notice(if (draftStoreFull(e)) DRAFT_STORE_FULL_ERROR else "Couldn't save the message. Keep the draft open and try again."); return
+        }
+        noticeNotSentYet(scope)
+    }
+    /** "Not sent yet" is raised for the account and profile of [scope] (follow-up 3, Root): only that owner's state ends it, and leaving that owner clears it ([dropNotSentYet]). */
+    private fun noticeNotSentYet(scope: Scope) { offlineNoticeOwner = scope.copy(session = ""); notice(OFFLINE_SEND_NOTICE) }
+    /** The owner left the account or profile the notice was raised for (a profile switch, another account): it goes; that chat's row still says "Not sent". */
+    private fun dropNotSentYet() { offlineNoticeOwner = null; _ui.update { if (it.notice == OFFLINE_SEND_NOTICE) it.copy(notice = "") else it } }
+    private var offlineNoticeOwner: Scope? = null
+    // P2-3: the chats of an account and profile that hold "Not sent" messages, saved so a restart keeps them.
+    private val outboxLock = Mutex()
+    /** CHATQA-121 follow-up 5: the times Hermes answered again (network back, reach check through, connected); a lost answer is asked once per time (main thread). */
+    private var reachEpoch = 0
+    private val askedAgain = mutableMapOf<String, Int>()
+    /** The ask on its way per send: another report of the same return (network, reach check, reconnect) finds it and asks nothing more. */
+    private val askJobs = mutableMapOf<String, Job>()
+    /** The submission ids whose first request is on its way now (a send, or the outbox's): they are never asked about until it answers. */
+    private val sendsOnTheirWay = mutableSetOf<String>()
+    private var hermesWasUnreachable = false
+    private fun bumpReachEpoch() { reachEpoch++ }
+    private fun hermesAnsweredAgain() { bumpReachEpoch(); askAgainUnconfirmed() }
+    /** The chats whose waiting messages are going now, by scope key (main thread only). */
+    private val outboxSends = mutableMapOf<String, Job>()
+    private suspend fun readOutbox(owner: Scope): List<String> =
+        app.cache.read(owner, OFFLINE_OUTBOX_KIND)?.let { raw -> runCatching { JSONArray(raw).let { a -> (0 until a.length()).map(a::optString) } }.getOrNull() }.orEmpty().filter(String::isNotBlank)
+    // CHATFIX-121 follow-up 1 (JOINBFIX's live check): "Not sent yet" goes once nothing waits any more, in the open chat's box or another chat's.
+    // It is asked when the open chat's box stops waiting, and (follow-up 2) when another chat's last waiting message goes ([drainOfflineOutbox]).
+    init { viewModelScope.launch { _chat.map { boxHoldsWaiting(it.queued) }.distinctUntilChanged().collect { waiting -> if (!waiting) endOfflineNoticeWhenNothingWaits() } } }
+    private suspend fun endOfflineNoticeWhenNothingWaits() {
+        val open = sourceScope ?: return
+        if (boxHoldsWaiting(_chat.value.queued) || _ui.value.notice != OFFLINE_SEND_NOTICE) return
+        val outbox = try { readOutbox(open.copy(session = "")) } catch (e: Exception) { if (e is CancellationException) throw e; return }
+        // Decided again after the read: the chat may have changed meanwhile, and its box is the one that must be empty.
+        if (sourceScope == open && offlineNoticeEnds(offlineNoticeOwner, open, boxHoldsWaiting(_chat.value.queued), outbox))
+            _ui.update { if (it.notice == OFFLINE_SEND_NOTICE) it.copy(notice = "") else it }
+    }
+    private suspend fun rememberOutbox(scope: Scope) = outboxLock.withLock {
+        val owner = scope.copy(session = "")
+        val ids = readOutbox(owner)
+        if (scope.session !in ids) app.cache.write(owner, OFFLINE_OUTBOX_KIND, JSONArray(ids + scope.session).toString(), true)
+    }
+    private suspend fun forgetOutbox(scope: Scope) = outboxLock.withLock {
+        val owner = scope.copy(session = "")
+        val ids = readOutbox(owner)
+        if (scope.session in ids) app.cache.write(owner, OFFLINE_OUTBOX_KIND, JSONArray(ids - scope.session).toString(), true)
+    }
+    /**
+     * P2-3: Hermes answers again. Every chat's "Not sent" messages go, open or not: the open chat's through its own queue, any other
+     * chat's here, each once (claimed before it goes, with its own submission id) and in order (the next waits until Hermes took the one before).
+     */
+    internal fun drainOfflineOutbox(openQueue: Boolean = true): Job? {
+        val owner = client?.scope?.copy(session = "") ?: return null
+        return viewModelScope.launch {
+            for (id in readOutbox(owner)) {
+                if (outboxClient(owner) == null) return@launch
+                val scope = owner.session(id)
+                // The open chat goes through its own queue; every other chat on its own, side by side. A chat already going keeps going.
+                if (sourceScope == scope) { if (openQueue) drainOpenQueue(); continue }
+                if (outboxSends[scope.key]?.isActive == true) continue
+                val job = viewModelScope.launch {
+                    try { if (!sendWaiting(owner, scope)) { forgetOutbox(scope); endOfflineNoticeWhenNothingWaits() } }
+                    catch (e: Throwable) { if (e is CancellationException) throw e }
+                }
+                outboxSends[scope.key] = job
+                job.invokeOnCompletion { if (outboxSends[scope.key] === job) outboxSends.remove(scope.key) }
+            }
+        }
+    }
+    /** The client of the account and profile [owner] while it is the current one (a reconnect gives a new one; a switch away ends the outbox's work). */
+    private fun outboxClient(owner: Scope): BeaconClient? = client?.takeIf { it.scope.copy(session = "") == owner }
+    /** Sends the waiting messages of [scope], a chat that is not open, one by one; true while some still wait (Hermes out of reach again, or the chat opened). */
+    private suspend fun sendWaiting(owner: Scope, scope: Scope): Boolean {
+        while (true) {
+            if (outboxClient(owner) == null || sourceScope == scope) return true
+            // Follow-up 5: a send of this chat whose answer was lost settles first; until it does, nothing behind it goes.
+            if (!askAgainSaved(owner, scope)) return true
+            // A chat stays listed while any of its "Not sent" messages still waits (behind one Hermes must settle first) or is going now.
+            var stillWaiting = false
+            val waiting = editSavedDraft(scope) { draft ->
+                stillWaiting = draft.queued.any { it.kind == "queue" && (it.waitingForConnection() || it.state == "sending") }
+                nextOfflineToSend(draft) to draft
+            } ?: return sourceScope == scope || stillWaiting
+            // As the open chat's queue does, a message goes only once the chat's reply is over (a Hermes without session authority refuses one
+            // sent into a running turn), so the next one waits for the one before it.
+            if (!awaitChatIdle(owner, scope)) return true
+            val c = outboxClient(owner)?.detached() ?: return true
+            // TURN's drain rule (chat join): the turn this message waited behind failed, and retrying does not help now. The messages that waited
+            // are held with its line, as the open chat holds them; only their Send releases them.
+            val hold = try { failedTurnHold(c.get("/api/session", mapOf("session_id" to scope.session)).let { it.optJSONObject("session") ?: it }.rows("messages")) }
+                catch (e: Throwable) { if (e is CancellationException) throw e; c.closeNative(); return true }
+            if (hold != null) {
+                c.closeNative()
+                editSavedDraft(scope) { draft -> Unit to draft.copy(queued = holdBehindFailedTurn(draft.queued, hold.first, hold.second)) }
+                return true
+            }
+            // Claimed first: "sending" is saved before it goes, so a restart never sends it a second time (a reopened chat asks Hermes instead).
+            val item = editSavedDraft(scope) { draft ->
+                val next = nextOfflineToSend(draft)?.takeIf { it.id == waiting.id }
+                next to (if (next == null) draft else draft.copy(queued = draft.queued.map { if (it.id == next.id) it.copy(state = "sending") else it }))
+            } ?: run { c.closeNative(); return true }
+            // Follow-up 5: saved before it goes, as the open chat's send is, so a lost answer (or a restart) can be asked about again under this identity.
+            val record = PendingSend.create(scope, Draft(item.text, attachments = item.attachments), item)
+            optionalLocalSave { app.cache.write(scope, "pending", record.encode(), true) }
+            var lostAnswer = false
+            var lostStaged = ""
+            sendsOnTheirWay += item.submissionId
+            val after = try {
+                val o = c.post("/api/chat/start", json("session_id" to scope.session, "message" to item.text, "attachments" to JSONArray(item.attachments), "profile" to scope.profile,
+                    "client_request_id" to item.submissionId, "model" to item.model.ifBlank { null }, "model_provider" to item.provider.ifBlank { null }, "queued_model_snapshot" to true))
+                if (o.string("status") == "unknown") item.copy(state = "unknown", admissionId = o.string("admission_id"))
+                else item.copy(state = "accepted", outcome = "", admissionId = o.string("admission_id"))
+            } catch (e: Throwable) {
+                if (e is CancellationException) throw e
+                val refused = refusedWithItsOwnWords(e)
+                if (!refused && (e is NativeTurnNotSent || requestNeverSent(e))) item.copy(state = "queued", outcome = OFFLINE_OUTCOME)
+                else if (refused) item.copy(state = "settled", outcome = NOT_SENT_OUTCOMES.first())
+                else {
+                    lostAnswer = answerLost(e)
+                    lostStaged = generateSequence(e) { it.cause }.take(8).filterIsInstance<NativeSubmitUnknown>().firstOrNull()?.staged?.takeIf { it.length() > 0 }?.toString().orEmpty()
+                    item.copy(state = "unknown")
+                }
+            } finally { c.closeNative(); sendsOnTheirWay -= item.submissionId }
+            // The record goes once Hermes answered either way; a lost answer keeps it (with its staged attachments) to be asked again the next time Hermes answers.
+            if (lostAnswer) { askedAgain[record.id] = reachEpoch; optionalLocalSave { app.cache.write(scope, "pending", record.copy(staged = lostStaged).encode(), true) } }
+            else optionalLocalSave { app.cache.delete(scope, "pending", record.encode()) }
+            // The chat may have opened meanwhile: its own queue then shows the outcome and settles it with Hermes.
+            // Follow-up 5: opened while this went, the chat restored its saved record as unconfirmed; asked now, Hermes' answer settles it.
+            if (sourceScope == scope) { updateQueued(scope, item.id) { if (it.id == item.id) after else it }; askAgainUnconfirmed(); return true }
+            // Hermes took it: it is the chat's now (its history shows it), so it leaves the box; any other outcome stays for the chat to settle.
+            editSavedDraft(scope) { draft -> Unit to draft.copy(queued = if (after.state == "accepted") draft.queued.filterNot { it.id == item.id } else draft.queued.map { if (it.id == item.id) after else it }) }
+            // Follow-up 3: Hermes took it, so this phone has a run in that chat it has not seen end, as after the open chat's send; opening the chat asks about it.
+            if (after.state == "accepted") optionalLocalSave { app.cache.write(scope, RUN_MARKER, item.submissionId) }
+            if (lostAnswer) return true
+            if (after.state != "accepted") return after.waitingForConnection()
+        }
+    }
+    /**
+     * Follow-up 5: the outbox's side of the ask. A chat that is not open and holds a saved send whose answer was lost asks Hermes once more under the
+     * same identity (once per time Hermes answers again). True when nothing waits on such a send any more.
+     */
+    private suspend fun askAgainSaved(owner: Scope, scope: Scope): Boolean {
+        val raw = app.cache.read(scope, "pending") ?: return true
+        val send = runCatching { PendingSend.decode(scope, raw) }.getOrNull() ?: return false
+        if (!askableAgain(send) || send.submissionId in sendsOnTheirWay || askedAgain[send.id] == reachEpoch) return false
+        askedAgain[send.id] = reachEpoch
+        val c = outboxClient(owner)?.detached() ?: return false
+        val answered = try {
+            if (!c.nativeSessionAuthority()) return false
+            c.post("/api/chat/start", askAgainBody(scope, send)).let { o ->
+                // Hermes holds it but its outcome is unknown: it stays unconfirmed (with its admission) until Hermes answers again.
+                if (o.string("status") != "unknown") true
+                else { optionalLocalSave { app.cache.write(scope, "pending", send.copy(admissionId = o.string("admission_id")).encode(), true) }; false }
+            }
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            // admission_conflict: Hermes holds a send under that id, so its own row is the message; anything else is lost again.
+            admissionConflict(e)
+        } finally { c.closeNative() }
+        if (!answered || sourceScope == scope) return false
+        // Hermes has it: the record and the box's copy go (its history shows the message), and opening the chat follows its reply.
+        app.cache.delete(scope, "pending", raw)
+        pending[scope.key]?.takeIf { it.id == send.id }?.let { pending.remove(scope.key, it) }
+        if (send.queued) editSavedDraft(scope) { draft -> Unit to draft.copy(queued = draft.queued.filterNot { it.id == send.id }) }
+        optionalLocalSave { app.cache.write(scope, RUN_MARKER, send.submissionId) }
+        return true
+    }
+    /**
+     * The chat [scope] has no reply running on Hermes. Asked again with a growing pause (3 s up to 30 s, at most [OUTBOX_IDLE_WAIT_MS]): a reply
+     * that runs long, or a state Hermes cannot name yet (a turn just settling), is waited out. False once Hermes is out of reach or the chat opened.
+     */
+    private suspend fun awaitChatIdle(owner: Scope, scope: Scope): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + OUTBOX_IDLE_WAIT_MS
+        var pause = 3_000L
+        while (true) {
+            if (sourceScope == scope) return false
+            val probe = outboxClient(owner)?.detached() ?: return false
+            // A look at the turn (WEDGE): a lost reply is closed only as lostCloseFor lets it (never while this chat's saved box holds the owner's
+            // messages), and a lost one ends the wait at once: the chat's own choice decides what goes next (R7).
+            val status = try { probe.recoveredNativeSessionStatus(scope.session, lostCloseFor(scope)) }
+                catch (e: Throwable) { if (e is CancellationException) throw e; return false }
+                finally { probe.closeNative() }
+            if (status == "idle") return true
+            if (status == "lost") return false
+            if (android.os.SystemClock.elapsedRealtime() > deadline) return false
+            delay(pause); pause = minOf(pause * 2, 30_000L)
+        }
+    }
+    /** Changes the saved draft of [scope], a chat that is not open, under the draft lock; null (nothing changed) once it is open. */
+    private suspend fun <T> editSavedDraft(scope: Scope, change: (Draft) -> Pair<T?, Draft>): T? = draftWriteLock.withLock {
+        if (sourceScope == scope) return@withLock null
+        val saved = drafts[scope.key] ?: app.cache.read(scope, draftKind(scope))?.let(Draft::decode) ?: return@withLock null
+        val (value, next) = change(saved)
+        if (next != saved) { val encoded = next.encode(); app.cache.write(scope, draftKind(scope), encoded, true); drafts[scope.key] = next; savedDraft(scope, encoded) }
+        value
+    }
+    /** D6: Hermes answers again (the network came back, or a reach check got through): a message waiting in the open chat's box goes now. */
+    private fun drainOpenQueue() {
+        val scope = sourceScope ?: return
+        val active = client ?: return
+        if (phoneQueueHead()?.state == "queued") drainQueued(scope, active)
+    }
+    /** D7: why a tap on Send would be refused now, or null when it sends. The button is off while this is not null; send() says the same line. */
+    internal fun sendRefusal(): String? = when {
+        !canonicalConversationReady(client?.scope ?: cachedOwnerScope, sourceScope, _chat.value.sessionId, _ui.value.tab == "Beacon", (client?.scope ?: cachedOwnerScope)?.let(::readBeaconSessionHandle),
+            _ui.value.beaconOpening, _ui.value.beaconError.isNotBlank(), preferences.value.assistantProfile) -> if (_ui.value.tab == "Beacon") "Open ${dev.hermes.android.data.currentAssistantName} first. Your draft is kept." else "Open a chat first."
+        _chat.value.raw.length() == 0 -> "Wait for this chat to load."
+        else -> null
     }
     private suspend fun acceptedWithoutRow(scope: Scope, result: JSONObject, send: PendingSend, request: ScopeSettlement) {
         if (!request.current()) return
@@ -4408,22 +6261,25 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             // A queued acceptance has no row yet; keep the sent files under the runtime and move them to
             // the persisted user row when its receipt settles (bindPersistedInput), so a reopen keeps them.
             val attachments = keptAttachmentReceipts(result, send.draft) ?: JSONArray()
-            val payload = json("attachments" to attachments, "display_text" to send.draft.text).toString()
-            result.string("stream_id").takeIf(String::isNotBlank)?.let { stream ->
-                optionalLocalSave { app.cache.write(scope, "attachments-pending:$stream", payload, true) }
-            }
+            val payload = attachmentRecord(attachments, send.draft.text, send.submissionId)
+            optionalLocalSave { app.cache.write(scope, pendingAttachmentsKind(send.submissionId), payload) }
             if (result.string("user_row_id").isNotBlank()) {
                 optionalLocalSave { app.cache.write(scope, "attachments:${result.optLong("user_row_id")}", payload) }
             }
         }
+        // Hermes admitted the message, row known or not, so it holds the sent files (file.attach answered before the submit): the copies kept on this phone go.
+        // An admission Hermes cancelled before it started goes back to the box as "Not sent" and keeps its files for the retry.
+        if (!(result.string("status") == "terminal" && result.string("outcome") in NOT_SENT_OUTCOMES)) releaseKeptFiles(scope, send.draft.attachments)
         check(deletePending(send)) { "The saved send receipt changed" }
         pending.remove(scope.key, send); sentComposerRevision.remove(scope.key)
         if (request.current() && _chat.value.uncertain == send.id) _chat.update { it.copy(uncertain = "", status = "") }
-        if (result.string("status") == "queued" && request.current() && foreground && streams[scope.key]?.isActive != true) {
+        if (result.string("status") == "queued" && request.current() && foreground && !followsHere(scope)) {
             val follower = client?.detached() ?: return
             try {
-                val answer = follower.recoveredNativeSession(scope.session) ?: return
-                if (request.current() && foreground && answer.second in setOf("working", "waiting") && streams[scope.key]?.isActive != true) {
+                val answer = follower.recoveredNativeSession(scope.session, lostCloseFor(scope)) ?: return
+                // Hermes holds the new message behind a reply its restart cut: the owner chooses to send it.
+                if (request.current() && foreground && answer.second == "lost") showLostChoice(scope)
+                if (request.current() && foreground && answer.second in setOf("working", "waiting") && !followsHere(scope)) {
                     optionalLocalSave { app.cache.write(scope, RUN_MARKER, send.submissionId) }
                     if (!request.current() || !foreground) return
                     _chat.update { it.copy(streamId = answer.first, status = "Working") }
@@ -4485,8 +6341,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             // return attachment_receipts; an image attached directly to the turn returns the row without
             // them, so the draft's own attachments keep the row's local display identity after a reopen.
             val attachments = keptAttachmentReceipts(result, send.draft) ?: JSONArray()
-            val payload = json("attachments" to attachments, "display_text" to sent.text).toString()
-            optionalLocalSave { app.cache.write(scope, "attachments-pending:${result.getString("stream_id")}", payload, true) }
+            val payload = attachmentRecord(attachments, sent.text, send.submissionId)
+            optionalLocalSave { app.cache.write(scope, pendingAttachmentsKind(send.submissionId), payload) }
+            // Hermes holds the sent files now (its own copies under attachments/); the copies kept on this phone go.
+            releaseKeptFiles(scope, send.draft.attachments)
             if (result.string("user_row_id").isNotBlank()) {
                 optionalLocalSave { app.cache.write(scope, "attachments:${result.optLong("user_row_id")}", payload) }
             }
@@ -4505,9 +6363,21 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val append = row.isNotBlank() && state.messages.none { it.id == row }
             state.copy(messages = if (append) state.messages + Message.from(confirmed, state.messages.size, scope.session) else state.messages,
                 raw = if (append) state.raw.copy().put("messages", JSONArray(state.raw.rows("messages") + confirmed)) else state.raw,
-                uncertain = "", streamId = result.getString("stream_id"), status = "Working", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList())
+                uncertain = "", streamId = result.getString("stream_id"), status = "Working", liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), liveSealedAt = emptyList(), liveBase = 0, liveBasePrompt = "", liveOrdinal = 0)
         }
         attachStream(c, scope, result.getString("stream_id"))
+    }
+    /**
+     * The large files kept on this phone for [items] (ChatAttachmentStore), once nothing here still needs them: Hermes holds them, or the message they belong to
+     * is gone. A file the composer, the saved draft or a message waiting in the box still lists stays (it is still to be sent).
+     */
+    private suspend fun releaseKeptFiles(scope: Scope, items: List<JSONObject>) {
+        val kept = items.filter { it.optBoolean("staged_file") }
+        if (kept.isEmpty()) return
+        val draft = drafts[scope.key] ?: try { app.cache.read(scope, draftKind(scope))?.let(Draft::decode) } catch (e: Exception) { if (e is CancellationException) throw e; return }
+        val inUse = ((if (sourceScope == scope) _attachments.value else emptyList()) + draft?.attachments.orEmpty() +
+            draft?.queued.orEmpty().filter { it.inBox() }.flatMap { it.attachments }).map { it.string("id") }.toSet()
+        withContext(Dispatchers.IO) { ChatAttachmentStore.deleteAll(kept.filter { it.string("id") !in inUse }) }
     }
     /** Hermes holds the prompt, whether its start was acknowledged or only found in history: the first-prompt markers, the receipt and the draft are done with. */
     private suspend fun promptDelivered(scope: Scope, send: PendingSend, response: JSONObject, accepted: Boolean, request: ScopeSettlement): Boolean {
@@ -4546,7 +6416,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val runtime = result.string("stream_id")
         return if (runtime.isBlank()) null else result to runtime
     }
-    private suspend fun reconcile(scope: Scope, c: BeaconClient) {
+    private suspend fun reconcile(scope: Scope, c: BeaconClient, quiet: Boolean = false) {
         val active = client ?: return
         val request = ScopeSettlement(scope, active, originGeneration, sessionGeneration)
         val send = pending[scope.key] ?: return
@@ -4583,6 +6453,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 }
             }
         }
+        if (quiet) return
         _chat.update { it.copy(uncertain = send.id, status = "") }
         notice("Tap your message to check it.")
     }
@@ -4607,6 +6478,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val generation = sessionGeneration; val origin = originGeneration; val active = client
         val owner = client?.scope ?: cachedOwnerScope
         val unknown = pending[scope.key] ?: return@launch
+        // Follow-up 5: Hermes is being asked about it under its own identity; its answer settles it first (a resend now could make it twice).
+        if (askJobs[unknown.id]?.isActive == true) return@launch
         if (scope.copy(session = "") != owner) { notice("Reopen this chat to check the message."); return@launch }
         if (resend && client == null) { notice("Reconnect before resending. Your draft is kept."); return@launch }
         try {
@@ -4634,7 +6507,158 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         _chat.update { it.copy(uncertain = "", status = "Draft kept") }
         if (resend) client?.let { drainQueued(scope, it) } else notice("Checked. Your draft is kept.")
     }
+    /**
+     * CHATQA-121 follow-up 5: the open chat's send whose answer was lost asks Hermes once more under the same identity, as Hermes' own CLI does
+     * (hermes_cli/gateway_queue.py submit_queued). Hermes answers with the admission it holds under that submission id (the first send arrived) or admits
+     * it once (it never did); the bubble then follows that admission like any accepted send. Hermes keeps an admission while its session lives (it is
+     * removed only when the session is deleted or swept whole: hermes_state_mutation_retirement.py retire_sessions), so the answer is Hermes' own. Once per
+     * time Hermes answers again or the chat is opened; never for a removed send, a Hermes without session authority or a payload that cannot be sent
+     * again unchanged (askableAgain). Lost again: "Not confirmed yet" until the next time.
+     */
+    private fun askAgainUnconfirmed(): Job? {
+        val scope = sourceScope ?: return null
+        val active = client ?: return null
+        val send = pending[scope.key]?.takeIf(::askableAgain) ?: return null
+        // Only a send known to be unconfirmed (never one whose first request is still on its way), once per time, never twice at once.
+        if (send.submissionId in sendsOnTheirWay || _chat.value.uncertain != send.id && !askedAgain.containsKey(send.id)) return null
+        if (askJobs[send.id]?.isActive == true || askedAgain[send.id] == reachEpoch) return null
+        askedAgain[send.id] = reachEpoch
+        val request = ScopeSettlement(scope, active, originGeneration, sessionGeneration)
+        return viewModelScope.launch(start = CoroutineStart.LAZY) {
+            val c = active.detached()
+            var handedOver = false
+            // Until Hermes answers, the send stays "Not confirmed yet" (today's bubble and choices, also on a Hermes that is not asked again).
+            var unconfirmed = true
+            try {
+                if (!c.nativeSessionAuthority()) return@launch
+                if (!request.current() || pending[scope.key] !== send) { unconfirmed = false; return@launch }
+                // While Hermes is asked, the bubble shows it going, as any send on its way (Remove waits for the answer, fix 4's rule for a send still going out).
+                _chat.update { if (it.uncertain == send.id) it.copy(status = "Sending") else it }
+                val o = c.post("/api/chat/start", askAgainBody(scope, send))
+                if (!request.current() || pending[scope.key] !== send) { unconfirmed = false; return@launch }
+                unconfirmed = o.string("status") == "unknown"
+                when (o.string("status")) {
+                    "queued" -> acceptedWithoutRow(scope, o, send, request)
+                    "terminal" -> {
+                        acceptedWithoutRow(scope, o, send, request)
+                        if (request.current()) {
+                            // The turn finished while the answer was lost: its rows (the message and the reply) are in Hermes' history now.
+                            val history = c.get("/api/session", mapOf("session_id" to scope.session))
+                            renderSession(history, scope)
+                            // Hermes' own row for this submission shows the message, so the phone's copy goes (never a second bubble); a turn that ended
+                            // before it started has no row, and its copy stays settled with Hermes' outcome.
+                            if (submissionRowId((history.optJSONObject("session") ?: history).rows("messages"), send.submissionId) != null) { updateQueued(scope, send.id) { null }; forgetPendingAttachments(scope, send.submissionId) }
+                            else updateQueued(scope, send.id) { it.copy(state = "settled", outcome = o.string("outcome")) }
+                            client?.let { drainQueued(scope, it) }
+                        }
+                    }
+                    "unknown" -> {
+                        if (send.queued) updateQueued(scope, send.id) { it.copy(state = "unknown", admissionId = o.string("admission_id")) }
+                        val unknown = send.copy(admissionId = o.string("admission_id"))
+                        savePending(unknown); pending[scope.key] = unknown
+                    }
+                    else -> { handedOver = true; accepted(scope, c, o, send, request) }
+                }
+            } catch (e: Throwable) {
+                if (e is CancellationException) { unconfirmed = false; throw e }
+                // Hermes holds a send under that id with another payload: its own row is the message, and nothing is sent again.
+                if (admissionConflict(e) && request.current() && pending[scope.key] === send) { unconfirmed = false; forgetAnsweredCopy(scope, send, c, request) }
+                // Otherwise the answer is lost again (or Hermes is out of reach): "Not confirmed yet" until Hermes answers again.
+            } finally {
+                if (unconfirmed && sourceScope == scope && request.current() && pending[scope.key]?.id == send.id) _chat.update { it.copy(uncertain = send.id, status = "") }
+                else if (sourceScope == scope && _chat.value.uncertain == send.id && _chat.value.status == "Sending") _chat.update { it.copy(status = "") }
+                if (!handedOver) c.closeNative()
+                askJobs.remove(send.id)
+            }
+        }.also { askJobs[send.id] = it; it.start() }
+    }
+    /** Follow-up 5: Hermes answered admission_conflict: it holds a send under this submission id, so its own row is the message. The phone's copy goes, nothing is sent again, and the chat reads Hermes' history. */
+    private suspend fun forgetAnsweredCopy(scope: Scope, send: PendingSend, c: BeaconClient, request: ScopeSettlement) {
+        if (!pending.remove(scope.key, send)) return
+        sentComposerRevision[scope.key]?.takeIf { it.first == send.id }?.let { sentComposerRevision.remove(scope.key) }
+        // Chat join (Root, rules15): the saved record and the box's copy go first, the bubble last, so a kill or a slow device between them never
+        // leaves a record behind that brings the copy back.
+        if (send.queued) updateQueued(scope, send.id) { null }
+        if (!deletePending(send)) app.cache.read(scope, "pending")
+            ?.takeIf { raw -> runCatching { PendingSend.decode(scope, raw).id == send.id }.getOrDefault(false) }
+            ?.let { raw -> app.cache.delete(scope, "pending", raw) }
+        forgetPendingAttachments(scope, send.submissionId)
+        if (sourceScope == scope && _chat.value.uncertain == send.id) _chat.update { it.copy(uncertain = "", status = "") }
+        if (request.current()) renderSession(c.get("/api/session", mapOf("session_id" to scope.session)), scope)
+    }
+    /** Follow-up 5: after an answer was lost, one look whether Hermes answers now (a dropped socket, not a lost network): then the send is asked again at once; otherwise the reach check asks when Hermes answers again. */
+    private fun lookForHermesAfterLostAnswer(origin: String) {
+        val active = client ?: return
+        viewModelScope.launch {
+            val c = active.detached()
+            val answered = try { c.get("/api/status"); true }
+            catch (e: Throwable) { if (e is CancellationException) throw e; HermesReach.failed(origin, e); false }
+            finally { runCatching { c.closeNative() } }
+            if (answered && client === active) { hermesAnsweredAgain(); drainOfflineOutbox() }
+        }
+    }
+    /**
+     * CHATQA-121 follow-up 4: "Remove this copy" on a send whose outcome is not known. The phone's copy goes at once and is never sent again:
+     * the bubble, the copy in the box (and any hold on it), the saved send record and the run marker it wrote, so a restart brings none of them
+     * back. If Hermes did take the message, its own row shows it, as any message of the chat (the phone keeps no copy to show twice).
+     */
+    fun removePendingSend() = viewModelScope.launch {
+        val scope = sourceScope ?: return@launch
+        val unknown = pending[scope.key] ?: return@launch
+        // Still going out: its outcome is not known yet, so there is no copy to remove.
+        if (_chat.value.uncertain == unknown.id && _chat.value.status == "Sending") return@launch
+        // From here nothing follows, checks or sends this copy.
+        if (!pending.remove(scope.key, unknown)) return@launch
+        sentComposerRevision[scope.key]?.takeIf { it.first == unknown.id }?.let { sentComposerRevision.remove(scope.key) }
+        // Chat join: no pause map here; the copy's hold (QueuedMessage.held) goes with the copy below.
+        // Chat join (Root, rules19): what is saved goes first and the bubble last, so an app that dies between them never wakes up with a removed
+        // message still saved, which fix 5's ask-again could send. A local delete takes milliseconds, so the bubble still goes at once.
+        try {
+            updateQueued(scope, unknown.id) { null }
+            if (!deletePending(unknown)) app.cache.read(scope, "pending")
+                ?.takeIf { raw -> runCatching { PendingSend.decode(scope, raw).id == unknown.id }.getOrDefault(false) }
+                ?.let { raw -> app.cache.delete(scope, "pending", raw) }
+            optionalLocalSave { app.cache.delete(scope, RUN_MARKER, unknown.submissionId) }
+            forgetPendingAttachments(scope, unknown.submissionId)
+        } catch (e: Throwable) {
+            if (e is CancellationException) throw e
+            // The copy is still saved: it stays this phone's unconfirmed send, on screen, for another Remove.
+            pending.putIfAbsent(scope.key, unknown)
+            if (sourceScope == scope) fail(e)
+            return@launch
+        }
+        // REVIEW-JOINB-121 P3-1: once nothing saved names the copy, its kept files go too (files still in the composer or another message stay).
+        releaseKeptFiles(scope, unknown.draft.attachments)
+        if (sourceScope == scope && _chat.value.uncertain == unknown.id) _chat.update { it.copy(uncertain = "", status = "") }
+    }
 
+    /**
+     * Delete withdrew [withdrawn] (admission id, words) from Hermes' queue and then could not finish: each goes back to this chat's queue on the
+     * phone (its own copy held again, or a new waiting message), so the owner's message is never lost silently. It waits there like any other.
+     */
+    private suspend fun restoreWithdrawn(scope: Scope, withdrawn: List<Pair<String, String>>) {
+        if (withdrawn.isEmpty()) return
+        if (sourceScope == scope) checkpointJob?.cancelAndJoin()
+        draftWriteLock.withLock {
+            val open = sourceScope == scope
+            val current = if (open) draft() else drafts[scope.key] ?: app.cache.read(scope, draftKind(scope))?.let(Draft::decode) ?: Draft()
+            var queued = current.queued
+            val back = mutableListOf<String>()
+            for ((admission, text) in withdrawn) {
+                val copy = queued.firstOrNull { admission.isNotBlank() && it.admissionId == admission }
+                val held = (copy?.heldAgain() ?: QueuedMessage(text).takeIf { text.isNotBlank() } ?: continue)
+                    .copy(held = dev.hermes.android.data.DELETE_KEPT_WAITING_ERROR)
+                queued = if (copy != null) queued.map { if (it === copy) held else it } else queued + held
+                back += held.id
+            }
+            // Held (as a failed turn's follow-up is, TURN-121's saved hold): no drain sends a handed-back message by itself; its row's Send does.
+            val next = current.copy(queued = queued)
+            val encoded = next.encode()
+            app.cache.write(scope, draftKind(scope), encoded, true)
+            drafts[scope.key] = next; savedDraft(scope, encoded)
+            if (open) _chat.update { it.copy(queued = queued) }
+        }
+    }
     private suspend fun updateQueued(scope: Scope, id: String, allowed: () -> Boolean = { true }, change: (QueuedMessage) -> QueuedMessage?): Boolean {
         val generation = sessionGeneration
         val origin = originGeneration
@@ -4659,8 +6683,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun steer(): Job = submitBusy(null, steer = true)
     private fun submitBusy(payload: String?, steer: Boolean): Job = viewModelScope.launch {
         if (!admitConversation()) return@launch
-        val active = client ?: run { notice("Reconnect before sending. Your draft is kept."); return@launch }
-        val scope = sourceScope ?: return@launch
+        val active = client ?: run { queueOffline(payload); return@launch }
+        // P3-5: as in send(), a tap with no open chat says why.
+        val scope = sourceScope ?: run { notice("Open a chat first."); return@launch }
         val state = _chat.value
         if (_attachmentPreparation.value.isNotEmpty() || state.uncertain.isNotBlank() || state.approval != null || state.clarification != null ||
             state.raw.optBoolean("read_only") || state.raw.optBoolean("is_read_only") || app.calls.state.value.active) {
@@ -4696,7 +6721,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (e is CancellationException) throw e
             if (sourceScope == scope && sessionGeneration == generation) {
                 _chat.update { it.copy(queued = it.queued.filterNot { q -> q.id == item.id }) }
-                notice("Couldn't save the message. Keep the draft open and try again.")
+                notice(if (draftStoreFull(e)) DRAFT_STORE_FULL_ERROR else "Couldn't save the message. Keep the draft open and try again.")
             }
             return@launch
         }
@@ -4738,7 +6763,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (save is CancellationException) throw save
                 if (sourceScope == scope && sessionGeneration == generation && originGeneration == origin && client === active) {
                     _chat.update { current -> current.copy(queued = current.queued.map { if (it.id == item.id) it.copy(state = if (notSent) "queued" else "unknown", kind = if (notSent) "queue" else it.kind) else it }) }
-                    notice("Couldn't save this change. Keep the chat open and check the message.")
+                    notice(if (draftStoreFull(save)) DRAFT_STORE_FULL_ERROR else "Couldn't save this change. Keep the chat open and check the message.")
                 }
                 return
             }
@@ -4752,7 +6777,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun steerQueued(id: String) = viewModelScope.launch {
         if (!admitConversation()) return@launch
         val active = client ?: run { notice("Reconnect before sending. Your draft is kept."); return@launch }
-        val scope = sourceScope ?: return@launch
+        val scope = sourceScope ?: run { notice("Open a chat first."); return@launch }
         val state = _chat.value
         if (state.uncertain.isNotBlank() || state.approval != null || state.clarification != null || state.raw.optBoolean("read_only") || state.raw.optBoolean("is_read_only") || app.calls.state.value.active) {
             notice("Wait for this chat to load, then try again."); return@launch
@@ -4775,7 +6800,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val scope = sourceScope ?: return@launch
         val item = _chat.value.queued.firstOrNull { it.id == id && it.inBox() } ?: return@launch
         try {
-            if (updateQueued(scope, item.id) { if (it.inBox()) null else it } && sourceScope == scope && _chat.value.queued.none { it.id == id }) clearQueueRetryPause(scope, id)
+            if (updateQueued(scope, item.id) { if (it.inBox()) null else it } && sourceScope == scope && _chat.value.queued.none { it.id == id })
+                releaseKeptFiles(scope, item.attachments)  // the message is gone, and so are the files kept for it
+            if (_chat.value.queued.none { it.id == id }) forgetPendingAttachments(scope, item.submissionId)
+            afterBoxShrank(scope)
         } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
     }
     fun removeUnresolvedLocalMessage(id: String) = viewModelScope.launch {
@@ -4783,10 +6811,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val item = _chat.value.queued.firstOrNull { it.id == id && it.state in setOf("accepted", "unknown", "settled") && pending[scope.key]?.id != it.id } ?: return@launch
         var removed = false
         try { updateQueued(scope, item.id) { if (it.state in setOf("accepted", "unknown", "settled") && pending[scope.key]?.id != it.id) { removed = true; null } else it }
-            if (removed && sourceScope == scope) {
-            if (_chat.value.queued.none { it.id == id }) clearQueueRetryPause(scope, id)
-            client?.let { drainQueued(scope, it) }
-        } }
+            // The copy and its files go whatever chat is open now (REVIEW-JOINB-121 P3-1); only the drain belongs to the open chat.
+            if (removed) { releaseKeptFiles(scope, item.attachments); forgetPendingAttachments(scope, item.submissionId) }
+            if (removed && sourceScope == scope) client?.let { drainQueued(scope, it) }
+        }
         catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
     }
     fun removeConfirmedLocalCopy(id: String) = viewModelScope.launch {
@@ -4797,11 +6825,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
     }
     private fun phoneQueueHead() = _chat.value.queued.firstOrNull { it.kind == "queue" && it.state !in setOf("sent", "settled") }
-    private fun pauseQueueRetry(scope: Scope, id: String) {
-        pausedQueueRetries.remove(scope.key); pausedQueueRetries[scope.key] = id
-        if (pausedQueueRetries.size > 16) pausedQueueRetries.remove(pausedQueueRetries.keys.first())
-    }
-    private fun clearQueueRetryPause(scope: Scope, id: String) { if (pausedQueueRetries[scope.key] == id) pausedQueueRetries.remove(scope.key) }
     /** A steer bubble whose saved row is now known stops being a second copy: it takes the row's identity and the history row is the one shown. */
     private suspend fun pairSteerCopies(scope: Scope, proofUserRows: List<Long>, rows: List<JSONObject>, current: () -> Boolean) {
         for ((id, row) in steerRowPairs(_chat.value.queued, proofUserRows, rows)) {
@@ -4810,13 +6833,24 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
     }
     private suspend fun pairAcceptedCopies(scope: Scope, rows: List<JSONObject>, current: () -> Boolean) {
+        // Hermes' own stamp first: that row is the copy's, the chat shows it in place of the copy, and the copy keeps its state for the turn's receipt.
+        for ((id, row) in submittedRowPairs(_chat.value.queued, rows)) {
+            if (!current()) return
+            val item = _chat.value.queued.firstOrNull { it.id == id } ?: continue
+            var named = false
+            updateQueued(scope, id, current) { q -> namedCopy(q, row).also { named = it !== q } }
+            if (!named || !current()) continue
+            keepLinkedAttachments(scope, item, row, current)
+            // Hermes' saved row holds the sent files now (its own copies under attachments/): the copies kept on this phone go, as when a send is accepted with its row.
+            releaseKeptFiles(scope, item.attachments)
+        }
         for ((id, row) in acceptedRowPairs(_chat.value.queued, rows)) {
             if (!current()) return
             val item = _chat.value.queued.firstOrNull { it.id == id } ?: continue
             // Only the call whose change really paired the copy keeps its pictures: updateQueued also says true for a copy a concurrent pass had already paired.
             var paired = false
             updateQueued(scope, id, current) { q -> pairedCopy(q, row).also { paired = it !== q } }
-            if (paired && current()) keepLinkedAttachments(scope, item, row, current)
+            if (paired && current()) { keepLinkedAttachments(scope, item, row, current); forgetPendingAttachments(scope, item.submissionId) }
         }
     }
     private suspend fun bindPersistedInput(scope: Scope, given: QueuedMessage, receipt: JSONObject, rows: List<JSONObject>, current: () -> Boolean): String? {
@@ -4833,10 +6867,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val ids = item.attachments.map { it.string("id") }.filter(String::isNotBlank).toSet()
             _chat.update { state -> releasedAttachmentChat(state, current, wrongRow, ids) }
         }
+        // Follow-up 6: the send's own record (by its submission id) goes to the row Hermes linked it to. A 1.2.0 record (by chat stream) moves only when it is exactly this send's.
         val stream = receipt.string("stream_id")
-        if (stream.isNotBlank()) app.cache.read(scope, "attachments-pending:$stream")?.let { attachment ->
-            app.cache.write(scope, "attachments:$linked", attachment); app.cache.delete(scope, "attachments-pending:$stream")
-        }
+        val own = app.cache.read(scope, pendingAttachmentsKind(item.submissionId))
+        val legacy = stream.takeIf(String::isNotBlank)?.let { app.cache.read(scope, legacyPendingAttachmentsKind(it)) }
+        pendingRecordForRow(own, legacy, item, rows.firstOrNull { it.string("row_id", it.string("_row_id")) == linked })?.let { app.cache.write(scope, "attachments:$linked", it) }
+        forgetPendingAttachments(scope, item.submissionId, stream)
         keepLinkedAttachments(scope, item, linked, current)
         val final = receipt.optJSONObject("_confirmed_persisted_turn")?.string("final_assistant_row_id").orEmpty()
         if (current() && final.isNotBlank() && rows.any { it.string("row_id", it.string("_row_id")) == final && it.string("role") == "assistant" }) {
@@ -4846,6 +6882,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         return linked
     }
+    /** Follow-up 6: the files kept for a send that has no row (removed, not sent, lost, or its row is linked) are dropped, with a 1.2.0 record of the same chat stream. */
+    private suspend fun forgetPendingAttachments(scope: Scope, submissionId: String, stream: String = "") {
+        if (submissionId.isNotBlank()) optionalLocalSave { app.cache.delete(scope, pendingAttachmentsKind(submissionId)) }
+        if (stream.isNotBlank()) optionalLocalSave { app.cache.delete(scope, legacyPendingAttachmentsKind(stream)) }
+    }
     /** The sent photos and files of [item] stay with the saved row [linked]: their small pictures are kept for a reopen and shown in the row at once. */
     private suspend fun keepLinkedAttachments(scope: Scope, item: QueuedMessage, linked: String, current: () -> Boolean) {
         val display = withContext(Dispatchers.Default) { withKeptThumbnails(JSONArray(item.attachments.map { it.copy() }), item.attachments, ::attachmentThumbnail) }
@@ -4853,7 +6894,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             // The queued item itself is the exact send for this admission; keep its display attachments
             // under the settled row even when the acceptance receipt did not carry a pending attachment
             // record (no media payload: just name/mime/identity for rendering after a reopen).
-            optionalLocalSave { app.cache.write(scope, "attachments:$linked", json("attachments" to display, "display_text" to item.text).toString()) }
+            optionalLocalSave { app.cache.write(scope, "attachments:$linked", attachmentRecord(display, item.text, item.submissionId)) }
             val shown = (0 until display.length()).mapNotNull { display.optJSONObject(it) }
             // The attachment cache saves on IO, so selection may change across that suspension; the mutation
             // itself re-checks the caller's existing current predicate.
@@ -4884,13 +6925,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         fun matches(q: QueuedMessage) = q.id == item.id && q.submissionId == item.submissionId && q.kind == item.kind && q.admissionId == item.admissionId
         val byWords = item.state == "sent" && item.outcome == PAIRED_BY_WORDS
         fun eligible() = foreground && request.current() && pending[scope.key]?.id != item.id &&
-            (!automatic || pending[scope.key] == null && (if (item.state == "settled" || byWords) streams[scope.key]?.isActive != true else phoneQueueHead()?.id == item.id)) &&
+            (!automatic || pending[scope.key] == null && (if (item.state == "settled" || byWords) !followsHere(scope) else phoneQueueHead()?.id == item.id)) &&
             _chat.value.queued.any { matches(it) && refreshableCopy(item, it, automatic) }
         val c = active.detached()
         try {
             val (receipt, runtime) = admissionReceipt(c, scope, item.submissionId, item.admissionId, completedProof = true) ?: return
             currentCoroutineContext().ensureActive()
             if (!eligible()) return
+            // A reply Hermes lost in a restart holds this message (or is it): close that turn first; the next check reads what Hermes made of it.
+            if (receipt.optBoolean("lost_turn")) { recoverLostTurn(scope); return }
+            if (_chat.value.lostWaiting && sourceScope == scope) _chat.update { it.copy(lostWaiting = false) }
             val status = receipt.string("status")
             val state = when (status) { "queued", "started" -> "accepted"; "terminal" -> "settled"; else -> "unknown" }
             val outcome = if (state == "settled") receipt.string("outcome") else ""
@@ -4924,7 +6968,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
             fun canFollow() = status == "started" && item.kind == "queue" && foreground && request.current() &&
                 pending[scope.key] == null && phoneQueueHead()?.let { matches(it) && it.state == "accepted" } == true &&
-                !app.calls.state.value.active && _chat.value.streamId.isBlank() && streams[scope.key]?.isActive != true
+                !app.calls.state.value.active && _chat.value.streamId.isBlank() && !followsHere(scope)
             if (!canFollow()) return
             try { app.cache.write(scope, RUN_MARKER, item.submissionId) }
             catch (e: Exception) { if (e is CancellationException) throw e; if (foreground && request.current()) notice("Couldn't save a local copy. Refresh before leaving.") }
@@ -4951,7 +6995,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             updateQueued(scope, item.id) { current ->
                 if (current.state in setOf("accepted", "unknown") && pending[scope.key]?.id != id) { held = true; current.heldAgain() } else current
             }
-            if (held && sourceScope == scope && client === active) { clearQueueRetryPause(scope, id); drainQueued(scope, active) }
+            if (held && sourceScope == scope && client === active) drainQueued(scope, active)
         } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
     }
     /**
@@ -4963,23 +7007,39 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val active = client ?: run { notice("Reconnect before sending. Your draft is kept."); return }
         val item = _chat.value.queued.firstOrNull { it.id == id } ?: return
         if (item.state == "queued") {
-            clearQueueRetryPause(scope, id)
             val state = _chat.value
             val blocked = queueSendBlockedNotice(app.calls.state.value.active, state.approval != null, state.clarification != null, state.uncertain.isNotBlank(),
                 state.streamId.isNotBlank() || state.liveText.isNotBlank() || state.liveTools.isNotEmpty(), phoneQueueHead()?.state)
             if (blocked != null) { notice(blocked); return }
-            drainQueued(scope, active, explicit = true)
+            // One whose file could not get through goes once more on this tap: it is a waiting message again (CHAT-121 follow-up 9).
+            if (item.fileNotSent()) viewModelScope.launch {
+                try {
+                    linkFailures.remove(item.submissionId)
+                    updateQueued(scope, id) { if (it.fileNotSent()) it.copy(outcome = "") else it }
+                    if (sourceScope == scope && client === active) drainQueued(scope, active, explicit = true)
+                } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
+            }
+            else drainQueued(scope, active, explicit = true)
         }
         else if (item.notSent()) viewModelScope.launch {
             var held = false
             try {
                 updateQueued(scope, id) { if (it.notSent()) { held = true; it.heldAgain() } else it }
-                if (held && sourceScope == scope && client === active) { clearQueueRetryPause(scope, id); drainQueued(scope, active, explicit = true) }
+                if (held && sourceScope == scope && client === active) drainQueued(scope, active, explicit = true)
             } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
         }
     }
     /** The words of the message the phone sent and could not confirm (a send with no copy in the queue); the chat shows them as its unconfirmed bubble. */
     fun pendingSendText(): String = sourceScope?.let { pending[it.key] }?.draft?.text.orEmpty()
+    /** D10: the composer still shows the words of the direct send in flight (the moment between the tap and the receipt). The field shows them as empty. */
+    internal fun heldBySend(): Boolean {
+        val send = sourceScope?.let { pending[it.key] } ?: return false
+        val chat = _chat.value
+        return !send.queued && chat.uncertain == send.id && chat.status == "Sending" && _composer.value.text == send.draft.text &&
+            _attachments.value.map { it.toString() } == send.draft.attachments.map { it.toString() }
+    }
+    /** What a quote, dictation or share adds to: the composer, without the words a send is taking (they must never go a second time). */
+    internal fun composerBase(): String = if (heldBySend()) "" else _composer.value.text
     fun editQueued(id: String) = viewModelScope.launch {
         val scope = sourceScope ?: return@launch
         val generation = sessionGeneration; val origin = originGeneration; val active = client
@@ -5000,7 +7060,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 _composer.value = TextFieldValue(item.text, TextRange(item.text.length)); _attachments.value = item.attachments
                 _chat.update { it.copy(queued = it.queued.filterNot { q -> q.id == item.id }) }; composerRevision++
             }
-            if (sourceScope == scope && _chat.value.queued.none { it.id == id }) clearQueueRetryPause(scope, id)
+            forgetPendingAttachments(scope, item.submissionId)
+            afterBoxShrank(scope)
             if (sourceScope == scope && sessionGeneration == generation && originGeneration == origin && client === active) checkpointNow()
         } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) }
     }
@@ -5014,15 +7075,23 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             if (!ready()) return@launch
             val item = phoneQueueHead()?.takeIf { it.state == "queued" } ?: return@launch
-            if (pausedQueueRetries[scope.key] == item.id) return@launch
+            // TURN's hold waits for an explicit Send; a file that could not get through goes only after its row's Send cleared fileNotSent (CHAT-121 fu9).
+            if (passiveDrainSkips(item, explicit) || item.fileNotSent()) return@launch
             val probe = active.detached()
             var unreachable = false
-            val idle = try {
-                probe.recoveredNativeSessionStatus(scope.session) == "idle"
-            } catch (e: Throwable) { if (e is CancellationException) throw e; unreachable = true; false }
+            // A queued message waiting behind a reply Hermes lost in a restart goes only on the owner's Send ([explicit]); otherwise the chat offers it.
+            val status = try { probe.recoveredNativeSessionStatus(scope.session, if (explicit) LostTurnClose.Decided else LostTurnClose.Never) }
+            catch (e: Throwable) { if (e is CancellationException) throw e; unreachable = true; null }
             finally { probe.closeNative() }
+            val idle = status == "idle"
+            if (unreachable && !explicit && current() && item.waitingForConnection() && item.submissionId in linkFailures) linkTryFailed(scope, active, item)
+            // The owner's Send closed the lost reply (Decided): WEDGE's choice is answered too (R2).
+            if (explicit && idle && current()) _chat.update { if (it.lostWaiting) it.copy(lostWaiting = false) else it }
+            if (status == "lost" && current()) showLostChoice(scope)
             if (!idle && explicit && current()) notice(if (unreachable) "Reconnect before sending. Your draft is kept." else "Wait for the current reply first.")
             if (!idle || !ready()) return@launch
+            // The owner's Send: every hold is released before the head goes (a passive drain never gets here with a held head).
+            if (explicit) for (held in _chat.value.queued.filter { it.held.isNotBlank() }) updateQueued(scope, held.id) { releaseHolds(listOf(it)).single() }
             val head = phoneQueueHead()?.takeIf { it.id == item.id && it.submissionId == item.submissionId && it.state == "queued" } ?: return@launch
             send(head).join()
         }
@@ -5033,22 +7102,47 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun cancel() = viewModelScope.launch {
         val c = client ?: return@launch
         val stream = _chat.value.streamId
+        // TURN-121: the interrupt that follows is this phone's Stop (interruptedTurnLine). A Stop that brings no interrupt frame (a lost reply
+        // closed, or a cancel that failed) drops its mark, so a later restart on this runtime still reads as one (R6, TF-P3-3).
+        val stopMark = sourceScope?.let { "${it.key}:$stream" }
+        stopMark?.let { stopsSentHere += it }
         notice("Stopping…")
         try {
-            c.get("/api/chat/cancel", mapOf("stream_id" to stream))
+            val stopped = c.get("/api/chat/cancel", mapOf("stream_id" to stream) + if (boxHoldsWaiting(_chat.value.queued)) mapOf("waiting" to "1") else emptyMap())
+            if (stopped.string("stopped") in setOf("lost_turn", "lost_waiting")) stopMark?.let { stopsSentHere -= it }
+            // Stop on a reply Hermes lost in a restart closed it: show the chat as Hermes now has it (idle, or the next message running).
+            if (stopped.string("stopped") == "lost_turn") {
+                notice("")
+                sourceScope?.let { scope -> _chat.update { if (it.streamId == stream) it.copy(streamId = "", status = "") else it }; recoverLostTurn(scope, known = false, fresh = true) }
+                return@launch
+            }
+            // With the owner's messages waiting behind it, Stop starts none of them: the chat offers the choice.
+            if (stopped.string("stopped") == "lost_waiting") { notice(""); sourceScope?.let { showLostChoice(it, stream) }; return@launch }
             if (stream.isBlank() || _chat.value.streamId != stream) notice("")
         } catch (e: Throwable) {
+            stopMark?.let { stopsSentHere -= it }
             notice("")
             if (e is CancellationException) throw e
             fail(e)
         }
     }
     /** Hermes' status for this conversation's turn, asked once on a connection of its own; null when it cannot be read. */
-    private suspend fun turnStatus(c: BeaconClient, session: String): String? {
+    private suspend fun turnStatus(c: BeaconClient, scope: Scope): String? {
         val probe = c.detached()
-        return try { probe.recoveredNativeSessionStatus(session) }
+        return try { probe.lookAtTurn(scope, lostCloseFor(scope))?.second }
         catch (e: Throwable) { if (e is CancellationException) throw e; null }
         finally { probe.closeNative() }
+    }
+    /**
+     * REVIEW-JOIN-121 P3-1 (Root msg_e2127e2ea974): each line goes on what proves it. "Reconnecting…" is about the link: a new subscription ends it
+     * ([linkLineBack]). "Couldn't check the reply · your messages are kept" is about the turn: only Hermes' answer about the turn ends it, with the
+     * link line ([turnLineBack]); a subscription alone does not say the turn still runs.
+     */
+    private fun linkLineBack(scope: Scope, stream: String) {
+        if (sourceScope == scope) _chat.update { if (it.streamId == stream && it.status == "Reconnecting…") it.copy(status = "Working") else it }
+    }
+    private fun turnLineBack(scope: Scope, stream: String) {
+        if (sourceScope == scope) _chat.update { if (it.streamId == stream && it.status in LINK_WAIT_LINES) it.copy(status = "Working") else it }
     }
     /** False when the chat is not in a state to follow a stream (the app is in the background, or another account is signed in); nothing was started then. */
     private fun attachStream(source: BeaconClient, scope: Scope, stream: String, terminalAlreadyObserved: Boolean = false, quietMs: Long = streamSilenceMs): Boolean {
@@ -5057,13 +7151,17 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val followedSubmission = _chat.value.takeIf { sourceScope == scope }?.raw?.string("_display_submission_id").orEmpty()
         // A stream that has already accepted the end of this send's turn settles it itself (it is reading the saved chat now): a second attach would replace it and then wait for an end that was delivered once.
         val ended = frameEndedTurn(liveFrames["${scope.key}:$stream"], followedSubmission)
-        if (ended && streams[scope.key]?.isActive == true) {
+        if (ended && followsHere(scope)) {
             if (source !== client && streamClients.values.none { it === source }) source.closeNative()
             return true
         }
         val c = source.detached()
         if (c.scope != scope.copy(session = "") || client?.scope != c.scope) { c.closeNative(); return false }
         streams[scope.key]?.cancel()
+        // rules24 (G6b restart 17): the runtime id is the same for every turn, so its boundary and saved-turn proof are this attach's own. They come from the
+        // frame it restores below, else start fresh: a cut turn's (left by the look that settled it) made a read with nothing running end the next turn's stream.
+        "${scope.key}:$stream".let { liveBoundaries.remove(it); persistedTurns.remove(it) }
+        streamSubmissions[scope.key] = followedSubmission
         streamClients[scope.key] = c; streamStarts[scope.key] = request
         streams[scope.key] = viewModelScope.launch {
             val streamJob = currentCoroutineContext()[Job]
@@ -5078,21 +7176,30 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val cursor = ReplayCursor(stream, last)
             var lastCheckpoint = 0L
             var retry = 0
+            // rules27b: this job's stream dropped at least once; its next subscription asks Hermes what it waits on when no card shows (the look before it
+            // may not have reached Hermes, or a render that raced it skipped it).
+            var droppedOnce = false
             var terminalError = ""
             var terminalObserved = false
             var terminalReplyVisible = false
             var completion: JSONObject? = null
+            var listedOnFirstEvent = false
             var heardAt = android.os.SystemClock.elapsedRealtime()
             val quiet = QuietWindow(streamSilenceMs, quietMs)
             var silence: Job? = null
+            // Reads of the saved chat for a turn whose copy has no saved row yet (readAdmittedRow), and when each admission's last one began; they end before the turn's end is settled.
+            val rowReads = mutableListOf<Job>()
+            val rowReadAt = mutableMapOf<String, Long>()
             try {
                 // A frame saved at the end of the turn (its cursor is the end) describes a finished turn: there is nothing to wait for, only to settle it from the saved chat.
                 // The frame belongs to the runtime, not to one turn: its end counts only for the turn this chat follows (a frame filtered for a chat with no submission of its own could be an earlier turn's).
                 // The chat keeps the id of its own failed turn and that turn left its frame, so a frame that names the chat's id can still be an earlier turn's: Hermes decides (only idle ends it).
                 // The question is a network round trip, so it is asked inside this try: a cancel while it waits still runs the cleanup below.
                 val frameSaysEnded = !terminalAlreadyObserved && frameEndedTurn(frame, followedSubmission)
-                val savedFrame = if (frameSaysEnded) savedTerminalFrame(turnStatus(c, scope.session)) else null
+                val savedFrame = if (frameSaysEnded) savedTerminalFrame(turnStatus(c, scope)) else null
                 val alreadyEnded = terminalAlreadyObserved || savedFrame == SavedTerminalFrame.Ended
+                // The turn ended by Hermes' idle answer, not by its own end event: a lone lost reply a look closed settles this way.
+                var endedByLook = alreadyEnded
                 // A newer turn Hermes reports is not the frame's: only the cursor is kept, never the failed turn's text, reasoning, tools, boundary or error.
                 val live = restoredFrame(frame, savedFrame)
                 terminalError = live?.string("error").orEmpty()
@@ -5100,11 +7207,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (live != null) liveBoundaries[frameKey] = LiveAssistantBoundary.from(live)
                 // A checkpoint can be older than the history read since: what that history holds does not come back.
                 if (live != null && sourceScope == scope) _chat.update { chat ->
-                    val restored = chat.copy(liveText = live.string("text"), liveReasoning = live.string("reasoning"), liveTools = live.rows("tools"), liveSealed = sealedFromFrame(live), streamId = stream)
+                    val restored = chat.copy(liveText = live.string("text"), liveReasoning = live.string("reasoning"), liveTools = live.rows("tools"), liveSealed = sealedFromFrame(live), liveSealedAt = sealedPlacesFromFrame(live), liveBase = live.optInt("base"), liveBasePrompt = live.optString("base_prompt"), liveOrdinal = live.optInt("ordinal"), streamId = stream,
+                        status = statusAfterRestore(chat.status, live))
                     if (restored.raw.has("messages")) withoutSavedLive(restored, restored.raw.rows("messages"), LiveAssistantBoundary.from(live)) else restored
                 }
                 if (live != null && sourceScope == scope && _chat.value.raw.has("messages") && _chat.value.raw.string("active_stream_id") == stream) renderSession(_chat.value.raw, scope)
-                if (terminalError.isNotBlank() && sourceScope == scope) _ui.update { it.copy(error = terminalError) }
+                if (terminalError.isNotBlank() && sourceScope == scope) _ui.update { it.copy(error = turnErrorHeadline(terminalError)) }
                 // A silent stream asks Hermes instead of waiting forever; only for the open chat, and less often while a long turn stays quiet.
                 heardAt = android.os.SystemClock.elapsedRealtime()
                 if (!alreadyEnded) silence = launch {
@@ -5112,12 +7220,21 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     while (!terminalObserved) {
                         delay(streamWatchMs)
                         if (sourceScope != scope || android.os.SystemClock.elapsedRealtime() - heardAt < quiet.ms) continue
-                        val status = turnStatus(c, scope.session)
+                        val status = turnStatus(c, scope)
                         when (silentStreamAction(status)) {
                             SilentStream.Settle -> attachStream(c, scope, stream, terminalAlreadyObserved = true)
-                            SilentStream.Resubscribe -> attachStream(c, scope, stream, quietMs = quiet.stretched())
-                            // Only Hermes' own answer stretches the window; a probe that failed checks again at the same pace.
-                            SilentStream.Wait -> { heardAt = android.os.SystemClock.elapsedRealtime(); if (status != null) quiet.stretch(); continue }
+                            SilentStream.Resubscribe -> { turnLineBack(scope, stream); attachStream(c, scope, stream, quietMs = quiet.stretched()) }
+                            // Only Hermes' own answer stretches the window; a probe that failed checks again at the same pace. CHAT-121 follow-up 11: a quiet
+                            // stream that cannot even ask Hermes is not left silent on a running turn: the chat says it is reconnecting until Hermes answers.
+                            SilentStream.Wait -> {
+                                heardAt = android.os.SystemClock.elapsedRealtime()
+                                // REVIEW-JOIN-121 P3-1: Hermes answered, so the link works; a line a failed check left goes.
+                                if (status != null) { quiet.stretch(); turnLineBack(scope, stream) }
+                                else if (sourceScope == scope) _chat.update { if (it.streamId == stream) it.copy(status = "Reconnecting…") else it }
+                                continue
+                            }
+                            // The followed reply will never end: the chat offers the choice, and this stream job ends.
+                            SilentStream.Lost -> { showLostChoice(scope, stream); streamJob?.cancel() }
                         }
                         return@launch
                     }
@@ -5125,21 +7242,45 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 while (isActive && !terminalObserved) {
                     try {
                         heardAt = android.os.SystemClock.elapsedRealtime()
-                        c.nativeStream("/api/chat/stream", mapOf("stream_id" to stream, "session_id" to scope.session, "replay" to "1"), cursor.lastId) { event ->
+                        val resumedFrom = cursor.lastId
+                        // rules27 (backlog 18): once subscribed, the link works, so a "Reconnecting…" this stream left is cleared. A card it may have missed comes
+                        // back through the look that found the turn waiting ([lookAtTurn]), or, after a drop, through this subscription.
+                        val opened: suspend () -> Unit = {
+                            linkLineBack(scope, stream)
+                            if (sourceScope == scope && droppedOnce && resumedFrom.isNotBlank() && _chat.value.approval == null && _chat.value.clarification == null) launch { pollPrompts(c, scope) }
+                        }
+                        c.nativeStream("/api/chat/stream", mapOf("stream_id" to stream, "session_id" to scope.session, "replay" to "1"), resumedFrom, opened) { event ->
                             if (!request.current()) return@nativeStream
                             heardAt = android.os.SystemClock.elapsedRealtime()
                             if (cursor.accept(event)) {
                                 quiet.heard()
                                 if (event.type in setOf("done", "error")) terminalObserved = true
-                                if (event.type == "done" && event.payload().string("status") == "interrupted") terminalError = "Interrupted"
+                                if (event.type == "done" && event.payload().string("status") == "interrupted") terminalError = interruptedTurnLine(event.payload(), stopsSentHere.remove("${scope.key}:$stream"))
                                 if (event.type in setOf("apperror", "error")) terminalError = turnErrorText(event.payload())
                                 retry = 0
                                 if (event.type == "done") completion = event.payload()
                                 if (_chat.value.queued.any { it.queuedBehindAnotherTurn() }) markOwnTurnStarted(scope, event, request)
+                                ownTurnWithoutRow(scope, event)?.let { admission ->
+                                    // The turn's first frame reads at once and a few times after; while the copy still has no row, a later frame reads once more, spaced, never two at a time.
+                                    val now = android.os.SystemClock.elapsedRealtime()
+                                    val last = rowReadAt[admission]
+                                    if (last == null || now - last >= ADMITTED_ROW_AGAIN_MS && rowReads.none { it.isActive }) {
+                                        rowReadAt[admission] = now
+                                        rowReads += launch { readAdmittedRow(c, scope, admission, request, if (last == null) ADMITTED_ROW_READS_MS else listOf(0L)) }
+                                    }
+                                }
+                                // rules24 (b): while its reply streams the chat stays bound to it; a read that blanked the stream id without an end does not unbind it.
+                                if (sourceScope == scope && _chat.value.streamId.isBlank() && streams[scope.key] === streamJob && ownsCompletion()) _chat.update { if (it.streamId.isBlank()) it.copy(streamId = stream) else it }
                                 applyEvent(scope, event)
+                                // REVIEW-FIXCHAT-121 P1: a reconcile (a cut-short replay, an epoch change, a gap) is the only time frames were missed, a
+                                // card Hermes settled meanwhile among them: Hermes' cards are read then, whatever shows. The two "no card" reads stay gated.
+                                if (event.type == "state_saved" && sourceScope == scope) launch { pollPrompts(c, scope) }
+                                // D4: the turn's first event means Hermes holds the chat: History and the share sheet's saved list are read again once
+                                // (native Hermes sends state_saved only with a reconciliation, so it cannot be the signal).
+                                if (!listedOnFirstEvent && sourceScope == scope) { listedOnFirstEvent = true; refreshSessions() }
                                 if (sourceScope == scope) {
                                     val state = _chat.value
-                                    val progress = (liveBoundaries[frameKey] ?: LiveAssistantBoundary()).saveInto(json("cursor" to cursor.lastId, "text" to state.liveText, "reasoning" to state.liveReasoning, "tools" to JSONArray(state.liveTools), "sealed" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.liveSealed), "error" to terminalError, "terminal" to terminalObserved, "submission_id" to state.raw.string("_display_submission_id")))
+                                    val progress = (liveBoundaries[frameKey] ?: LiveAssistantBoundary()).saveInto(json("cursor" to cursor.lastId, "text" to state.liveText, "reasoning" to state.liveReasoning, "tools" to JSONArray(state.liveTools), "sealed" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.liveSealed), "sealed_at" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.sealedPlaces()), "ordinal" to state.liveOrdinal, "base" to state.liveBase, "base_prompt" to state.liveBasePrompt, "error" to terminalError, "terminal" to terminalObserved, "wait" to savedWaitLine(state.status), "submission_id" to state.raw.string("_display_submission_id")))
                                     liveFrames[frameKey] = progress
                                     val now = android.os.SystemClock.elapsedRealtime()
                                     if (now - lastCheckpoint >= 200 || event.type in setOf("done", "state_saved") || event.terminal) { app.cache.write(scope, "live:$stream", progress.toString()); lastCheckpoint = now }
@@ -5151,6 +7292,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
                         if (streamClients[scope.key] === c && _securePrompt.value?.scope == scope) releaseSecurePrompt(scope)
                         if (sourceScope == scope) _chat.update { it.copy(status = "Reconnecting…") }
+                        droppedOnce = true
                     }
                     if (terminalObserved) break
                     var active: String? = null
@@ -5164,19 +7306,21 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                             ?.takeIf { it.matches(streamIdPattern) }
                         if (!active.isNullOrBlank() && active != stream) {
                             liveFrames.remove(frameKey); liveBoundaries.remove(frameKey); persistedTurns.remove(frameKey); app.cache.delete(scope, "live:$stream")
-                            if (sourceScope == scope) _chat.update { it.copy(streamId = active, liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), status = "Working") }
+                            if (sourceScope == scope) _chat.update { it.copy(streamId = active, liveText = "", liveReasoning = "", liveTools = emptyList(), liveSealed = emptyList(), liveSealedAt = emptyList(), liveBase = 0, liveBasePrompt = "", liveOrdinal = 0, status = "Working") }
                             attachStream(c, scope, active)
                             return@launch
                         }
                     } catch (e: Throwable) {
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
                     }
-                    val liveStatus = try { c.recoveredNativeSessionStatus(scope.session) }
+                    val liveStatus = try { c.lookAtTurn(scope, lostCloseFor(scope))?.second }
                     catch (e: Throwable) {
                         if (e is CancellationException || e is ApiFailure && e.status in setOf(401, 403)) throw e
                         null
                     }
-                    if (liveStatus == "idle") { terminalObserved = true; break }
+                    if (liveStatus == "idle") { terminalObserved = true; endedByLook = true; break }
+                    // The followed reply was lost in a restart and the owner's messages wait behind it: this job has nothing left to follow.
+                    if (liveStatus == "lost") { showLostChoice(scope, stream); break }
                     if (sourceScope == scope) _chat.update { it.copy(status = when (liveStatus) {
                         "working" -> "Reconnecting…"
                         "waiting" -> "Reconnecting…"
@@ -5184,6 +7328,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     }) }
                     delay((500L shl retry.coerceAtMost(4)).coerceAtMost(8000)); retry++
                 }
+                // The end of the turn reads the saved chat itself and checks that nothing else rendered meanwhile: a row read still running would make it skip its proof.
+                rowReads.forEach { it.cancelAndJoin() }
                 // Both a terminal event and a validated idle read need the final saved projection.
                 if (terminalObserved && ownsCompletion()) {
                     val revision = chatHistoryRevision
@@ -5255,13 +7401,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     }
                     if (ownsCompletion()) {
                         _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError, followedSubmission) }
+                        // A turn that ended by its own events uses up a stale mark without a line.
+                        if (endedByLook) showQuietLostClose(scope) else quietLostCloses.remove(scope.key)
                         if (_chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, _chat.value.raw.toString())
                         pollPrompts(c, scope); refreshSessions()
                         if (drainsQueueAfterTerminal(terminalReplyVisible, alreadyEnded, terminalError)) client?.let { drainQueued(scope, it) }
+                        // A failure trying again cannot fix, a stop or a restart: each waiting message is held, saved with the draft, until the owner's Send.
+                        else if (terminalError.isNotBlank()) for (waiting in _chat.value.queued.filter { it.kind == "queue" && it.state == "queued" && it.held.isBlank() })
+                            updateQueued(scope, waiting.id, { ownsCompletion() }) { holdFollowUps(listOf(it), terminalError).single() }
                     }
                 }
             } catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e) } finally {
                 silence?.cancel()
+                rowReads.forEach { it.cancel() }
                 if (terminalObserved && ownsCompletion()) _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError, followedSubmission) }
                 if (streams[scope.key] == currentCoroutineContext()[Job]) {
                     if (_securePrompt.value?.scope == scope) releaseSecurePrompt(scope)
@@ -5321,6 +7473,36 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         notice("Secure input sent. Waiting for Hermes.")
     }
 
+    /** The admission a frame of this chat's stream names, when the phone holds an accepted copy of it with no saved row yet; null otherwise. */
+    private fun ownTurnWithoutRow(scope: Scope, event: SseEvent): String? {
+        if (sourceScope != scope) return null
+        val admission = event.payload().string("turn_admission_id").ifBlank { return null }
+        return admission.takeIf { _chat.value.queued.any { q -> q.kind == "queue" && q.state == "accepted" && q.rowId.isBlank() && q.admissionId == admission } }
+    }
+    /**
+     * Hermes saves the user row of an admission when its turn starts, before the model is asked (agent/turn_context._persist_turn_start), stamped with this
+     * phone's submission id. A frame of that turn has arrived, so the saved chat is read now and rendered: the render ties the copy to its stamped row
+     * ([submittedRowPairs]) and the chat shows Hermes' row while the reply runs, however long the model takes. The frame can come just before the write,
+     * so the turn's first frame reads at [waits] ([ADMITTED_ROW_READS_MS]) until the copy has its row, and a later frame once more ([ADMITTED_ROW_AGAIN_MS]).
+     * A failed read changes nothing; the turn's end reads again.
+     */
+    private suspend fun readAdmittedRow(c: BeaconClient, scope: Scope, admission: String, request: ScopeSettlement, waits: List<Long>) {
+        fun waiting() = sourceScope == scope && request.current() && _chat.value.queued.any { it.admissionId == admission && it.state == "accepted" && it.rowId.isBlank() }
+        for (wait in waits) {
+            delay(wait)
+            if (!waiting()) return
+            val reader = c.detached()
+            try {
+                val revision = chatHistoryRevision
+                val response = reader.get("/api/session", mapOf("session_id" to scope.session))
+                if (!waiting() || revision != chatHistoryRevision) continue
+                renderSession(response, scope, revision)
+                // Saved for a cold open, as the reconnect read saves its render, but only when this render ran: a skipped one would save a copy without the chat's kept keys.
+                if (chatHistoryRevision == revision + 1) app.cache.writeSession(scope, response.toString())
+            } catch (e: Throwable) { if (e is CancellationException) throw e }
+            finally { reader.closeNative() }
+        }
+    }
     /** A frame of the turn Hermes runs names that turn's admission: a copy Hermes still held as queued is started once a frame names its own (QueuedMessage.afterTurnFrame). */
     private suspend fun markOwnTurnStarted(scope: Scope, event: SseEvent, request: ScopeSettlement) {
         if (sourceScope != scope) return
@@ -5348,7 +7530,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val nextBoundary = boundary.after(event.type, o)
         liveBoundaries[boundaryKey] = nextBoundary
         if (event.type in setOf("done", "state_saved") && o.optJSONObject("session")?.has("messages") == true) ++chatHistoryRevision
-        if (event.type in setOf("apperror", "error")) _ui.update { it.copy(error = turnErrorText(o)) }
+        if (event.type in setOf("apperror", "error")) _ui.update { it.copy(error = turnErrorHeadline(turnErrorText(o))) }
+        // Hermes came back from a restart holding this chat's reply as lost: close it, so the chat and what was queued behind it move on.
+        if (event.type == "state_saved" && o.optJSONObject("session")?.let { it.string("active_stream_id").isBlank() && lostTurnHeld(it) } == true) recoverLostTurn(scope, fresh = true)
         _chat.update { s -> liveAfterEvent(s, event.type, o, previousClosed, nextBoundary) ?: when (event.type) {
             "title" -> s.copy(title = o.string("title").ifBlank { s.title })
             "approval" -> s.promptAsked("approval", pendingPrompt(o), clockNow())
@@ -5368,13 +7552,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (event.type in setOf("done", "state_saved", "cancel", "stream_end", "error", "apperror"))
             _ui.update { it.copy(notice = stoppingNoticeAfterEvent(it.notice, event.type)) }
     }
-    /** Asks Hermes for its pending approval and question and shows its answer. A failed ask is not an answer: what is on screen stays, so a question the agent still waits on is not lost to a bad connection. */
-    private suspend fun pollPrompts(c: BeaconClient, scope: Scope) {
-        suspend fun ask(path: String): JSONObject? = runCatching { c.get(path, mapOf("session_id" to scope.session)) }.onFailure { if (it is CancellationException) throw it }.getOrNull()
-        val since = clockNow()
-        val approval = ask("/api/approval/pending")
-        val clarify = ask("/api/clarify/pending")
-        if (sourceScope == scope) _chat.update { it.promptsPolled(approval, clarify, clockNow(), since) }
+    /**
+     * Asks Hermes for its pending approval and question and shows its answer. A failed ask is not an answer: what is on screen stays, so a question the agent still waits on is not lost to a bad connection.
+     * The ask uses a connection of its own and closes it (REVIEW-JOIN-121 P3-2): the caller's connection, the stream's own when a look asks, stays as it was.
+     */
+    private suspend fun pollPrompts(source: BeaconClient, scope: Scope) {
+        val c = source.detached()
+        try {
+            suspend fun ask(path: String): JSONObject? = runCatching { c.get(path, mapOf("session_id" to scope.session)) }.onFailure { if (it is CancellationException) throw it }.getOrNull()
+            val since = clockNow()
+            val approval = ask("/api/approval/pending")
+            val clarify = ask("/api/clarify/pending")
+            if (sourceScope == scope) _chat.update { it.promptsPolled(approval, clarify, clockNow(), since) }
+        } finally { c.closeNative() }
     }
     private fun watchSession(c: BeaconClient, scope: Scope) {
         val active = client ?: return
@@ -5393,6 +7583,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     // History alone cannot end a turn nobody heard (a saved projection names no running stream), so a chat that still shows one without a stream asks Hermes.
                     val unfollowed = _chat.value.takeIf { sourceScope == scope && it.sessionId == scope.session && !pending.containsKey(scope.key) }?.streamId.orEmpty()
                     if (unfollowed.isNotBlank()) { followRunningTurn(c.detached(), scope, unfollowed, request); continue }
+                    // REVIEW-JOIN-121 P2-4: a live copy no stream is bound to is checked again on each tick until it is settled (one check at a time).
+                    if (sourceScope == scope && liveCopyUnbound(_chat.value)) reconcileUnboundLive()
                     if (pending[scope.key] != null && _chat.value.status != "Sending") {
                         val receiptClient = active.detached()
                         try { reconcile(scope, receiptClient) } finally { receiptClient.closeNative() }
@@ -5400,19 +7592,19 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     val head = phoneQueueHead()
                     if (head != null && head.state in setOf("accepted", "unknown") && pending[scope.key] == null)
                         refreshQueuedReceipt(scope, active, head, request, automatic = true)
-                    if (!foreground || !request.current() || streams[scope.key]?.isActive == true) continue
+                    if (!foreground || !request.current() || followsHere(scope)) continue
                     if (pending[scope.key] == null) {
                         val finished = _chat.value.queued.filter(::receiptSweepCandidate)
                         fun key(item: QueuedMessage) = Triple(item.id, item.submissionId, item.admissionId)
                         finishedChecks.keys.retainAll(finished.map(::key).toSet())
                         val now = android.os.SystemClock.elapsedRealtime()
                         for (item in finished.filter { finishedChecks[key(it)]?.let { last -> now - last < 60_000L } != true }.take(4)) {
-                            if (!foreground || !request.current() || pending[scope.key] != null || streams[scope.key]?.isActive == true) break
+                            if (!foreground || !request.current() || pending[scope.key] != null || followsHere(scope)) break
                             finishedChecks[key(item)] = now
                             refreshQueuedReceipt(scope, active, item, request, automatic = true)
                         }
                     }
-                    if (!foreground || !request.current() || streams[scope.key]?.isActive == true) continue
+                    if (!foreground || !request.current() || followsHere(scope)) continue
                     if (phoneQueueHead()?.state == "queued") drainQueued(scope, active, request.sessionGeneration, request.originGeneration)
                     val revision = chatHistoryRevision
                     val metadata = c.nativeRequest("/api/sessions/${scope.session}", params = mapOf("profile" to scope.profile))
@@ -5427,7 +7619,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     val response = c.get("/api/session", mapOf("session_id" to scope.session))
                     if (!foreground || !request.current() || revision != chatHistoryRevision) continue
                     val projection = scope to response.toString()
-                    if (renderedServerProjection != projection) {
+                    val historyMoved = renderedServerProjection != projection
+                    if (historyMoved) {
                         renderSession(response, scope, revision)
                         if (!foreground || !request.current() || renderedServerProjection != projection) continue
                         app.cache.writeSession(scope, response.toString())
@@ -5441,10 +7634,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         optionalLocalSave { app.cache.delete(scope, "client-created-shell") }
                     }
                     val running = response.string("active_stream_id")
-                    if (running.isNotBlank() && streams[scope.key]?.isActive != true) {
-                        pollPrompts(c.detached(), scope)
+                    if (running.isNotBlank() && !followsHere(scope)) {
                         attachStream(c.detached(), scope, running)
-                    }
+                    } else if (historyMoved && running.isBlank()) followUnseenTurn(c, scope, request)
                 } catch (e: Throwable) {
                     if (e is CancellationException) throw e
                     if (e is ApiFailure && e.status == 404 && sessionCanStillBeUnpersisted(clientCreatedSessions.contains(scope.key), _chat.value)) continue
@@ -5482,7 +7674,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         retirePrompt(scope, idKey, id)
         // The answer landed: a request that follows closely is met by the owner's repeat tap, so the guard window counts from now too.
         _chat.update { it.answerTapped(clockNow()) }
-        if (result.string("status") == "ended") notice(PROMPT_ENDED_NOTICE)
+        // Hermes took no answer from this tap: the request had ended, or another phone answered first. Either way the owner is told, so a Deny that met an earlier Allow is never taken for the answer.
+        promptAnswerNotice(result.string("status")).takeIf { it.isNotBlank() }?.let { notice(it) }
+    }
+    /** The answers on their way, by request: a second tap on a request whose answer has not come back is not a second answer (Allow, then Deny, in one breath). It is open again when the first ends, whether it went or failed. */
+    private val answering = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private fun answerPrompt(scope: Scope, idKey: String, id: String, path: String, body: JSONObject) {
+        val key = "${scope.key}|$idKey|$id"
+        if (!answering.add(key)) return
+        _chat.update { it.answerTapped(clockNow()) }
+        action(path, body, successNotice = "", onSuccess = { _, result -> promptAnswered(scope, idKey, id, result) }).invokeOnCompletion { answering.remove(key) }
     }
     fun approval(choice: String, shown: JSONObject, scope: Scope) {
         val pending = _chat.value.approval
@@ -5491,20 +7692,17 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (promptGuarded(pending, clockNow())) return
         if (choice !in pending?.optJSONArray("choices")?.strings().orEmpty()) { notice("That choice isn't available."); return }
         val id = shown.string("approval_id", shown.string("id"))
-        _chat.update { it.answerTapped(clockNow()) }
-        action("/api/approval/respond", json("session_id" to scope.session, "scope_key" to scope.key, "choice" to choice, "approval_id" to id), successNotice = "", onSuccess = { _, result -> promptAnswered(scope, "approval_id", id, result) })
+        answerPrompt(scope, "approval_id", id, "/api/approval/respond", json("session_id" to scope.session, "scope_key" to scope.key, "choice" to choice, "approval_id" to id))
     }
     fun clarify(answer: String, shown: JSONObject, scope: Scope) {
         if (!acceptsPrompt(shown, _chat.value.clarification, scope, "clarify_id") || promptGuarded(_chat.value.clarification, clockNow())) return
         val id = shown.string("clarify_id", shown.string("id"))
-        _chat.update { it.answerTapped(clockNow()) }
-        action("/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "response" to answer, "clarify_id" to id), successNotice = "", onSuccess = { _, result -> promptAnswered(scope, "clarify_id", id, result) })
+        answerPrompt(scope, "clarify_id", id, "/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "response" to answer, "clarify_id" to id))
     }
     fun clarifyBatch(answers: JSONObject, shown: JSONObject, scope: Scope) {
         if (!acceptsPrompt(shown, _chat.value.clarification, scope, "clarify_id") || promptGuarded(_chat.value.clarification, clockNow())) return
         val id = shown.string("clarify_id", shown.string("id"))
-        _chat.update { it.answerTapped(clockNow()) }
-        action("/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "answers" to answers, "clarify_id" to id), successNotice = "", onSuccess = { _, result -> promptAnswered(scope, "clarify_id", id, result) })
+        answerPrompt(scope, "clarify_id", id, "/api/clarify/respond", json("session_id" to scope.session, "scope_key" to scope.key, "answers" to answers, "clarify_id" to id))
     }
     fun sessionAction(path: String, body: JSONObject = JSONObject(), callback: (suspend (JSONObject) -> Unit)? = null) {
         if (!admitConversation()) return
@@ -5518,8 +7716,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     }
     private suspend fun retainSideQuestion() { val side = _side.value ?: return; app.cache.write(side.scope, "side-question", json("question" to side.question, "session_id" to side.sessionId, "stream_id" to side.streamId, "text" to side.text, "status" to side.status, "cursor" to side.cursor, "error" to side.error).toString(), side.status !in setOf("Complete", "Stopped")) }
     fun resumeSideQuestion(): Job? {
-        val side = _side.value ?: return null; val c = client?.detached() ?: return null
+        val side = _side.value ?: return null; val active = client ?: return null; val c = active.detached()
         if (side.scope != sourceScope || side.scope.copy(session = "") != c.scope) return null
+        val request = ScopeSettlement(side.scope, active, originGeneration, sessionGeneration)
         sideJob?.cancel()
         sideJob = viewModelScope.launch {
             val cursor = ReplayCursor(side.streamId, side.cursor)
@@ -5529,7 +7728,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     c.stream("/api/chat/stream", mapOf("session_id" to side.sessionId, "stream_id" to side.streamId, "replay" to "1"), cursor.lastId) { event ->
                         if (_side.value?.scope != side.scope || _side.value?.streamId != side.streamId || !cursor.accept(event)) return@stream
                         val p = event.payload()
-                        if (event.type in setOf("error", "apperror")) terminalError = turnErrorText(p)
+                        if (event.type in setOf("error", "apperror")) terminalError = turnErrorHeadline(turnErrorText(p))
                         _side.update { old -> old?.copy(cursor = cursor.lastId, error = terminalError, text = when (event.type) { "token" -> old.text + p.string("text"); "done", "state_saved" -> p.optJSONObject("session")?.rows("messages")?.lastOrNull { it.string("role") == "assistant" }?.string("content") ?: old.text; else -> old.text }, status = when (event.type) { "stream_end" -> "Complete"; "cancel" -> "Stopped"; "error", "apperror" -> terminalError; else -> old.status }) }
                         sideCheckpointJob?.cancel(); sideCheckpointJob = viewModelScope.launch { delay(200); runCatching { retainSideQuestion() }.onFailure(::fail) }
                     }
@@ -5546,7 +7745,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (active.isNotBlank() && active != side.streamId) resumeSideQuestion()
             } catch (e: Throwable) {
                 if (e is CancellationException) throw e
-                if (e is ApiFailure && e.status in setOf(401, 403)) fail(e)
+                // Follow-up 2, as A1: a refused sign-in fails only the account still in use (an account change also cancels this job, via clearDetails).
+                if (e is ApiFailure && e.status in setOf(401, 403)) { if (request.current()) fail(e) }
                 else if (_side.value?.scope == side.scope && _side.value?.streamId == side.streamId) _side.update { it?.copy(status = terminalError.ifBlank { appErrorText(e) }) }
             }
         }
@@ -5565,7 +7765,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private fun hydrateScreens(scope: Scope) {
         viewModelScope.launch {
             val cached = cachedScreens(scope)
-            if ((client?.scope ?: cachedOwnerScope) == scope) _data.update { cached + it }
+            if ((client?.scope ?: cachedOwnerScope) == scope) { _data.update { cached + it }; phoneSettings.bind(); phoneSettings.seedSaved() }
         }
     }
     /** For a screen that loads outside [load] (Kanban, devices): show its answer at once next time, and keep it on the phone. */
@@ -5579,14 +7779,24 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private suspend fun deleteForgotten(scope: Scope, kind: String, removal: DeviceRemovalAuthority?) {
         if (removal == null) app.cache.delete(scope, kind) else app.cache.deleteIfCurrent(scope, kind, removal)
     }
-    private suspend fun forgetScreens(scope: Scope, removal: DeviceRemovalAuthority? = null) {
+    /** Sign-out, account change and a phone removed on the computer (Root, 18 Nov): the saved chats go with the screens; drafts and in-flight sends stay. */
+    private suspend fun forgetScreens(scope: Scope, removal: DeviceRemovalAuthority? = null, chats: Boolean = true) {
+        forgetKeptData()
         if (removal == null) screens.clear(scope)
         else screens.clear(removal) { account -> app.cache.deleteIfCurrent(account, "screens", removal) }
         try {
             startupReads.forEach { deleteForgotten(scope, "read:${it.path}", removal) }
-            listOf("settings:skills", "settings:memory").forEach { deleteForgotten(scope, it, removal) }
+            listOf("settings:skills", "settings:memory", dev.hermes.android.agentphone.AGENT_PHONE_LOG_KIND).forEach { deleteForgotten(scope, it, removal) }
+            // Chat join (rules22): the agent phone's activity page is kept at its link's scope, the assistant's profile for a push.
+            preferences.value.assistantProfile.takeIf { it.isNotBlank() && it != scope.profile }?.let { assistant ->
+                deleteForgotten(scope.copy(profile = assistant, session = ""), dev.hermes.android.agentphone.AGENT_PHONE_LOG_KIND, removal)
+            }
         } catch (e: CancellationException) { throw e } catch (_: Exception) { /* those unprotected rows expire after two days */ }
-        forgetGlances(scope, removal)
+        // Chat join (rules22): and what this process holds of the account's agent phone (the list's last rows, the approval board).
+        dev.hermes.android.agentphone.forgetAgentPhoneAccount(scope)
+        forgetGlances(scope, removal, chats)
+        // Files the agent sent this account leave the phone with its screens.
+        dev.hermes.android.data.ReceivedFiles.store(app).forgetAccount(scope)
     }
     fun forgetScreens() { val scope = client?.scope ?: return; viewModelScope.launch { forgetScreens(scope) } }
     private val forgetOnDeviceRemoval: (DeviceRemovalAuthority) -> Unit = { removal -> viewModelScope.launch { forgetScreens(removal.scope, removal) } }
@@ -5619,14 +7829,25 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             var waited = 0L
             while (current() && waited < PREFETCH_READY_WAIT && !(_ui.value.initialChatReady || _chat.value.projectionReady)) { delay(250); waited += 250 }
             delay(PREFETCH_DELAY)
+            // The plugin's own reads wait for the probe that says whether it is there; asked too early they would be left out until the next warm-up.
+            withTimeoutOrNull(PREFETCH_PROBE_WAIT) { optionalProbe?.join() }
             if (!current()) return@launch
+            // Battery saver keeps the small startup reads and leaves the rest until a screen opens; nothing is retried in the background.
+            if (!warmScreensAllowed(readWarmConditions(app))) return@launch
             val plugin = _ui.value.bootstrap.optJSONObject("optional_features")?.optString("plugin") == "available"
-            val reads = (prefetchReads + StartupRead("files", "/api/pc/files", mapOf("path" to pcFolder()))).filter { plugin || "/plugins/beacon/" !in it.path }
+            // A startup read that did not finish inside its budget is asked again here (only when it is still cold), then the rest.
+            val reads = (startupReads + prefetchReads +
+                StartupRead("$HISTORY_RETENTION_READ_KEY:${scope.key}", HISTORY_RETENTION_READ_PATH) + StartupRead(PUSH_STATUS_READ_KEY, PUSH_STATUS_READ_PATH))
+                .filter { (plugin || "/plugins/beacon/" !in it.path) && (app.firebaseConfigured || it.key != PUSH_STATUS_READ_KEY) }
             // Warming never cancels or replaces what a screen is loading or showing: only cold, stale or failed answers are fetched.
             fun cold(read: StartupRead) = loads[read.key]?.isActive != true && _data.value[read.key].let { shown ->
                 shown == null || (shown.optBoolean("_stale") || shown.has("_error")) && shown.optString("_requested_path").let { it.isEmpty() || it == read.query["path"] } }
-            val steps = reads.map<StartupRead, suspend () -> Unit> { read -> { if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } } + listOf<suspend () -> Unit>(
-                { if (plugin) phoneSettings.loadBots()?.join() }, { prefetchKanban(active) }, { prefetchVault(active) }, { if (plugin) prefetchDevices(active) })
+            // Files lists the folder it will open in, worked out when this step runs, after the projects it may depend on.
+            val files: suspend () -> Unit = { StartupRead("files", "/api/pc/files", mapOf("path" to filesFolder())).let { read -> if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } }
+            // Chat join: CACHEFIX-B's steps and EMU-JOIN's agent phone.
+            val steps = reads.map<StartupRead, suspend () -> Unit> { read -> { if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } } + files + listOf<suspend () -> Unit>(
+                { if (plugin) phoneSettings.loadBots()?.join() }, { prefetchKanban(active) }, { prefetchVault(active) }, { if (plugin) prefetchDevices(active) },
+                { if (plugin) prefetchPluginHealth(active) }, { if (plugin) prefetchProactive(active) }, { if (plugin) prefetchAgentPhone(active) })
             val slots = kotlinx.coroutines.sync.Semaphore(PREFETCH_PARALLELISM)
             coroutineScope {
                 steps.forEach { step -> launch {
@@ -5638,8 +7859,31 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     finally { slots.release() }
                 } }
             }
+            // The schedules the page opens with: the history of the first few, so a tapped row is already filled.
+            if (current()) _data.value["crons"]?.rows("jobs").orEmpty().mapNotNull { it.string("id").takeIf(String::isNotBlank) }.take(PREFETCH_SCHEDULE_HISTORIES).forEach { id ->
+                if (current() && idle()) try { ensureLoaded("cron-history:$id", "/api/crons/history", mapOf("job_id" to id)).join() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+            }
+            // What a screen's own read left cold (a startup read that ran out of its budget shares its job with this warm-up and takes it down with it) is asked once more.
+            if (current()) reads.filter(::cold).forEach { read ->
+                if (current() && idle()) try { ensureLoaded(read.key, read.path, read.query).join() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+            }
+            // Files: the folder it opens in is known once the projects are, and a listing of another folder is not the one the page shows.
+            if (current() && idle()) filesFolder().let { folder ->
+                if (_data.value["files"]?.optString("_requested_path") != folder) try { ensureLoaded("files", "/api/pc/files", mapOf("path" to folder)).join() } catch (e: CancellationException) { throw e } catch (_: Exception) { }
+            }
             if (current()) prefetched = scope.key to System.currentTimeMillis()
         }
+    }
+    /** The Connection page's plugin status, kept like every screen's last answer. The route answers the owner only; for anyone else the read fails and the step stays cold. */
+    private suspend fun prefetchPluginHealth(active: BeaconClient) {
+        val c = active.detached()
+        try { keepScreen(c.scope, dev.hermes.android.ui.PLUGIN_HEALTH_KEY, c.nativeRequest(dev.hermes.android.ui.PLUGIN_HEALTH_PATH)) } finally { c.closeNative() }
+    }
+    /** The Assistant page's watch settings (the sources among them), read for the assistant's profile as that page reads them. */
+    private suspend fun prefetchProactive(active: BeaconClient) {
+        val profile = preferences.value.assistantProfile.ifBlank { return }
+        val key = dev.hermes.android.ui.proactiveSettingsKey((pcScope() ?: active.scope).copy(profile = profile, session = ""))
+        keepScreen(active.scope, key, dev.hermes.android.ui.fetchProactiveSettings(active, profile))
     }
     private suspend fun prefetchKanban(active: BeaconClient) {
         val c = active.detached()
@@ -5654,6 +7898,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val c = active.detached()
         try { keepScreen(c.scope, dev.hermes.android.ui.VAULT_CACHE_KEY, NativeVaultApi(c).snapshot().toJson()) } finally { c.closeNative() }
     }
+    /** Beacon's phone page for the assistant's profile (status, policy, activity, Needs-you), so it opens filled (cache review, fu2). */
+    private suspend fun prefetchAgentPhone(active: BeaconClient) {
+        val profile = preferences.value.assistantProfile
+        val c = active.detached()
+        val scoped = runCatching { c.forAuthorizedProfile(profile) }.getOrNull()
+        try {
+            val page = scoped?.let { dev.hermes.android.ui.agentPhonePageRead(dev.hermes.android.data.AgentPhoneApi(dev.hermes.android.data.ClientAgentPhoneEndpoint(it))) }
+            page?.let { keepScreen(c.scope, dev.hermes.android.ui.agentPhoneCacheKey(profile), it) }
+        } finally { scoped?.closeNative(); c.closeNative() }
+    }
     private suspend fun prefetchDevices(active: BeaconClient) {
         val c = active.detached()
         try { keepScreen(c.scope, PAIRED_DEVICES_KEY, pairedDevicesJson(NativePairing.devices(c))) } finally { c.closeNative() }
@@ -5661,7 +7915,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun ensureLoaded(key: String, path: String, query: Map<String, String> = emptyMap()): Job = load(key, path, query, force = false, quiet = true)
     /** A [quiet] read warms data nobody asked for yet: a failure stays on its key and never raises the app-wide error (an expired sign-in still does). */
     fun load(key: String, path: String, query: Map<String, String> = emptyMap(), force: Boolean = true, quiet: Boolean = false): Job {
-        val active = client ?: return viewModelScope.launch { storeData(key, (_data.value[key]?.copy() ?: JSONObject()).apply { remove("_loading"); put("_error", dev.hermes.android.ui.OfflineReadError) }) }
+        val active = client ?: return loadWithoutClient(key, path, query, force, quiet)
         val scope = active.scope; val generation = originGeneration
         val version = screens.readVersion(scope, path)
         val session = query["session_id"]
@@ -5727,6 +7981,30 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         loads[key] = job; job.start(); return job
     }
+    /** No client yet. A restored sign-in shows the saved answer of this read (stale) and asks again once connected; "Reconnect" is said only when nothing is saved and nothing is connecting. */
+    private fun loadWithoutClient(key: String, path: String, query: Map<String, String>, force: Boolean, quiet: Boolean): Job {
+        val owner = cachedOwnerScope
+        val generation = originGeneration
+        fun waiting() = generation == originGeneration && client == null && cachedOwnerScope == owner
+        if (owner != null) askedEarly[key] = AskedEarly(owner, path, query, force, quiet)
+        return viewModelScope.launch {
+            var shown = _data.value[key]?.has("_error") == false
+            if (owner != null && screenReadCacheable(path, query, owner.profile) && waiting()) {
+                screens.open(owner)
+                if (waiting()) (screens.exact(owner, key, screenRequest(path, query)) ?: screens.sameRequest(owner, screenRequest(path, query)))?.let { saved ->
+                    _data.update { it + (key to saved.value.copy().put("_stale", true).put("_cached_at", saved.at)) }; shown = true
+                }
+            }
+            if (earlyReadShows(owner != null, shown, _ui.value.loading || _ui.value.restoringSession) == EarlyRead.Reconnect && generation == originGeneration && client == null)
+                storeData(key, (_data.value[key]?.copy() ?: JSONObject()).apply { remove("_loading"); put("_error", dev.hermes.android.ui.OfflineReadError) })
+        }
+    }
+    /** The connection is up: what pages asked for meanwhile (and a failed first read of the same keys) is read now. */
+    private fun replayEarlyReads(active: BeaconClient) {
+        val early = askedEarly.entries.filter { it.value.scope.key == active.scope.key }.map { it.key to it.value }
+        askedEarly.clear()
+        early.forEach { (key, ask) -> load(key, ask.path, ask.query, force = ask.force, quiet = ask.quiet) }
+    }
     fun action(path: String, body: JSONObject = JSONObject(), method: String = "POST", refresh: Boolean = true, successNotice: String = "Saved", onSuccess: (suspend (BeaconClient, JSONObject) -> Unit)? = null): Job {
         val tracked = path in setOf("/api/session/update", "/api/session/branch", "/api/session/pin", "/api/session/archive", "/api/session/rename", "/api/session/delete", "/api/session/undo", "/api/session/compress", "/api/reasoning", "/api/approval/mode", "/api/profile/approval-mode", "/api/commands/exec")
         val pendingKey = if (tracked) "${client?.scope?.copy(session = body.string("session_id"))?.key}|$path" else null
@@ -5751,7 +8029,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val result = c.call(path, method = method, data = body)
             if (result.has("ok") && !result.optBoolean("ok")) error(result.string("message", result.string("status", "Hermes didn't accept that.")))
             committed = true
+            // Hermes has the answer: the card closes even if the chat was reselected meanwhile (the rest below is then skipped), or it would stay up to be answered a second time.
+            if (path in PROMPT_ANSWER_PATHS && selected != null) retirePrompt(selected, if (path == "/api/approval/respond") "approval_id" else "clarify_id", body.string(if (path == "/api/approval/respond") "approval_id" else "clarify_id"))
             if (removing && selected != null) {
+                archivedHere.remove(selected.key)
                 clientCreatedSessions.remove(selected.key)
                 val keptRows = _chat.value.raw.rows("messages")
                 optionalLocalSave { app.cache.delete(selected, "client-created-shell"); forgetKeptAttachments(selected, keptRows) }
@@ -5761,6 +8042,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (path == "/api/session/archive" && selected != null) {
                     confirmedSessions.remove(selected.key)
                     val archived = result.getBoolean("hidden")
+                    rememberArchived(selected, selected.session, archived)
                     _chat.update { it.copy(raw = it.raw.copy().put("archived", archived)) }
                     _ui.update { it.copy(sessions = updatedHistoryRows(it.sessions, selected.session, path, body, result, sessionIndexArchived, "", selected.profile)) }
                     _data.update { it - "history:search" }
@@ -5806,7 +8088,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     if (current() && revision == chatHistoryRevision) { renderSession(response, selected, revision,
                         allowRemoval = path == "/api/session/delete" || path == "/api/session/undo" && removedUser.isNotBlank(), removedUserRowId = removedUser)
                         val running = _chat.value.streamId
-                        if (running.isNotBlank() && streams[selected.key]?.isActive != true) attachStream(c.detached(), selected, running)
+                        if (running.isNotBlank() && !followsHere(selected)) attachStream(c.detached(), selected, running)
                         if (current()) refreshSessions() }
                 }
             }
@@ -5815,7 +8097,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (current() && e is NativeModelConfirmation && selected != null) {
                 closeCatalog()
                 openForm(dev.hermes.android.ui.ActionForm("Confirm model change", path, emptyList(), body.copy().put("confirm_expensive_model", true).put("scope_key", selected.key), explanation = "Model: ${body.string("model")}\n\n${e.message.orEmpty()}", actionLabel = "Use model"))
-            } else if (current()) { val failure = conversationActionFailure(path, e); _form.update { if (submission != null && it?.id == submission) it.copy(error = appErrorText(failure)) else it }; fail(failure) }
+            } else {
+                if (e is DeleteKeptWaiting && selected != null) restoreWithdrawn(selected, e.withdrawn)
+                if (current()) { val failure = conversationActionFailure(path, e); _form.update { if (submission != null && it?.id == submission) it.copy(error = appErrorText(failure)) else it }; fail(failure) }
+                // An answer that did not go is never silent, even when the chat was reselected or the connection replaced while it was in flight (the card is still there to answer again).
+                else if (!committed && path in PROMPT_ANSWER_PATHS && e !is NativeAuthExpiredException && !(e is ApiFailure && e.status == 401)) notice(lostAnswerNotice(sameChat = selected != null && sourceScope == selected))            }
         } finally {
             c.closeNative()
             if (removing && !committed && current() && selected != null) watchSession(active.detached(), selected)
@@ -5854,14 +8140,23 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         }
                     } ?: ("" to null)
                 }
-                name = details.first.takeIf(String::isNotBlank) ?: "Attachment"
+                name = attachmentName(uri.toString(), details.first)
                 if (!current()) return@launch
                 if (!workspace) _attachmentPreparation.update { it + json("id" to id, "name" to name, "status" to "preparing") }
                 uploadSlots.withPermit {
                     if (!current()) return@withPermit
                     val mime = resolver.getType(uri) ?: "application/octet-stream"
                     val sizeHint = details.second
-                    if (!workspace && sizeHint != null && sizeHint > MAX_CHAT_ATTACHMENT_BYTES) error("Attachments are too large (11 MB in total at most).")
+                    // What this chat's connection sends (CHAT-121 follow-up 4). With session authority, a file up to that connection's limit (Hermes' own
+                    // cap and what one frame carries, in pieces through a plugin that takes them, about 6 MB through one that does not); a file past one
+                    // text frame stays on this phone as a file, not as base64, until it is sent. Without session authority, as before: 11 MB in all.
+                    val (authority, limits) = if (workspace) false to AttachmentLimits()
+                        else try { active.nativeAttachmentLimits() } catch (e: CancellationException) { throw e } catch (_: Exception) { false to AttachmentLimits() }
+                    val fileCap = attachmentLimitBytes(limits, name, mime)
+                    val readCap = if (workspace) 32L * 1024 * 1024 else if (authority) fileCap else MAX_CHAT_ATTACHMENT_BYTES
+                    fun tooLarge(): Exception = if (workspace) IllegalArgumentException("This file is too large (32 MB at most).")
+                        else if (authority) AttachmentTooLarge(fileCap) else IllegalArgumentException("Attachments are too large (11 MB in total at most).")
+                    if (sizeHint != null && sizeHint > readCap) throw tooLarge()
                     val file = File.createTempFile("upload", ".data", app.cacheDir)
                     try {
                         withContext(Dispatchers.IO) {
@@ -5870,13 +8165,17 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                                 while (true) {
                                     ensureActive()
                                     val n = input.read(bytes); if (n < 0) break
-                                    total += n; require(total <= if (workspace) 32L * 1024 * 1024 else MAX_CHAT_ATTACHMENT_BYTES) { if (workspace) "This file is too large (32 MB at most)." else "Attachments are too large (11 MB in total at most)." }
+                                    total += n; if (total > readCap) throw tooLarge()
                                     out.write(bytes, 0, n)
                                 }
                             } } ?: error("Could not read attachment")
                         }
-                        val response = c.upload(if (workspace) "/api/workspace/upload" else "/api/upload", file, name, mime, scope.session, directory)
-                        val items = if (workspace) emptyList() else response.rows("files").ifEmpty { listOf(response.optJSONObject("file") ?: response) }
+                        val kept = !workspace && authority && file.length() > textFrameFileBytes(name, mime)
+                        val items = if (kept) listOf(json("id" to java.util.UUID.randomUUID().toString(), "state" to "ready", "scope_key" to c.scope.session(scope.session).key,
+                            "name" to name, "mime" to mime, "size" to file.length(), "staged_file" to true))
+                        else c.upload(if (workspace) "/api/workspace/upload" else "/api/upload", file, name, mime, scope.session, directory).let { response ->
+                            if (workspace) emptyList() else response.rows("files").ifEmpty { listOf(response.optJSONObject("file") ?: response) }
+                        }
                         if (!workspace && !withContext(Dispatchers.IO) { attachmentFitsLocalCheckpoint(PendingSend.create(scope, draft().let { it.copy(attachments = it.attachments + items) })) }) error("Attachments are too large (11 MB in total at most).")
                         if (current()) {
                             if (workspace) {
@@ -5887,6 +8186,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                             }
                         }
                             else {
+                                if (kept) withContext(Dispatchers.IO) { ChatAttachmentStore.adopt(file, items.single().string("id")) }
                                 _attachments.update { it + items }
                                 _attachmentPreparation.update { it.filterNot { row -> row.string("id") == id } }
                                 checkpoint()
@@ -5898,7 +8198,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             catch (e: Exception) {
                 if (current()) {
                     if (workspace || e is ApiFailure && e.status in setOf(401, 403)) fail(e)
-                    else _attachmentPreparation.update { rows -> rows.filterNot { it.string("id") == id } + json("id" to id, "name" to name, "status" to "error", "error" to (appErrorText(e))) }
+                    // A file over the limit says the limit, in the owner's language (the row's text is shown as it is).
+                    else _attachmentPreparation.update { rows -> rows.filterNot { it.string("id") == id } + json("id" to id, "name" to name, "status" to "error",
+                        "error" to (if (e is AttachmentTooLarge) dev.hermes.android.push.serviceText(app, ATTACHMENT_TOO_LARGE_ROW).replace("{0}", megabytes(e.limitBytes)) else appErrorText(e))) }
                 }
             } finally {
                 if (chatLocked) chatAttachmentLock.unlock()
@@ -5916,8 +8218,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         uploadJobs.remove(id)?.cancel()
         _attachmentPreparation.update { it.filterNot { row -> row.string("id") == id } }
     }
-    fun removeAttachment(index: Int) { _attachments.update { it.filterIndexed { i, _ -> i != index } }; checkpoint() }
-    fun dictated(text: String, append: Boolean = true) { val next = if (append) (_composer.value.text + " " + text).trim() else text; composer(TextFieldValue(next, TextRange(next.length))) }
+    fun removeAttachment(index: Int) {
+        _attachments.value.getOrNull(index)?.let { item -> viewModelScope.launch(Dispatchers.IO) { ChatAttachmentStore.delete(item) } }
+        _attachments.update { it.filterIndexed { i, _ -> i != index } }; checkpoint()
+    }
+    fun dictated(text: String, append: Boolean = true) { val next = if (append) (composerBase() + " " + text).trim() else text; composer(TextFieldValue(next, TextRange(next.length))) }
     fun authenticatedScope(): Scope? = sourceScope
     fun followNativeReference(reference: NativeReference, origin: Scope): Job {
         val active = client
@@ -5937,6 +8242,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             }
         }
     }
+    /** The folder Files opens in, and the one the warm-up lists: the one chosen, else the one last listed (saved with the screens), else the first project's. */
+    fun filesFolder(): String = dev.hermes.android.ui.initialFilesFolder(pcFolder().ifBlank { _data.value["files"]?.takeIf { !it.has("_error") }?.optString("_requested_path").orEmpty() }, _data.value["native-projects"])
     fun pcFolder(): String = saved.get<String>("pc-folder-scope").takeIf { it == client?.scope?.key }?.let { saved.get<String>("pc-folder") }.orEmpty()
     fun rememberPcFolder(path: String) { saved["pc-folder-scope"] = client?.scope?.key; saved["pc-folder"] = path }
     fun browsePcFolder(path: String) { rememberPcFolder(path); tab("Spaces") }
@@ -6075,6 +8382,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (startsCall) { if (_incomingBusy.value) return@launch; _incomingBusy.value = true }
         var generation = -1
         var temporaryClient: BeaconClient? = null
+        var keptScope: Scope? = null
+        var left = false
         try {
             val credentialVersion=app.auth.authorityEpoch.readVersion()
             require(dev.hermes.android.push.validOpaque(source) && dev.hermes.android.push.validOpaque(event)) { "Notification route is invalid" }
@@ -6088,6 +8397,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             clearPendingVoiceKeyRequests()
             checkpointPhoneSettingsNow()
             clearSettingsProfile()
+            keptScope = client?.scope
             generation = ++originGeneration
             cancelStartup()
             cancelNewChatWork()
@@ -6106,12 +8416,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (action=="callback") dev.hermes.android.voice.requireMissedCallbackRoute(route,requireNotNull(app.push.deadlineInvitation(source,event)) { "This missed call is no longer available" },c.scope)
             else if (dev.hermes.android.voice.incomingRouteEnded(route, source, c.auth.profile)) app.push.discardInvitation(source, event)
             if (action == "answer") dev.hermes.android.voice.requireIncomingRoute(route, source, c.auth.profile)
-            val id = route.string("session_id")
             // The saved handle is empty after a cold start; the prepared chat or the cache still name the Beacon chat. Read before the guard below.
             val beaconChat = preparedBeacon?.takeIf { it.first == c.scope }?.second ?: readBeaconSession(c.scope)
+            val assistantChat = route.optBoolean("assistant_chat")
+            // A notice of the Beacon chat opens that chat by the id this phone keeps it under, never as a separate chat by the id a turn finished under.
+            val id = route.string("session_id").let { if (assistantChat && !beaconChat.isNullOrBlank()) beaconChat else it }
             if (generation != originGeneration) return@launch
             checkpointVisible()
             if (generation != originGeneration) return@launch
+            left = true
             clearDetails(); retireSavedDrafts(null); sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
             if (app.calls.state.value.active && !keepsRestoredCall(app.calls.state.value.conversationScope,c.scope,false)) app.calls.hangup()
             require(persistAuthIfCurrent(c.auth, credentialVersion, snapshot = true, selectProfileIf = { generation == originGeneration })) { "Sign-in changed while opening this notification" }
@@ -6138,7 +8451,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val assistantProfile = app.preferences.data.first().let(AppPreferences::read).assistantProfile
             if (generation != originGeneration) return@launch
             // A former assistant profile's callback must keep its own chat, not switch to today's assistant profile.
-            val destination = pushDestination(route.string("kind"), id, beaconChat).let { tab ->
+            val destination = pushDestination(route.string("kind"), id, beaconChat, assistantChat).let { tab ->
                 if (tab == "Beacon" && c.auth.profile != assistantProfile) "Chat" else tab
             }
             saved["tab"] = destination; saved["more"] = ""
@@ -6158,7 +8471,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     app.calls.start(requireNotNull(client),id)
                     app.push.discardInvitation(source,event)
                 }
-            } else if (id.isNotBlank()) selectSession(id) else {
+            } else if (destination == "Beacon" && id.isNotBlank() && id != beaconChat) openBeacon() else if (id.isNotBlank()) selectSession(id) else {
                 val active = requireNotNull(client)
                 val shell = app.cache.read(active.scope, "new-chat-shell")
                 if (generation != originGeneration || client !== active) return@launch
@@ -6172,7 +8485,10 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if(needsVoiceKey) { pendingIncomingAfterKey=Triple(source,event,action);more(voiceKeySetupPage()) }
             if (e !is CancellationException && !needsVoiceKey && (generation == -1 || generation == originGeneration)) _ui.update { it.copy(loading = false, restoringSession = false, error = if (e is ApiFailure && e.status == 401) "Sign in to the notification's owner account to open this activity" else if (gone) "This missed call has expired. Call from the chat." else if (action == "callback") "Couldn't start the call. Try again." else appErrorText(e)) }
         }
-        finally { temporaryClient?.closeNative(); if (startsCall) _incomingBusy.value = false }
+        finally {
+            temporaryClient?.closeNative(); if (startsCall) _incomingBusy.value = false
+            if (!left && generation != -1) followKeptChat(generation, keptScope)
+        }
     }
     override fun onCleared() { clearSettingsProfile(forget = false); if (NativeDeviceRemoval.onForgetScreens === forgetOnDeviceRemoval) NativeDeviceRemoval.onForgetScreens = null; if (dev.hermes.android.updates.PluginInstallHub.controller === pluginInstall) dev.hermes.android.updates.PluginInstallHub.controller = null; pluginInstall.reset(); pluginRepair.reset(); networkCallback?.let { runCatching { app.getSystemService(android.net.ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }; botMode.clear(); sessionWatch?.cancel(); stopReadAloud(); speech?.shutdown(); super.onCleared() }
 }

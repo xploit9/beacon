@@ -51,11 +51,30 @@ class SessionUsagePageGapsUiTest {
         compose.runOnIdle { assertNull(vm.data.value[key(vm, "")]) }
     }
 
+    /** REVIEW-FIXCHAT-121 P3: an untitled chat is "New chat", as in its header, and its model is named as the composer's chip names it (no raw ids). */
+    @Test fun anUntitledChatAndItsModelReadAsTheHeaderAndTheChipSayThem() = withClientlessVm(compose) { vm ->
+        compose.runOnIdle { vm.openSyntheticChat(session, title = "New conversation", raw = json("model" to "synthetic-model", "model_provider" to "example")) }
+        compose.showPage { NativeAdministration(vm, "Session usage") }
+        compose.waitForIdle()
+        compose.runOnIdle { vm.forget(key(vm)) }
+        compose.onNodeWithText("New chat").assertIsDisplayed()
+        compose.onNodeWithText("Synthetic Model").assertIsDisplayed()
+        compose.onAllNodesWithText("New conversation").assertCountEquals(0)
+        compose.onAllNodesWithText("example", substring = true).assertCountEquals(0)
+        serve(vm, figures)
+        compose.onNodeWithTag("usage-figures").assertIsDisplayed()
+        compose.onNodeWithText("New chat").assertIsDisplayed()
+        compose.onNodeWithText("Synthetic Model").assertIsDisplayed()
+    }
+
+    /** UX-121 P3-10: the chat and its model, which the phone knows, show at once; only the figures wait (placeholder rows). */
     @Test fun theFirstReadShowsPlaceholderRowsNotFiguresOrAnError() = withClientlessVm(compose) { vm ->
         show(vm)
         compose.runOnIdle { vm.forget(key(vm)) }
         compose.onNodeWithTag("settings-skeleton").assertIsDisplayed()
-        compose.onNodeWithTag("usage-hero").assertDoesNotExist()
+        compose.onNodeWithTag("usage-hero").assertIsDisplayed()
+        compose.onNodeWithText("Synthetic Model").assertIsDisplayed()
+        compose.onNodeWithTag("usage-figures").assertDoesNotExist()
         compose.onNodeWithText("Retry").assertDoesNotExist()
         compose.onNodeWithText(offline).assertDoesNotExist()
     }
@@ -78,7 +97,7 @@ class SessionUsagePageGapsUiTest {
         serve(vm, figures)
         compose.onNodeWithTag("usage-hero").assertIsDisplayed()
         compose.onNodeWithText("Synthetic chat").assertIsDisplayed()
-        compose.onNodeWithText("example · synthetic-model").assertIsDisplayed()
+        compose.onNodeWithText("Synthetic Model").assertIsDisplayed()
         compose.onNodeWithTag("usage-figures").assertIsDisplayed()
         for ((label, value) in listOf("Tokens in" to formatTokenCount(1234), "Tokens out" to formatTokenCount(560), "Context" to formatTokenCount(32000))) {
             compose.onNodeWithText(value).assertIsDisplayed()

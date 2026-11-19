@@ -105,7 +105,7 @@ class CallTrustTest {
         assertEquals("Arabic", withheld.getJSONObject("context").getString("language"))
         assertTrue(withheld.getJSONObject("capabilities").getBoolean("memory_recall"))
         val instruction = liveInstruction(withheld)
-        assertTrue(instruction, instruction.contains("Configured call language: Arabic."))
+        assertTrue(instruction, instruction.contains("the persona says they prefer, otherwise Arabic."))
         // It greets without a name, and a plain context gives no callback.
         assertTrue(instruction.contains("without using any name"))
     }

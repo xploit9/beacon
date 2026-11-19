@@ -38,7 +38,9 @@ import androidx.core.app.ServiceCompat
 import java.util.concurrent.atomic.AtomicBoolean
 
 data class AudioRoute(val id: String, val name: String)
-data class CallState(val active: Boolean = false, val state: String = "idle", val muted: Boolean = false, val transcript: String = "", val error: String = "", val routes: List<AudioRoute> = emptyList(), val route: String = "", val startedAt: Long = 0, val conversationScope: Scope? = null, val callId: String = "", val transcripts: List<CallTranscript> = emptyList(), val transcriptStatus: String = "", val cameraSharing: Boolean = false, val cameraRear: Boolean = false, val cameraBusy: Boolean = false, val cameraCanFlip: Boolean = false, val cameraStopPending: Boolean = false, val held: Boolean = false, val userSpeaking: Boolean = false, val remoteSpeaking: Boolean = false, val localAudioLevel: Float? = null, val remoteAudioLevel: Float? = null, val minimized: Boolean = false, val screenSharing: Boolean = false, val screenBusy: Boolean = false, val screenStopPending: Boolean = false, val overlayPermissionMissing: Boolean = false, val contextNotice: String = "", val audioStopPending: Boolean = false, val hostCleanupPending: Boolean = false, val toolApprovals: List<CallToolApproval> = emptyList(), val voiceProvider: String = "gemini", val visionAvailable: Boolean = true, val failureReason: String = "", val toolReceipts: List<CallToolReceipt> = emptyList())
+data class CallState(val active: Boolean = false, val state: String = "idle", val muted: Boolean = false, val transcript: String = "", val error: String = "", val routes: List<AudioRoute> = emptyList(), val route: String = "", val startedAt: Long = 0, val conversationScope: Scope? = null, val callId: String = "", val transcripts: List<CallTranscript> = emptyList(), val transcriptStatus: String = "", val cameraSharing: Boolean = false, val cameraRear: Boolean = false, val cameraBusy: Boolean = false, val cameraCanFlip: Boolean = false, val cameraStopPending: Boolean = false, val held: Boolean = false, val userSpeaking: Boolean = false, val remoteSpeaking: Boolean = false, val localAudioLevel: Float? = null, val remoteAudioLevel: Float? = null, val minimized: Boolean = false, val screenSharing: Boolean = false, val screenBusy: Boolean = false, val screenStopPending: Boolean = false, val overlayPermissionMissing: Boolean = false, val contextNotice: String = "", val audioStopPending: Boolean = false, val hostCleanupPending: Boolean = false, val toolApprovals: List<CallToolApproval> = emptyList(), val voiceProvider: String = "gemini", val visionAvailable: Boolean = true, val failureReason: String = "", val toolReceipts: List<CallToolReceipt> = emptyList(),
+    /** The call's link to Hermes is lost (a function was told hermes_unreachable or lost_result) until Hermes answers again. */
+    val hermesUnreachable: Boolean = false)
 internal fun CallState.failedCallConversation(expectedId: String): Scope? =
     conversationScope.takeIf { !active && callId == expectedId && failureReason.isNotBlank() }
 internal fun callEndNotSentText(count: Int): String =
@@ -47,6 +49,9 @@ internal fun callEndUnknownText(count: Int): String =
     if (count == 1) "${dev.hermes.android.data.currentAssistantName} couldn't confirm 1 request. Check the chat before asking again."
     else "${dev.hermes.android.data.currentAssistantName} couldn't confirm $count requests. Check the chat before asking again."
 
+/** Whether the call can reach Hermes; once it can again, the "Lost Hermes" line of that outage goes (device round 2). */
+internal fun CallState.withHermesLink(reachable: Boolean): CallState =
+    copy(hermesUnreachable = !reachable, error = if (reachable && error == CALL_LOST_HERMES) "" else error)
 internal fun CallState.withServerWarning(message: String, eventCallId: String, authorizedCallId: String): CallState {
     if (!active || callId.isBlank() || callId != authorizedCallId || eventCallId.isNotBlank() && eventCallId != callId || message.isBlank() || message.length > 240) return this
     return copy(error = message)
@@ -87,7 +92,7 @@ internal fun CallState.afterOwnedCleanupFailure(error: Throwable, ownsCall: Bool
     if (ownsCall) afterCleanupFailure(error) else this
 internal fun CallState.afterTerminalControls(fenceFailure: Throwable?): CallState = copy(
     held=false,muted=false,userSpeaking=false,remoteSpeaking=false,localAudioLevel=null,remoteAudioLevel=null,
-    routes=emptyList(),route="",cameraRear=false,cameraCanFlip=false,overlayPermissionMissing=false,contextNotice="",toolApprovals=emptyList(),toolReceipts=emptyList(),
+    routes=emptyList(),route="",cameraRear=false,cameraCanFlip=false,overlayPermissionMissing=false,contextNotice="",toolApprovals=emptyList(),toolReceipts=emptyList(),hermesUnreachable=false,
     error=listOf(error,if(fenceFailure!=null) "Call ended. Some of it may not be saved." else "")
         .filter(String::isNotBlank).distinct().joinToString(" "))
 internal fun cameraMayShare(requested: Boolean, visible: Boolean, held: Boolean, closed: Boolean): Boolean =
@@ -134,7 +139,7 @@ internal fun callText(context: Context, template: String): String =
 /** Every fixed line a call's start or failure can show, so the translation test checks each one. */
 internal val CallFailureStrings = listOf(CALL_START_FAILED, CALL_ALREADY_ON, CALL_STILL_CONNECTING, CALL_ALLOW_MIC, CALL_STILL_ENDING, CALL_MIC_STILL_ON,
     CALL_INVITATION_ENDED, CALL_SIGN_IN_TO_ANSWER, CALL_OPEN_TO_ANSWER, CALL_ANDROID_REFUSED, CALL_SIGN_IN_AND_MIC,
-    CALL_HERMES_NO_ANSWER, CALL_VOICE_NO_ANSWER, CALL_SIGN_IN_EXPIRED, CALL_MIC_FAILED, CALL_DROPPED, CALL_VOICE_STOPPED)
+    CALL_HERMES_NO_ANSWER, CALL_VOICE_NO_ANSWER, CALL_SIGN_IN_EXPIRED, CALL_MIC_FAILED, CALL_DROPPED, CALL_VOICE_STOPPED, dev.hermes.android.data.APP_CONNECTION_ERROR)
 /** A call the phone refused to start; its message is the owner's line, already translated. */
 internal class CallStartRefused(text: String) : IllegalStateException(text)
 /** The line a call start that failed shows: a refusal's own line as it is, a known call line in the phone's language, else a generic one. */
@@ -173,13 +178,6 @@ internal class LineOnce {
     }
 }
 
-/** What the owner reads when Hermes refuses or never answers a call's admission. */
-internal fun grantFailureText(error: Throwable): String = when {
-    error is ApiFailure && error.status in setOf(401, 403) -> CALL_SIGN_IN_EXPIRED
-    error is ApiFailure && error.status in 400..499 && error.status !in setOf(408, 429) && !error.message.isNullOrBlank() -> error.message.orEmpty()
-    else -> CALL_HERMES_NO_ANSWER
-}
-
 /** [ownerName] lets the grant's greeting use the name the owner typed in Beacon, as the call context does. */
 internal fun phoneKeyCallBody(provider:String,profile:String,conversationId:String?,ownerName:String=""):JSONObject {
     require(voiceProviderSupported(provider))
@@ -191,6 +189,19 @@ internal fun phoneKeyCallBody(provider:String,profile:String,conversationId:Stri
 internal fun phoneKeyAnswerBody(provider:String):JSONObject {
     require(voiceProviderSupported(provider))
     return JSONObject().put("voice_provider",provider).put("client_key",true)
+}
+
+/**
+ * A tool receipt as the call's timeline stores it, with the lost link's cause (LINK-121) when this call's plugin keeps it ([voice]'s own
+ * context advertises `call_capabilities.tool_receipt_cause`); an older plugin would refuse the whole event batch over it.
+ */
+internal fun callTimelineReceipt(value: JSONObject, voice: DirectVoice?): JSONObject? = timelineToolReceipt(value, voice?.takesReceiptCause == true)
+
+/** One row of a call's tool log: what the call engine reported for a request, at [elapsedMs] from the tap. */
+internal fun toolLogEntry(value: JSONObject, elapsedMs: Long): JSONObject = JSONObject().put("elapsed_ms", elapsedMs).apply {
+    for (key in listOf("request_id", "tool_name", "status", "error_code", "ran_on_hermes", "detail", "log_only", "cause_class")) if (value.has(key)) put(key, value.get(key))
+    // Hermes' own execute time for the request (a v3 receipt's server_ms), for the tool budget of live timing (device round 1).
+    value.optJSONObject("server_ms")?.optDouble("execute")?.takeIf { !it.isNaN() }?.let { put("execute_ms", it) }
 }
 
 class CallController(private val app: BeaconApplication) {
@@ -242,10 +253,61 @@ class CallController(private val app: BeaconApplication) {
     private val switching = AtomicBoolean(false)
     private val epoch = java.util.concurrent.atomic.AtomicLong()
     private val background = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    /** Keeps the next call ready while a call entry is on screen ([VoicePrewarm]). */
-    internal val prewarm = CallPrewarm(app, { ownerScope }, { _state.value.active || starting.get() })
+    /** Each call start, kept until a Hermes that takes start diagnostics has it (calls contract section 5). */
+    internal val startDiagnostics by lazy { CallStartDiagnostics(java.io.File(app.noBackupFilesDir, "call-start-diagnostics.json")) }
+    /** Keeps the next call ready while a call entry is on screen ([VoicePrewarm]); each context it reads says what that Hermes takes. */
+    internal val prewarm = CallPrewarm(app, { ownerScope }, { _state.value.active || starting.get() }, contextRead = { client, context ->
+        startDiagnostics.learned(client.scope, context)
+        if (startDiagnostics.takes(client.scope)) sendStartDiagnostics(client)
+    }, callStarting = { starting.get() })
     /** The call-start stages of the current call, as they were reported, and its tap on `elapsedRealtime` (live timing reads them). */
     internal val stageLog = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+    /** The current call's tool receipts as the call engine reported them, with the time from the tap (live timing and device tests read them). */
+    internal val toolLog = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
+    internal fun toolEvent(value: JSONObject) {
+        if (toolLog.size >= 256) return
+        toolLog.add(toolLogEntry(value, android.os.SystemClock.elapsedRealtime() - tappedAt))
+    }
+    private var diagnosticsJob: Job? = null
+    /**
+     * Sends [client]'s account's unsent start rows. While a row cannot be sent it tries again every few seconds for two minutes,
+     * so a start that failed for want of Hermes is on record soon after the link returns.
+     */
+    internal fun sendStartDiagnostics(client: BeaconClient) {
+        val account = client.scope.copy(session = "")
+        synchronized(this) {
+            if (diagnosticsJob?.isActive == true) return
+            diagnosticsJob = background.launch {
+                val until = android.os.SystemClock.elapsedRealtime() + 120_000
+                while (isActive && app.auth.read(account.origin).authorizesPushSource(account)) {
+                    if (startDiagnostics.flush(account, client::nativeRequest)) return@launch
+                    if (!startDiagnostics.takes(account) || android.os.SystemClock.elapsedRealtime() > until) return@launch
+                    delay(3_000)
+                }
+            }
+        }
+    }
+    /**
+     * Keeps one row for the start of [call] (connected, failed or cancelled): its stages from [stageLog] and, for a failure, the
+     * line it showed ([shownLine], before translation). A refusal before the grant was sent leaves no row.
+     */
+    internal fun recordStart(call: CallSpec, failed: Boolean, shownLine: String?) {
+        val stages = stageLog.toList()
+        if (stages.none { it.optString("stage") == "grant_sent" }) return
+        val account = call.client.scope.copy(session = "")
+        val context = call.context ?: call.earlyContext?.takeIf { it.isCompleted && !it.isCancelled }?.let { runCatching { it.getCompleted() }.getOrNull() }
+        val tappedAtEpoch = System.currentTimeMillis() - (android.os.SystemClock.elapsedRealtime() - call.tappedAt)
+        val callId = call.grant.optString("call_id")
+        // A hang-up can end the call from the main thread: the store's disk work runs in the background.
+        background.launch {
+            context?.let { startDiagnostics.learned(account, it) }
+            val row = callStartRow(java.util.UUID.randomUUID().toString(), callId, tappedAtEpoch, call.credentials?.provider.orEmpty(),
+                when { call.incoming -> "callback_answer"; call.phoneOrigin == dev.hermes.android.phone.PhoneOrigin.Overlay -> "overlay"; else -> "tap" },
+                dev.hermes.android.BuildConfig.VERSION_NAME, startDiagnostics.contract(account), stages, failed, shownLine)
+            runCatching { startDiagnostics.record(account, row) }
+            if (startDiagnostics.takes(account)) sendStartDiagnostics(call.client)
+        }
+    }
     @Volatile internal var tappedAt = 0L
         private set
     /** Which call line a screen has been told about ([lineIsNew]); declared before the collectors in init that reset it. */
@@ -266,10 +328,15 @@ class CallController(private val app: BeaconApplication) {
     private suspend fun readOwnerName(): String = try { app.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).ownerName }
         catch(error:CancellationException) { throw error } catch(_:Exception) { "" }
     /** A stage reported before the service took the call: kept with the call and uploaded once it has an id. */
-    private fun earlyStage(pending: MutableList<JSONObject>, stage: String, tappedAt: Long, provider: String, warm: Boolean? = null) {
+    private fun earlyStage(pending: MutableList<JSONObject>, stage: String, tappedAt: Long, provider: String) {
         val value = JSONObject().put("type", "media_diagnostic").put("stage", stage).put("elapsed_ms", android.os.SystemClock.elapsedRealtime() - tappedAt)
-            .put("provider", provider).put("attempt", 0).apply { warm?.let { put("warm", it) } }
+            .put("provider", provider).put("attempt", 0)
         pending.add(value); stageLog.add(value)
+    }
+    /** The grant found no Hermes: kept for the start's diagnostics row only, never for the call timeline (whose stage list lacks it). */
+    private fun unreachable(tappedAt: Long, provider: String, error: Throwable) {
+        stageLog.add(JSONObject().put("type", "media_diagnostic").put("stage", "reach_failed").put("elapsed_ms", android.os.SystemClock.elapsedRealtime() - tappedAt)
+            .put("provider", provider).put("attempt", 0).put("error_code", diagnosticErrorCode(error)).put("cause_class", voiceTransportCause(error)))
     }
     suspend fun start(client: BeaconClient, conversationId: String? = null, phoneOrigin: dev.hermes.android.phone.PhoneOrigin = dev.hermes.android.phone.PhoneOrigin.LiveCall) {
         val tappedAt=android.os.SystemClock.elapsedRealtime()
@@ -339,7 +406,7 @@ class CallController(private val app: BeaconApplication) {
         try {
             service?.let { awaitCallTeardown(it.destroyed) { generation == epoch.get() } }
             check(generation == epoch.get()) { "Call start was cancelled" }
-            stageLog.clear(); this.tappedAt = tappedAt
+            stageLog.clear(); toolLog.clear(); this.tappedAt = tappedAt
             // Saved-auth restoration must recognize an already admitted local owner during reservation.
             _state.value = CallState(true, "connecting", startedAt = System.currentTimeMillis(), conversationScope = conversationId?.let { frozen.scope.session(it) })
             if (incoming != null && app.push.invitation(incoming.source, incoming.event) == null) refuse(CALL_INVITATION_ENDED)
@@ -349,7 +416,8 @@ class CallController(private val app: BeaconApplication) {
             // the live model is asked to greet now, while Hermes admits the call and the service, Telecom and microphone start.
             // The context and the live session read before the tap carry the owner's memory: a locked start takes neither.
             val prefetched = if (trust.trusted()) target?.let { prewarm.context(it, ownerName) } else null
-            warm = if (target != null && prefetched != null) prewarm.claim(target, voiceSettings) else null
+            // Taken, or closed when this call cannot use it (no context, locked, an incoming call): never a second session beside the call's own.
+            warm = prewarm.claim(target?.takeIf { prefetched != null }, voiceSettings)
             // The Call button's touch-down usually sent it already.
             warm?.takeIf { !it.cueRequested }?.let { it.startTurn(liveStartCue(it.context)) }
             // An authenticated, scoped context read may overlap the service/Telecom/media pipeline. Its value is never
@@ -363,21 +431,23 @@ class CallController(private val app: BeaconApplication) {
                         withTimeoutOrNull(8_000) { frozen.nativeVoiceContext(earlySession, ownerName) }
                     } catch (error: CancellationException) { currentCoroutineContext().ensureActive(); null }
                     catch (_: Throwable) { null }
-                }
+                }.also { read -> read.invokeOnCompletion { error -> if (error == null) read.getCompleted()?.let { startDiagnostics.learned(frozen.scope, it) } } }
             } else null
             val early = java.util.Collections.synchronizedList(mutableListOf<JSONObject>())
             earlyStage(early, "grant_sent", tappedAt, voiceSettings.provider)
             suspend fun admit(): JSONObject {
-                // A grant Hermes never answers is a failure, not a cancellation, so the call ends saying so.
-                val value = withTimeoutOrNull(15_000) {
+                // A grant with no answer within its reach budget, or a connection that never opened, ends the call at once saying Hermes can't be reached.
+                val value = reachHermes(callStartReachMs(callbackAnswer = incoming != null), unreachable = { unreachable(tappedAt, voiceSettings.provider, it) }) {
                     if (incoming == null) frozen.nativeRequest("/api/plugins/beacon/mobile/calls", "POST", phoneKeyCallBody(voiceSettings.provider,frozen.auth.profile,conversationId,ownerName))
                     else frozen.nativeRequest("/api/plugins/beacon/mobile/callbacks/" + incoming.event + "/answer", "POST", phoneKeyAnswerBody(voiceSettings.provider))
-                } ?: throw java.net.SocketTimeoutException("Hermes did not admit the call")
+                }
                 require(value.string("provider")==voiceSettings.provider&&voiceProviderSupported(voiceSettings.provider)&&
                     value.string("transport")==voiceSettings.provider+"_live_direct") { "Unsupported voice transport" }
                 require(value.string("profile") == frozen.auth.profile && value.string("call_id").isNotBlank() && value.string("conversation_id").isNotBlank() &&
                     (target == null || value.string("conversation_id") == target.session)) { "Invalid call authorization" }
                 earlyStage(early, "grant_ok", tappedAt, voiceSettings.provider)
+                // Hermes answered: rows of earlier starts go with it.
+                if (startDiagnostics.takes(frozen.scope)) sendStartDiagnostics(frozen)
                 return value
             }
             val admission: Deferred<JSONObject> = if (target != null) {
@@ -417,6 +487,9 @@ class CallController(private val app: BeaconApplication) {
             }
             if (generation == epoch.get()) { spec = null; _state.value = CallState(error = reason) }
             val failed = e !is CancellationException && generation == epoch.get()
+            // The service never took this start: its row is kept here (a refusal before the grant leaves none; the stage log is this start's).
+            if (!started && this.tappedAt == tappedAt) recordStart(CallSpec(frozen, CompletableDeferred(grant ?: JSONObject()), incoming != null, voiceSettings, tappedAt, phoneOrigin = phoneOrigin),
+                failed, if (e is ApiFailure || e is java.io.IOException || e is TimeoutCancellationException) grantFailureText(e) else null)
             grant?.takeIf { it.string("call_id").isNotBlank() }?.let { release(CallSpec(frozen, it), failed) }
                 // A service that never started leaves the parallel admission to release here.
                 ?: parallel?.takeIf { !started }?.let { pending -> background.launch { release(CallSpec(frozen, pending), failed) } }
@@ -544,10 +617,9 @@ class BeaconCallService : Service() {
         spec = pending; app.calls.spec = null; app.calls.service = this
         // Hermes' admission may still be running: the call's text sync starts when it lands, and a refusal ends the call with its reason.
         pending.admission.invokeOnCompletion { error ->
-            scope.launch(mediaDispatcher) {
-                if (error == null) admitted(pending)
-                else if (error !is CancellationException && !closed.get()) failure(grantFailureText(error))
-            }
+            if (error == null) scope.launch(mediaDispatcher) { admitted(pending) }
+            // A refused or unreachable grant ends the call at once, whatever the media thread is still doing.
+            else if (error !is CancellationException && !closed.get()) scope.launch { failure(grantFailureText(error)) }
         }
         scope.launch {
             var last = ""
@@ -600,7 +672,10 @@ class BeaconCallService : Service() {
                         }
                     }
                 }
-            } catch (e: Throwable) { if (e !is CancellationException) endCall(callStartFailureLine(e) { dev.hermes.android.push.serviceText(this@BeaconCallService, it) }, failedConnection = true) else hangup() }
+            } catch (e: Throwable) {
+                if (e !is CancellationException) { failureLine = failureLine ?: e.message.orEmpty(); endCall(callStartFailureLine(e) { dev.hermes.android.push.serviceText(this@BeaconCallService, it) }, failedConnection = true) }
+                else hangup()
+            }
             finally { control = null }
         }
         return START_NOT_STICKY
@@ -699,6 +774,8 @@ class BeaconCallService : Service() {
         when(value.string("type")) {
             "interrupted" -> {
                 pcm?.interrupt();handleControl(value)
+                // The final caption and the chat line keep only what played (device round 4, D2).
+                cutCaptions(transcriptText,value)
                 finishDirectTurn(interrupted=true)
             }
             "transcript" -> {
@@ -727,20 +804,20 @@ class BeaconCallService : Service() {
                 refreshNotification()
                 updateToolNotification()
             }
+            "hermes_link" -> app.calls.updateFrom(this) { it.withHermesLink(value.optBoolean("reachable",true)) }
             "media_diagnostic" -> {
                 app.calls.stageLog.add(JSONObject(value.toString()))
                 syncEvent(diagnosticReceipt(value))
             }
-            "tool_receipt" -> {
+            "tool_receipt" -> if (value.optBoolean("log_only")) app.calls.toolEvent(value) else {
+                app.calls.toolEvent(value)
                 CallToolReceipt.from(value)?.let { receipt -> app.calls.updateFrom(this) { call ->
                     call.copy(toolReceipts=(call.toolReceipts.filterNot { it.requestId==receipt.requestId }+receipt).takeLast(8))
                 } }
                 app.calls.updateFrom(this) { it.copy(toolApprovals=pendingCallToolApprovals(it.toolApprovals,value)) }
                 refreshNotification()
                 updateToolNotification()
-                val receipt=JSONObject().put("type","tool_receipt").put("event_id",java.util.UUID.randomUUID().toString()).put("turn_id","tools").put("at_ms",pcm?.clock()?:0)
-                for(key in listOf("request_id","tool_name","status","error_code")) if(value.has(key)) receipt.put(key,value.get(key))
-                syncEvent(receipt)
+                callTimelineReceipt(value,directVoice)?.let { syncEvent(it.put("event_id",java.util.UUID.randomUUID().toString()).put("turn_id","tools").put("at_ms",pcm?.clock()?:0)) }
             }
             "visual_state" -> {
                 val receipt=JSONObject().put("type","visual_state").put("event_id",java.util.UUID.randomUUID().toString()).put("turn_id","visual").put("at_ms",pcm?.clock()?:0)
@@ -933,7 +1010,9 @@ class BeaconCallService : Service() {
     }
     fun route(id: String) { val endpoint = endpoints.find { it.identifier.toString() == id } ?: return; startingRoute.chosenByOwner(); scope.launch { val result = control?.requestEndpointChange(endpoint); if (result is CallControlResult.Error) app.calls.updateFrom(this@BeaconCallService) { it.copy(error = dev.hermes.android.push.serviceText(this@BeaconCallService, "Couldn't switch the audio.")) } } }
     // Services have no Compose strings: the reason comes from the same catalog, in the phone's language.
-    private fun failure(message: String) { endCall(dev.hermes.android.push.serviceText(this, message), failedConnection = true) }
+    private fun failure(message: String) { failureLine = failureLine ?: message; endCall(dev.hermes.android.push.serviceText(this, message), failedConnection = true) }
+    /** The first failure line of this call before translation: the start diagnostics row names it. */
+    @Volatile private var failureLine: String? = null
     fun hangup() { endCall(null) }
     @Synchronized private fun syncRemainingTranscript() {
         val pending=spec?:return
@@ -943,6 +1022,7 @@ class BeaconCallService : Service() {
         }
     }
     private fun endCall(error:String?,failedConnection:Boolean=false) { finishCallOnce(closed,{ pcm?.mute(true);syncRemainingTranscript() }) { fenceFailure ->
+        spec?.let { app.calls.recordStart(it,failedConnection,failureLine) }
         getSystemService(NotificationManager::class.java).cancel(TOOL_NOTIFICATION)
         overlayAuthority.close();overlayAuthorityJob?.cancel();connectionJob?.cancel();cameraRequested=false;screenRequested=false;cameraGate.invalidate();screenGate.invalidate()
         val endingGemini=directVoice

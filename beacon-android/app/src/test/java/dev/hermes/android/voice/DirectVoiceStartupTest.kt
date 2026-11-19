@@ -133,7 +133,8 @@ class DirectVoiceStartupTest {
             listener.onMessage(socket,json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "invented","name" to "delete_everything","args" to json())))).toString())
             withTimeout(3000) { while(frames.none { it.has("toolResponse") }) delay(5) }
             val response=frames.first { it.has("toolResponse") }.getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0).getJSONObject("response")
-            assertEquals("unsupported",response.getString("status"))
+            assertEquals("failed",response.getString("status"));assertEquals("tool_unknown",response.getString("detail"))
+            assertFalse(response.getBoolean("will_update"))
             assertEquals(0,tickets.get());assertTrue(paths.none { it.contains("/tools") })
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
@@ -242,11 +243,10 @@ class DirectVoiceStartupTest {
             runCatching { suspendCoroutineUninterceptedOrReturn<Unit> { continuation ->
                 method.invoke(voice,json("id" to "updating-native","name" to "hermes_work","args" to json("text" to "Owned fixture")),0L,continuation)
             } }
-            @Suppress("UNCHECKED_CAST")
-            val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(voice) as Map<String,JSONObject>
-            val response=receipts.getValue("updating-native")
-            assertEquals("not_sent",response.getString("status"));assertEquals("hermes_updating",response.getString("error_code"))
-            assertTrue("The model is told why and when to try again",response.getString("message").contains("updating"))
+            // The model hears the real state, data only: nothing ran because Hermes is updating.
+            val response=told(voice,"updating-native")!!
+            assertEquals("failed",response.getString("status"));assertEquals("hermes_updating",response.getString("detail"))
+            assertEquals(false,response.get("ran_on_hermes"));assertFalse(response.getBoolean("will_update"));assertFalse(response.has("message"))
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
@@ -278,6 +278,78 @@ class DirectVoiceStartupTest {
             assertEquals(providerRejectionMessage("gemini", "API key not valid"), withTimeout(3000) { failed.await() })
             assertEquals(1, connections.get())
         } finally { voice.close(); scope.cancel(); client.closeNative() }
+    }
+
+    /** One call whose every provider setup is closed with [code] and [reason]: the line it ends with, and how many provider sockets it opened. */
+    private suspend fun refusedCall(code: Int, reason: String, waitMs: Long): Pair<String?, Int> {
+        val connections = AtomicInteger()
+        val failed = CompletableDeferred<String>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val client = client("stored")
+        val factory = WebSocket.Factory { request, listener ->
+            connections.incrementAndGet()
+            val socket = object : WebSocket {
+                override fun request() = request
+                override fun queueSize() = 0L
+                override fun send(text: String): Boolean {
+                    if (JSONObject(text).has("setup")) listener.onClosing(this, code, reason)
+                    return true
+                }
+                override fun send(bytes: ByteString) = false
+                override fun close(code: Int, reason: String?) = true
+                override fun cancel() = Unit
+            }
+            listener.onOpen(socket, Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(101).message("Fixture").build())
+            socket
+        }
+        val voice = DirectVoice(client, "call", "stored", scope, {}, {}, { failed.complete(it) },
+            credentials = credentials(), providerSocketFactory = factory)
+        try {
+            voice.start()
+            return withTimeoutOrNull(waitMs) { failed.await() } to connections.get()
+        } finally { voice.close(); scope.cancel(); client.closeNative() }
+    }
+
+    /**
+     * Backlog 81 (CHAT-121 follow-up 11): Gemini refused every call on the demo for money (close 1011 "Your prepayment credits are depleted",
+     * from 16 Nov), and the call took it for a passing fault: about six setups in 12 s, then a line about the connection. A refusal for money
+     * never heals by retrying: one setup, and the call ends at once with one plain line.
+     */
+    @Test(timeout = 8000) fun aCallTheProviderRefusesForMoneyEndsAtOnceWithItsOwnLine() = runBlocking {
+        val (line, sockets) = refusedCall(1011, "Your prepayment credits are depleted. Please go to AI Studio at https://ai.studio/projects to manage your project and billing.", 3000)
+        assertEquals("Your Gemini credits ran out.", line)
+        assertEquals("One setup, never sent again", 1, sockets)
+    }
+
+    /** A passing fault keeps its short retry, and the retry is bounded: the call ends after a few tries, never with the money line. */
+    @Test(timeout = 30000) fun aPassingProviderFaultIsTriedAgainABoundedNumberOfTimes() = runBlocking {
+        val (line, sockets) = refusedCall(1011, "Internal error encountered.", 20000)
+        assertTrue("Tried again: $sockets", sockets in 2..6)
+        assertNotEquals("Your Gemini credits ran out.", line)
+    }
+
+    @Test fun onlyAReasonAboutMoneyReadsAsARefusalForMoney() {
+        for (money in listOf("Your prepayment credits are depleted. Please go to AI Studio at https://ai.studio/projects to manage your project and billing.",
+            "You exceeded your current quota, please check your plan and billing details.", "Billing account is disabled", "Insufficient credits"))
+            assertTrue(money, providerMoneyRefusal(money))
+        for (passing in listOf("Internal error encountered.", "The service is currently unavailable.", "Deadline expired before operation could complete.",
+            "Resource has been exhausted (e.g. check quota).", "Session closed due to client inactivity", "API key not valid", ""))
+            assertFalse(passing, providerMoneyRefusal(passing))
+        assertEquals("Your Gemini credits ran out.", providerRejectionMessage("gemini", PROVIDER_MONEY_REFUSAL))
+        assertEquals("Your Grok credits ran out.", providerRejectionMessage("grok", PROVIDER_MONEY_REFUSAL))
+        assertEquals("Your OpenAI credits ran out.", providerRejectionMessage("openai", PROVIDER_MONEY_REFUSAL))
+    }
+
+    @Test fun theLineForARefusalForMoneyIsInEveryLanguage() {
+        val app = requireNotNull(listOf(".", "app", "beacon-android/app").map { java.io.File(it) }.firstOrNull { java.io.File(it, "src/main/assets/native-locales.json").isFile }) { "Run from the Android project" }
+        val catalog = JSONObject(java.io.File(app, "src/main/assets/native-locales.json").readText())
+        for (provider in listOf("gemini", "grok", "openai")) {
+            val line = providerRejectionMessage(provider, PROVIDER_MONEY_REFUSAL)
+            for (language in catalog.keys()) {
+                val translated = catalog.getJSONObject(language).optString(dev.hermes.android.ui.normalized(line))
+                assertTrue("$language: $line", translated.isNotBlank() && translated.contains(line.substringAfter("Your ").substringBefore(" credits")))
+            }
+        }
     }
 
     @Test fun directVoiceAcceptsOpenAiAsASelectedProvider() {
@@ -386,9 +458,9 @@ class DirectVoiceStartupTest {
             assertTrue("The caller must receive a terminal result: ${result.exceptionOrNull()}",result.isSuccess)
             assertTrue(currentCoroutineContext().isActive)
             assertEquals(0,submitted.get())
-            @Suppress("UNCHECKED_CAST")
-            val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(voice) as Map<String,JSONObject>
-            assertEquals("not_sent",receipts.getValue("work-timeout").getString("status"))
+            val response=told(voice,"work-timeout")!!
+            assertEquals("Nothing was sent, so it is a failure, not an unknown outcome","failed",response.getString("status"))
+            assertEquals(false,response.get("ran_on_hermes"))
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
@@ -493,13 +565,20 @@ class DirectVoiceStartupTest {
         @Suppress("UNCHECKED_CAST")
         val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(voice) as MutableMap<String,JSONObject>
         receipts["work"]=json("function_name" to "hermes_work","job_id" to "owned-job")
+        // The owner said yes after the model's question (device round 1: only then may the call back go on).
+        val askedAt=DirectVoice::class.java.getDeclaredField("callBackAskedAt").apply { isAccessible=true }.get(voice) as java.util.concurrent.atomic.AtomicLong
+        val words=DirectVoice::class.java.getDeclaredField("ownerWords").apply { isAccessible=true }.get(voice) as java.util.concurrent.atomic.AtomicLong
+        fun answered() { askedAt.set(words.get());words.incrementAndGet() }
+        answered()
         try {
             invoke("callback");invoke("callback")
             assertEquals(1,posts.get());assertTrue(receipts.getValue("callback").getBoolean("subscribed"))
             invoke("foreign-scope","foreign")
-            assertEquals(1,posts.get());assertEquals("not_sent",receipts.getValue("foreign-scope").getString("status"))
-            httpStatus=503;invoke("unknown");invoke("unknown")
-            assertEquals(2,posts.get());assertEquals("submission_unconfirmed",receipts.getValue("unknown").getString("status"))
+            assertEquals(1,posts.get());assertEquals("invalid_arguments",told(voice,"foreign-scope")!!.getString("detail"))
+            // One answer turns the call back on once (REVIEW-E3 finding 1): the next turn-on comes after another answer.
+            answered();httpStatus=503;invoke("unknown");invoke("unknown")
+            assertEquals("One answer from Hermes is one request, never replayed",2,posts.get())
+            assertEquals("failed",told(voice,"unknown")!!.getString("status"));assertEquals("http_503",told(voice,"unknown")!!.getString("detail"))
         } finally { voice.close();scope.cancel();client.closeNative() }
     }
 
@@ -563,7 +642,23 @@ class DirectVoiceStartupTest {
             assertTrue("$gone must not exist", sources.none { (_, text) -> text.contains(gone) })
         // A final owner transcript is a caption, never a Hermes request.
         assertFalse(sources.getValue("DirectVoice.kt").contains("Your request is still pending."))
-        assertTrue(callToolHint("hermes_callback", json("subscribed" to true)).contains("call back"))
-        assertEquals("", callToolHint("discover_tools", json("tools" to JSONArray())))
+        // Calls contract v3: results carry their real state; the call engine writes no lines for the model to say.
+        val engine = listOf("DirectVoice.kt", "CallLinkState.kt", "CallToolLedger.kt", "NativeSubmission.kt").joinToString(" ") { sources.getValue(it) }
+        for (gone in listOf("Verified update from Hermes", "Tell the owner", "tell the owner", "Give one brief progress line", "HANDOFF_AFTER_FAILED_LOOKUP",
+            "DISCOVER_STILL_STARTING", "VoiceWorkProgress", "discoverWithRetry", "already pending. No new invocation"))
+            assertFalse("$gone must not be in the call engine", engine.contains(gone))
+    }
+
+    private val queued = java.util.WeakHashMap<DirectVoice, MutableList<JSONObject>>()
+    /** What function call [id] was last told: these calls have no provider socket, so the responses wait in the call's control queue. */
+    private fun told(voice: DirectVoice, id: String): JSONObject? {
+        val frames = queued.getOrPut(voice) { mutableListOf() }
+        val controls = DirectVoice::class.java.getDeclaredField("controls").apply { isAccessible = true }.get(voice) as kotlinx.coroutines.channels.Channel<*>
+        while (true) {
+            val next = controls.tryReceive().getOrNull() ?: break
+            frames += JSONObject(next.javaClass.getDeclaredField("json").apply { isAccessible = true }.get(next) as String)
+        }
+        return frames.flatMap { f -> f.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } }.orEmpty() }
+            .lastOrNull { it.optString("id") == id }?.getJSONObject("response")
     }
 }

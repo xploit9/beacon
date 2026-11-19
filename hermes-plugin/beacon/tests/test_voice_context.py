@@ -343,7 +343,6 @@ def test_context_leaves_the_name_to_the_phone_and_keeps_profile_personality(harn
     monkeypatch.setattr(voice,'builtin_memory',lambda root,cfg:'')
     monkeypatch.setattr(voice,'history',lambda *args:[])
     monkeypatch.setattr(voice,'tool_catalogue',lambda profile:'')
-    monkeypatch.setattr(voice,'local_time',lambda profile:'')
 
     result=voice.context('owner','basic','default','native-stored',call_id)
 
@@ -403,22 +402,15 @@ class _KeyedZone(tzinfo):
     def tzname(self, dt): return '+04'
 
 
-def test_greeting_plan_holds_every_ordinary_line_of_the_profile_day(harness):
+def test_zone_id_reads_an_iana_key_or_the_utc_offset(harness):
     api, _, _, _, _ = harness
     voice = api.voice_context
-    plan = voice.greeting_plan('Maya Example', 'Asia/Dubai')
-    assert plan['zone'] == 'Asia/Dubai'
-    assert [v['from_hour'] for v in plan['variants']] == [0, 5, 12, 17]
-    for hour in range(24):
-        line = [v for v in plan['variants'] if v['from_hour'] <= hour][-1]['text']
-        assert line == voice.greeting_for('Maya Example', f'Tuesday 20 October 2026, {hour:02d}:30 (Asia/Dubai)', False)
-    # Without a profile clock the one line holds all day.
-    assert voice.greeting_plan('Maya', '') == {'zone': 'UTC', 'variants': [{'from_hour': 0, 'text': 'Hi, Maya.'}]}
+    assert not hasattr(voice, 'greeting_plan'), 'no app reads a greeting plan; the live model greets itself'
     assert voice._zone_id(datetime(2026, 10, 20, 18, 15, tzinfo=timezone(-timedelta(hours=3, minutes=30)))) == '-03:30'
     assert voice._zone_id(datetime(2026, 10, 20, 18, 15, tzinfo=_KeyedZone())) == 'Asia/Dubai'
 
 
-def test_context_plans_greetings_in_the_profile_zone_from_its_one_clock_read(harness, monkeypatch):
+def test_context_takes_zone_time_and_greeting_from_its_one_clock_read(harness, monkeypatch):
     api, _, _, root, _ = harness
     call_id = api.mobile.reserve('owner', 'default', 'native-stored')['call_id']
     voice = api.voice_context
@@ -435,8 +427,9 @@ def test_context_plans_greetings_in_the_profile_zone_from_its_one_clock_read(har
     result = voice.context('owner', 'basic', 'default', 'native-stored', call_id, display_name='Maya Example', native_backend=True)
 
     assert reads == ['bound']
-    plan = result['greeting_plan']
-    assert plan['zone'] == 'Asia/Dubai'
-    # The phone's line for the call's hour is the greeting the call speaks.
-    assert [v for v in plan['variants'] if v['from_hour'] <= 18][-1]['text'] == result['greeting'] == 'Good evening, Maya. What can I do for you?'
-    assert 'Good morning, Maya. What can I do for you?' in [v['text'] for v in plan['variants']]
+    assert 'greeting_plan' not in result
+    assert result['zone'] == 'Asia/Dubai'
+    # A 1.2.0 app still speaks `greeting`; a v3 app gives the live model `local_time` and lets it greet in its own words.
+    assert result['greeting'] == 'Good evening, Maya. What can I do for you?'
+    assert result['local_time'] == 'Tuesday 20 October 2026, 18:15 (Asia/Dubai)'
+    assert result['persona'] == '' and result['preferred_language'] == ''

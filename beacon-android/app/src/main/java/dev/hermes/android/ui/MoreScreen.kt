@@ -62,6 +62,7 @@ private fun settingsIcon(name: String): ImageVector = when (name) {
     "Chat", "Settings" -> Icons.Rounded.ChatBubbleOutline
     "Notifications & Keep connected", "Notifications" -> Icons.Rounded.NotificationsNone
     "Phone access" -> Icons.Rounded.PhoneAndroid
+    AGENT_PHONE_ROUTE -> Icons.Rounded.MobileFriendly
     "App updates" -> Icons.Rounded.SystemUpdate
     "Server" -> Icons.Rounded.SettingsSuggest
     "Health" -> Icons.Rounded.MonitorHeart
@@ -91,7 +92,7 @@ internal val SettingsRowMinHeight = 78.dp
 @Composable private fun SettingsRow(name: String, summary: SettingsRowSummary, compatibilityTag: String? = null, selected: Boolean? = null, onClick: () -> Unit) {
     val pill = summary.status != null && summary.statusLabel.isNotBlank()
     SettingsNavRow(
-        label = uiText(settingsLabel(name)), onClick = onClick, icon = settingsIcon(name),
+        label = uiText(settingsLabel(name)).named(), onClick = onClick, icon = settingsIcon(name),
         value = summary.value.ifBlank { if (pill) "" else uiText(settingsDescriptions[name].orEmpty()) },
         status = summary.status.takeIf { pill }, statusLabel = summary.statusLabel,
         selected = selected, minHeight = SettingsRowMinHeight, valueMaxLines = 2,
@@ -128,7 +129,7 @@ internal fun settingsSearchResults(routes: List<String>, shown: List<Triple<Stri
     var query by rememberSaveable(category) { mutableStateOf("") }
     // Only a search needs the matches, and they are worked out once per query and language, not on every recomposition of the overview.
     val shown = if (query.isBlank()) emptyList() else settingsSearchRoutes.map { route ->
-        Triple(uiText(settingsLabel(route)), uiText(settingsDescriptions[route].orEmpty()), settingsKeywordsOf(route).takeIf(String::isNotBlank)?.let { uiText(it) }.orEmpty())
+        Triple(uiText(settingsLabel(route)).named(), uiText(settingsDescriptions[route].orEmpty()), settingsKeywordsOf(route).takeIf(String::isNotBlank)?.let { uiText(it) }.orEmpty())
     }
     val matches = remember(query, shown) { settingsSearchResults(settingsSearchRoutes, shown, query) }
     SettingsList(testTag = "settings-overview") {
@@ -241,6 +242,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
         serverOverall = server.overall,
         serverUpdateAvailable = server.update?.optBoolean("update_available"),
         checkpointSize = checkpointSize, phoneAccess = phoneAccess,
+        agentPhone = agentPhoneHubState(data[agentPhoneCacheKey(prefs.assistantProfile)]),
     ).withLoaded(data["profile-settings"])
     val summaries = localizedSettingsSummaries(snapshot)
     SettingsOverview(summaries, { vm.more(it) }, category, selectedPage)
@@ -281,7 +283,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
 @Composable private fun SettingsStatePage(vm: BeaconViewModel, page: String, back: Boolean = true, refreshing: Boolean = false, content: LazyListScope.() -> Unit) {
     androidx.activity.compose.BackHandler { vm.backFromSettings() }
     Column(Modifier.fillMaxSize()) {
-        Header(uiText(settingsLabel(page)), back = if (back) ({ vm.backFromSettings() }) else null, menu = LocalOpenNavigationMenu.current)
+        Header(uiText(settingsLabel(page)).named(), back = if (back) ({ vm.backFromSettings() }) else null, menu = LocalOpenNavigationMenu.current)
         SettingsList(Modifier.weight(1f), refreshing = refreshing, content = content)
     }
 }
@@ -291,8 +293,10 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
         SettingsStatePage(vm, page) { item { SettingsSection(testTag = "settings-plugin-missing") { MissingBeaconPluginState(compact = true) } } }
         return
     }
-    val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Vault", "Beacon", "Notifications", "Bots", "Profiles", "Commands", "Session usage")) && page !in setOf("Beacon", "App updates")
-    if (remotePage && vm.client == null && !ui.loading) {
+    // Chat join: EMU-JOIN's agent-phone page is remote too; CACHEFIX-A shows a page's saved copy instead of Reconnect.
+    val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Vault", "Beacon", "Notifications", "Bots", "Profiles", "Commands", "Session usage", AGENT_PHONE_ROUTE)) && page !in setOf("Beacon", "App updates")
+    val savedData by vm.data.collectAsStateWithLifecycle()
+    if (remotePage && vm.client == null && !ui.loading && !savedPageHasCopy(page, savedData)) {
         SettingsStatePage(vm, page, back = page !in setOf("Skills", "Bots")) {
             item {
                 SettingsStatusHero(SettingsStatus.Error, uiText("Reconnect to Hermes"), line = uiText("Check your network"),
@@ -327,6 +331,7 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
         }
         page == "Settings" -> NativeChatPreferences(vm)
         page == "Phone access" -> PhoneAccessSettings(vm)
+        page == AGENT_PHONE_ROUTE -> AgentPhoneSettings(vm)
         page in setOf("Appearance", "Assistant", "Connection", "Beacon", "Notifications", "App updates", "Licenses") -> Column(Modifier.fillMaxSize()) {
             // Fixed route names only reach this branch; Skills/Bots are handled above and keep their own headers.
             Header(uiText(settingsLabel(page)), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
@@ -492,7 +497,8 @@ internal fun settingsHost(address: String): String {
             SettingsSection(uiText("Server"), testTag = "settings-section:Server") {
                 Column(Modifier.animateContentSize(tween(if (motion) 200 else 0))) {
                     SettingsNavRow(uiText("Server address"), { editing = !editing }, icon = Icons.Rounded.Dns, value = host, valueTestTag = "connection-server-value", testTag = "connection-server-row", valueOverflow = TextOverflow.MiddleEllipsis)
-                    if (ui.error.isNotBlank()) { SettingsDivider(); SettingsErrorRow(uiText(ui.error), null, "", Modifier.testTag("connection-error")) }
+                    // Only a connection error belongs under the address: while connected, an app error (a chat setting, a page's read) is about something else.
+                    if (ui.error.isNotBlank() && verdict != ConnectionVerdict.Connected) { SettingsDivider(); SettingsErrorRow(uiText(ui.error), null, "", Modifier.testTag("connection-error")) }
                     if (editing) {
                         SettingsDivider()
                         SettingsTextFieldRow(uiText("Server address"), origin, { origin = it }, placeholder = "https://…", enabled = !ui.loading, fieldTestTag = "connection-address")

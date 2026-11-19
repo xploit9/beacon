@@ -37,8 +37,8 @@ android {
         applicationId = "dev.hermes.android"
         minSdk = 29
         targetSdk = 36
-        versionCode = 145
-        versionName = "1.2.0"
+        versionCode = 146
+        versionName = "1.2.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEFAULT_ORIGIN", quoted(owner.getProperty("native.origin", "")))
         buildConfigField("String", "FIREBASE_APP_ID", quoted(owner.getProperty("firebase.appId", "")))
@@ -92,6 +92,8 @@ android {
     compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
     buildFeatures { compose = true; buildConfig = true }
     testOptions { unitTests.isReturnDefaultValues = true }
+    // The calls contract fixtures (calls_v3/) have one copy, the plugin's: its route tests prove them, the app's tests read them.
+    sourceSets["test"].resources.srcDir("../../hermes-plugin/beacon/tests/fixtures")
     packaging { resources.excludes += "/META-INF/{AL2.0,LGPL2.1}" }
 }
 

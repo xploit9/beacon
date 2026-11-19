@@ -2,7 +2,6 @@ package dev.hermes.android.ui
 
 import dev.hermes.android.Message
 import dev.hermes.android.NOT_SENT_OUTCOMES
-import dev.hermes.android.STARTED_OUTCOMES
 import dev.hermes.android.core.QueuedMessage
 import dev.hermes.android.queuedBehindAnotherTurn
 
@@ -46,8 +45,8 @@ internal fun historySendTick(answered: Boolean): SendTick = if (answered) SendTi
 /**
  * The tick of a message the phone still tracks. Until Hermes is known to hold it, it is one tick: a message of unknown outcome is not
  * called delivered, and one Hermes cancelled before it started (it lives in the queue box as "Not sent") is never shown as delivered or answered.
- * A turn that completed, failed, was rejected or was interrupted was started by Hermes (it settles those only for a turn it started), so the message
- * shows two blue ticks, with or without a reply row after it.
+ * A turn that completed was answered: two blue ticks, with or without a reply row after it. A turn that failed, was rejected or was interrupted was
+ * started by Hermes but not answered (Root's rule, TURN-121: blue only once answer words arrive), so it is blue only when a reply row follows it.
  */
 internal fun localSendTick(message: QueuedMessage, answered: Boolean): SendTick = when (message.state) {
     // Blue needs real data for this message. One Hermes still holds as queued behind another turn has none: two grey ticks, whatever streams or follows it.
@@ -55,7 +54,7 @@ internal fun localSendTick(message: QueuedMessage, answered: Boolean): SendTick 
     "accepted" -> if (message.queuedBehindAnotherTurn()) SendTick.Delivered else historySendTick(answered)
     "sent" -> historySendTick(answered)
     "settled" -> when {
-        message.outcome in STARTED_OUTCOMES -> SendTick.Answered
+        message.outcome == "completed" -> SendTick.Answered
         // A row id from Hermes means Hermes holds the message, whatever its turn did afterwards.
         message.outcome in NOT_SENT_OUTCOMES && message.rowId.isBlank() -> SendTick.Pending
         else -> historySendTick(answered)
@@ -64,10 +63,14 @@ internal fun localSendTick(message: QueuedMessage, answered: Boolean): SendTick 
 }
 
 /** Rows that are Beacon's own words to the owner but not a reply to a message: alerts, call lines, and results of background work. */
-private val NOT_A_REPLY = setOf("async_delegation_complete", "process_complete")
+private val NOT_A_REPLY = setOf("async_delegation_complete", "process_complete", "failed_turn")
+/** Hermes' own boundary row of a turn that failed or was stopped ("Your request was not processed…", agent/turn_failure_copy.py FAILED_TURN_DISPLAY_KIND). */
+private fun closesAFailedTurn(message: Message): Boolean = message.role == "assistant" && message.displayKind == "failed_turn"
 
 private fun isBeaconReply(message: Message): Boolean =
-    message.role == "assistant" && !message.id.startsWith("alert:") && !message.id.startsWith("call:") && message.displayKind !in NOT_A_REPLY
+    message.role == "assistant" && !message.id.startsWith("alert:") && !message.id.startsWith("call:") && message.displayKind !in NOT_A_REPLY &&
+        // Only answer words, or a file or media sent back, answer a message: a row that only calls a tool (or only reasons) does not (chat join, live 17 Nov).
+        (message.text.isNotBlank() || message.attachments.isNotEmpty() || message.media.isNotEmpty())
 
 /**
  * The own messages Beacon has answered: an assistant reply comes after them in the chat, or [replying] (a reply is streaming now, below
@@ -81,10 +84,18 @@ internal fun answeredOwnMessageIds(messages: List<Message>, replying: Boolean): 
     var replyFollows = replying
     for (message in messages.asReversed()) {
         if (isBeaconReply(message)) replyFollows = true
+        // Hermes closed that turn as failed: a later reply answers what came after it, never what Hermes did not answer (Root's rule, TURN-121).
+        else if (closesAFailedTurn(message)) replyFollows = false
         else if (replyFollows && isOwnMessage(message)) answered += message.id
     }
     return answered
 }
+
+/**
+ * Whether the live reply answers the messages before it (the `replying` of [answeredOwnMessageIds]): only once its first answer words arrive (the live bubble,
+ * or words said before a tool step). An open stream, Thinking, a wait line or tool progress alone leave the ticks grey.
+ */
+internal fun replyWordsShown(chat: dev.hermes.android.ChatState): Boolean = chat.liveText.isNotBlank() || chat.liveSealed.isNotEmpty()
 
 /** A steer is marked in its bubble; Hermes' saved row names it, and so does the phone's own copy. */
 internal fun isSteerMessage(message: Message): Boolean = message.displayKind == "steer"

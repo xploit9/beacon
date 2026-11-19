@@ -1,5 +1,6 @@
 package dev.hermes.android.assist
 
+import dev.hermes.android.core.rows
 import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -303,6 +304,9 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         vm = model
         scope.launch { model.chat.collect { chat -> follow(chat) } }
         scope.launch { model.voiceCallRequest.collect { request -> request?.let { startRequestedCall(model, it) } } }
+        // A press that ended before a call could start (Hermes cannot be reached, or never connected): its line at once, never the
+        // give-up's generic one later (device round 4, F3). Nothing is tried again by itself; Call again asks once more.
+        scope.launch { model.beaconCallFailures.collect { line -> endWanted(OverlayLine.CallFailed, callReason(line) { listOf(serviceText(app, it)) }) } }
         scope.launch {
             app.calls.state.collect { call ->
                 when {
@@ -331,9 +335,8 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         return model
     }
 
-    /** A failure another try can fix: not a sign-in that expired or a microphone that failed. */
-    private fun retryable(reason: String): Boolean =
-        callReason(reason) { listOf(serviceText(app, it)) }.let { it != CallReason.SignInExpired && it != CallReason.MicFailed }
+    /** A failure another try can fix ([retryableCallFailure]). */
+    private fun retryable(reason: String): Boolean = retryableCallFailure(callReason(reason) { listOf(serviceText(app, it)) })
 
     private fun signedIn(model: BeaconViewModel): Boolean {
         val ui = model.ui.value
@@ -371,7 +374,8 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
             if (opened == null) { notSent(); return@launch }
             if (opened.isEmpty()) { notSent(); state = reduce(state, OverlayEvent.Line(OverlayLine.SignIn)); return@launch }
             if (withScreen) attachScreen(model)
-            val before = model.chat.value.messages.mapTo(HashSet()) { it.id }
+            // What is in the chat now: its messages and the replies an earlier turn left kept (not this question's reply).
+            val before = model.chat.value.let { chat -> chat.messages.mapTo(HashSet()) { it.id } + chat.raw.rows(dev.hermes.android.UNCONFIRMED_REPLIES).map { it.optString("id") } }
             asked = before to opened
             state = state.copy(ask = state.ask?.copy(sessionId = opened))
             // The owner may have an unsent draft in the assistant's chat in the app: it is put back right after this send.
@@ -546,9 +550,11 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
         }
     }
 
-    private fun endWanted(line: OverlayLine) {
+    /** The conversation asked for here ends with [line] (a failed call with its [reason], if it has one); the give-up has nothing left to say. */
+    private fun endWanted(line: OverlayLine, reason: CallReason? = null) {
         if (!live.gaveUp()) return
-        state = reduce(reduce(state, OverlayEvent.LiveEnded), OverlayEvent.Line(line))
+        giveUp?.cancel()
+        state = reduce(reduce(state, OverlayEvent.LiveEnded), if (line == OverlayLine.CallFailed) OverlayEvent.CallFailed(reason) else OverlayEvent.Line(line))
     }
 
     /**

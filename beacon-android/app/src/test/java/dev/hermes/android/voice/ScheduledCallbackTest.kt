@@ -44,8 +44,6 @@ class ScheduledCallbackTest {
     }
 
     @Test fun theCallOffersTheToolAndTheJobCallbackPointsToIt() {
-        assertTrue("schedule_callback" in DIRECT_CALL_TOOLS)
-        assertTrue(callToolHint("hermes_callback", JSONObject().put("status", "not_sent")).contains("schedule_callback"))
-        assertTrue(callToolHint("schedule_callback", JSONObject().put("status", "scheduled")).contains("scheduled_at"))
+        assertTrue("schedule_callback" in GeminiWire.CALL_FUNCTIONS)
     }
 }

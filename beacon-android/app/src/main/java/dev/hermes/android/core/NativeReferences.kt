@@ -85,6 +85,18 @@ private fun fileReferencePath(source: String): String {
     }
     return if (Regex("^/[A-Za-z]:[\\\\/]").containsMatchIn(path)) path.drop(1) else path
 }
+/**
+ * What a `MEDIA:` tag names: a file on the Hermes computer, read through the message's own conversation (base.py validate_media_delivery_path
+ * wants a path; the desktop downloads it through /api/fs/download). A Unix path is never read as an address on the Hermes origin. Only a tag
+ * that holds an address (https, file, data, session or workspace) is resolved as one.
+ */
+fun resolveMediaTag(path: String, scope: Scope, snapshots: Map<String, String> = emptyMap()): NativeReference {
+    val value = path.trim()
+    if (Regex("^[A-Za-z][A-Za-z0-9+.-]*:").containsMatchIn(value) && !Regex("^[A-Za-z]:[\\\\/]").containsMatchIn(value)) return resolveNativeReference(value, scope, snapshots)
+    if (!validReferenceText(value, 8192) || scope.session.isBlank()) return NativeReference.Unsupported(value, "This file has no valid conversation or path")
+    return NativeReference.LocalMedia(value, scope.session, snapshots[value]?.takeIf(::validMediaSnapshot)?.lowercase())
+}
+
 /** Finite WebUI references are resolved once. Local URLs never supply a different
  * session identity; snapshot selection is exact-path, never a prefix replacement. */
 fun resolveNativeReference(raw: String, scope: Scope, snapshots: Map<String, String> = emptyMap(), media: Boolean = true): NativeReference {

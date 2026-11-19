@@ -35,8 +35,10 @@ private fun fileName(path: String) = path.substringAfterLast('/').substringAfter
 
 internal fun splitAttachedMedia(text: String): UserMessageParts {
     val media = mutableListOf<AttachedMedia>()
-    var rest = text
-    if (mentionsHermesNote(text)) {
+    // Hermes' footer below the words (its @-references' notes, with each file's path on the host: UsabilityPresentation) is never the owner's either, whatever
+    // else the row holds; so every path that turns a stored row into the owner's words drops it, Edit and branch and search included (REVIEW-121B F2-P3-3/4).
+    var rest = withoutHermesContextFooter(text)
+    if (mentionsHermesNote(rest)) {
         // The notes Hermes writes in front, one after another.
         while (true) rest = leadingNote(rest, media) ?: break
         // A note cut short at the front is no longer the owner's words either: drop it whole (a complete note of an unknown shape is kept).
@@ -54,6 +56,20 @@ internal fun splitAttachedMedia(text: String): UserMessageParts {
         media += later.asReversed()
     }
     return UserMessageParts(rest.replace(Regex("[ \t]+(?=\n)"), "").replace(Regex("\n{3,}"), "\n\n").trim(), media)
+}
+
+/**
+ * What "Edit and branch" puts in the composer for a stored user row: the owner's words as they sent them, without Hermes' notes and footer (no host path). The
+ * @file: references the phone added stay, so the edited message still carries its files (Hermes reads them again from the copies it keeps).
+ */
+internal fun editAndBranchDraft(text: String): String = splitAttachedMedia(text).text
+
+/** What find in chat looks in for a row: what its bubble shows. A user row's words without Hermes' notes and footer, and the names on its file chips; any other row as it is. */
+internal fun findableText(role: String, text: String): String {
+    if (role != "user") return text
+    val split = splitAttachedMedia(text)
+    val shown = safeHistoryMessagePresentation("user", split.text)
+    return (listOf(shown.text) + shown.attachments.map { it.name } + split.media.map { it.name }.filter(String::isNotBlank)).joinToString("\n")
 }
 
 /** The row without its first note (and that note's file added to [media]), or null when it does not start with one. */

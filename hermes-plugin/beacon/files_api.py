@@ -105,12 +105,12 @@ def build_router(identity, read_body, native):
 
     @router.get('/mobile/files/text')
     async def read_text(request: Request, path: str):
-        identity(request)
+        await asyncio.to_thread(identity, request)
         return await text_read(managed_path(request, path))
 
     @router.post('/mobile/files/text')
     async def write_text(request: Request):
-        identity(request)
+        await asyncio.to_thread(identity, request)
         payload = await read_body(request, limit=2 * 1024 * 1024)
         path = managed_path(request, payload.get('path'), write=True)
         content, expected = payload.get('content'), payload.get('expected_content')
@@ -134,7 +134,7 @@ def build_router(identity, read_body, native):
     @router.post('/mobile/files/create')
     async def create(request: Request):
         payload = await read_body(request, limit=2 * 1024 * 1024)
-        owner, provider, profile, _ = identity(request)
+        owner, provider, profile, _ = await asyncio.to_thread(identity, request)
         stored = payload.get('session_id')
         if stored:
             if not isinstance(stored, str):

@@ -259,8 +259,9 @@ def confirm_created(mobile,pending,receipt):
         return False
 
 
-def confirm_remote_receipt(mobile,pending,receipt):
-    """Record current remote authorization only after its matching native response."""
+def confirm_remote_receipt(mobile,pending,receipt,media=False):
+    """Record current remote authorization only after its matching native response. `media`: the submitter staged an image
+    for this turn on its own socket, so the admitted payload also holds Hermes' attachments_v1, which is not compared."""
     try:
         from tui_gateway import server
         names={'owner','provider','profile','principal','home','session','request','payload_digest','wire_digest'}
@@ -286,7 +287,8 @@ def confirm_remote_receipt(mobile,pending,receipt):
                 row.get('principal_id') not in (execution,principal) or row.get('target_session_id')!=pending['session'] or
                 row.get('request_id')!=pending['request'] or row.get('owner_epoch')!=epoch or
                 row.get('status') not in ('queued','started','terminal') or not isinstance(row.get('payload'),dict) or
-                _payload_fingerprint(row['payload'])!=pending['payload_digest']): return False
+                media is not ('attachments_v1' in row['payload']) or
+                _payload_fingerprint({k:v for k,v in row['payload'].items() if k!='attachments_v1'})!=pending['payload_digest']): return False
         value={key:pending[key] for key in ('owner','provider','profile','home','session','request','principal','wire_digest')}
         value.update(admission_id=admission,epoch=epoch,payload_digest=_payload_fingerprint(row['payload']),execution=row['principal_id'])
         if not mobile.confirm_remote_admission(value): return False
@@ -595,6 +597,22 @@ def reserve_conversation(owner,provider,profile,stored,principal=None):
                 if db is not None and db.set_session_title(stored,title): record['pending_title']=None
         except Exception: pass  # a taken title stays queued; the first turn names the thread as before
     return verify(owner,provider,profile,stored,principal=principal)
+
+
+def continues_chat(profile, stored, session_id):
+    """Whether `session_id` is `stored` or a session Hermes continued it under.
+
+    Hermes ends a chat's session and carries on under a new id when it compresses the history; a turn then finishes under the new
+    id (agent/turn_finalizer.py, on_session_end session_id=agent.session_id) while the chat stays saved under its first one.
+    Same lineage test as verify(): the compression chain from the saved id, never a branch or a helper's own session."""
+    if not isinstance(stored, str) or not stored or not isinstance(session_id, str) or not session_id: return False
+    if session_id == stored: return True
+    try:
+        from tui_gateway import server
+        with server._profile_db({'profile': profile}) as db:
+            chain = db.get_compression_chain(stored) if db else None
+    except Exception: return False  # unknown is not a claim: the chat keeps its own title
+    return isinstance(chain, list) and bool(chain) and chain[0] == stored and session_id in chain
 
 
 def conversation_snapshot(owner, provider, profile, stored,principal=None):

@@ -502,15 +502,21 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
     val error = recordError(usage)
     var details by rememberSaveable(usageKey) { mutableStateOf(false) }
     val reload = { vm.load(usageKey, "/api/session/usage", mapOf("session_id" to chat.sessionId)); Unit }
+    // REVIEW-FIXCHAT-121 P3: the title follows the chat header's rule, and the model is named as the composer's chip names it (no raw ids).
+    val title = if (chat.title == "New conversation") uiText("New chat") else chat.title.ifBlank { uiText("Chat usage") }
+    val modelLine = chatModelTitle(chat.raw.string("model").ifBlank { usage?.string("model").orEmpty() }, data["picker:models"]?.rows("groups").orEmpty())
     SettingsList(refreshing = usage != null && usageKey in refreshing, testTag = "usage-page") {
         when {
             chat.sessionId.isBlank() -> item { SettingsSection { SettingsEmpty(uiText("Open a chat first"), Icons.Rounded.ChatBubbleOutline) } }
-            usage == null -> item { SettingsSection { SettingsSkeletonRows(3) } }
+            // UX-121 P3-10: what the phone knows (the chat and its model) shows at once; only the figures wait for Hermes.
+            usage == null -> {
+                item { SettingsStatusHero(null, title, line = modelLine, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
+                item { SettingsSection { SettingsSkeletonRows(2) } }
+            }
             error.isNotBlank() && !sessionUsageReadable(usage) -> item { SettingsSection { SettingsErrorRow(uiText(error), reload, uiText("Retry")) } }
             else -> {
                 val figures = sessionUsageFigures(usage)
-                val line = listOf(chat.raw.string("model_provider"), chat.raw.string("model").ifBlank { usage.string("model") }).filter { it.isNotBlank() }.joinToString(" · ")
-                item { SettingsStatusHero(null, chat.title.ifBlank { uiText("Chat usage") }, line = line, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
+                item { SettingsStatusHero(null, title, line = modelLine, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
                 // "0 in, 0 out" under a chat full of replies is Hermes not counting, not the chat using nothing.
                 val unreported = sessionUsageUnreported(figures, chat.messages.any { it.role == "assistant" })
                 if (unreported || figures.input != null || figures.output != null || figures.window != null || figures.percent != null) item { SettingsSection(testTag = "usage-figures") {

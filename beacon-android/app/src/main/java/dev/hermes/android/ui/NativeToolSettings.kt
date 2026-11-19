@@ -83,7 +83,7 @@ internal fun mcpTestPill(testedTools: Int?, testFailed: Boolean): ToolPill = whe
     val shown = remember(mcp) { java.util.concurrent.atomic.AtomicBoolean(true) }
     DisposableEffect(mcp) { onDispose { shown.set(false) } }
     fun operate(name: String, enabled: Boolean? = null) {
-        val active = vm.client ?: return
+        val active = vm.client ?: run { vm.notice("Reconnect before saving changes."); return }
         val c = active.detached()
         busy = name; error = ""
         vm.viewModelScope.launch {

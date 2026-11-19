@@ -1,2 +1,4 @@
 # Generated vendor bundle: keep its bytes exact (no line-ending conversion, no whitespace checks).
 beacon-android/app/src/main/assets/rich/mermaid-*.min.js binary
+# Vendored upstream sources (hermes-plugin/beacon/vendor/README.md pins their bytes): no whitespace checks.
+hermes-plugin/beacon/vendor/**/*.py -whitespace

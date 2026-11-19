@@ -122,8 +122,36 @@ class NativeVaultPromptUiTest {
         assertEquals("no CVC sentence and no \"Approve only if\"", 0, compose.onAllNodesWithText("CVC", substring = true).fetchSemanticsNodes().size + compose.onAllNodesWithText("Approve only", substring = true).fetchSemanticsNodes().size)
         compose.onNodeWithTag("approval-amount").assertTextContains("12.50 USD", substring = true)
         assertEquals("Hermes offers once and deny for a card", 0, compose.onAllNodesWithText("For this chat").fetchSemanticsNodes().size)
-        compose.onNodeWithText("Allow once").performScrollTo().performClick()
+        // A card that has just come up or moved takes no tap for a moment; the coordinate tap is repeated until it goes through.
+        dev.hermes.android.CardMoveProbe.answerWhenSettled(compose, "Allow once") { answered(fixture, "wire-card") != null }
         await { answered(fixture, "wire-card") != null }
         assertEquals("once", answered(fixture, "wire-card")!!.getJSONObject("result").getString("choice"))
+    }
+
+    /** The combined card-purchase question is the same card, so a move under the owner's finger cannot pay: it takes no tap until it has stood still (backlog 17, 19 and lane L6). */
+    @Test fun aCardFillApprovalThatMovedTakesNoTapUntilItHasStoodStill() = harness.run(chat = true) { vm, fixture ->
+        startRun(vm, fixture)
+        dev.hermes.android.CardMoveProbe.withWindow(dev.hermes.android.CardMoveProbe.WIDE_WINDOW_MS) {
+            fixture.emitCardFillApproval("wire-card-moved", "Visa", "https://shop.example", amount = "12.50 USD")
+            await { shown("approval-line") }
+            dev.hermes.android.CardMoveProbe.fillTranscript(compose, { vm.chat.value }, { state ->
+                @Suppress("UNCHECKED_CAST") (dev.hermes.android.BeaconViewModel::class.java.getDeclaredField("_chat").apply { isAccessible = true }.get(vm) as kotlinx.coroutines.flow.MutableStateFlow<dev.hermes.android.ChatState>).value = state })
+            dev.hermes.android.CardMoveProbe.waitToSettle(compose, "Allow once")
+            assertTrue("the notice moved the buttons", dev.hermes.android.CardMoveProbe.showNotice(compose, "Allow once") { vm.notice("Synthetic notice that makes room") })
+            dev.hermes.android.CardMoveProbe.tapBothWays(compose, "Allow once")
+            compose.waitForIdle(); Thread.sleep(500)
+            assertEquals("A tap right after the payment card moved paid", null, answered(fixture, "wire-card-moved"))
+            dev.hermes.android.CardMoveProbe.waitToSettle(compose, "Allow once")
+            val finger = dev.hermes.android.CardMoveProbe.center(compose, "Allow once")
+            compose.onRoot().performTouchInput { down(finger) }
+            assertTrue("the transcript moved the buttons", dev.hermes.android.CardMoveProbe.scrollBy(compose, "Allow once", -6f))
+            assertTrue("the finger is still on Allow", dev.hermes.android.CardMoveProbe.contains(compose, "Allow once", finger))
+            compose.onRoot().performTouchInput { up() }
+            compose.waitForIdle(); Thread.sleep(500)
+            assertEquals("A release after the payment card moved under the finger paid", null, answered(fixture, "wire-card-moved"))
+            dev.hermes.android.CardMoveProbe.waitToSettle(compose, "Allow once")
+            dev.hermes.android.CardMoveProbe.answerWhenSettled(compose, "Allow once") { answered(fixture, "wire-card-moved") != null }
+            assertEquals("once", answered(fixture, "wire-card-moved")!!.getJSONObject("result").getString("choice"))
+        }
     }
 }

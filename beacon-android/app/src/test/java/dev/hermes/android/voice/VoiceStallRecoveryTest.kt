@@ -53,13 +53,14 @@ class VoiceStallRecoveryTest {
 
     private fun credentials(provider: String) = VoiceSessionCredentials(provider, "fixture-provider-key", defaultVoiceModel(provider), defaultVoiceName(provider), "balanced")
 
-    private fun client(reads: AtomicInteger = AtomicInteger()) =
+    private fun client(reads: AtomicInteger = AtomicInteger(), memoryDown: Boolean = false, log: MutableList<Pair<Long, String>>? = null) =
         BeaconClient(AuthContext("https://voice-fixture.invalid", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain ->
                 val path = chain.request().url.encodedPath
+                log?.add(System.nanoTime() / 1_000_000 to path)
                 val body = when {
                     path.endsWith("/context") -> json("profile" to "default", "selected_session_id" to "stored", "capabilities" to json("memory_recall" to true))
-                    path.endsWith("/memory") -> { reads.incrementAndGet(); json("summary" to "Verified owned memory", "observed_at" to "2026-10-23", "sources" to JSONArray()) }
+                    path.endsWith("/memory") -> { reads.incrementAndGet(); if (memoryDown) throw java.io.IOException("sent ping but didn't receive pong within 1500ms"); json("summary" to "Verified owned memory", "observed_at" to "2026-10-23", "sources" to JSONArray()) }
                     else -> json("jobs" to JSONArray())
                 }
                 Response.Builder().request(chain.request()).protocol(Protocol.HTTP_1_1).code(200).message("Fixture")
@@ -101,6 +102,26 @@ class VoiceStallRecoveryTest {
             assertEquals("Recovery never invokes a parallel memory backend", 0, reads.get())
             // The plugin accepts only known diagnostic stages and codes.
             assertTrue(events.any { it.optString("type") == "media_diagnostic" && it.optString("stage") == "provider_error" && it.optString("error_code") == "timeout" && it.optString("cause_class") == "socket_timeout" })
+        } finally { voice.close(); scope.cancel(); client.closeNative() }
+    }
+
+    // REVIEW-INT-121 finding 12: a replaced session is told again only the final results it never answered; a state (here the phone's
+    // own hermes_unreachable) stays with the call's ledger and is never re-said as an "outcome".
+    @Test(timeout = 120000) fun aStateTheModelLeftUnansweredIsNotReplayedAsAnOutcome() = runBlocking<Unit> {
+        val provider = Provider(); val events = CopyOnWriteArrayList<JSONObject>()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val client = client(memoryDown = true)
+        val voice = DirectVoice(client, "call", "stored", scope, {}, { events += it }, {}, credentials = credentials("gemini"), providerSocketFactory = provider.factory, stallAfterMs = 500)
+        try {
+            voice.start()
+            await { events.any { it.optString("state") == "listening" } }
+            val (first, listener) = provider.sockets.first()
+            listener.onMessage(first, json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "mem-1", "name" to "hermes_memory", "args" to json("query" to "synthetic"))))).toString())
+            await { provider.sent(1).any { it.optJSONObject("toolResponse")?.toString()?.contains("hermes_unreachable") == true } }
+            // The model never answers that state: the session is replaced.
+            await { provider.sent(2).any { it.has("setup") } }
+            delay(1_000)
+            assertFalse("a state is not replayed as an outcome", provider.frames.any { it.second.toString().contains("Verified earlier hermes_memory tool outcome") })
         } finally { voice.close(); scope.cancel(); client.closeNative() }
     }
 
@@ -228,5 +249,29 @@ class VoiceStallRecoveryTest {
                 assertTrue("$wire: the replacement session is told what was said so far", second.contains("remember the blue door"))
             } finally { voice.close(); scope.cancel(); client.closeNative() }
         }
+    }
+
+    // REVIEW-E7 P3-1: a function call's read that keeps failing while Hermes answers the rest. While the link is lost only the probe tries;
+    // each return wakes the read once, and the returns come at the probe's backoff (0.5, 1, 2, 2 s): within the 5 tries such a backoff makes
+    // in 6 s (E7: every ~0.5 s).
+    @Test(timeout = 60000) fun aReadThatKeepsFailingKeepsTheBackoff() = runBlocking<Unit> {
+        val provider = Provider(); val events = CopyOnWriteArrayList<JSONObject>(); val reads = AtomicInteger()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default); val log = CopyOnWriteArrayList<Pair<Long, String>>()
+        val client = client(reads, memoryDown = true, log = log)
+        val voice = DirectVoice(client, "call", "stored", scope, {}, { events += it }, {}, credentials = credentials("gemini"), providerSocketFactory = provider.factory)
+        try {
+            voice.start()
+            await { events.any { it.optString("state") == "listening" } }
+            val (first, listener) = provider.sockets.first()
+            listener.onMessage(first, json("toolCall" to json("functionCalls" to JSONArray().put(json("id" to "mem-1", "name" to "hermes_memory", "args" to json("query" to "synthetic"))))).toString())
+            await { reads.get() >= 1 }
+            val start = System.nanoTime(); val at = CopyOnWriteArrayList<Long>(listOf(0L))
+            val watch = scope.launch { var seen = 1; while (isActive) { while (seen < reads.get()) { seen++;at += (System.nanoTime() - start) / 1_000_000 };delay(2) } }
+            delay(6_000);watch.cancel()
+            val t0 = log.first { it.second.endsWith("/memory") }.first
+            println("P3-1 reads=${reads.get()} at=$at requests=${log.filter { it.first >= t0 }.map { (it.first - t0).toString() + " " + it.second.substringAfterLast("/beacon/") }}")
+            assertTrue("the read is retried: $at", reads.get() >= 3)
+            assertTrue("reads within the backoff: $at", reads.get() <= 5)
+        } finally { voice.close(); scope.cancel(); client.closeNative() }
     }
 }

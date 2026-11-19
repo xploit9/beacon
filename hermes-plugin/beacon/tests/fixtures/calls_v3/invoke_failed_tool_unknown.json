@@ -1,0 +1,13 @@
+{
+  "request_id": "req-synthetic-0003",
+  "tool_id": null,
+  "tool": "no_such_tool",
+  "tool_name": "no_such_tool",
+  "read_only": false,
+  "approved_by": null,
+  "status": "failed",
+  "ran_on_hermes": false,
+  "server_ms": {},
+  "error_code": "tool_unknown",
+  "reason": "No tool with this name is configured."
+}

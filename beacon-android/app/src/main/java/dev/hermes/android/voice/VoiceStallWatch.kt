@@ -56,8 +56,9 @@ internal enum class OwedReply { None, Tool, Turn }
 /** Whether a frame sent to the provider obliges the model to speak. Progress receipts are SILENT by design. */
 internal fun voiceOwedReply(json:String):OwedReply {
     val frame=JSONObject(json)
-    frame.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.optJSONObject(0)?.let {
-        return if(it.optString("scheduling")=="SILENT") OwedReply.None else OwedReply.Tool
+    // One release of results asks for an answer at most once, on its last response (CallLinkState).
+    frame.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { rows ->
+        return if((0 until rows.length()).all { rows.optJSONObject(it)?.optString("scheduling")=="SILENT" }) OwedReply.None else OwedReply.Tool
     }
     return if(frame.optJSONObject("clientContent")?.optBoolean("turnComplete")==true) OwedReply.Turn else OwedReply.None
 }

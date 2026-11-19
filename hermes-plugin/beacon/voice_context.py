@@ -605,11 +605,6 @@ def _zone_id(now):
         return ''
 
 
-def local_time(profile,*,bound=False):
-    """The owner's date and time on the profile's own clock; a voice model has no clock of its own."""
-    return profile_clock(profile,bound=bound)[0]
-
-
 GENERIC_OWNER_NAMES = {'hermes','admin','root','user','owner','default','beacon','test'}
 
 
@@ -644,30 +639,9 @@ def greeting_for(display_name,clock,callback):
     return f"Good {part}{', '+name if name else ''}. What can I do for you?"
 
 
-def greeting_plan(display_name,zone):
-    """An ordinary call's opening line for each part of the profile's day, so the phone has the next call's greeting
-    ready before the tap. Built by greeting_for itself; without a profile clock its one line holds all day."""
-    if not zone: return {'zone':'UTC','variants':[{'from_hour':0,'text':greeting_for(display_name,'',False)[:160]}]}
-    variants=[]
-    for hour in range(24):
-        text=greeting_for(display_name,f'{hour:02d}:00',False)[:160]
-        if not variants or variants[-1]['text']!=text: variants.append({'from_hour':hour,'text':text})
-    return {'zone':zone,'variants':variants}
-
-
 def opening_name(display_name,owner_name,remembered):
     """The name the owner typed in Beacon wins; else the one Hermes' USER.md holds; else the sign-in name."""
     return (owner_name.strip() if valid_owner_name(owner_name) else '') or remembered or display_name
-
-
-def grant_greeting(profile,display_name,owner_name=''):
-    """The opening line of an ordinary (not callback) call, kept for older phones; current phones let the live model greet.
-    The name and clock rules of context()'s native path, from cached profile reads."""
-    def load(root):
-        try: remembered=cached_owner_name(root,cached_config(root))
-        except Exception: remembered=''
-        return greeting_for(opening_name(display_name,owner_name,remembered),local_time(profile,bound=True),False)[:160]
-    return scoped(profile,load,hydrate_secrets=False)
 
 
 # Profile files the call paths read on every call, kept until the file changes. The reader's identity is part of the
@@ -890,9 +864,11 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
         return {'backend':'hermes' if native_backend else 'direct','profile':profile,'selected_session_id':stored,'system_instruction':'' if native_backend else instruction,'context_summary':summary,
                 # The app may send the owner's Ask for approval choice with each tool request (gateway_tools.APPROVAL_CHOICES).
                 'tool_approval_choice':True,
-                'tool_catalogue':catalogue,'greeting':greeting,'greeting_plan':greeting_plan(greeting_name,zone),'owner_first_name':first_name,'callback':callback,
+                'tool_catalogue':catalogue,'greeting':greeting,'owner_first_name':first_name,'callback':callback,
                 # The profile's clock zone: the live model's opening takes the owner's time of day from it at the tap.
                 'zone':zone,
+                # Call contract v3 (section 7): the app builds its own instruction from these instead of system_instruction.
+                'persona':soul,'preferred_language':language,'local_time':clock,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
                 'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
                 'capabilities':{'profile_context':True} if native_backend else {'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},

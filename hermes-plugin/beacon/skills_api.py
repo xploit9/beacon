@@ -131,17 +131,17 @@ def build_router(identity, read_body, scoped):
 
     @router.get('/skills')
     async def list_skills(request: Request):
-        _, _, profile, _ = identity(request)
+        _, _, profile, _ = await asyncio.to_thread(identity, request)
         return await asyncio.to_thread(scoped, profile, inventory)
 
     @router.get('/skills/content')
     async def read(request: Request, name: str):
-        _, _, profile, _ = identity(request)
+        _, _, profile, _ = await asyncio.to_thread(identity, request)
         return await asyncio.to_thread(scoped, profile, lambda root: document(root, name))
 
     @router.put('/skills/content')
     async def write(request: Request):
-        _, _, profile, _ = identity(request)
+        _, _, profile, _ = await asyncio.to_thread(identity, request)
         payload = await read_body(request, limit=MAX_BYTES * 2)
         return await asyncio.to_thread(scoped, profile, lambda root: update(root, payload))
 

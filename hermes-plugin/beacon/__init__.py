@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
+import threading
 import time
 
 ROOT=Path(__file__).resolve().parent
@@ -142,6 +143,73 @@ def native_live_context(session_id=None,**kwargs):
         job_scope=bool(row and _cron_job_id(row,session_id)==proactive._managed_id(mobile,owner,profile,'watch_email'))
     context=live_context.snapshot(mobile,owner,profile,proactive,job_scope=job_scope,session_id=session_id)
     return {'context':context} if context else None
+
+
+# Hermes tells its desktop chat how to hand over a file (agent/prompt_builder.py PLATFORM_HINTS['desktop']: "Deliver files by writing
+# MEDIA:/absolute/path/to/file"). A Beacon chat is not a desktop chat to Hermes: on the canonical path it has no source (Hermes resolves
+# 'tui', whose hint says MEDIA: tags are NOT intercepted and to state plain paths), on the older path it is 'android' (no hint at all,
+# agent/system_prompt.py _default_platform_hint). Hermes has no hint-only registration for a session source (register_platform registers
+# a whole messaging adapter). The phone does read the tag and fetches the file through Hermes' own /api/fs/download, under Hermes' read
+# rules, so the owner's own chats are told so. Hermes replays a turn's context in later turns (agent/turn_context.py
+# compose_user_api_content), so the note goes once per chat, again after FILE_NOTE_REPEAT_SECONDS.
+# Hermes appends a pre_llm_call context to the owner's own words, so the note is framed as Hermes frames its own notes there ("[System:
+# ...]", agent/surface_switch.py) and states the surface as a fact, in the desktop hint's file wording: nothing for the model to weigh
+# against the terminal hint or to explain to the owner.
+FILE_DELIVERY_NOTE=("[System: This conversation is shown in the Beacon phone app, which delivers each MEDIA:/absolute/path/to/file line "
+                    "as a file of any type the owner can open, save or share - deliver files that way.]")
+FILE_NOTE_REPEAT_SECONDS=30*60
+_FILE_NOTE_SENT={}
+# Chats whose history has shown the note, so its disappearance there means Hermes dropped it.
+_FILE_NOTE_SEEN=set()
+_FILE_NOTE_LOCK=threading.Lock()
+
+
+def _note_in_context(history):
+    """Whether the note is still in what the model will read: a turn's context rides its user row (content, or the api_content sidecar)."""
+    for message in history or ():
+        if not isinstance(message,dict): continue
+        for value in (message.get('api_content'),message.get('content')):
+            parts=value if isinstance(value,list) else [value]
+            if any(FILE_DELIVERY_NOTE in (part.get('text','') if isinstance(part,dict) else part) for part in parts if isinstance(part,(str,dict))):
+                return True
+    return False
+
+
+def native_file_delivery_context(session_id=None,conversation_history=None,**kwargs):
+    """How a file reaches the phone, told only in the owner's own Beacon chats (the native_live_context gate), and only when the owner's
+    phone shows file cards."""
+    if not session_id: return None
+    # Not due: the note went less than 30 minutes ago, unless this chat's history showed it and has since lost it (Hermes rewrote or
+    # compressed that turn: it goes again at once). Still in the history: nothing to add. The 30 minutes stay the floor because some turns
+    # never carry the note in their history (MoA and codex_app_server turns stamp no api_content, agent/surface_switch.py). Nothing is
+    # read before this (None tells nothing about the chat).
+    in_context=conversation_history is not None and _note_in_context(conversation_history)
+    with _FILE_NOTE_LOCK:
+        if in_context:
+            if len(_FILE_NOTE_SEEN)>=512: _FILE_NOTE_SEEN.clear()  # bounded; forgetting falls back to the 30-minute memory
+            _FILE_NOTE_SEEN.add(session_id)
+        sent=_FILE_NOTE_SENT.get(session_id)
+        recent=sent is not None and time.monotonic()-sent<FILE_NOTE_REPEAT_SECONDS
+        lost=conversation_history is not None and session_id in _FILE_NOTE_SEEN and not in_context
+    if in_context or recent and not lost: return None
+    cfg=mobile.settings()
+    try:
+        profile=current_profile(cfg)
+        owner,provider=cfg.get('owner_id'),cfg.get('owner_provider')
+        if not owner or not provider: return None
+        # Only an app that shows MEDIA: lines as file cards reports its version (X-Beacon-App-Version, since this release); an older app
+        # would show the raw tag and the path on the computer, so its owner's agent keeps writing plain paths. Unknown: no note.
+        if not mobile.newest_app_version(owner,provider): return None
+        _verify_owned(owner,provider,profile,session_id)
+    except (LookupError,ValueError,RuntimeError):
+        return None
+    # Recorded only once the chat proved the owner's, so a failed check never silences the note.
+    with _FILE_NOTE_LOCK:
+        _FILE_NOTE_SEEN.discard(session_id)
+        _FILE_NOTE_SENT.pop(session_id,None)
+        _FILE_NOTE_SENT[session_id]=time.monotonic()
+        while len(_FILE_NOTE_SENT)>512: _FILE_NOTE_SENT.pop(next(iter(_FILE_NOTE_SENT)))
+    return {'context':FILE_DELIVERY_NOTE}
 
 
 def _watch_context(cfg,profile,session_id):
@@ -303,7 +371,7 @@ _BLOCKED_PROACTIVE_TOOLSETS={'delegation','code_execution','computer_use','kanba
 # let an injected email read or change the owner's phone.
 _BLOCKED_PROACTIVE_TOOLS={'delegate_task','execute_code','computer_use','kanban','cronjob_manage',
                           'beacon_call_user','browser_click','browser_type','browser_press',
-                          'browser_cdp','browser_exec','web_extract','web_fetch'}|set(phone_tools.NAMES)
+                          'browser_cdp','browser_exec','web_extract','web_fetch','agent_phone'}|set(phone_tools.NAMES)
 # Read commands only: the subcommand words before the first option say what runs.
 _HIMALAYA_READS={('envelope','list'),('envelope','search'),('folder','list'),('mailbox','list')}
 _GWS_READ_OPTIONS={'--params','--format','--page-all','--page-limit','--page-delay'}
@@ -764,6 +832,7 @@ def register(ctx):
 
     ctx.register_hook('pre_llm_call',native_voice_context)
     ctx.register_hook('pre_llm_call',native_live_context)
+    ctx.register_hook('pre_llm_call',native_file_delivery_context)
     ctx.register_hook('pre_llm_call',native_watch_guard_context)
     ctx.register_hook('on_session_end',native_completion)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
@@ -771,8 +840,30 @@ def register(ctx):
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)
     phone_delivery.register(ctx)
     phone_tools.register(ctx)
+    _register_agent_phone(ctx)
     email_drafts.register(ctx)
-    _after_load(_record_gateway_plugin_version,_restart_stale_dashboard)
+    _after_load(_record_gateway_plugin_version,_restart_stale_dashboard,_follow_agent_phone_keeper)
+
+def _register_agent_phone(ctx):
+    # The assistant's own phone (agent_phone_tools.py): one tool, no hooks. Loaded here by path, as phone_tools loads the card tool,
+    # so the module list above stays as released; its siblings load on first use. A failure to add it never costs the other tools.
+    try:
+        key,path='beacon_agent_phone_tools',ROOT/'agent_phone_tools.py'
+        module=sys.modules.get(key)
+        if module is None or getattr(module,'_beacon_mtime',None)!=path.stat().st_mtime_ns:
+            spec=importlib.util.spec_from_file_location(key,path);module=importlib.util.module_from_spec(spec)
+            module._beacon_mtime=path.stat().st_mtime_ns;sys.modules[key]=module;spec.loader.exec_module(module)
+        module.register(ctx)
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning('Beacon could not add the phone tool: %s',type(exc).__name__)
+
+def _follow_agent_phone_keeper():
+    # After a Hermes update the phone's keeper moves to Hermes' current runtime (agent_phone_tools.follow_keeper); beside the
+    # load, since it may wait for a phone start in progress.
+    module=sys.modules.get('beacon_agent_phone_tools')
+    if module is not None and hasattr(module,'follow_keeper'):
+        module.follow_keeper()
 
 _after_load_thread=None
 

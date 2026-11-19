@@ -56,11 +56,4 @@ class VoiceContinuationTest {
         assertTrue(directToolMayCancel("staging_native"))
         assertFalse(outcomeUnknownAtCallEnd(JSONObject().put("function_name","hermes_work").put("status","queued")))
     }
-
-    @Test fun queuedCallbackUsesHermesVoiceAndDoesNotAskForAnotherAssistant() {
-        val hint=callToolHint("hermes_work",JSONObject().put("status","queued").put("callback","scheduled"))
-        assertTrue(hint.contains("hang up"))
-        assertTrue(hint.contains("you")&&hint.contains("call"))
-        assertFalse(hint.contains("once it starts"))
-    }
 }

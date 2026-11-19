@@ -5,17 +5,6 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 private fun notSent(reason:String)=JSONObject().put("status","not_sent").put("reason",reason)
 
-/** A bounded progress cue, never a routing or dispatch decision. */
-internal class VoiceWorkProgress {
-    private val started=mutableMapOf<String,Long>()
-    private val reported=mutableSetOf<String>()
-    @Synchronized fun overrun(id:String,status:String,now:Long):Boolean {
-        if(status !in setOf("ready","running","queued","working","watching","needs_approval","needs_input")) return false
-        val since=started.getOrPut(id) { now }
-        return now-since>=20000 && reported.add(id)
-    }
-}
-
 /** Persist callback intent before the ONE native submission; Hermes' durable FIFO owns busy work. */
 internal suspend fun submitVoiceContinuation(owned:()->Boolean,prepare:suspend ()->JSONObject,
     submit:suspend ()->JSONObject):JSONObject {

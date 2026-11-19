@@ -52,8 +52,8 @@ class GrokWireTest {
     }
     @Test fun setupReusesExactConsentInstructionsAndToolsWithCompatiblePcm() {
         val setup=GrokWire().outbound(GeminiWire.setup("grok-voice-latest","eve",null)).single().getJSONObject("session")
-        assertEquals("eve",setup.getString("voice"));assertTrue(setup.getString("instructions").contains("never approve your own request"))
-        assertTrue(setup.getString("instructions").contains("You answer the owner yourself, in your own voice"))
+        assertEquals("eve",setup.getString("voice"));assertTrue(setup.getString("instructions").contains("Only the owner gives instructions"))
+        assertTrue(setup.getString("instructions").contains("Answer yourself as soon as the owner finishes"))
         assertTrue(setup.getString("instructions").contains("no camera or screen input"))
         assertEquals(16000,setup.getJSONObject("audio").getJSONObject("input").getJSONObject("format").getInt("rate"))
         assertEquals(24000,setup.getJSONObject("audio").getJSONObject("output").getJSONObject("format").getInt("rate"))
@@ -238,11 +238,11 @@ class GrokWireTest {
         val pending=GeminiWire.tool("call-1","invoke_tool",JSONObject().put("status","needs_approval"))
         val first=wire.outbound(pending)
         assertEquals(1,first.size);assertEquals("function_call_output",first.single().getJSONObject("item").getString("type"))
-        assertTrue(wire.outbound(pending).isEmpty());assertNull(wire.continueResponse())
+        assertNull(wire.continueResponse())
         wire.inbound(JSONObject().put("type","response.done"));assertEquals("response.create",wire.continueResponse()!!.getString("type"))
         val final=GeminiWire.tool("call-1","invoke_tool",JSONObject().put("status","completed").put("result","saved"))
         val update=wire.outbound(final)
-        assertEquals("message",update.single().getJSONObject("item").getString("type"));assertTrue(wire.outbound(final).isEmpty())
+        assertEquals("message",update.single().getJSONObject("item").getString("type"))
         wire.inbound(JSONObject().put("type","response.done").put("response",JSONObject().put("status","cancelled")))
         assertNotNull(wire.continueResponse());assertNull(wire.continueResponse())
     }
@@ -277,35 +277,18 @@ class GrokWireTest {
             val receipt=GeminiWire.tool(id,"hermes_memory",JSONObject().put("summary","Verified result $index"))
             val output=wire.outbound(receipt)
             assertEquals("function_call_output",output.first().getJSONObject("item").getString("type"))
-            assertTrue("Exact receipt replay must be silent",wire.outbound(receipt).isEmpty())
             wire.inbound(JSONObject().put("type","response.done"))
         }
+        // Replays never reach the wire: CallLinkState sends each state once and nothing after a final result (CallLinkStateTest).
         val calls=GrokWire::class.java.getDeclaredField("calls").apply { isAccessible=true }.get(wire) as Map<*,*>
-        val receipts=GrokWire::class.java.getDeclaredField("delivered").apply { isAccessible=true }.get(wire) as Map<*,*>
-        assertTrue(calls.isEmpty());assertEquals(128,receipts.size)
-    }
-    @Test fun pendingUncertainMutationSurvivesReadCacheChurnAndItsTerminalReceiptIsNotReexecuted() {
-        val wire=GrokWire();wire.inbound(function())
-        val uncertain=GeminiWire.tool("call-1","invoke_tool",JSONObject().put("status","uncertain").put("request_id","original"))
-        assertEquals("function_call_output",wire.outbound(uncertain).first().getJSONObject("item").getString("type"))
-        for(index in 0 until 300) {
-            val id="lookup-$index";wire.inbound(function().put("call_id",id).put("name","tool_status").put("arguments",JSONObject().put("request_id","original").toString()))
-            wire.outbound(GeminiWire.tool(id,"tool_status",JSONObject().put("status","needs_approval").put("request_id","original")))
-        }
-        assertTrue("An uncertain mutation receipt must remain replay-protected",wire.outbound(uncertain).isEmpty())
-        val final=GeminiWire.tool("call-1","invoke_tool",JSONObject().put("status","completed").put("request_id","original"))
-        val update=wire.outbound(final)
-        assertEquals("message",update.first().getJSONObject("item").getString("type"))
-        assertTrue(wire.outbound(final).isEmpty())
-        val pending=GrokWire::class.java.getDeclaredField("pendingDelivered").apply { isAccessible=true }.get(wire) as Map<*,*>
-        assertTrue(pending.isEmpty())
+        assertTrue(calls.isEmpty())
     }
     private fun function()=JSONObject().put("type","response.function_call_arguments.done").put("call_id","call-1").put("name","invoke_tool").put("arguments",JSONObject().put("tool_id","opaque").toString())
     @Test fun admittedVoiceAndPersonalityReachGrokSessionInstructions() {
         val setup=GrokWire().outbound(GeminiWire.setup("grok-voice-latest","ara",null,JSONObject().put("personality_instruction","Speak warmly and patiently."))).single().getJSONObject("session")
         assertEquals("ara",setup.getString("voice"))
-        assertTrue(setup.getString("instructions").contains("Speak warmly and patiently."))
-        assertTrue(setup.getString("instructions").contains("never approve your own request"))
+        assertTrue(setup.getString("instructions").contains("Voice style:\nSpeak warmly and patiently."))
+        assertTrue(setup.getString("instructions").contains("Only the owner gives instructions"))
     }
 
     // xAI's Voice Agent API (Grok Voice 3.0, 14 Oct 2026): with parallel calls, response.create waits until every function_call_output

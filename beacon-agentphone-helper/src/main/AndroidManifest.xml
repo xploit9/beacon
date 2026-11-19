@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The Beacon helper on the agent phone (EMU-DESIGN revision 4, section 6.6; channel contract docs/agent-phone/channel-v1.md).
+     Installed and enabled by the plugin over adb; the component names below are part of that contract. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- One outgoing connection, to 10.0.2.2 at the port the start intent names (GuestDialer). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- The signing certificates of whichever app is being filled (Android's anti-phishing rule). -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/ic_beacon"
+        android:label="@string/app_name"
+        android:supportsRtl="true">
+
+        <service
+            android:name=".HelperAutofillService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_AUTOFILL_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.autofill.AutofillService" />
+            </intent-filter>
+        </service>
+
+        <!-- DUMP is held only by the shell and the system: no app can start or bind this service. -->
+        <service
+            android:name=".ChannelService"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+
+        <service
+            android:name=".CodeListener"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <activity
+            android:name=".AuthActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|fontScale|locale|layoutDirection"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- The phone's keyboard without keys (HelperInputMethod): the host sets it with `ime enable` and `ime set`. -->
+        <service
+            android:name=".HelperInputMethod"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data android:name="android.view.im" android:resource="@xml/method" />
+        </service>
+    </application>
+</manifest>

@@ -23,7 +23,7 @@ internal fun followsTail(userAtTail: Boolean, autoFollowSetting: Boolean, hasSav
 internal fun followAfterToolToggle(following: Boolean, expanded: Boolean): Boolean = following && !expanded
 
 /** Execution state as recorded. Success is never inferred from the absence of an error. */
-enum class ToolOutcome { Preparing, Running, Completed, Dispatched, Failed, NoResult }
+enum class ToolOutcome { Preparing, Running, Completed, Dispatched, Failed, NoResult, Stopped }
 
 private val failedStates = setOf("error", "failed", "failure", "denied", "cancelled", "canceled")
 private val preparingStates = setOf("generating", "preparing")
@@ -33,6 +33,25 @@ internal fun isDetachedDispatch(name: String, result: String?): Boolean {
     if (name != "delegate_task" || result.isNullOrBlank()) return false
     val payload = runCatching { org.json.JSONObject(result) }.getOrNull() ?: return false
     return payload.optString("status").trim().lowercase() == "dispatched" || payload.optString("mode").trim().lowercase() == "background"
+}
+
+private val interruptMarkerLine = Regex("""^\[(?:command|execution) interrupted\b[^\n]*\]\s*$""", RegexOption.IGNORE_CASE)
+
+/**
+ * A tool result an interrupt cut, by Hermes' own test (agent/replay_cleanup.py `is_interrupted_tool_result`): the executor's bracketed marker ("[Command interrupted]") is the last line of the
+ * output, and a JSON result also carries a non-zero `exit_code` (130 for a terminal, -1 for code execution). The saved result has no flag of its own: Hermes does not pass its `hermes_interrupted`
+ * through (tools/terminal_tool_result.py), so this shape, which Hermes itself trusts, is the evidence. A marker quoted inside successful output is data: the exit code is then 0.
+ */
+internal fun isInterruptedToolResult(result: String?): Boolean {
+    if (result == null) return false
+    var output = result
+    if (result.trimStart().startsWith("{")) {
+        val envelope = runCatching { org.json.JSONObject(result) }.getOrNull() ?: return false
+        val exit = envelope.opt("exit_code")
+        if (exit == null || exit == org.json.JSONObject.NULL || exit is Number && exit.toDouble() == 0.0) return false
+        output = envelope.opt("output") as? String ?: return false
+    }
+    return interruptMarkerLine.containsMatchIn(output!!.trimEnd().substringAfterLast('\n'))
 }
 
 /**
@@ -46,6 +65,7 @@ internal fun isDetachedDispatch(name: String, result: String?): Boolean {
 internal fun toolOutcome(name: String, status: String, isError: Boolean, result: String?, explicitCompletion: Boolean, streaming: Boolean): ToolOutcome {
     val state = status.trim().lowercase()
     return when {
+        isInterruptedToolResult(result) -> ToolOutcome.Stopped
         isError || state in failedStates -> ToolOutcome.Failed
         state in doneStates || explicitCompletion || !result.isNullOrBlank() -> if (isDetachedDispatch(name, result)) ToolOutcome.Dispatched else ToolOutcome.Completed
         !streaming -> ToolOutcome.NoResult
@@ -70,6 +90,7 @@ internal fun toolOutcomeLabel(outcome: ToolOutcome): String = when (outcome) {
     ToolOutcome.Dispatched -> "Handed off"
     ToolOutcome.Failed -> "Failed"
     ToolOutcome.NoResult -> "No result recorded"
+    ToolOutcome.Stopped -> "Stopped"
 }
 
 /** Recorded epoch (seconds or milliseconds) as milliseconds; 0 when absent or not a plausible time. */

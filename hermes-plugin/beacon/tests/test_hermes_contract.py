@@ -265,7 +265,7 @@ except ImportError:
 
 # Turning Beacon on for another profile reaches Hermes' own enable by these private spellings: Hermes has no profile-scoped enable route, its name
 # resolver only sees the active profile's own plugins, and the one way it changes plugins.enabled is the PM transaction behind `_activate_key`.
-PROFILE_ENABLE_NAMES = {'_resolve_plugin_key', '_activate_key', '_get_enabled_set'}
+PROFILE_ENABLE_NAMES = {'_resolve_plugin_key', '_activate_key', '_get_enabled_set', '_get_disabled_set'}
 
 
 def test_the_profile_enable_names_are_watched_and_exist(hermes):
@@ -297,6 +297,8 @@ def test_hermes_enable_still_has_the_shape_the_route_relies_on(hermes):
     admission = _function(commands, '_set_plugin_enabled')
     assert '_admit_and_save_plugin_sets' in {n.func.id for n in ast.walk(admission) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert '_get_enabled_set' in commands.read_text(encoding='utf-8-sig')
+    # plugins.disabled is the deny-list Hermes' loader obeys over plugins.enabled; the phone's own turn-on and the background pass leave a profile it names alone.
+    assert '_get_disabled_set = functools.partial(_config_name_set, "plugins", "disabled")' in commands.read_text(encoding='utf-8-sig')
     scope = _function(hermes / 'hermes_cli' / 'web_server_profiles.py', '_config_profile_scope')
     assert [a.arg for a in scope.args.args] == ['profile']
     assert any((isinstance(d, ast.Name) and d.id == 'contextmanager') for d in scope.decorator_list)
@@ -364,3 +366,109 @@ def test_every_route_the_app_asks_the_plugin_for_to_turn_a_profile_on_exists(app
     routes = _beacon_routes()
     assert '/api/plugins/beacon/admin/profile-plugin/enable' in routes
     assert _matches('/api/plugins/beacon/admin/profile-plugin/enable', routes)
+
+
+
+def test_every_pm_selection_race_is_read_as_a_race_and_hermes_wraps_it_as_the_pass_expects(hermes):
+    """The background pass (admin_api.turn_on_for_profiles) asks again on the next pass, without parking or a warning, when PM refused only because
+    the selection changed while it worked. Hermes has no type for that: the worker re-raises a plain ValueError and admission wraps it in a plain
+    AdmissionRefused, so the pass reads PM's own messages. Each of them must still read as a race, and the wrapping must still keep the message."""
+    spec = importlib.util.spec_from_file_location('beacon_admin_api_contract', PLUGIN / 'admin_api.py')
+    admin = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(admin)
+    messages = set()
+    for source in sorted((hermes / 'pm').glob('*.py')):
+        messages.update(re.findall(r'raise ValueError\(\s*"([^"]*changed[^"]*retry\.?)"\s*\)', source.read_text(encoding='utf-8-sig')))
+    assert 'plugin configuration changed while preparing publication; retry' in messages, sorted(messages)
+    assert 'Plugin configuration changed since this selection was read; retry.' in messages, sorted(messages)
+
+    class AdmissionRefused(RuntimeError):
+        pass
+    for message in sorted(messages):
+        error = AdmissionRefused(message)
+        error.__cause__ = ValueError(message)
+        assert admin._changed_meanwhile(error), message
+    admission = _text(hermes, 'hermes_cli', 'plugins_admission.py')
+    assert 'raise AdmissionRefused(str(exc)) from exc' in admission
+    assert 'raise DependencyConflict(exc.cause, plugin=plugin) from exc' in admission
+    assert '"ValueError": ValueError' in _text(hermes, 'pm', 'client.py')
+
+def test_hermes_still_reads_pending_admissions_the_way_the_lost_turn_route_asks(hermes):
+    """lost_turns_api reads Hermes' own admission rows on a read-only store (WEDGE-121 follow-up 3). compat names a renamed function;
+    this pins what compat cannot see: the keyword, that the read stays a read, that a lost turn is still pending as `unknown`, and
+    that SessionDB still opens read-only by keyword."""
+    import ast
+    runtime = hermes / 'hermes_state_runtime.py'
+    source = runtime.read_text(encoding='utf-8-sig')
+    read = _function(runtime, 'list_session_admissions')
+    assert [a.arg for a in read.args.args] == ['db'] and [a.arg for a in read.args.kwonlyargs] == ['session_id', 'pending_only']
+    body = ast.get_source_segment(source, read)
+    assert '_read_ctx' in body and '_execute_write' not in body, 'the admission read must stay a read'
+    assert "'unknown'" in body and "'queued'" in body, 'a lost turn is pending as unknown, what waits behind it as queued'
+    common = (hermes / 'hermes_state_common.py').read_text(encoding='utf-8-sig')
+    assert "status IN ('queued','started','unknown','terminal')" in common
+    state = ast.parse((hermes / 'hermes_state.py').read_text(encoding='utf-8-sig'))
+    session_db = next(n for n in state.body if isinstance(n, ast.ClassDef) and n.name == 'SessionDB')
+    init = next(n for n in session_db.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+    assert [a.arg for a in init.args.args][:3] == ['self', 'db_path', 'read_only']
+
+
+def test_hermes_still_discards_a_lost_turn_and_finds_a_bot_chat_the_way_follow_up_4_relies_on(hermes):
+    """WEDGE-121 follow-up 4. The app lets a lone lost reply go on open with prompt.resolve_unknown, taking exactly the session, the
+    admission and the generation the route reads; Hermes must still treat it as Discard (the input is never requeued, only the paused
+    queue resumes). The route finds a bot's chat by Hermes' own exact-title lookup and reads each lost admission's generation."""
+    import ast
+    controls = (hermes / 'gateway' / 'session_controls.py').read_text(encoding='utf-8-sig')
+    assert "if set(params) != {'session_id', 'admission_id', 'execution_generation'}:" in controls
+    authority = (hermes / 'gateway' / 'session_authority.py').read_text(encoding='utf-8-sig')
+    discard = authority[authority.index('async def resolve_unknown(self, actor, ref, admission_id, generation):'):]
+    discard = discard[:discard.index('async def resolve_unknown_as_owner')]
+    assert 'Never requeues the input' in discard and 'paused FIFO behind' in discard
+    assert "self.authorize(actor, ref, 'session:control')" in discard
+    common = (hermes / 'hermes_state_common.py').read_text(encoding='utf-8-sig')
+    assert 'generation INTEGER' in common[common.index('CREATE TABLE IF NOT EXISTS session_admissions'):]
+    titles = ast.parse((hermes / 'hermes_state_titles.py').read_text(encoding='utf-8-sig'))
+    lookup = next(n for n in ast.walk(titles) if isinstance(n, ast.FunctionDef) and n.name == 'resolve_session_by_title')
+    assert [a.arg for a in lookup.args.args] == ['self', 'title']
+    state = (hermes / 'hermes_state.py').read_text(encoding='utf-8-sig')
+    assert 'CANONICAL_BOT_CHAT_TITLE = "Bot Chat"' in state
+
+
+# The agent phone's vault bridge (agent_phone_vault.py) reaches Hermes' vault by these names; EMU-DESIGN §6.2 lists them.
+PHONE_VAULT_NAMES = {('agent.vault_store', 'VaultStore'), ('agent.vault_store', 'get_vault_store'), ('agent.vault_store', 'normalize_origin'),
+                     ('agent.vault_backends', 'enabled_backends'), ('agent.vault_backends', 'backend_for_handle'),
+                     ('agent.redact', 'register_vault_redaction_value'), ('tools.approval_prompt', 'request_elicitation_consent'),
+                     ('agent.vault_backends.unlock', 'get_save_login_prompt_callback'), ('agent.vault_backends.unlock', 'can_prompt_here'),
+                     ('agent.vault_backends.unlock', 'get_code_prompt_callback'), ('tools.browser_vault_context', 'saved_origins')}
+
+
+def test_the_agent_phone_vault_names_are_watched_and_exist(hermes):
+    compat = _compat()
+    groups = [group for group in compat.needs() if any(entry[3] == compat.PHONE_VAULT_FILE for entry in group)]
+    watched = {(entry[0], entry[1]) for group in groups for entry in group}
+    assert PHONE_VAULT_NAMES <= watched, sorted(PHONE_VAULT_NAMES - watched)
+    assert compat.missing(groups, hermes) == []
+
+
+def test_a_renamed_agent_phone_vault_name_says_which_feature_needs_a_beacon_update(hermes):
+    compat = _compat()
+    renamed = (('agent.vault_store', 'VaultStore_renamed_in_a_later_hermes', None, 'agent_phone_vault.py', False),)
+    gone = compat.missing([renamed], hermes)
+    assert gone == ['agent.vault_store.VaultStore_renamed_in_a_later_hermes (agent_phone_vault.py)']
+    assert compat.stopped(gone) == ["Saved logins on the assistant's phone need a Beacon update for this Hermes"]
+
+
+def test_hermes_vault_still_has_the_shapes_the_agent_phone_relies_on(hermes):
+    # VaultStore(base_dir=...) is how the dashboard binds the owning profile's vault, never the request's (EMU-DESIGN §6.2).
+    store = _text(hermes, 'agent', 'vault_store.py')
+    assert 'def __init__(self, base_dir: Optional[Path] = None):' in store
+    assert re.search(r'def add_item\(\s*self,\s*kind: str,\s*label: str,\s*secret: dict\[str, Any\],\s*origin: Optional\[str\] = None', store)
+    assert '"login items require identifier and password"' in store and 'LOGIN_IDENTIFIER_TYPES = ("email", "phone", "username")' in store
+    # The card question is Hermes' own consent with the vault-payment surface, answered "accept" for yes.
+    consent = _text(hermes, 'tools', 'approval_prompt.py')
+    assert re.search(r'def request_elicitation_consent\(message: str, description: str, \*,.*?surface: str = ', consent, re.S)
+    assert 'surface="vault-payment"' in _text(hermes, 'tools', 'browser_vault_tool.py')
+    # The save prompt is called as prompt(origin, site) and answers {identifier, password}; the code prompt as prompt(site, hint).
+    unlock = _text(hermes, 'agent', 'vault_backends', 'unlock.py')
+    assert 'SaveLoginPrompt = Callable[[str, str], Optional[dict[str, str]]]' in unlock and 'CodePrompt = Callable[[str, str], str]' in unlock
+    assert 'def saved_origins(meta) -> list[str]:' in _text(hermes, 'tools', 'browser_vault_context.py')

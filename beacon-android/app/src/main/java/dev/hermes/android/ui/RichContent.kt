@@ -82,6 +82,28 @@ private const val PREVIEW_OTHER_PROFILE = "Switch to the profile this came from 
 internal val LocalMarkdownMaxLines = compositionLocalOf { Int.MAX_VALUE }
 /** Told when a paragraph was cut by [LocalMarkdownMaxLines], so the card can offer to open it. */
 internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
+/**
+ * How a MEDIA: tag in this text shows. [Cards]: a stored reply, the file Hermes delivered. [Names]: a reply still arriving, whose last tag may
+ * be half a path, so a tag is only its file's name (no card, nothing fetched) until the reply is stored. [Typed]: the owner's own message,
+ * kept as typed. Names unless a surface says otherwise: only a stored chat reply opts in to cards, so text that streams elsewhere, reasoning
+ * and side answers never fetch a half-written path.
+ */
+internal enum class FileTags { Cards, Names, Typed }
+internal val LocalFileTags = compositionLocalOf { FileTags.Names }
+/** The message whose text is shown (a stored reply's id), so a file card asks Hermes once per message rather than once per file. */
+internal val LocalMessageKey = compositionLocalOf<String?> { null }
+/** The widest a reply's prose runs: a reply holding a table may be wider, its words stay this wide. */
+internal val ReadableWidth = 560.dp
+/** The widest a reply holding a table may be in a transcript [width] wide: the row inside the list's 12 dp edges, at most 840 dp (an unfolded
+ * phone or a tablet keeps a bubble, not a page), never narrower than an ordinary bubble ([bubbleMax]). */
+internal fun tableBubbleMax(width: androidx.compose.ui.unit.Dp, bubbleMax: androidx.compose.ui.unit.Dp): androidx.compose.ui.unit.Dp =
+    (width - 24.dp).coerceAtMost(840.dp).coerceAtLeast(bubbleMax)
+
+/** The pictures and files under a paragraph: images always; MEDIA: tags only as cards of a stored reply. */
+internal fun mediaUnder(node: Node, tags: FileTags): List<Node> =
+    node.descendants().filter { it is org.commonmark.node.Image || it is NativeMediaNode && (tags == FileTags.Cards || !it.mediaTag) }.toList()
+/** Whether a paragraph shows its own text: one that only delivers files shows just its cards. */
+internal fun showsParagraphText(node: Node, tags: FileTags): Boolean = tags != FileTags.Cards || !deliversOnlyFiles(node)
 
 @Composable fun Markdown(source: String, vm: BeaconViewModel, origin: Scope? = vm.authenticatedScope(), snapshots: Map<String, String> = emptyMap(), documentKey: String = "", interactive: Boolean = true) {
     val checklist = checklistReading(vm, origin, documentKey, source, interactive)
@@ -93,7 +115,12 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
     }
     // Retain the same message's rendered prefix while streaming text is parsed; avoid a zero-height frame.
     val document = parsed?.forGrowingText(scopeKey, source)
-    CompositionLocalProvider(LocalChecklist provides checklist) { SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) { document?.children()?.forEach { block -> MarkdownBlock(block, vm, origin, snapshots) } } } }
+    CompositionLocalProvider(LocalChecklist provides checklist) { SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) { document?.children()?.let { blocks ->
+        // Only a document holding a table runs wider than a bubble: its table may use the whole (capped) width, its prose keeps a line length
+        // people can read on a wide screen. Everything else renders as before.
+        val wide = blocks.any { it is TableBlock }
+        blocks.forEach { block -> if (!wide || block is TableBlock) MarkdownBlock(block, vm, origin, snapshots) else Box(Modifier.widthIn(max = ReadableWidth)) { MarkdownBlock(block, vm, origin, snapshots) } }
+    } } } }
 }
 @Composable private fun MarkdownBlock(block: Node, vm: BeaconViewModel, origin: Scope?, snapshots: Map<String, String>) {
     when (block) {
@@ -139,26 +166,32 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
 }
 @Composable private fun RichInline(node: Node, vm: BeaconViewModel, origin: Scope?, snapshots: Map<String, String>, style: TextStyle = MaterialTheme.typography.bodyLarge) {
     val uriHandler = LocalUriHandler.current
-    var linkedMedia by remember(node, origin?.key) { mutableStateOf<Pair<NativeReference, String>?>(null) }
+    var linkedMedia by remember(node, origin?.key) { mutableStateOf<Triple<NativeReference, String, Boolean>?>(null) }
     val needsConversation = uiText("Open this from its chat.")
     val attachmentLabel = uiText("Attachment")
     val linkFailed = uiText("This link could not be opened")
-    MathParagraph(node, origin?.key ?: vm.client?.scope?.key.orEmpty(), style) { destination ->
-        if (origin == null) vm.notice(needsConversation) else when (val reference = resolveNativeReference(destination, origin, snapshots, media = false)) {
+    val fileTags = LocalFileTags.current
+    if (showsParagraphText(node, fileTags)) MathParagraph(node, origin?.key ?: vm.client?.scope?.key.orEmpty(), style, fileTags != FileTags.Typed) { destination ->
+        // A link naming a file on the Hermes computer by its path opens that file's card, as Hermes' desktop does (markdown-text.tsx
+        // MarkdownLink); Hermes' own file links (/api/file/raw) keep their viewer.
+        if (origin == null) vm.notice(needsConversation) else tappedLink(destination, origin, snapshots).let { (reference, card) -> when (reference) {
             is NativeReference.Conversation, is NativeReference.Workspace -> vm.followNativeReference(reference, origin)
-            is NativeReference.LocalMedia, is NativeReference.DataImage -> linkedMedia = reference to node.descendants().filterIsInstance<org.commonmark.node.Link>().firstOrNull { it.destination == destination }?.plain().orEmpty().ifBlank { attachmentLabel }
+            is NativeReference.LocalMedia, is NativeReference.DataImage -> linkedMedia = Triple(reference, node.descendants().filterIsInstance<org.commonmark.node.Link>().firstOrNull { it.destination == destination }?.plain().orEmpty().ifBlank { attachmentLabel }, card)
             is NativeReference.ExternalLink -> runCatching { uriHandler.openUri(reference.url) }.onFailure { vm.notice(linkFailed) }
             is NativeReference.Unsupported -> vm.notice(linkFailed)
             else -> Unit
-        }
+        } }
     }
-    node.descendants().filter { it is org.commonmark.node.Image || it is NativeMediaNode }.forEach { media ->
+    mediaUnder(node, fileTags).forEach { media ->
         key(media, origin?.key) {
             val reference = if (media is org.commonmark.node.Image) media.destination else (media as NativeMediaNode).reference
             val label = if (media is org.commonmark.node.Image) media.plain().ifBlank { media.title?.takeIf(String::isNotBlank) ?: reference } else (media as NativeMediaNode).source
             if (origin != null) {
-                val resolved = resolveNativeReference(reference, origin, snapshots)
-                if (resolved is NativeReference.ExternalMedia && externalMediaNeedsTap(resolved, origin.origin.toHttpUrl())) {
+                val delivered = media is NativeMediaNode && media.mediaTag
+                val resolved = if (delivered) resolveMediaTag(reference, origin, snapshots) else resolveNativeReference(reference, origin, snapshots)
+                // A file Hermes delivered is a card: name, type, size, Open, Save, Share (a picture also shows inline).
+                if (delivered && resolved is NativeReference.LocalMedia) ReceivedFileCard(vm, resolved, origin)
+                else if (resolved is NativeReference.ExternalMedia && externalMediaNeedsTap(resolved, origin.origin.toHttpUrl())) {
                     var loadExternalImage by remember { mutableStateOf(false) }
                     if (loadExternalImage) NativeReferencePreview(vm, resolved, label, origin)
                     else OutlinedButton(onClick = { loadExternalImage = true }) { Text(uiText(if (media is org.commonmark.node.Image) "Load image from" else "Load media from") + " " + resolved.url.host) }
@@ -166,9 +199,9 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
             } else Text(uiText("Open this from its chat."), color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
-    linkedMedia?.let { (reference, label) -> AlertDialog(onDismissRequest = { linkedMedia = null }, title = { Text(label.take(160)) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState())) { if (origin != null) NativeReferencePreview(vm, reference, label, origin) } }, confirmButton = { TextButton(onClick = { linkedMedia = null }) { Text(uiText("Close")) } }) }
+    linkedMedia?.let { (reference, label, card) -> AlertDialog(onDismissRequest = { linkedMedia = null }, title = { Text(label.take(160)) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState())) { if (origin != null) { if (card && reference is NativeReference.LocalMedia) ReceivedFileCard(vm, reference, origin) else NativeReferencePreview(vm, reference, label, origin) } } }, confirmButton = { TextButton(onClick = { linkedMedia = null }) { Text(uiText("Close")) } }) }
 }
-@Composable private fun MathParagraph(node: Node, scopeKey: String, style: TextStyle = MaterialTheme.typography.bodyLarge, onLink: (String) -> Unit) {
+@Composable private fun MathParagraph(node: Node, scopeKey: String, style: TextStyle = MaterialTheme.typography.bodyLarge, fileNames: Boolean = true, onLink: (String) -> Unit) {
     val math = remember(node) { node.descendants().filterIsInstance<MathNode>().take(64).toList() }
     val density = LocalDensity.current
     val sizePx = with(density) { style.fontSize.toPx() }
@@ -194,7 +227,7 @@ internal val LocalMarkdownCut = compositionLocalOf<() -> Unit> { {} }
     val inline = math.indices.mapNotNull { i -> bitmaps.getOrNull(i)?.let { bitmap ->
         "math:$i" to InlineTextContent(Placeholder(with(density) { bitmap.width.toSp() }, with(density) { bitmap.height.toSp() }, PlaceholderVerticalAlign.Center)) { Image(bitmap.asImageBitmap(), math[i].source) }
     } }.toMap()
-    val annotated = inlineAnnotations(node, primary, ids, onLink, MaterialTheme.colorScheme.onSurface.copy(alpha = .08f))
+    val annotated = inlineAnnotations(node, primary, ids, onLink, MaterialTheme.colorScheme.onSurface.copy(alpha = .08f), fileNames)
     val prefix = if(node is org.commonmark.node.Paragraph && checklistItem(node.parent) != null) 4 else if(node is org.commonmark.node.Paragraph && node.parent is BlockQuote && calloutLabel(node.parent as BlockQuote) != null && node === node.parent.firstChild) Regex("^\\[![A-Za-z]+\\]\\s*").find(annotated.text)?.value?.length ?: 0 else 0
     val maxLines = LocalMarkdownMaxLines.current
     val cut = LocalMarkdownCut.current
@@ -267,24 +300,34 @@ internal fun Modifier.scrollEdgeFade(state: androidx.compose.foundation.ScrollSt
     var visible by remember(rows) { mutableIntStateOf(24) }
     var copyError by remember(rows) { mutableStateOf("") }
     val horizontal=rememberScrollState()
+    val scroller=rememberCoroutineScope()
     Column {
         Row(verticalAlignment=androidx.compose.ui.Alignment.CenterVertically) {
             Text(uiText(if(rows.size==2) "1 row" else "{0} rows").replace("{0}","${rows.size-1}"), Modifier.weight(1f), style=MaterialTheme.typography.labelSmall)
+            // Wider than its bubble: say so, and move one screen of columns on a tap (the edge fade alone was missed, D20).
+            if(horizontal.canScrollForward) TextButton(onClick={ scroller.launch { horizontal.animateScrollTo(horizontal.value+(horizontal.viewportSize*.8f).toInt()) } }, modifier=Modifier.testTag("table-more-columns"), contentPadding=PaddingValues(horizontal=8.dp)) {
+                Text(uiText("More columns"), style=MaterialTheme.typography.labelLarge)
+                Icon(Icons.AutoMirrored.Rounded.KeyboardArrowRight, null, Modifier.size(18.dp))
+            }
             IconButton(onClick={ runCatching { (context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("Table",tableClipboard(sorted))) }.onSuccess { vm?.notice(copied) }.onFailure { copyError=it.message.orEmpty() } }) { Icon(Icons.Rounded.ContentCopy,uiText("Copy table")) }
         }
         if(copyError.isNotBlank()) Text(uiText(copyError),color=MaterialTheme.colorScheme.error)
+        BoxWithConstraints {
+        // The border takes 1 dp each side; an unbounded parent leaves the measured widths as they are.
+        val fitted=remember(widths,maxWidth) { if(constraints.hasBoundedWidth) tableFitWidths(widths,maxWidth.value.toInt()-2) else widths }
         Column(Modifier.scrollEdgeFade(horizontal).horizontalScroll(horizontal).border(1.dp,MaterialTheme.colorScheme.outlineVariant)) {
             sorted.take(visible).forEachIndexed { index,row ->
                 Row(Modifier.background(if(index==0) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)) {
                     widths.indices.forEach { col ->
                         val cell=row.getOrNull(col).orEmpty()
-                        val modifier=Modifier.width(widths[col].dp).heightIn(min=48.dp)
+                        val modifier=Modifier.width(fitted[col].dp).heightIn(min=48.dp)
                         if(index==0) TextButton(onClick={ if(column==col) descending=!descending else { column=col; descending=false } }, modifier=modifier) { Text(cell + if(column==col) if(descending) " ↓" else " ↑" else "", fontWeight=FontWeight.SemiBold) }
                         else Column(modifier.padding(12.dp).semantics { contentDescription="${rows.first().getOrNull(col).orEmpty()}, $rowLabel $index: $cell" }) { if(cellContent != null) cellContent(order[index],col) else Text(cell,style=MaterialTheme.typography.bodyMedium) }
                     }
                 }
                 HorizontalDivider()
             }
+        }
         }
         if(visible<rows.size) TextButton(onClick={ visible+=24 }) { Text(uiText("Show next 24 rows")) }
     }
@@ -330,8 +373,11 @@ internal fun imagePanOffset(scale: Float, offset: androidx.compose.ui.geometry.O
 private fun cachedMedia(key: MediaKey, reference: NativeReference, signedIn: Boolean): NativeMediaBytes? =
     if (reference is NativeReference.ExternalMedia || signedIn && (reference is NativeReference.LocalMedia || reference is NativeReference.HistoryImage)) MediaCache.payloads.get(key) else null
 private fun referenceFilename(reference: NativeReference, name: String): String = when (reference) { is NativeReference.LocalMedia -> reference.path; is NativeReference.ExternalMedia -> reference.url.pathSegments.lastOrNull().orEmpty(); else -> name }
-/** [aspect] is the picture's width / height when the message says it; the placeholder reserves that shape while the file loads. */
-@Composable private fun NativeReferencePreview(vm: BeaconViewModel, reference: NativeReference, name: String, origin: Scope, aspect: Float? = null) {
+/**
+ * [aspect] is the picture's width / height when the message says it; the placeholder reserves that shape while the file loads. [received]: a
+ * file card's picture, which shows from the card's copy on this phone when there is one; every other preview reads Hermes as before.
+ */
+@Composable internal fun NativeReferencePreview(vm: BeaconViewModel, reference: NativeReference, name: String, origin: Scope, aspect: Float? = null, received: Boolean = false) {
     val active = vm.client
     val resultClient = active.takeIf { reference is NativeReference.LocalMedia || reference is NativeReference.HistoryImage }
     val client = remember(origin.key, active) { active?.takeIf { it.scope == origin.copy(session = "") }?.detached() }
@@ -344,7 +390,8 @@ private fun referenceFilename(reference: NativeReference, name: String): String 
         cachedMedia(cacheKey, reference, client != null)?.let { hit -> value = PreparedContent(origin.key, reference, hit, resultClient); return@produceState }
         value = null
         try { val payload = when (reference) {
-            is NativeReference.LocalMedia -> { require(client != null) { PREVIEW_OTHER_PROFILE }; NativeMediaBytes(client.bytes(reference.endpoint, reference.query())) }
+            // A received file already on this phone shows from its copy, offline too.
+            is NativeReference.LocalMedia -> (if (received) receivedPreviewBytes(vm, origin, reference) else null) ?: run { require(client != null) { PREVIEW_OTHER_PROFILE }; NativeMediaBytes(client.bytes(reference.endpoint, reference.query())) }
             is NativeReference.HistoryImage -> { require(client != null) { PREVIEW_OTHER_PROFILE }; client.historyImage(reference) }
             is NativeReference.DataImage -> withContext(Dispatchers.Default) { NativeMediaBytes(reference.bytes(), reference.mime) }
             is NativeReference.ExternalMedia -> externalMediaBytes(reference)
@@ -387,7 +434,7 @@ private fun referenceFilename(reference: NativeReference, name: String): String 
     }
 }
 /** The loading state of a preview, reserving the shape it will fill so nothing around it jumps when it arrives. */
-@Composable private fun MediaPlaceholder(shape: PlaceholderShape) {
+@Composable internal fun MediaPlaceholder(shape: PlaceholderShape) {
     Box((if (shape.fixedHeightDp != null) Modifier.fillMaxWidth().height(shape.fixedHeightDp.dp) else Modifier.fillMaxWidth().heightIn(max = InlineImageMaxHeightDp.dp).aspectRatio(shape.aspect))
         .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = .05f)).testTag("media-placeholder"), contentAlignment = androidx.compose.ui.Alignment.Center) { LinearProgressIndicator() }
 }
@@ -449,11 +496,18 @@ private data class PdfPage(val bitmap: Bitmap, val count: Int, val index: Int)
         }; value = PreparedContent(scopeKey, contentKey, result) } catch (e: Throwable) { if (e is CancellationException) throw e; error = "Can't show this PDF." }
     }
     val result = rendered?.forContext(scopeKey, contentKey)
+    // UX-121 P3-9: a page stays until the next is drawn, in a box of the first page's ratio, so paging never resizes the viewer.
+    var shown by remember(scopeKey, data) { mutableStateOf<PdfPage?>(null) }
+    var firstRatio by remember(scopeKey, data) { mutableStateOf<Float?>(null) }
+    SideEffect { if (result != null) { shown = result; if (firstRatio == null) firstRatio = result.bitmap.width.toFloat() / result.bitmap.height } }
+    val page0 = result ?: shown
     Column {
         if (error.isNotBlank()) SelectionContainer { Text(uiText(error), color = MaterialTheme.colorScheme.error) }
-        else if (result == null) MediaPlaceholder(placeholderShape(MediaKind.Pdf, aspect))
-        result?.let { current ->
-            ZoomImage(current.bitmap, "${uiText("PDF page")} ${current.index + 1}")
+        else if (page0 == null) MediaPlaceholder(placeholderShape(MediaKind.Pdf, aspect))
+        if (error.isBlank()) page0?.let { current ->
+            Box(Modifier.fillMaxWidth().heightIn(max = 440.dp).aspectRatio(firstRatio ?: (current.bitmap.width.toFloat() / current.bitmap.height)).testTag("pdf-page-box"), contentAlignment = androidx.compose.ui.Alignment.Center) {
+                ZoomImage(current.bitmap, "${uiText("PDF page")} ${current.index + 1}")
+            }
             val previousLabel = uiText("Previous PDF page")
             val nextLabel = uiText("Next PDF page")
             Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {

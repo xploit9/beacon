@@ -116,38 +116,16 @@ fun runningTurnMessages(messages: List<JSONObject>): List<JSONObject> = messages
     row.string("role") == "user" && !isSteeringText(messageContentText("user", historyRowContent(row)))
 }.coerceAtLeast(0))
 
-private val runsOfSpace = Regex("\\s+")
-
 /** The most sealed segments a turn keeps on screen and in its live frame. */
-private const val MAX_SEALED_SEGMENTS = 24
-
-/**
- * The words of the running turn's closed segments that its saved rows do not hold yet, in the order they were said. Hermes saves a model message before it runs its tools,
- * and the phone reads that history only now and then, so a closed segment stays on screen (as Hermes desktop's sealed interim bubble does) until a saved assistant row of the turn
- * has the same words. Each saved row holds ONE sealed entry: a sentence the model repeats in two messages is not dropped because only the first one is saved.
- */
-fun sealedWordsNotSaved(messages: List<JSONObject>, sealed: List<String>): List<String> {
-    if (sealed.isEmpty()) return sealed
-    val saved = runningTurnMessages(messages).filter { it.string("role") == "assistant" }
-        .map { messageContentText("assistant", historyRowContent(it)).trim().replace(runsOfSpace, " ") }.filter { it.isNotEmpty() }.toMutableList()
-    return sealed.filter { words ->
-        val key = words.trim().replace(runsOfSpace, " ")
-        key.isNotEmpty() && !saved.remove(key)
-    }.takeLast(MAX_SEALED_SEGMENTS)
-}
+internal const val MAX_SEALED_SEGMENTS = 24
 
 /** The sealed words in a live frame (the checkpoint a reselect or reconnect restores); a frame of an older build has none. */
 fun sealedFromFrame(frame: JSONObject): List<String> = frame.optJSONArray("sealed")?.let { values ->
     (0 until values.length()).mapNotNull { (values.opt(it) as? String)?.takeIf(String::isNotBlank) }.takeLast(MAX_SEALED_SEGMENTS)
 }.orEmpty()
 
-/**
- * Words that name no tool call (Hermes saves such a message when it makes the model go on, and its turn continues) have only their text to be told by.
- * A closed live segment is held once a saved assistant message without tool calls, in the running turn, says the same words; a message with tool calls is still told by them.
- */
-fun historyOwnsTextSegment(messages: List<JSONObject>, liveText: String, boundaryClosed: Boolean): Boolean {
-    val live = liveText.trim().replace(runsOfSpace, " ")
-    return boundaryClosed && live.isNotEmpty() && messages.any { row ->
-        row.string("role") == "assistant" && row.rows("tool_calls").isEmpty() && messageContentText("assistant", historyRowContent(row)).trim().replace(runsOfSpace, " ") == live
-    }
-}
+/** The place in the turn of each sealed text [sealedFromFrame] returns, in the same order ("sealed_at" in the frame); 0 where a frame of an older build has none. */
+fun sealedPlacesFromFrame(frame: JSONObject): List<Int> = frame.optJSONArray("sealed")?.let { values ->
+    val places = frame.optJSONArray("sealed_at")
+    (0 until values.length()).filter { (values.opt(it) as? String)?.isNotBlank() == true }.map { places?.optInt(it, 0) ?: 0 }.takeLast(MAX_SEALED_SEGMENTS)
+}.orEmpty()

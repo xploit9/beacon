@@ -1,0 +1,3 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The helper's input method (no keys of its own; the phone's hardware keyboard types). -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android" />

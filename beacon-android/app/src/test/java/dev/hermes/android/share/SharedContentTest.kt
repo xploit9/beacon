@@ -21,7 +21,7 @@ class SharedContentTest {
     @Test fun plainTextIsKeptAsWrittenAndTrimmed() {
         val shared = content("  Pick up bread\nand milk \n")
         assertEquals("Pick up bread\nand milk", shared.text)
-        assertTrue(shared.images.isEmpty())
+        assertTrue(shared.files.isEmpty())
         assertFalse(shared.isEmpty)
     }
 
@@ -49,11 +49,19 @@ class SharedContentTest {
         assertEquals("", over.text)
     }
 
-    @Test fun onlyImagesFromAnotherAppsContentProviderAreKept() {
-        val types = mapOf(image to "image/png", "content://docs/file/7" to "application/pdf", "content://media/external/images/media/43" to "IMAGE/JPEG")
+    /** CHAT-121 follow-up 3: a document shared from another app reaches the chat as the attach button's files do; before, only images did. */
+    @Test fun imagesAndDocumentsFromAnotherAppsContentProviderAreKept() {
+        val docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        val types = mapOf(image to "image/png", "content://docs/file/7" to "application/pdf", "content://docs/file/8" to docx, "content://docs/file/9" to "text/plain",
+            "content://media/external/images/media/43" to "IMAGE/JPEG", "content://media/external/audio/media/5" to "audio/mpeg", "content://media/external/video/media/6" to "video/mp4")
         val shared = content(streams = types.keys.toList(), type = types::get)
-        assertEquals(listOf(image, "content://media/external/images/media/43"), shared.images)
-        assertTrue("an item that is not an image is left out", content(streams = listOf("content://docs/file/7"), type = { "application/pdf" }).isEmpty)
+        assertEquals(listOf(image, "content://docs/file/7", "content://docs/file/8", "content://docs/file/9", "content://media/external/images/media/43"), shared.files)
+        assertFalse("a share with a document is not images only", shared.onlyImages)
+        assertTrue(content(streams = listOf(image, "content://media/external/images/media/43")).onlyImages)
+        val pdf = content(streams = listOf("content://docs/file/7"), type = { "application/pdf" })
+        assertEquals(listOf("content://docs/file/7"), pdf.files)
+        assertFalse(pdf.isEmpty)
+        assertTrue("audio and video are left out", content(streams = listOf("content://media/external/audio/media/5"), type = { "audio/mpeg" }).isEmpty)
         assertTrue("an item with no known type is left out", content(streams = listOf(image), type = { null }).isEmpty)
     }
 
@@ -67,12 +75,12 @@ class SharedContentTest {
         assertFalse("an address longer than any provider uses", acceptableShareUri("content://media/" + "a".repeat(3000), pkg))
     }
 
-    @Test fun manyImagesAreCappedAndTheRestCounted() {
-        val streams = (1..SHARE_IMAGE_LIMIT + 3).map { "content://media/external/images/media/$it" }
+    @Test fun manyFilesAreCappedAndTheRestCounted() {
+        val streams = (1..SHARE_FILE_LIMIT + 3).map { "content://media/external/images/media/$it" }
         val shared = content(streams = streams)
-        assertEquals(streams.take(SHARE_IMAGE_LIMIT), shared.images)
-        assertEquals(3, shared.skippedImages)
-        assertEquals("the same image twice is one", 1, content(streams = listOf(image, image)).images.size)
+        assertEquals(streams.take(SHARE_FILE_LIMIT), shared.files)
+        assertEquals(3, shared.skippedFiles)
+        assertEquals("the same image twice is one", 1, content(streams = listOf(image, image)).files.size)
     }
 
     @Test fun sharedTextGoesUnderWhatIsAlreadyTypedNeverOverIt() {

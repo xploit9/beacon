@@ -3,6 +3,7 @@ package dev.hermes.android
 import dev.hermes.android.core.Draft
 import dev.hermes.android.core.QueuedMessage
 import dev.hermes.android.core.Scope
+import dev.hermes.android.data.BeaconOffLines
 import dev.hermes.android.data.PROFILE_PLUGIN_OFF_ERROR
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -18,7 +19,8 @@ class BeaconOffChatDraftTest {
     private val off = ChatState(sessionId = "chat-x", status = PROFILE_PLUGIN_OFF_ERROR)
 
     @Test fun whatIsTypedOnTheOffChatPageIsSavedWithThatChat() {
-        assertEquals(owner.session("chat-x"), retainedDraftScope(off, null, owner))
+        // Every line a refused profile can show (an owner's off, a turn-on that failed, a profile Hermes no longer has) is that page.
+        for (line in BeaconOffLines) assertEquals(line, owner.session("chat-x"), retainedDraftScope(off.copy(status = line), null, owner))
     }
 
     @Test fun noOtherPageOwnsADraftThisWay() {

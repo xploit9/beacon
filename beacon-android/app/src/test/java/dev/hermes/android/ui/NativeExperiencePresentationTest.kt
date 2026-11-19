@@ -46,6 +46,13 @@ class NativeExperiencePresentationTest {
         // A measured amount sets its column's width, so it never wraps mid-number.
         assertEquals(listOf(134), tableColumnWidths(listOf(listOf("Total"), listOf("€484,968.26"))) { it.length * 10 })
     }
+    /** UX-121 P3-17: Plan | Duration (280 + 100) in a 330 dp bubble wraps Plan to 230 so "3 day" is not cut; a table that still would not fit scrolls. */
+    @Test fun aTableALittleTooWideWrapsItsWidestColumn() {
+        assertEquals(listOf(230, 100), tableFitWidths(listOf(280, 100), 330))
+        assertEquals("fits already", listOf(120, 100), tableFitWidths(listOf(120, 100), 330))
+        assertEquals("the widest would drop under 100 dp: it scrolls", listOf(280, 280, 280), tableFitWidths(listOf(280, 280, 280), 330))
+        assertTrue(tableFitWidths(emptyList(), 330).isEmpty())
+    }
     @Test fun slashDiscoveryFiltersWithoutTreatingArgumentsAsCommands() {
         assertTrue(slashMatches("/help", "Commands", "/he"))
         assertFalse(slashMatches("/save", "Export the current conversation", "/he"))
@@ -75,6 +82,38 @@ class NativeExperiencePresentationTest {
         assertEquals(listOf("image", "file"), content.attachments.map { it.kind })
         assertFalse(content.text.contains("C:\\SyntheticOwner"))
         assertFalse(safeHistoryMessageText("user", "@file:C:\\SyntheticOwner\\Documents\\.beacon-attachments\\123e4567-e89b-12d3-a456-426614174000-plan.md").contains("C:\\SyntheticOwner"))
+    }
+    /**
+     * CHAT-121 follow-up 3: a sent document comes back from Hermes with its @-reference expanded below the typed words (agent/context_references.py):
+     * an "Attached Context" block naming each file's type, size and host path. The bubble shows the words and one chip per file, never that block.
+     */
+    @Test fun hermesAttachedContextBelowTheWordsIsNotShown() {
+        val stored = "Synthetic document check\n" +
+            "@file:`Synthetic/attachments/Synthetic report 2026.pdf`\n" +
+            "@file:`Synthetic/attachments/ملف تجريبي.docx`\n\n" +
+            "--- Context Warnings ---\n- @ context injection warning: 9000 tokens exceeds the 25% soft limit (8000).\n\n" +
+            "--- Attached Context ---\n\n" +
+            "\uD83D\uDCCE @file:`Synthetic/attachments/Synthetic report 2026.pdf` (application/pdf, 6.2 MB) — binary file, not inlined as text. It is available on disk at `C:\\SyntheticOwner\\attachments\\Synthetic report 2026.pdf`.\n\n" +
+            "\uD83D\uDCCE @file:`Synthetic/attachments/ملف تجريبي.docx` (application/vnd.openxmlformats-officedocument.wordprocessingml.document, 26 B) — binary file, not inlined as text."
+        val shown = safeHistoryMessagePresentation("user", stored)
+        assertEquals("Synthetic document check", shown.text)
+        assertEquals(listOf("Synthetic report 2026.pdf", "ملف تجريبي.docx"), shown.attachments.map { it.name })
+        // Only Hermes' own footer: the same words inside a line the owner typed stay.
+        assertEquals("Notes --- Attached Context --- here", safeHistoryMessageText("user", "Notes --- Attached Context --- here"))
+    }
+    /**
+     * CHAT-121 follow-up 4: Hermes' chat-list preview is the first message on one line, cut at 60 characters (hermes_state_common._shape_preview),
+     * so a sent file's "Attached Context" footer arrives flattened or cut short; the list line never shows it, or the path in it.
+     */
+    @Test fun aChatListPreviewNeverShowsHermesContextFooter() {
+        assertEquals("Read these", chatPreviewText("Read these @file:`Synthetic/attachments/a.pdf`  --- Attached Context ---  📎 @file:`Synthetic/at..."))
+        assertEquals("Read these", chatPreviewText("Read these @file:`Synthetic/attachments/a.pdf`  --- Attached Co..."))
+        assertEquals("Read these", chatPreviewText("Read these @file:`Synthetic/attachments/a.pdf`  --- Context Warnings ---  - @ context injection..."))
+        assertEquals("a.pdf", chatPreviewText("@file:`Synthetic/attachments/a.pdf`  --- Attached Context ---  📎 @file:`Synthetic/attachments/a..."))
+        // The stored row itself (with its line breaks), as the glance line reads it.
+        assertEquals("Read these", chatPreviewText("Read these\n@file:`Synthetic/attachments/a.pdf`\n\n--- Attached Context ---\n\n📎 @file:`Synthetic/attachments/a.pdf` (application/pdf, 6 MB)"))
+        // Words the owner typed with the same marks stay.
+        assertEquals("Agenda --- tomorrow at 9", chatPreviewText("Agenda --- tomorrow at 9"))
     }
     @Test fun stoppedAssistantErrorsUseAQuietMarkerAndKeepOtherMessages() {
         assertEquals("Stopped", stoppedMessageMarker("assistant", "Operation interrupted: waiting for model response (6.8s elapsed).", false))

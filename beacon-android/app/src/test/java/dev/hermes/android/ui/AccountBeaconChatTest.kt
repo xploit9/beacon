@@ -52,6 +52,20 @@ class AccountBeaconChatTest {
         assertEquals("Chat", pushDestination("message", "qa-chat", "qa-chat"))
     }
 
+    // Owner, 17 Nov: a reply notification of the Beacon chat opened its session as a separate chat ("hi") in Chat.
+    @Test fun aReplyOrAlertOfTheBeaconChatOpensTheBeaconChat() {
+        for (kind in listOf("completion", "failure", "approval", "clarify", "task_result", "incoming_call")) {
+            assertEquals(kind, "Beacon", pushDestination(kind, "beacon-chat", "beacon-chat"))
+            assertEquals(kind, "Chat", pushDestination(kind, "qa-chat", "beacon-chat"))
+            assertEquals(kind, "Chat", pushDestination(kind, "qa-chat", null))
+            // Hermes says it is the Beacon chat (it finishes turns under a new session id after compressing the chat), or this phone has none kept yet.
+            assertEquals(kind, "Beacon", pushDestination(kind, "beacon-chat-2", "beacon-chat", assistantChat = true))
+            assertEquals(kind, "Beacon", pushDestination(kind, "beacon-chat", null, assistantChat = true))
+        }
+        assertEquals("Chat", pushDestination("completion", "", "beacon-chat"))
+        assertEquals("Tasks", pushDestination("task_result", "", "beacon-chat"))
+    }
+
     @Test fun onlyAPluginWithoutABeaconChatLetsThePhoneStartOne() {
         for (status in listOf(401, 403, 404, 405)) assertTrue(status.toString(), beaconChatLookupMissing(ApiFailure(status, "none")))
         for (status in listOf(408, 429, 500, 502, 503, 504)) assertFalse(status.toString(), beaconChatLookupMissing(ApiFailure(status, "failed")))

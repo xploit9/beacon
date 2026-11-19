@@ -5,6 +5,33 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CallToolApprovalTest {
+    // Device round 2, item 2: "Lost Hermes. Check the chat." stayed on the call screen after the link was back and the result was said.
+    @Test fun theLostHermesLineGoesWhenHermesIsBack() {
+        val lost = CallState(active = true, callId = "call-synthetic", error = CALL_LOST_HERMES)
+        assertEquals("", lost.withHermesLink(true).error);assertFalse(lost.withHermesLink(true).hermesUnreachable)
+        assertEquals(CALL_LOST_HERMES, lost.withHermesLink(false).error);assertTrue(lost.withHermesLink(false).hermesUnreachable)
+        assertEquals("another line stays", "Open the chat to answer.", lost.copy(error = "Open the chat to answer.").withHermesLink(true).error)
+    }
+
+    // Device round 1, item 5: a read asked while Hermes is out of reach has no Hermes receipt; the phone's own state still gives it a
+    // chip, and that chip says "Can't reach Hermes" (before: no chip for the whole outage).
+    @Test fun aRequestWaitingWhileHermesIsOutOfReachHasAChipThatSaysSo() {
+        for (state in listOf("hermes_unreachable", "lost_result")) {
+            val receipt = CallToolReceipt.from(JSONObject().put("type", "tool_receipt").put("request_id", "req-synthetic-0009").put("tool_name", "session_search").put("status", state))
+            assertNotNull(state, receipt)
+            assertEquals(HERMES_UNREACHABLE_LINE, receipt!!.chipText(unreachable = true))
+        }
+    }
+
+    // Device round 1, item 8: the call's tool log keeps Hermes' own execute time, so live timing can hold a read to execute + 500 ms.
+    @Test fun theToolLogKeepsHermesExecuteTimeAndALogOnlyState() {
+        val row = toolLogEntry(JSONObject().put("request_id", "req-synthetic-0001").put("tool_name", "notes_search").put("status", "completed")
+            .put("server_ms", JSONObject().put("execute", 420.551).put("total", 438.031)), 1234)
+        assertEquals(420.551, row.getDouble("execute_ms"), 0.0001);assertEquals(1234, row.getLong("elapsed_ms"))
+        val state = toolLogEntry(JSONObject().put("request_id", "req-synthetic-0002").put("tool_name", "t_hermes_notes_create").put("status", "hermes_unreachable").put("log_only", true), 5)
+        assertTrue(state.getBoolean("log_only"));assertFalse(state.has("execute_ms"))
+    }
+
     @Test fun fixedReadPresenceMustBeAnExplicitBooleanOnACompletedLookup() {
         val event=directLookupReceipt("lookup","hermes_memory",GeminiWire.evidence(JSONObject()
             .put("summary","Fixture evidence").put("sources",org.json.JSONArray()).put("observed_at",123),false))
@@ -15,7 +42,8 @@ class CallToolApprovalTest {
         assertFalse(CallToolReceipt.from(JSONObject(event.toString()).apply { remove("result_present") })!!.hasResult)
         for(status in listOf("running","failed","uncertain","needs_approval","cancelled"))
             assertFalse(CallToolReceipt.from(JSONObject(event.toString()).put("status",status))!!.hasResult)
-        for(name in listOf("write_file","hermes_work","mcp__native__hermes_memory","other_lookup")) {
+        // A hand-over is not a tool on the call screen at all (CallToolReceipt.from returns null for it); any other name is checked here.
+        for(name in listOf("write_file","notes_search","mcp__native__hermes_memory","other_lookup")) {
             val parsed=CallToolReceipt.from(JSONObject(event.toString()).put("tool_name",name))!!
             assertFalse(parsed.hasResult);assertEquals("Not confirmed",parsed.chipLabel())
         }

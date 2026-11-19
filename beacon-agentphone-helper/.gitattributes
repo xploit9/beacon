@@ -1,0 +1,2 @@
+# L9's channel contract and test vectors, copied byte for byte: the tests pin their sha256, so no line-ending conversion.
+src/test/resources/channel-v1/* -text -whitespace

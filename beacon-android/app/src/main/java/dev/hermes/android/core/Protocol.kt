@@ -67,9 +67,14 @@ data class QueuedMessage(
     val afterRowId: String? = null,
     /** What Hermes said about this copy's admission when it accepted it: "queued" (it waits behind another turn), "started" (it is running), or "" (not told, e.g. a legacy gateway). */
     val admissionStatus: String = "",
+    /**
+     * Why this waiting message is held: the line the turn before it ended on (a failure retrying cannot fix, a stop, or a turn a Hermes restart cut). While it is set no
+     * passive drain sends it (the open, the watch tick, a stream's end); the owner's Send releases it. Saved with the draft, so a cold start keeps the hold and its reason.
+     */
+    val held: String = "",
 ) {
     fun encode(): JSONObject = json("text" to text, "attachments" to JSONArray(attachments), "model" to model, "provider" to provider,
-        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId, "after_row_id" to afterRowId, "admission_status" to admissionStatus)
+        "id" to id, "created_at" to createdAt, "state" to state, "kind" to kind, "row_id" to rowId, "admission_id" to admissionId, "outcome" to outcome, "submission_id" to submissionId, "after_row_id" to afterRowId, "admission_status" to admissionStatus, "held" to held)
     companion object {
         fun decode(item: Any?): QueuedMessage {
             if (item !is JSONObject) return QueuedMessage(item?.toString().orEmpty(), createdAt = 0L)
@@ -79,7 +84,7 @@ data class QueuedMessage(
             return QueuedMessage(item.string("text"), item.rows("attachments"), item.string("model"), item.string("provider"),
                 id, item.optLong("created_at").coerceAtLeast(0), state, item.string("kind").takeIf { it in setOf("queue", "steer") } ?: "queue",
                 item.string("row_id"), item.string("admission_id"), item.string("outcome"), item.string("submission_id").ifBlank { id }, item.opt("after_row_id") as? String,
-                item.string("admission_status").takeIf { it == "queued" || it == "started" }.orEmpty())
+                item.string("admission_status").takeIf { it == "queued" || it == "started" }.orEmpty(), item.string("held"))
         }
     }
 }
@@ -107,9 +112,14 @@ sealed interface SendReceipt {
 
 data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val state: String = "uncertain",
     val createdAt: Long = System.currentTimeMillis(), val model: String = "", val provider: String = "", val queued: Boolean = false,
-    val rowId: String = "", val admissionId: String = "", val submissionId: String = id, val afterRowId: String? = null) {
+    val rowId: String = "", val admissionId: String = "", val submissionId: String = id, val afterRowId: String? = null,
+    /** CHATQA-121 follow-up 5: the staged attachments (JSON array) the lost answer's payload carried, so asking again sends them unchanged. */
+    val staged: String = "",
+    /** Follow-up 5: the record names its submission id (one saved before submission ids were saved does not, and its first request may have used another). */
+    val submissionSaved: Boolean = true) {
     fun encode(): String = json("id" to id, "draft" to draft.encode(), "state" to state, "created_at" to createdAt,
-        "model" to model, "provider" to provider, "queued" to queued, "row_id" to rowId, "admission_id" to admissionId, "submission_id" to submissionId, "after_row_id" to afterRowId).toString()
+        "model" to model, "provider" to provider, "queued" to queued, "row_id" to rowId, "admission_id" to admissionId, "submission_id" to submissionId, "after_row_id" to afterRowId)
+        .apply { if (staged.isNotBlank()) put("staged_attachments", staged) }.toString()
     companion object {
         fun create(scope: Scope, draft: Draft, queued: QueuedMessage? = null): PendingSend {
             val id = queued?.id ?: UUID.randomUUID().toString()
@@ -117,7 +127,7 @@ data class PendingSend(val id: String, val scope: Scope, val draft: Draft, val s
                 provider = queued?.provider.orEmpty(), queued = queued != null, submissionId = queued?.submissionId ?: id)
         }
         fun decode(scope: Scope, raw: String): PendingSend = JSONObject(raw).let { o -> PendingSend(o.getString("id"), scope, Draft.decode(o.getString("draft")),
-            o.string("state", "uncertain"), o.optLong("created_at").coerceAtLeast(0), o.string("model"), o.string("provider"), o.optBoolean("queued"), o.string("row_id"), o.string("admission_id"), o.string("submission_id").ifBlank { o.getString("id") }, o.opt("after_row_id") as? String) }
+            o.string("state", "uncertain"), o.optLong("created_at").coerceAtLeast(0), o.string("model"), o.string("provider"), o.optBoolean("queued"), o.string("row_id"), o.string("admission_id"), o.string("submission_id").ifBlank { o.getString("id") }, o.opt("after_row_id") as? String, o.string("staged_attachments"), o.string("submission_id").isNotBlank()) }
     }
 }
 

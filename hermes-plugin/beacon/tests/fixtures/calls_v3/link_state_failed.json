@@ -1,0 +1,11 @@
+{
+  "status": "failed",
+  "state_source": "phone",
+  "request_id": "req-synthetic-0001",
+  "tool": "notes_search",
+  "elapsed_ms": 30500,
+  "ran_on_hermes": null,
+  "retry_safe": true,
+  "will_update": false,
+  "detail": "connection_lost"
+}

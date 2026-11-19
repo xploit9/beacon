@@ -1,0 +1,98 @@
+{
+  "note": "An array without items makes Gemini Live refuse the whole session setup; the plugin gives every array items (a string when the tool says nothing), so the tool stays declared and its arguments are still validated against the original schema.",
+  "source": {
+    "type": "object",
+    "properties": {
+      "tags": {
+        "type": "array",
+        "description": "Tags to match."
+      },
+      "pairs": {
+        "type": "array",
+        "items": []
+      },
+      "nested": {
+        "type": "object",
+        "properties": {
+          "list": {
+            "type": "array",
+            "items": {}
+          }
+        }
+      },
+      "either": {
+        "anyOf": [
+          {
+            "type": "array"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "maybe": {
+        "type": [
+          "array",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "tags"
+    ]
+  },
+  "portable": {
+    "type": "object",
+    "properties": {
+      "tags": {
+        "description": "Tags to match.",
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "pairs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "nested": {
+        "type": "object",
+        "properties": {
+          "list": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "either": {
+        "anyOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "maybe": {
+        "type": [
+          "array",
+          "null"
+        ],
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "tags"
+    ]
+  }
+}

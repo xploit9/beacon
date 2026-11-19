@@ -161,7 +161,7 @@ def build_router(identity, mobile, principal_for, verify):
 
     @router.get('/mobile/calls')
     async def call_history(request: Request):
-        owner, provider, profile, _ = identity(request)
+        owner, provider, profile, _ = await asyncio.to_thread(identity, request)
         principal=principal_for(request,owner,provider)
         raw_limit = request.query_params.get('limit', '50')
         # ASCII digits only: str.isdigit() also accepts '²', which int() rejects.
@@ -176,7 +176,7 @@ def build_router(identity, mobile, principal_for, verify):
         # Not call history: this module already carries the verified-login principal and the owner check this route needs, and the frozen
         # dashboard router cannot take a new route. A chat made on a Hermes with session authority cannot carry the thread source, so
         # the app marks it here (idempotent). Only a chat the caller can see is ever marked; the mark goes when Hermes drops the chat.
-        owner, provider, profile, _ = identity(request)
+        owner, provider, profile, _ = await asyncio.to_thread(identity, request)
         if not re.fullmatch(r'[A-Za-z0-9_.:-]{1,256}', stored_id):
             raise HTTPException(400, 'Choose an existing conversation')
         principal = principal_for(request, owner, provider)

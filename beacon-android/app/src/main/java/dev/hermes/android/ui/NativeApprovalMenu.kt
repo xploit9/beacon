@@ -156,7 +156,9 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     var readGeneration by remember(active, version) { mutableIntStateOf(0) }
     val busy = saving || selecting
     val key = "profile:approvals"
-    val value = data[key]?.takeIf { it.string("scope_key") == active?.scope?.key }
+    // Before the client exists (a cold start, or offline) the saved answer of the signed-in profile shows; its saving waits for the client.
+    val shownScope = active?.scope ?: if (target.isBlank()) vm.restoredScope() else null
+    val value = data[key]?.takeIf { it.string("scope_key") == shownScope?.key }
     val updatedNotice = uiText("Profile approvals updated")
     fun refresh() {
         val captured = active ?: return

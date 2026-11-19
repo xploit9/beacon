@@ -109,3 +109,45 @@ async def test_phone_delivery_keeps_cron_title_and_rejects_unwrapped_standalone(
     cron_detail=client.get(f"/api/plugins/beacon/mobile/notifications/events/{cron.message_id}").json()
     assert cron_detail['preview']['title']=='Task finished'
 
+
+
+def _chat_store(monkeypatch, chains):
+    """The saved chats of a fake Hermes store: `chains` maps a chat's first id to the ids Hermes continued it under (compression)."""
+    import contextlib
+    from types import SimpleNamespace
+    db = SimpleNamespace(get_compression_chain=lambda sid: [sid, *chains.get(sid, [])])
+    server = sys.modules["tui_gateway"].server
+    monkeypatch.setattr(server, "_profile_db", lambda *a, **k: contextlib.nullcontext(db), raising=False)
+
+
+def _notice(api, event, conversation, kind="completion"):
+    import time
+    with api.mobile.connect() as conn:
+        conn.execute("INSERT INTO notices(id,owner,profile,kind,conversation,created,expires) VALUES(?,?,?,?,?,?,?)",
+                     (event, "owner", "default", kind, conversation, time.time(), time.time() + 300))
+    return f"/api/plugins/beacon/mobile/notifications/events/{event}"
+
+
+def test_a_reply_after_hermes_moved_the_beacon_chat_to_a_new_session_still_says_so(harness, monkeypatch):
+    # Hermes ends a chat's session and continues it under a new id when it compresses the history; the turn then finishes under the new id
+    # (agent/turn_finalizer.py on_session_end session_id=agent.session_id), the chat's saved id stays the first one.
+    api, client, cfg, _, _ = harness
+    monkeypatch.setattr(api.native, "conversation_snapshot", lambda *args: {"title": "hi", "messages": [{"role": "assistant", "text": "Alarm set."}]})
+    stored = cfg["scheduled_callback_conversation_id"]
+    _chat_store(monkeypatch, {stored: ["assistant-chat-2", "assistant-chat-3"], "other-chat": ["other-chat-2"]})
+    for event, conversation, expected in (("1" * 32, "assistant-chat-2", True), ("2" * 32, "assistant-chat-3", True), ("3" * 32, stored, True),
+                                          ("4" * 32, "other-chat-2", False), ("5" * 32, "native-stored", False)):
+        detail = client.get(_notice(api, event, conversation)).json()
+        assert detail["assistant_chat"] is expected, conversation
+        # The phone opens and answers the chat by the id it saved it under, not by the one the turn happened to finish under.
+        assert detail["session_id"] == (stored if expected else conversation), conversation
+        assert detail["conversation_id"] == detail["session_id"]
+
+
+def test_a_notice_of_the_beacon_chat_stays_named_when_hermes_cannot_read_the_chat_lineage(harness, monkeypatch):
+    api, client, cfg, _, _ = harness
+    monkeypatch.setattr(api.native, "conversation_snapshot", lambda *args: {"title": "hi", "messages": [{"role": "assistant", "text": "Done."}]})
+    monkeypatch.setattr(sys.modules["tui_gateway"].server, "_profile_db", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("store busy")), raising=False)
+    stored = cfg["scheduled_callback_conversation_id"]
+    assert client.get(_notice(api, "6" * 32, stored)).json()["assistant_chat"] is True
+    assert client.get(_notice(api, "7" * 32, "assistant-chat-2")).json()["assistant_chat"] is False  # unknown stays unnamed, never an error

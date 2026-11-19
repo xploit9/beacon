@@ -52,7 +52,7 @@ class MixedTimelineJourneyTest {
         assertEquals("", after.streamId)
         val reopened = JSONObject(after.raw.toString())
         assertEquals("Already visible reply", reopened.rows("_unconfirmed_replies").single().string("text"))
-        assertEquals("Reply status unknown", after.status)
+        assertEquals("Hermes restarted during this reply.", after.status)
     }
 
     @Test fun completedCallArchiveUnavailableThenAvailableDoesNotEraseTheEarlierCall() {

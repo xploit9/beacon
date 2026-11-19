@@ -413,7 +413,7 @@ def sync(mobile,native,owner,provider,profile):
                             or value.get('interrupted') or value.get('completed') is False
                             or not isinstance(value.get('final_response'),str)):
                         status='unknown';error='Native completion result is unconfirmed. Review the conversation.'
-                    else: result=value['final_response'][:65536]
+                    else: result=mobile.named_files(value['final_response'],after=mobile.CALL_FILE_NOTE)[:65536]  # names, never a path to read aloud
                 elif status=='failed': error='Native Hermes turn failed; review the native session.'
             else: continue
             with mobile.LOCK,mobile.connect() as conn:

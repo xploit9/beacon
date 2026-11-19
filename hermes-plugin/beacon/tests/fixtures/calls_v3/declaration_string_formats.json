@@ -1,0 +1,96 @@
+{
+  "note": "Gemini function schemas: only date-time and enum keep their format (the formats Google documents a meaning for); any other format becomes words in the description, so a tool with a uri, email or date field can never refuse a Live setup. Validation still uses the original schema.",
+  "source": {
+    "type": "object",
+    "properties": {
+      "when": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "kind": {
+        "type": "string",
+        "format": "enum",
+        "enum": [
+          "open",
+          "done"
+        ]
+      },
+      "link": {
+        "type": "string",
+        "format": "uri",
+        "description": "Page to open."
+      },
+      "address": {
+        "type": "string",
+        "format": "email"
+      },
+      "day": {
+        "type": "string",
+        "format": "date"
+      },
+      "maybe": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "uuid"
+      },
+      "hosts": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "format": "hostname"
+        }
+      }
+    },
+    "required": [
+      "when"
+    ]
+  },
+  "portable": {
+    "type": "object",
+    "properties": {
+      "when": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "kind": {
+        "type": "string",
+        "format": "enum",
+        "enum": [
+          "open",
+          "done"
+        ]
+      },
+      "link": {
+        "description": "Page to open. Format: uri.",
+        "type": "string"
+      },
+      "address": {
+        "type": "string",
+        "description": "Format: email."
+      },
+      "day": {
+        "type": "string",
+        "description": "Format: date."
+      },
+      "maybe": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "description": "Format: uuid."
+      },
+      "hosts": {
+        "type": "array",
+        "items": {
+          "type": "string",
+          "description": "Format: hostname."
+        }
+      }
+    },
+    "required": [
+      "when"
+    ]
+  }
+}

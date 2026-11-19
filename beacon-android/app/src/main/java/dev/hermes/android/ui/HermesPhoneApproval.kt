@@ -9,7 +9,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -185,10 +187,10 @@ internal fun PhoneApprovalCard(
         },
         confirmButton = {
             if (expired) TextButton(onClick = onClose, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-close")) { Text(uiText("Done")) }
-            else TextButton(onClick = onAllow, enabled = !locked && !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-allow")) { Text(uiText("Allow once")) }
+            else Button(onClick = onAllow, enabled = !locked && !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-allow")) { Text(uiText("Allow once")) }
         },
         dismissButton = {
-            if (!expired) TextButton(onClick = onDeny, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-deny")) { Text(uiText("Deny")) }
+            if (!expired) OutlinedButton(onClick = onDeny, enabled = !busy, modifier = Modifier.heightIn(min = 48.dp).testTag("phone-request-deny")) { Text(uiText("Deny")) }
         },
     )
 }

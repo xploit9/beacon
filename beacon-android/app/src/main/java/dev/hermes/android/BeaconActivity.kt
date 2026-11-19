@@ -74,12 +74,16 @@ import dev.hermes.android.assist.AssistLaunchEffect
 import dev.hermes.android.assist.ContentDirection
 import dev.hermes.android.assist.EXTRA_ASSIST_TOKEN
 import dev.hermes.android.assist.assistFresh
+import dev.hermes.android.data.BeaconOffLines
 import dev.hermes.android.data.NativeAuth
+import dev.hermes.android.data.PROFILE_PLUGIN_OFF_ERROR
+import dev.hermes.android.data.beaconOffAction
 import dev.hermes.android.ui.*
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.CallToolApproval
 import dev.hermes.android.voice.callTimerLabel
-import dev.hermes.android.voice.callToolApprovalErrorMessage
+import dev.hermes.android.voice.line
+import dev.hermes.android.voice.showsProgress
 import dev.hermes.android.voice.callToolApprovalSummary
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
@@ -179,6 +183,7 @@ class BeaconActivity : ComponentActivity() {
                 BeaconRoot(model, externalConnectionLinkOrigin) { externalConnectionLinkOrigin = null }
                 IncomingCallSheet(model, permissionSource.isNotBlank(), answer)
                 HermesPhoneApprovalHost(if (ui.authenticated) model.client else null)
+                dev.hermes.android.agentphone.AgentApprovalHost(if (ui.authenticated) model.client else null)
                 CallBubbleAskHost(call)
                 // With the client, a plugin restart that waited for Hermes to go idle is retried whenever Beacon is in front.
                 dev.hermes.android.updates.AppUpdateHost(model.app.updates, model.client, ui.bootstrap.optJSONObject("optional_features")?.optString("plugin") == "absent")
@@ -447,12 +452,19 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
         }
     }
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
+    val savedScreens by vm.data.collectAsStateWithLifecycle()
+    // A normal cold start reconnects quietly under the saved pages; the banner speaks once Hermes did not answer (or a Reconnect tap is running).
+    var failedToConnect by remember { mutableStateOf(false) }
+    LaunchedEffect(ui.connected, ui.loading, ui.restoringSession) { if (ui.connected) failedToConnect = false else if (!ui.loading && !ui.restoringSession) failedToConnect = true }
     BackHandler(ui.authenticated && !ui.showSessions && ui.tab !in setOf("Chat", "Beacon") && (ui.tab != "More" || ui.morePage.isBlank())) {
         if (ui.tab == "More") vm.backFromSettings() else if (ui.tab == "Spaces" && vm.editor.value.path.isNotBlank()) vm.closeEditor() else if (ui.botModeEnabled) vm.showBotMode() else vm.tab("Chat")
     }
     val archiveUndo by vm.archiveUndo.collectAsStateWithLifecycle()
+    // A refused profile's line carries its own button wherever it shows, this bar included: Turn on for a profile that turned Beacon off, else Retry.
+    val beaconOff = ui.error.takeIf { it in BeaconOffLines }?.let(::beaconOffAction).orEmpty()
     NativeFeedbackEffect(uiText(ui.error), uiText(ui.notice), ui.setupWizard, snackbar,
-        actionLabel = uiText("Undo").takeIf { archiveUndo != null && ui.error.isBlank() && ui.notice == "Archived" }, onAction = vm::undoArchive, clearMessage = vm::clearMessage)
+        actionLabel = if (beaconOff.isNotBlank()) uiText(beaconOff) else uiText("Undo").takeIf { archiveUndo != null && ui.error.isBlank() && ui.notice == "Archived" },
+        onAction = { if (beaconOff.isNotBlank()) vm.turnOnBeaconForProfile(auto = ui.error != PROFILE_PLUGIN_OFF_ERROR) else vm.undoArchive() }, clearMessage = vm::clearMessage)
     // The wizard stays composed while it connects after sign-in: swapping in the logo would drop what it has typed.
     if (ui.restoringSession && !ui.setupWizard) {
         Surface(Modifier.fillMaxSize().testTag("session-restore-logo"), color = MaterialTheme.colorScheme.background) {
@@ -530,7 +542,7 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
                         // Signed in but Hermes stopped answering (a VPN that dropped): the same banner says so (owner, 4 Nov 2026).
                         val unreachableOrigins by dev.hermes.android.data.HermesReach.origins.collectAsState()
                         val cantReach = ui.connected && ui.origin in unreachableOrigins
-                        if (!ui.connected || cantReach) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
+                        if (offlineBannerShown(ui.connected, ui.loading, cantReach, failedToConnect)) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
                             Row(Modifier.padding(start = 16.dp).heightIn(min = 48.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 if (ui.loading) BeaconDustCore(18.dp) else Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text(if (cantReach) uiText("Can't reach Hermes · check your connection") else if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.labelMedium)
@@ -541,7 +553,7 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
                         }
                         if (call.active && (ui.tab !in setOf("Chat","Beacon") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) CallBanner(call, onOpen = { vm.openCurrentCall() }, onHangUp = vm.app.calls::hangup)
                         Box(Modifier.weight(1f).then(modeMotion)) {
-                        if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban")) {
+                        if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban") && !savedPageHasCopy(ui.tab, savedScreens)) {
                             Header(when(ui.tab) { "Tasks" -> uiText("Schedules"); "Spaces" -> uiText("Files"); else -> uiText(ui.tab) }, menu = openMenu)
                             EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network. Drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
                         } else when (ui.tab) { "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
@@ -569,7 +581,7 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
         ApprovalCardOnScreen(approval.requestId, vm.app.calls::approvalCardShown)
         CallToolApprovalDialog(approval, onDecision = { decision ->
             vm.app.calls.decideTool(call.callId,approval.requestId,approval.proposalId,decision)
-        })
+        }, unreachable = call.hermesUnreachable)
     }
 }
 
@@ -588,7 +600,7 @@ internal fun incomingReasonFromHistory(history: org.json.JSONObject, event: Stri
 }
 
 @Composable
-internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (String) -> Unit) {
+internal fun CallToolApprovalDialog(approval: CallToolApproval, unreachable: Boolean = false, onDecision: (String) -> Unit) {
     // A call the owner asked for in a live call counts down on its own card instead of waiting for a tap.
     if ((approval.phone?.countdown ?: 0) > 0) { PhoneCallCountdownDialog(approval, onDecision); return }
     var details by rememberSaveable(approval.requestId) { mutableStateOf(false) }
@@ -617,8 +629,8 @@ internal fun CallToolApprovalDialog(approval: CallToolApproval, onDecision: (Str
                 if (details) androidx.compose.foundation.text.selection.SelectionContainer {
                     Text(approval.arguments, Modifier.testTag("beacon-tool-approval-details"), style = MaterialTheme.typography.bodySmall.copy(fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace))
                 }
-                if (approval.error.isNotBlank()) Text(callToolApprovalErrorMessage(approval.error), color = MaterialTheme.colorScheme.error)
-                if (approval.busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                approval.line(unreachable)?.let { Text(if (unreachable) uiText(it) else it, Modifier.testTag("beacon-tool-approval-line"), color = MaterialTheme.colorScheme.error) }
+                if (approval.showsProgress(unreachable)) LinearProgressIndicator(Modifier.fillMaxWidth())
             }
         },
         confirmButton = {

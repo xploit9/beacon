@@ -108,8 +108,14 @@ internal fun lockedToolResult(): JSONObject = JSONObject().put("status", "unavai
 internal const val LOCKED_TOOL_MESSAGE = "Unlock your phone first. Nothing was read or done; ask the owner to unlock the phone, in one short sentence in their language, " +
     "and say you will do it as soon as they have. The screen shows an Unlock button, and this conversation carries on after it. Do not try this again until then."
 
-/** The parts of the plugin's call context that say nothing about the owner: which profile and chat it is, the time zone and what the profile can do. */
-private val CONTEXT_KEPT = setOf("backend", "profile", "selected_session_id", "zone", "capabilities")
+/**
+ * The parts of the plugin's call context that say nothing about the owner: which profile and chat it is, the time zone, what the
+ * profile can do and which call contract the plugin speaks. The profile's declared tools are not among them (contract v3, section 1).
+ */
+private val CONTEXT_KEPT = setOf("backend", "profile", "selected_session_id", "zone", "capabilities", "call_contract", "call_capabilities")
+
+/** Marks a context [withholdPersonal] made: the call instruction then carries [LOCKED_BRIEF] as the app's own words, not as a persona. */
+internal const val PHONE_LOCKED = "phone_locked"
 
 /**
  * What a conversation that is not trusted is told about itself, in the place of the profile's persona: the phone is locked, so it talks
@@ -132,7 +138,7 @@ internal fun withholdPersonal(context: JSONObject): JSONObject {
     val kept = JSONObject()
     for (key in CONTEXT_KEPT) if (context.has(key)) kept.put(key, context.get(key))
     context.optJSONObject("context")?.optString("language")?.takeIf { it.isNotBlank() }?.let { kept.put("context", JSONObject().put("language", it)) }
-    return kept.put("system_instruction", LOCKED_BRIEF)
+    return kept.put("system_instruction", LOCKED_BRIEF).put(PHONE_LOCKED, true)
 }
 
 /** The context a call's live session is set up with: the whole of it once the conversation is trusted, else [withholdPersonal]. */

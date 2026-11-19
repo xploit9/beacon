@@ -582,7 +582,7 @@ class KeepConnectedTest {
                 )
             }.exceptionOrNull()
             assertTrue("expected read timeout, got $error", error is SocketTimeoutException)
-            assertEquals("Hermes did not answer in time", keepConnectedFailureReason("default", error!!))
+            assertEquals("Lost the connection to Hermes", keepConnectedFailureReason("default", error!!))
         } finally {
             shortTimeoutClient.closeNative()
             server.shutdown()

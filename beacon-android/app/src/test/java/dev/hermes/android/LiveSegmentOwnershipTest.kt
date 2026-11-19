@@ -15,7 +15,7 @@ class LiveSegmentOwnershipTest {
     private val prelude = "I'll set the alarm for 10 am tomorrow now."
 
     private fun row(role: String, content: String, vararg extra: Pair<String, Any?>) =
-        json("role" to role, "content" to content, "row_id" to "$role-${content.hashCode()}", *extra)
+        json("role" to role, "content" to content, "row_id" to Math.floorMod("$role|$content|${extra.joinToString { it.second.toString() }}".hashCode(), 900_000) + 1000, *extra)
     private fun steering() = row("user", "[System: Continue now. Execute the required tool calls and only send your final answer after completing the task.]")
 
     /** The chat as the view model drives it: stream events through [liveAfterEvent], saved history through [settleLive]. */
@@ -118,18 +118,24 @@ class LiveSegmentOwnershipTest {
         assertFalse(isSteeringText("[system note] hello"))
     }
 
-    @Test fun onlyAClosedSegmentAndOnlyEqualWordsAreHeld() {
-        val saved = listOf(ask, row("assistant", "I'll  set the alarm\nfor 10 am tomorrow now."))
-        assertTrue("Spacing is not part of the words", historyOwnsTextSegment(saved, prelude, true))
-        assertFalse("Words still arriving are not held yet", historyOwnsTextSegment(saved, prelude, false))
-        assertFalse("Another sentence is another message", historyOwnsTextSegment(saved, "I'll set the alarm for 11 am tomorrow now.", true))
-        assertFalse("Nothing to hold", historyOwnsTextSegment(saved, "  ", true))
-        assertFalse("A user's own words are not an assistant message", historyOwnsTextSegment(listOf(row("user", prelude)), prelude, true))
+    @Test fun onlyAClosedSegmentOfAHeldPlaceIsHeld() {
+        val closed = LiveAssistantBoundary(closed = true)
+        val turn = listOf(row("assistant", "I'll  set the alarm\nfor 10 am tomorrow, now."))
+        assertTrue("Held by its place, whatever words Hermes saved", liveWordsSaved(prelude, 1, closed, turn))
+        assertFalse("Words still arriving are not held yet", liveWordsSaved(prelude, 1, LiveAssistantBoundary(), turn))
+        assertFalse("The next segment is not held by the first one's row", liveWordsSaved(prelude, 2, closed, turn))
+        val withCall = listOf(row("assistant", prelude, "tool_calls" to JSONArray().put(json("id" to "call-1"))))
+        assertTrue("A message with calls is told by them: its own call", liveWordsSaved(prelude, 1, LiveAssistantBoundary(closed = true, toolIds = setOf("call-1")), withCall))
+        assertFalse("...and another call is another message", liveWordsSaved(prelude, 1, LiveAssistantBoundary(closed = true, toolIds = setOf("call-2")), withCall))
+        assertFalse("Nothing to hold", liveWordsSaved("  ", 1, closed, turn))
+        assertFalse("A user's own words are not a model message", liveWordsSaved(prelude, 1, closed, listOf(row("user", prelude))))
+        assertFalse("With no turn known nothing is judged saved", liveWordsSaved(prelude, 1, closed, null))
+        assertFalse("A place not known is not held", liveWordsSaved(prelude, 0, closed, turn))
     }
 
     @Test fun aCheckpointDoesNotBringBackWhatTheSavedRowsHold() {
         val boundary = LiveAssistantBoundary().after("interim_assistant").after("tool", json("tid" to "describe-0"))
-        val checkpoint = ChatState(sessionId = "s", streamId = "runtime-s", liveText = prelude, liveReasoning = "Considering.", liveTools = listOf(json("tid" to "describe-0")))
+        val checkpoint = ChatState(sessionId = "s", streamId = "runtime-s", messages = listOf(Message.from(ask, 0, "s")), liveText = prelude, liveReasoning = "Considering.", liveTools = listOf(json("tid" to "describe-0")), liveOrdinal = 1)
         val rows = listOf(ask, row("assistant", prelude), steering())
         val restored = withoutSavedLive(checkpoint, rows, boundary)
         assertEquals("", restored.liveText)

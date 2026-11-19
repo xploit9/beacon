@@ -16,13 +16,15 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Reads whose last good answer is kept on the phone: configuration lists, never messages or secrets (MCP server configs can carry env secrets, so they stay in memory). The one per-chat read is the chat's project.
+/** Reads whose last good answer is kept on the phone: configuration lists, never messages or secrets (MCP server configs can carry env secrets, so only a redacted copy is kept). The one per-chat read is the chat's project.
  *  Bot Mode also keeps its roster here with each group's newest line (140 characters), like a chat list's preview; the row is encrypted and cleared on sign-out. */
 val screenReadPaths = setOf(
     "/api/profiles", "/api/tools/toolsets", "/api/commands/catalog", "/api/projects", "/api/plugins/beacon/mobile/voice-settings",
     "/api/crons", "/api/crons/delivery-options", "/api/crons/history", "/api/plugins/beacon/mobile/tasks/capabilities",
     "/api/pc/files", "/api/models", "/api/profile/approval-mode", "/api/plugins/beacon/mobile/history-retention",
     "/api/projects/for-session",
+    // The notification page's push status: sender and registered-phone counts, no tokens.
+    "/api/plugins/beacon/mobile/notifications/status",
 )
 // Query keys that name the screen; a chat, session or cursor makes a read live-only.
 private val SCREEN_QUERY_KEYS = setOf("profile", "path", "job_id")
@@ -30,8 +32,28 @@ private val SCREEN_QUERY_KEYS = setOf("profile", "path", "job_id")
 // A chat's project is a small configuration answer (no messages), so it is the one read kept per chat.
 internal const val CHAT_PROJECT_READ = "/api/projects/for-session"
 
+/** MCP server configs can carry secrets in env, headers, args and url, so the list is kept on disk only as the redacted rows [redactMcpServers] builds. */
+internal const val MCP_SERVERS_PATH = "/api/mcp/servers"
+private val MCP_KEPT_FIELDS = listOf("name", "transport", "enabled", "source", "plugin")
+
+/** An allowlist, not a strip: each row keeps its name, transport, enabled switch and who manages it (config or a plugin), and nothing else. Idempotent. */
+internal fun redactMcpServers(value: JSONObject): JSONObject {
+    val rows = value.optJSONArray("servers") ?: JSONArray()
+    val kept = JSONArray()
+    for (index in 0 until rows.length()) {
+        val row = rows.optJSONObject(index) ?: continue
+        val out = JSONObject()
+        for (field in MCP_KEPT_FIELDS) when (val item = row.opt(field)) {
+            is Boolean -> out.put(field, item)
+            is String -> out.put(field, item.take(200))
+        }
+        if (out.optString("name").isNotBlank()) kept.put(out)
+    }
+    return JSONObject().put("servers", kept)
+}
+
 fun screenReadCacheable(path: String, query: Map<String, String>, profile: String): Boolean =
-    path in screenReadPaths && query.keys.all { it in SCREEN_QUERY_KEYS || it == "chat" && path == CHAT_PROJECT_READ } && (query["profile"] ?: profile) == profile
+    (path in screenReadPaths || path == MCP_SERVERS_PATH) && query.keys.all { it in SCREEN_QUERY_KEYS || it == "chat" && path == CHAT_PROJECT_READ } && (query["profile"] ?: profile) == profile
 
 /** The answer's identity inside one profile: the profile is the scope, so it is not part of the request. */
 fun screenRequest(path: String, query: Map<String, String>): String =
@@ -142,7 +164,9 @@ class ScreenCache(
     fun set(scope: Scope, key: String, value: JSONObject, request: String = "") = put(scope, key, request, clock(), value)
 
     /** A payload that is too large or credential-shaped replaces nothing on disk and removes the older copy. */
-    fun put(scope: Scope, key: String, request: String, at: Long, value: JSONObject, version: ScreenReadVersion? = null) {
+    fun put(scope: Scope, key: String, request: String, at: Long, answer: JSONObject, version: ScreenReadVersion? = null) {
+        // Whatever the caller holds, the MCP list reaches the row only in its redacted form.
+        val value = if (request.startsWith(MCP_SERVERS_PATH)) redactMcpServers(answer) else answer
         val text = value.toString()
         val bytes = text.toByteArray().size
         val account = account(scope)

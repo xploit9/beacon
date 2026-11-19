@@ -8,10 +8,11 @@ import org.junit.Test
 /**
  * A secondary profile can only be served by Beacon once its own config lists the plugin (Hermes `web_server_dashboard.py` `_plugin_api_mount_skip_reason`,
  * read through the plugin's `canonical_transport.native_policy`). Until then Hermes answers the ticket request 403 "Plugin not authorized" and no socket
- * ever opens: the app must say that in one plain line, not "Conversation opening failed or was not confirmed. Retry" and "Couldn't load models".
+ * ever opens. The client turns Beacon on by itself and asks again (ProfileTurnOnTest); when that does not work the app says so in one plain line with its
+ * button, not "Conversation opening failed or was not confirmed. Retry" and "Couldn't load models".
  */
 class SecondProfileTest {
-    private val line = "Beacon isn't turned on for this profile."
+    private val line = "Couldn't turn on Beacon for this profile."
     private val refusal = ApiFailure(403, "Plugin not authorized", true)
 
     @Test fun theLineIsAFixedErrorString() {
@@ -31,7 +32,8 @@ class SecondProfileTest {
     }
 
     @Test fun theModelPickerSaysWhyInsteadOfCouldntLoadModels() {
-        assertEquals(line, profileDefaultsAfterFailure(null, "scope", "work", "", refusal).string("_error"))
+        assertEquals(line, profileDefaultsAfterFailure(null, "scope", "work", "", BeaconOffFailure(ApiFailure(504, "slow", true))).string("_error"))
+        assertEquals("Beacon isn't turned on for this profile.", profileDefaultsAfterFailure(null, "scope", "work", "", BeaconOffFailure(null)).string("_error"))
         assertEquals("Couldn't load models", profileDefaultsAfterFailure(null, "scope", "work", "", java.io.IOException("down")).string("_error"))
         assertEquals("Couldn't load models", profileDefaultsAfterFailure(null, "scope", "work", "").string("_error"))
         // The last good answer for this account and profile still wins.
@@ -39,10 +41,11 @@ class SecondProfileTest {
         assertEquals("m", profileDefaultsAfterFailure(good, "scope", "work", "", refusal).string("model"))
     }
 
-    @Test fun theFirstChatCardOffersTurnOnNotRetryWhenBeaconIsOff() {
+    @Test fun theFirstChatCardOffersTheLinesOwnButton() {
         assertEquals("", newChatAction("", false))
         assertEquals("", newChatAction(line, true))
-        assertEquals("Turn on", newChatAction(line, false))
+        assertEquals("Retry", newChatAction(line, false))
+        assertEquals("Turn on", newChatAction("Beacon isn't turned on for this profile.", false))
         assertEquals("Retry", newChatAction("Couldn't open the chat. Your draft is kept.", false))
     }
 }

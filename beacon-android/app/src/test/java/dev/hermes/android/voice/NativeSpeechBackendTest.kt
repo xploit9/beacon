@@ -467,10 +467,10 @@ class NativeSpeechBackendTest {
             listener.onMessage(socket, frame.toString())
         }
         /** What the live model was answered for its tool calls, in the order sent. */
-        fun responses() = providerFrames.mapNotNull { it.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.optJSONObject(0)?.optJSONObject("response") }
+        fun responses() = providerFrames.flatMap { f -> f.optJSONObject("toolResponse")?.optJSONArray("functionResponses")?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } }.orEmpty() }.mapNotNull { it.optJSONObject("response") }
         fun answered(status: String) = responses().any { it.optString("status") == status }
-        /** How many times the live model was told [text] as a verified Hermes update. */
-        fun told(text: String) = providerFrames.count { it.toString().contains("Verified update from Hermes") && it.toString().contains(text) }
+        /** How many times the live model got [text] as a hand-over's completed result, its function's own final response. */
+        fun completedWith(text: String) = responses().count { it.optString("status") == "completed" && it.optString("result") == text }
         private var calls = 0
         /** The live model calls [name]; the provider's own frame carries it. */
         fun call(name: String, args: JSONObject, id: String = "call-${++calls}") = receive(
@@ -592,7 +592,7 @@ class NativeSpeechBackendTest {
             f.strictCanonicalResume = true
             f.start(); f.work("Check this")
             assertTrue("Canonical resume must accept only its actual fields before submitting",
-                waitFor { f.prompts().isNotEmpty() || f.answered("not_sent") })
+                waitFor { f.prompts().isNotEmpty() || f.answered("failed") })
             assertEquals(1, f.executedPrompts.size)
             val params = f.executedPrompts.single().getJSONObject("params")
             assertTrue(params.getString("submission_id").isNotBlank())
@@ -636,7 +636,7 @@ class NativeSpeechBackendTest {
             f.start(); f.work("Cold native request")
             val outcome = withTimeoutOrNull(22000) {
                 while (f.jobPosts.isEmpty() && f.rejectedPrompts.isEmpty() &&
-                    !f.answered("not_sent")) delay(20)
+                    !f.answered("failed")) delay(20)
                 true
             }
             assertTrue("The native cold read must finish within the enclosing budget", outcome == true)
@@ -652,7 +652,7 @@ class NativeSpeechBackendTest {
         try {
             f.approvalError = 5032
             f.start(); f.work("Do work")
-            assertTrue(waitFor { f.answered("not_sent") })
+            assertTrue(waitFor { f.answered("failed") })
             assertEquals(1, f.nativeFrames.count { it.optString("method") == "approval.pending" })
             assertTrue(f.prompts().isEmpty()); assertTrue(f.jobPosts.isEmpty())
         } finally { f.close() }
@@ -663,11 +663,11 @@ class NativeSpeechBackendTest {
         try {
             f.promptError = 4000
             f.start(); f.work("Do work")
-            assertTrue(waitFor { (f.answered("not_sent") || f.answered("submission_unconfirmed")) })
+            assertTrue(waitFor { (f.answered("failed") || f.answered("uncertain")) })
             assertEquals(1, f.rejectedPrompts.size)
             assertTrue("The rejected request cannot run a handler", f.executedPrompts.isEmpty())
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue("A legacy pre-handler validation refusal is definite", f.answered("not_sent"))
+            assertTrue("A legacy pre-handler validation refusal is definite", f.answered("failed"))
         } finally { f.close() }
     }
 
@@ -677,10 +677,10 @@ class NativeSpeechBackendTest {
             f.promptError = 4000
             f.promptErrorMessage = "Some other failure"
             f.start(); f.work("Do work")
-            assertTrue(waitFor { f.answered("submission_unconfirmed") })
+            assertTrue(waitFor { f.answered("uncertain") })
             assertEquals(1, f.prompts().size)
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(!f.answered("not_sent"))
+            assertTrue(!f.answered("failed"))
         } finally { f.close() }
     }
 
@@ -689,10 +689,10 @@ class NativeSpeechBackendTest {
         try {
             f.promptError = 4000
             f.start(); f.work("Do work")
-            assertTrue(waitFor { f.answered("submission_unconfirmed") })
+            assertTrue(waitFor { f.answered("uncertain") })
             assertEquals(1, f.prompts().size)
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(!f.answered("not_sent"))
+            assertTrue(!f.answered("failed"))
         } finally { f.close() }
     }
 
@@ -701,11 +701,11 @@ class NativeSpeechBackendTest {
         try {
             f.dropPromptResponse = true
             f.start(); f.work("Do work")
-            assertTrue(waitFor { f.answered("submission_unconfirmed") })
+            assertTrue(waitFor { f.answered("uncertain") })
             assertEquals(1, f.executedPrompts.size)
             assertEquals(1, f.prompts().size)
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue(!f.answered("not_sent"))
+            assertTrue(!f.answered("failed"))
         } finally { f.close() }
     }
 
@@ -784,9 +784,9 @@ class NativeSpeechBackendTest {
                 f.dropStageResponse = true; f.start(); f.voice.setVisualState("camera", "starting")
                 assertTrue(f.voice.image(byteArrayOf(0xff.toByte(), 0xd8.toByte(), 0xff.toByte()), { true }))
                 f.work("What is visible?")
-                assertTrue(waitFor { f.answered("not_sent") })
+                assertTrue(waitFor { f.answered("failed") })
                 assertTrue(f.prompts().isEmpty()); assertTrue(f.jobPosts.isEmpty())
-                assertTrue(!f.answered("submission_unconfirmed"))
+                assertTrue(!f.answered("uncertain"))
             } finally { f.close() }
         }
     }
@@ -935,7 +935,7 @@ class NativeSpeechBackendTest {
             repeat(40) { f.voice.pcm(speech) { true };delay(20) }
             f.work("Long native task")
             assertTrue(waitFor { f.prompts().size==1 })
-            assertTrue(waitFor { f.answered("started") })
+            assertTrue(waitFor { f.answered("handed_over") })
             // The model says its piece about the hand-off; a pending native job is Hermes' to finish, not a stalled provider.
             f.receive(json("serverContent" to json("turnComplete" to true)))
             delay(1200)
@@ -1039,11 +1039,11 @@ class NativeSpeechBackendTest {
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
             f.work("Check this")
-            assertTrue(waitFor { f.prompts().isNotEmpty() || f.answered("not_sent") })
+            assertTrue(waitFor { f.prompts().isNotEmpty() || f.answered("failed") })
             assertEquals("A full legacy call must refuse before prompt.submit",0,f.prompts().size)
             assertTrue("A refused turn must not stage image bytes",f.nativeFrames.none { it.optString("method") in setOf("file.attach","image.attach_bytes") })
             assertTrue(f.jobPosts.isEmpty())
-            assertTrue("The model is told the call reached its work limit", f.responses().any { it.optString("reason") == "job_capacity" })
+            assertTrue("The model is told the call reached its work limit", f.responses().any { it.optString("status") == "failed" && it.optString("detail") == "job_capacity" })
         } finally { f.close() }
     }
 
@@ -1068,7 +1068,7 @@ class NativeSpeechBackendTest {
         val f=Fixture(authority=true)
         try {
             f.rowBound=true;f.canonicalAlsoRow=true
-            f.start();f.call("hermes_work",json("text" to "Draft the reply to Carlos","callback" to true))
+            f.start();f.call("hermes_work",json("text" to "Draft the reply to Carlos",GeminiWire.OWNER_ASKED_FOR_CALL_BACK to true))
             assertTrue("Callback intent is durable before native admission",waitFor { f.workPosts.size==1 && f.prompts().size==1 })
             assertTrue(f.workPosts.single().getBoolean("callback"))
             assertEquals(f.workPosts.single().getString("request_id"),f.prompts().single().getJSONObject("params").getString("submission_id"))
@@ -1085,6 +1085,9 @@ class NativeSpeechBackendTest {
             val receipts=DirectVoice::class.java.getDeclaredField("toolReceipts").apply { isAccessible=true }.get(f.voice) as Map<String,JSONObject>
             assertTrue(waitFor { synchronized(receipts) { receipts.values.any { it.optString("admission_id")=="admission-1" } } })
             assertTrue("Canonical admission needs no legacy row link",f.jobPosts.isEmpty())
+            // The model's turn after the hand-over ends (the greeting's turn first), and the owner says yes (device round 1).
+            repeat(2) { f.receive(json("serverContent" to json("turnComplete" to true))) }
+            f.receive(json("serverContent" to json("inputTranscription" to json("text" to "Yes, call me back."))))
             f.call("hermes_callback",json("scope" to "latest"))
             assertTrue(waitFor { f.callbackPosts.size==1 })
             assertEquals("latest",f.callbackPosts.single().getString("scope"))
@@ -1115,7 +1118,7 @@ class NativeSpeechBackendTest {
             f.start();f.voice.setVisualState("camera","starting")
             assertTrue(f.voice.image(byteArrayOf(0xff.toByte(),0xd8.toByte(),0xff.toByte()),{ true }))
             f.work("What is visible?")
-            val settled=withTimeoutOrNull(6500) { while(f.prompts().isEmpty() && !f.answered("not_sent")) delay(10);true }==true
+            val settled=withTimeoutOrNull(6500) { while(f.prompts().isEmpty() && !f.answered("failed")) delay(10);true }==true
             assertTrue("An unknown ready state must end with an honest refusal",settled)
             assertTrue("No resume, image staging or prompt.submit is safe without gateway.ready",f.nativeFrames.none { it.optString("method") in setOf("session.resume","file.attach","image.attach_bytes","prompt.submit") })
         } finally { f.close() }
@@ -1233,9 +1236,10 @@ class NativeSpeechBackendTest {
             f.start(); f.work("Check this")
             assertTrue(waitFor { f.prompts().size == 1 })
             f.admission = json("status" to "terminal", "outcome" to "completed", "admission_id" to "admission-1", "ref" to json("session_id" to "stored"), "result" to json("final_response" to "Hermes verified it."))
-            assertTrue("The result reaches the live model as a turn", withTimeoutOrNull(6000) { while (f.told("Hermes verified it.") == 0) delay(10); true } == true)
-            delay(200)
-            assertEquals("It is told once", 1, f.told("Hermes verified it."))
+            assertTrue("The result reaches the live model as the hand-over's own answer", withTimeoutOrNull(6000) { while (f.completedWith("Hermes verified it.") == 0) delay(10); true } == true)
+            delay(3500)
+            assertEquals("It is told once, though the job list is read again", 1, f.completedWith("Hermes verified it."))
+            assertTrue("No scripted turn carries it", f.providerFrames.none { it.toString().contains("Verified update from Hermes") })
             assertTrue("The phone renders no speech of its own", f.audio.isEmpty())
         } finally { f.close() }
     }
@@ -1248,11 +1252,13 @@ class NativeSpeechBackendTest {
             val requestId = f.jobPosts.single().getString("request_id")
             f.jobs = JSONArray().put(json("job_id" to "job-1", "request_id" to requestId, "stored_session_id" to "stored", "runtime_session_id" to "runtime",
                 "status" to "uncertain", "error_code" to "native_turn_pending_confirmation", "will_continue" to true))
-            val pendingText = "Your request is still pending; its outcome is not yet confirmed."
-            assertTrue(withTimeoutOrNull(6000) { while (f.told(pendingText) == 0) delay(10); true } == true)
+            // Hermes is still confirming: the hand-over stays open (quietly running), nothing final and nothing scripted is said.
+            delay(3500)
+            assertTrue(f.answered("handed_over"));assertFalse(f.answered("uncertain"))
             f.jobs = JSONArray().put(json("job_id" to "job-1", "request_id" to requestId, "stored_session_id" to "stored", "runtime_session_id" to "runtime",
                 "status" to "done", "result" to "A verified final reply."))
-            assertTrue("A later verified result is still told to the model", withTimeoutOrNull(6000) { while (f.told("A verified final reply.") == 0) delay(10); true } == true)
+            assertTrue("A later verified result is still told to the model", withTimeoutOrNull(6000) { while (f.completedWith("A verified final reply.") == 0) delay(10); true } == true)
+            assertEquals(1, f.completedWith("A verified final reply."))
         } finally { f.close() }
     }
 
@@ -1271,7 +1277,7 @@ class NativeSpeechBackendTest {
             assertTrue(waitFor { f.responses().isNotEmpty() })
             assertTrue("The current runtime is generation2; a cached row101 from generation1 has no authority to stop it",newerGenerationRunning)
             assertTrue(f.nativeFrames.none { it.optString("method")=="session.interrupt" })
-            assertEquals("not_sent",f.responses().last().getString("status"))
+            assertEquals("failed",f.responses().last().getString("status"))
         } finally { f.close() }
     }
 
@@ -1282,8 +1288,8 @@ class NativeSpeechBackendTest {
             f.jobs = JSONArray().put(json("job_id" to "new", "status" to "watching", "runtime_session_id" to "runtime"))
             f.call("hermes_cancel", json("job_id" to "new"), "cancel-1")
             assertTrue(waitFor { f.responses().isNotEmpty() })
-            assertEquals("not_sent",f.responses().last().getString("status"))
-            assertEquals("exact_cancel_unavailable",f.responses().last().getString("reason"))
+            assertEquals("failed",f.responses().last().getString("status"))
+            assertEquals("exact_cancel_unavailable",f.responses().last().getString("detail"))
             f.call("hermes_cancel", json("job_id" to "new"), "cancel-1")
             assertTrue("The model gets the outcome", waitFor { f.providerFrames.any { it.optJSONObject("toolResponse")?.toString()?.contains("cancel-1") == true } })
             delay(200)

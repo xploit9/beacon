@@ -572,8 +572,6 @@ def migration_client(b):
     async def signed_in(request,call_next):
         request.state.session=verified
         return await call_next(request)
-    async def no_greeting(*args): return None
-    b.monkeypatch.setattr(b.api,'grant_greeting',no_greeting)
     return b.client
 
 

@@ -52,7 +52,7 @@ class SettingsSearchTest {
     }
     @Test fun everyDestinationAndSearchAliasStaysSearchableInOrder() {
         assertEquals(
-            listOf("Connection", "Assistant", "Voice & calls", "Phone access", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
+            listOf("Connection", "Assistant", "Voice & calls", "Phone access", "Agent phone", "Notifications & Keep connected", "Chat", "Profiles & model", "Skills", "Tools & MCP", "Server", "Appearance", "App updates", "About & licenses",
                 "Profiles", "Providers & models", "Tools & commands", "MCP servers", "Health", "Logs", "Server updates", "Session checkpoints", "Devices", "Memory"),
             settingsSearchRoutes,
         )
@@ -72,7 +72,7 @@ class SettingsSearchTest {
     }
     @Test fun rowsOpenTheIncumbentRouteArguments() {
         assertEquals(
-            listOf("Connection", "Assistant", "Beacon", "Phone access", "Notifications", "Settings", "category:Profiles & model", "Skills", "category:Tools & MCP", "category:Server", "Appearance", "App updates", "Licenses"),
+            listOf("Connection", "Assistant", "Beacon", "Phone access", "Agent phone", "Notifications", "Settings", "category:Profiles & model", "Skills", "category:Tools & MCP", "category:Server", "Appearance", "App updates", "Licenses"),
             settingsHubRoutes.map(::settingsRoute),
         )
         assertEquals("Sections in Relay's order with the assistant up front", listOf("", "Assistant", "Hermes", "App"), settingsHubSections.keys.toList())

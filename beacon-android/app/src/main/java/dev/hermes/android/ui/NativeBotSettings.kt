@@ -35,7 +35,7 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
     onEditModel: () -> Unit, onModelDraft: (String, String) -> Unit, onSaveModel: () -> Unit, onCancel: () -> Unit,
     onSettings: (String, String) -> Unit, onRefresh: () -> Unit, models: List<Pair<String, String>> = emptyList(), onEditDescription: (() -> Unit)? = null, onEditInstructions: (() -> Unit)? = null, profileLabel: (String) -> String = { it },
     onNewProfile: (() -> Unit)? = null, canDelete: (String) -> Boolean = { false }, onDelete: (String) -> Unit = {},
-    activeProfile: String = "", approvals: (@Composable () -> Unit)? = null) {
+    activeProfile: String = "", approvals: (@Composable () -> Unit)? = null, readOnly: Boolean = false) {
     var modelSearch by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf("") }
     var customModel by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
     var moreModels by rememberSaveable(state.selected?.profile, state.editing) { mutableStateOf(false) }
@@ -64,11 +64,11 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                                 val active = activeProfile.isNotBlank() && summary.profile == activeProfile
                                 // A profile with no description shows only its name: "No purpose" read as a judgement.
                                 SettingsNavRow(profileLabel(summary.profile), { onOpen(summary.profile) }, icon = ProfilesIcon, value = summary.purpose,
-                                    status = if (active) SettingsStatus.Ok else null, statusLabel = if (active) uiText("Active") else "", enabled = !state.loading, testTag = "profile-open:${summary.profile}")
+                                    status = if (active) SettingsStatus.Ok else null, statusLabel = if (active) uiText("Active") else "", enabled = !state.loading && !readOnly, testTag = "profile-open:${summary.profile}")
                             }
                             if (onNewProfile != null) {
                                 if (state.profiles.isNotEmpty() || shown) SettingsDivider()
-                                SettingsActionRow(uiText("New profile"), onNewProfile, icon = Icons.Rounded.Add, enabled = !state.loading, testTag = "new-profile")
+                                SettingsActionRow(uiText("New profile"), onNewProfile, icon = Icons.Rounded.Add, enabled = !state.loading && !readOnly, testTag = "new-profile")
                             }
                         }
                     }

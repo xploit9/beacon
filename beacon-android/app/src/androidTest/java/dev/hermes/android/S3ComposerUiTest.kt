@@ -301,6 +301,28 @@ class S3ComposerUiTest {
     }
 
     /**
+     * APPFIX-121 (backlog 44): the same lost create, but the owner taps New chat instead of Retry (the app was killed mid-create and the marker came back). The tap used to
+     * answer "Tap Retry" and send nothing; it now asks Hermes again with the kept id, so it finds the chat the first create made.
+     */
+    @Test fun aNewChatTapAfterALostCreateAsksHermesAgainAndIsNeverADeadEnd() = withSignedOutPhone(canonical = true) { vm, fixture ->
+        fixture.loseNextCreateAnswer = true
+        signIn(vm, fixture)
+        finishSetup(vm)
+        val lost = try { compose.waitUntil(15_000) { creates(fixture) == 1 && vm.ui.value.newChatError.isNotBlank() }; true } catch (_: Throwable) { false }
+        assertTrue("The first create was not left unconfirmed: ${describe(vm, fixture)}", lost)
+        compose.runOnIdle { vm.newChat() }
+        compose.waitUntil(15_000) { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        compose.waitForIdle()
+        Thread.sleep(1_500)
+        assertEquals("the tap found the chat the first create made: ${describe(vm, fixture)}", 1, madeSessions(fixture))
+        val frames = createFrames(fixture)
+        assertEquals("the tap sent a second create: $frames", 2, frames.size)
+        assertEquals("with the first create's retry identity: $frames", 1, frames.map { it.optString("request_id") }.filter { it.isNotBlank() }.toSet().size)
+        assertTrue("no notice sends the owner to Retry: ${vm.ui.value.notice}", !vm.ui.value.notice.contains("Tap Retry"))
+        assertTheFirstChatIsUsable(vm, fixture, createsBefore = 1)
+    }
+
+    /**
      * R10 Should 3: the owner is on the first-chat screen with no conversation (the create's answer was lost, Retry shows), types a message, opens the Beacon tab (its return record
      * has no chat) and comes back. The assistant's conversation leaves Chat and the composer is cleared for it; the typed message must be back in the composer, and the Retry
      * must open the chat the lost create made, with the message in it. One chat, no lost text.
@@ -329,6 +351,98 @@ class S3ComposerUiTest {
         assertTrue("The Retry did not open the chat the first create made: ${describe(vm, fixture)}", opened)
         compose.waitForIdle()
         assertEquals("the message is in the chat that opened", draft, vm.composer.value.text)
-        assertEquals("one retry identity, so one first chat: ${createFrames(fixture)}", 1, createFrames(fixture).map { it.optString("request_id") }.filter { it.isNotBlank() }.toSet().size)
+        // The first chat's create and its Retry share one retry identity; the Beacon chat's own create (fix 6) carries its own.
+        val frames = createFrames(fixture)
+        assertEquals("the Retry repeats the first chat's create, so one first chat: $frames", frames.first().optString("request_id"), frames.last().optString("request_id"))
+        assertEquals("one first chat and one Beacon chat: $frames", 2, frames.map { it.optString("request_id") }.filter { it.isNotBlank() }.toSet().size)
+    }
+
+    private fun beaconState(vm: BeaconViewModel, fixture: NativeExperienceFixture) =
+        "beaconError='${vm.ui.value.beaconError}' beaconOpening=${vm.ui.value.beaconOpening} ${describe(vm, fixture)}"
+
+    /**
+     * Fix 6 (demo, 16 Nov 2026): the Beacon chat's create reached Hermes but its answer was lost (Hermes cut off mid-way). The release then refused every later open
+     * ("Beacon opening outcome is unknown", shown as "Can't open Beacon · Hermes couldn't do that"), its Retry too, and a side-button call waited for a chat that never
+     * opened. The Retry now repeats that create with its retry identity: the Beacon chat it made opens, and Hermes makes no second one.
+     */
+    @Test fun aBeaconChatCreateWhoseAnswerWasLostOpensOnRetryAndIsNotMadeTwice() = withSignedOutPhone(canonical = true) { vm, fixture ->
+        signIn(vm, fixture)
+        finishSetup(vm)
+        assertTheFirstChatIsUsable(vm, fixture)
+        val first = vm.chat.value.sessionId
+        val createsBefore = creates(fixture)
+        val madeBefore = madeSessions(fixture)
+        fixture.loseNextCreateAnswer = true
+        compose.runOnIdle { vm.tab("Beacon") }
+        val lost = try { compose.waitUntil(15_000) { creates(fixture) == createsBefore + 1 && vm.ui.value.beaconError.isNotBlank() }; true } catch (_: Throwable) { false }
+        assertTrue("The Beacon chat's create was not left unanswered: ${beaconState(vm, fixture)}", lost)
+        assertEquals("Hermes made the Beacon chat", madeBefore + 1, madeSessions(fixture))
+        // The Retry on "Can't open Beacon".
+        compose.runOnIdle { vm.openBeacon() }
+        val opened = try {
+            compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.ui.value.beaconError.isBlank() && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != first && vm.chat.value.projectionReady }
+            true
+        } catch (_: Throwable) { false }
+        assertTrue("Retry did not open the Beacon chat: ${beaconState(vm, fixture)}", opened)
+        compose.waitForIdle()
+        Thread.sleep(1_500)
+        assertEquals("No second Beacon chat: ${beaconState(vm, fixture)}", madeBefore + 1, madeSessions(fixture))
+        val beaconCreates = createFrames(fixture).drop(createsBefore)
+        assertEquals("the create and its one retry: $beaconCreates", 2, beaconCreates.size)
+        assertEquals("one retry identity: $beaconCreates", 1, beaconCreates.map { it.optString("request_id") }.filter { it.isNotBlank() }.toSet().size)
+        assertNull("the answer cleared the marker", runBlocking { app.cache.read(fixture.scope, "beacon-opening") })
+    }
+
+    /** Fix 6: a phone left with the marker the release wrote ("unknown": no retry identity) opens its Beacon chat again, making a fresh one, with nothing for the owner to do. */
+    @Test fun aBeaconOpeningMarkerWithNoRetryIdentityNoLongerBlocksTheBeaconChat() = withSignedOutPhone(canonical = true, seed = { f -> app.cache.write(f.scope, "beacon-opening", "unknown", true) }) { vm, fixture ->
+        signIn(vm, fixture)
+        finishSetup(vm)
+        assertTheFirstChatIsUsable(vm, fixture)
+        val first = vm.chat.value.sessionId
+        val createsBefore = creates(fixture)
+        compose.runOnIdle { vm.tab("Beacon") }
+        val opened = try {
+            compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.ui.value.beaconError.isBlank() && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != first && vm.chat.value.projectionReady }
+            true
+        } catch (_: Throwable) { false }
+        assertTrue("The Beacon chat did not open: ${beaconState(vm, fixture)}", opened)
+        compose.waitForIdle()
+        Thread.sleep(1_000)
+        assertEquals("one fresh Beacon chat: ${beaconState(vm, fixture)}", createsBefore + 1, creates(fixture))
+        assertNull("the marker is gone", runBlocking { app.cache.read(fixture.scope, "beacon-opening") })
+    }
+
+    /**
+     * Fix 6: a Beacon chat create whose answer was lost, and whose chat was then deleted on Hermes (the dashboard, another client) before the phone came back.
+     * Hermes never makes a deleted id again (not_found), so repeating it would block Beacon as the release did: Retry makes one fresh Beacon chat instead.
+     */
+    @Test fun aLostBeaconChatCreateWhoseChatWasDeletedOnHermesStartsAFreshOneOnRetry() = withSignedOutPhone(canonical = true) { vm, fixture ->
+        signIn(vm, fixture)
+        finishSetup(vm)
+        assertTheFirstChatIsUsable(vm, fixture)
+        val first = vm.chat.value.sessionId
+        val createsBefore = creates(fixture)
+        val madeBefore = madeSessions(fixture)
+        fixture.loseNextCreateAnswer = true
+        compose.runOnIdle { vm.tab("Beacon") }
+        val lost = try { compose.waitUntil(15_000) { creates(fixture) == createsBefore + 1 && vm.ui.value.beaconError.isNotBlank() }; true } catch (_: Throwable) { false }
+        assertTrue("The Beacon chat's create was not left unanswered: ${beaconState(vm, fixture)}", lost)
+        val made = fixture.sessions.keys.filter { it.startsWith("new-") }.maxByOrNull { it.removePrefix("new-").toInt() }!!
+        fixture.deleteOnHermes(made)
+        compose.runOnIdle { vm.openBeacon() }
+        val opened = try {
+            compose.waitUntil(15_000) { vm.ui.value.tab == "Beacon" && vm.ui.value.beaconError.isBlank() && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.sessionId != first && vm.chat.value.sessionId != made && vm.chat.value.projectionReady }
+            true
+        } catch (_: Throwable) { false }
+        assertTrue("Retry did not open a fresh Beacon chat: ${beaconState(vm, fixture)}", opened)
+        compose.waitForIdle()
+        Thread.sleep(1_500)
+        val beaconCreates = createFrames(fixture).drop(createsBefore).map { it.optString("request_id") }
+        assertEquals("the lost create, its refused retry, one fresh create: $beaconCreates", 3, beaconCreates.size)
+        assertEquals("the retry repeated the lost create: $beaconCreates", beaconCreates[0], beaconCreates[1])
+        assertNotEquals("the fresh create has its own id: $beaconCreates", beaconCreates[1], beaconCreates[2])
+        assertEquals("the deleted chat stays deleted; one fresh Beacon chat: ${beaconState(vm, fixture)}", madeBefore + 1, madeSessions(fixture))
+        assertFalse("the deleted chat was not made again", fixture.sessions.containsKey(made))
+        assertNull("the answer cleared the marker", runBlocking { app.cache.read(fixture.scope, "beacon-opening") })
     }
 }

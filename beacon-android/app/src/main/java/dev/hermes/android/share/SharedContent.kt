@@ -13,7 +13,7 @@ import org.json.JSONObject
  * only ever placed in a composer; nothing is sent until the owner taps send.
  */
 internal const val SHARE_TEXT_LIMIT = 40_000
-internal const val SHARE_IMAGE_LIMIT = 10
+internal const val SHARE_FILE_LIMIT = 10
 private const val SHARE_URI_LIMIT = 2_048
 private const val SHARE_SUBJECT_LIMIT = 200
 internal const val SHARE_RECENT_LIMIT = 6
@@ -30,17 +30,23 @@ internal object ShareStrings {
     const val NEW_CHAT = "New chat"
     const val ONE_IMAGE = "1 image"
     const val IMAGES = "{0} images"
+    const val ONE_FILE = "1 file"
+    const val FILES = "{0} files"
     const val SIGN_IN = "Open Beacon and connect to your Hermes first."
-    const val UNSUPPORTED = "Beacon can only take text, links and images."
-    const val IMAGE_CAP = "Beacon takes up to {0} images at a time."
+    const val UNSUPPORTED = "Beacon can only take text, links, images and documents."
+    const val FILE_CAP = "Beacon takes up to {0} files at a time."
     const val TOO_LONG = "That is too long to share here."
     const val NOT_OPENED = "Couldn't open the chat. Try again."
-    val all = listOf(TITLE, RECENT, NEW_CHAT, ONE_IMAGE, IMAGES, SIGN_IN, UNSUPPORTED, IMAGE_CAP, TOO_LONG, NOT_OPENED)
+    val all = listOf(TITLE, RECENT, NEW_CHAT, ONE_IMAGE, IMAGES, ONE_FILE, FILES, SIGN_IN, UNSUPPORTED, FILE_CAP, TOO_LONG, NOT_OPENED)
 }
 
-internal data class SharedContent(val text: String, val images: List<String>, val skippedImages: Int = 0, val tooLong: Boolean = false) {
-    val isEmpty get() = text.isBlank() && images.isEmpty()
+/** [files]: the shared images and documents, attached as the attach button does; [onlyImages] when every one of them is an image. */
+internal data class SharedContent(val text: String, val files: List<String>, val skippedFiles: Int = 0, val tooLong: Boolean = false, val onlyImages: Boolean = true) {
+    val isEmpty get() = text.isBlank() && files.isEmpty()
 }
+
+/** What a chat can send from a share: images and documents (PDF, Office, text and any other application type Hermes stages with file.attach). */
+internal fun sharableFileType(type: String?): Boolean = type != null && listOf("image/", "application/", "text/").any { type.startsWith(it, ignoreCase = true) }
 
 private fun cleanLine(value: CharSequence?): String = value?.toString().orEmpty().filter { !it.isISOControl() || it == '\n' || it == '\t' }.trim()
 
@@ -61,16 +67,18 @@ internal fun acceptableShareUri(uri: String, ownPackage: String): Boolean {
 }
 
 /**
- * The text, link and images of one share. A bare link keeps its page title above it when the sender gave one; images are only the ones
- * the sender's provider says are images, at most [SHARE_IMAGE_LIMIT].
+ * The text, link and files of one share. A bare link keeps its page title above it when the sender gave one; files are only the ones the
+ * sender's provider says are images or documents ([sharableFileType]), at most [SHARE_FILE_LIMIT].
  */
 internal fun sharedContentOf(text: CharSequence?, subject: CharSequence?, streams: List<String>, typeOf: (String) -> String?, ownPackage: String): SharedContent {
     val body = cleanLine(text)
     val title = cleanLine(subject).lineSequence().firstOrNull().orEmpty().take(SHARE_SUBJECT_LIMIT).trim()
     val combined = if (title.isNotEmpty() && bareLink(body) && !body.contains(title)) "$title\n$body" else body
-    val images = streams.filter { acceptableShareUri(it, ownPackage) && typeOf(it)?.startsWith("image/", ignoreCase = true) == true }.distinct()
+    val files = streams.filter { acceptableShareUri(it, ownPackage) }.distinct().mapNotNull { uri -> typeOf(uri)?.takeIf(::sharableFileType)?.let { uri to it } }
     val tooLong = combined.length > SHARE_TEXT_LIMIT
-    return SharedContent(if (tooLong) "" else combined, images.take(SHARE_IMAGE_LIMIT), (images.size - SHARE_IMAGE_LIMIT).coerceAtLeast(0), tooLong)
+    val kept = files.take(SHARE_FILE_LIMIT)
+    return SharedContent(if (tooLong) "" else combined, kept.map { it.first }, (files.size - SHARE_FILE_LIMIT).coerceAtLeast(0), tooLong,
+        kept.all { it.second.startsWith("image/", ignoreCase = true) })
 }
 
 /** The shared text under what the composer already holds, never over it. */
@@ -80,7 +88,7 @@ internal fun mergeSharedDraft(existing: String, shared: String): String = when {
     else -> existing.trimEnd() + "\n\n" + shared
 }
 
-/** One short line naming what was shared: the start of its text, or how many images. */
+/** One short line naming what was shared: the start of its text. */
 internal fun shareSnippet(text: String, limit: Int = 80): String {
     val first = text.lineSequence().map { it.trim() }.firstOrNull { it.isNotEmpty() }.orEmpty()
     return if (first.length <= limit) first else first.take(limit - 1).trimEnd() + "…"

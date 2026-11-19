@@ -177,7 +177,7 @@ internal fun PhoneCountdownButtons(approval: CallToolApproval, run: CountdownRun
 internal fun PhoneCallCountdownDialog(approval: CallToolApproval, onDecision: (String) -> Unit, now: () -> Long = SystemClock::elapsedRealtime, locked: () -> Boolean = rememberKeyguardLocked()) {
     val card = approval.phone ?: return
     val run = rememberCountdownRun(approval, onDecision, now, locked)
-        ?: kotlin.run { CallToolApprovalDialog(approval.copy(phone = card.copy(countdown = 0)), onDecision); return }
+        ?: kotlin.run { CallToolApprovalDialog(approval.copy(phone = card.copy(countdown = 0)), onDecision = onDecision); return }
     AlertDialog(
         onDismissRequest = run.dismiss,
         icon = { Icon(Icons.Rounded.Call, null) },

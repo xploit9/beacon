@@ -1,0 +1,11 @@
+{
+  "status": "still_running",
+  "state_source": "phone",
+  "request_id": "req-synthetic-0001",
+  "tool": "notes_search",
+  "elapsed_ms": 8100,
+  "ran_on_hermes": true,
+  "retry_safe": true,
+  "will_update": true,
+  "detail": "no_response"
+}

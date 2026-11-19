@@ -29,7 +29,7 @@ def _stale(module):
     seen=getattr(module,'_beacon_mtime',None)
     try: return seen is not None and seen!=Path(module.__file__).stat().st_mtime_ns
     except (OSError,TypeError): return True
-_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api','checkups','voice_continuation','canonical_transport')
+_MODULE_NAMES=('mobile','native','voice_context','voice_models','activity','memory_api','skills_api','admin_api','files_api','call_updates','gateway_tools','gateway_api','bot_mode_api','observers','callbacks','callback_api','call_history_api','proactive','compat','health_api','phone_tools','email_drafts','email_drafts_api','checkups','voice_continuation','canonical_transport','lost_turns_api','agent_phone_api')
 # Only purge the siblings loaded here; other plugin entry points may still serve live work.
 if any(_stale(sys.modules.get('beacon_'+name)) for name in _MODULE_NAMES):
     for name in _MODULE_NAMES: sys.modules.pop('beacon_'+name,None)
@@ -108,7 +108,7 @@ def _native_profile_names():
 def _check_device_request(request,owner,provider,profile,update_seen=True):
     device_id=request.headers.get('x-beacon-device-id')
     if device_id is None: return
-    try: mobile.touch_device(owner,provider,profile,device_id,update_seen)
+    try: mobile.touch_device(owner,provider,profile,device_id,update_seen,app_version=request.headers.get('x-beacon-app-version'))
     except LookupError as exc: raise HTTPException(403,str(exc)) from None
 
 def identity(request,profile=None,owner_only=False,allow_loopback=False):
@@ -219,11 +219,13 @@ async def register_assistant_conversation(request:Request):
     if set(value)!={'profile','session_id'} or not isinstance(value.get('profile'),str) or not isinstance(value.get('session_id'),str):
         raise HTTPException(400,'Profile and session_id are required')
     owner,provider,profile,_=await identity_async(request,value['profile'])
-    try: await feature(native.verify,owner,provider,profile,value['session_id'],timeout=8)
+    # A chat made under a canonical login belongs to that login's principal: verified without it, the phone's own Beacon chat is never "owned" and never registered.
+    principal=voice_principal(request,owner,provider)
+    try: await feature(verify_voice_stored,owner,provider,profile,value['session_id'],principal,timeout=8)
     except HTTPException as exc:
         if exc.status_code==404: raise HTTPException(404,'Owned assistant conversation unavailable') from None
         raise
-    conversation_id=mobile.register_assistant_conversation(owner,provider,profile,value['session_id'],native.verify)
+    conversation_id=mobile.register_assistant_conversation(owner,provider,profile,value['session_id'],lambda o,p,pr,sid:verify_voice_stored(o,p,pr,sid,principal))
     if not conversation_id:
         raise HTTPException(409,'Assistant conversation registration unavailable')
     return {'registered':True,'conversation_id':conversation_id}
@@ -234,7 +236,7 @@ async def assistant_conversation(request:Request):
     owner,provider,profile,cfg=await identity_async(request)
     stored=cfg.get('scheduled_callback_conversation_id')
     if not isinstance(stored,str) or not stored: raise HTTPException(404,'No assistant conversation')
-    await feature(native.verify,owner,provider,profile,stored,timeout=8,lookup_message='No assistant conversation')
+    await feature(verify_voice_stored,owner,provider,profile,stored,voice_principal(request,owner,provider),timeout=8,lookup_message='No assistant conversation')
     return JSONResponse({'conversation_id':stored},headers={'Cache-Control':'no-store'})
 
 def skill_scope(profile,fn):
@@ -269,6 +271,35 @@ def reject_unowned_conversation(owner,provider,profile,stored,principal=None):
         raise HTTPException(404,_NOT_OWNED_CONVERSATION) from None
 # A call authorisation slower than this is logged with the seconds each step took (step names only, nothing about the call).
 SLOW_AUTHORISE_SECONDS=1.0
+# After the grant (or a call's first request) the slow half of a call's authorisation is held this long: the profile's
+# settings and phone are taken from the owner check and the duplicate ownership read is skipped. Every request still checks
+# the owner, the phone, the open call row, its principal and (one read) that the conversation is still the owner's.
+CALL_AUTHORITY_SECONDS=60
+# The call row's last-seen time keeps an active call from the stale sweep; it is written at most this often.
+CALL_SEEN_SECONDS=10
+_call_authority={}
+def remember_call_authority(call_id,owner,provider,principal,profile):
+    with mobile.LOCK:
+        if len(_call_authority)>=1024: _call_authority.pop(next(iter(_call_authority)))
+        _call_authority[(call_id,owner,provider,principal or '',profile)]=time.monotonic()+CALL_AUTHORITY_SECONDS
+def _call_authority_held(key):
+    with mobile.LOCK: return time.monotonic()<_call_authority.get(key,0)
+_contract_noted={}
+CALL_CONTRACT_NOTE_SECONDS=600
+def note_call_contract(request,owner):
+    """The last time each phone called with and without the v3 header, for the v2 removal rule (CALLS-CONTRACT.md section 8)."""
+    headers=getattr(request,'headers',None) or {}
+    device=headers.get('x-beacon-device-id') or ''
+    if device and not mobile.DEVICE_ID.fullmatch(device): device=''
+    contract='3' if headers.get('x-beacon-call-contract','').strip()=='3' else '2'
+    key=(owner,device,contract);now=time.monotonic()
+    if _contract_noted.get(key,0)>now: return
+    if len(_contract_noted)>=256: _contract_noted.clear()
+    _contract_noted[key]=now+CALL_CONTRACT_NOTE_SECONDS
+    try:
+        with mobile.connect() as conn:
+            conn.execute('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',('call-contract-seen:'+contract+':'+device,str(int(time.time()))))
+    except Exception: pass  # a count, never a reason to refuse the call
 async def call(request,call_id,writable=False):
     def authorize():
         spent={};mark=[time.monotonic()]
@@ -277,21 +308,30 @@ async def call(request,call_id,writable=False):
         try:
             # First authorize owner, then select the call's recorded profile rather than trust input.
             owner,provider,profile,cfg=identity(request,owner_only=True);took('identity')
+            note_call_contract(request,owner)
             with mobile.connect() as conn:
                 row=safely(mobile.owned,conn,call_id,owner,None,writable)
                 principal=voice_principal(request,owner,provider)
                 saved=row.get('principal') or ''
                 if saved and saved!=principal: raise HTTPException(403,'Call principal mismatch')
-                if not row['closed']:
+                if not row['closed'] and time.time()-(row.get('seen') or 0)>=CALL_SEEN_SECONDS:
                     conn.execute('UPDATE calls SET seen=? WHERE id=? AND owner=? AND profile=? AND closed=0',(time.time(),call_id,owner,row['profile']))
             took('call_row')
             selected=request.query_params.get('beacon_profile') or request.query_params.get('profile')
             if selected and selected!=row['profile']: raise HTTPException(403,'Call profile mismatch')
-            _,_,_,cfg=identity(request,row['profile']);took('profile')
-            reject_unowned_conversation(owner,provider,row['profile'],row['conversation'],saved or None);took('ownership')
+            held=(call_id,owner,provider,saved,row['profile'])
+            fresh=not _call_authority_held(held)
+            if fresh:
+                _,_,_,cfg=identity(request,row['profile']);took('profile')
+                reject_unowned_conversation(owner,provider,row['profile'],row['conversation'],saved or None);took('ownership')
+            else:
+                if row['profile'] not in cfg['profiles']: raise HTTPException(403,'Profile not authorized')
+                _check_device_request(request,owner,provider,row['profile'])
+                cfg={**mobile.settings(row['profile']),'profiles':cfg['profiles']};took('profile')
             if saved: safely(native.verify,owner,provider,row['profile'],row['conversation'],None,True,saved)
             else: safely(native.verify,owner,provider,row['profile'],row['conversation'])
             took('verify')
+            if fresh: remember_call_authority(*held)
             return owner,provider,row,cfg
         finally:
             rest=time.monotonic()-mark[0]
@@ -305,14 +345,48 @@ async def refuse_while_updating():
     if await asyncio.to_thread(admin.update_in_progress): raise HTTPException(503,admin.UPDATING)
 router.include_router(sys.modules['beacon_gateway_api'].build_router(call,body,voice_context.scoped,mobile,refuse_while_updating))
 router.include_router(sys.modules['beacon_canonical_transport'].build_router(mobile,dashboard_identity,enforce_request_policy,_native_profile_names,_check_device_request,body,lambda:admin.update_in_progress()))
+router.include_router(sys.modules['beacon_agent_phone_api'].build_router(mobile,identity_async,body,dashboard_identity,enforce_request_policy,_native_profile_names,_check_device_request,lambda:admin.update_in_progress()))
 
+# Call contract v3 (CALLS-CONTRACT.md section 0): the same values in the bootstrap and both call contexts. The app decides per
+# call from the context it builds the call with; a capability that is false keeps that one feature on its v2 route.
+CALL_CONTRACT=3
+def call_capabilities(principal):
+    # /handover needs the call's verified principal and this dashboard's canonical relay; a relay that is down at the time
+    # answers not_sent/transport_unavailable, as the v2 hand-over would fail too, so nothing is probed here.
+    return {'tool_declarations':True,'invoke_wait':True,'call_updates':True,
+            'handover':bool(principal) and 'hermes_cli.web_server' in sys.modules,'call_diagnostics':True,
+            # A timeline tool receipt may carry cause_class (LINK-121); an older plugin refuses the whole batch on it.
+            'tool_receipt_cause':True}
+def call_tools(profile):
+    """The profile's call tools as the background refresh last built them (TOOLS_REFRESH_SECONDS); a call context never builds
+    or scans a list. Nothing built yet declares nothing, and the call finds its tools with discover_tools."""
+    module=sys.modules['beacon_gateway_tools']
+    now=time.monotonic()
+    with module.CATALOG_LOCK:
+        built=[entry for key,entry in module.CATALOG_CACHE.items()
+               if isinstance(key,tuple) and key[:1]==(profile,) and now-entry[0]<module.CATALOG_STALE_TTL]
+        return max(built,key=lambda entry:entry[0])[1] if built else module.LAST_CATALOG.get(profile) or []
+_declared={}
+def call_contract_fields(profile,principal,declare=True):
+    # The declarations change only when the background refresh stores a new list, so they are built once per list.
+    module=sys.modules['beacon_gateway_tools']
+    rows=call_tools(profile) if declare else []
+    held=_declared.get(profile)
+    if held is None or held[0] is not rows:
+        declarations=module.tool_declarations(module.Gateway._call_tools(rows))
+        if not declarations['tool_declarations']: declarations['tool_declarations_complete']=False
+        if len(_declared)>=64: _declared.clear()
+        held=_declared[profile]=(rows,declarations)
+    return {'call_contract':CALL_CONTRACT,'call_capabilities':call_capabilities(principal),**held[1]}
 @router.get('/mobile/bootstrap')
 async def bootstrap(request:Request):
     owner,provider,profile,cfg=await identity_async(request)
     selection=await asyncio.to_thread(voice_models.selected,mobile,owner,profile,cfg)
+    capabilities=call_capabilities(voice_principal(request,owner,provider))
     return {'contract_version':2,'backend':'hermes-dashboard','owner_id':owner,'profile':profile,
             'voice':{**selection,'available':True,'configured':True,'availability_scope':'plugin_enabled'},
-            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':cfg.get('callback_tool_enabled') is True and cfg.get('scheduled_callbacks_enabled') is True,'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False}}
+            'capabilities':{'native_jobs':True,'pc_recording':False,'callbacks':cfg.get('callback_tool_enabled') is True and cfg.get('scheduled_callbacks_enabled') is True,'push':bool(cfg.get('firebase_credentials')),'permanent_recording_retention':False},
+            'call_contract':CALL_CONTRACT,'call_capabilities':capabilities}
 @router.get('/mobile/voice-settings')
 async def voice_settings(request:Request):
     owner,_,profile,cfg=await identity_async(request)
@@ -419,44 +493,37 @@ def flush_held_posts(owner,provider,profile):
         mobile.drop_held_post(owner,profile,row['key'])
 @router.post('/mobile/calls')
 async def calls(request:Request):
-    value=await body(request);owner,provider,profile,cfg=await identity_async(request,value.get('profile'))
-    principal=voice_principal(request,owner,provider)
-    native_home=await asyncio.to_thread(safely,native.profile_fingerprint,profile) if principal else None
-    _client_key_mode(value)
-    requested=value['voice_provider']
-    if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
-    selection=await asyncio.to_thread(voice_models.provider_selection,mobile,owner,profile,cfg,requested)
-    conversation=value.get('conversation_id')
-    if conversation:
-        if principal:
-            # A create whose socket confirmation was lost is retired here, only on the owner's
-            # explicit call start and only from its exact native receipt.
-            await asyncio.to_thread(safely,native.reconcile_created,mobile,owner,provider,profile,conversation,principal)
-        await asyncio.to_thread(reject_unowned_conversation,owner,provider,profile,conversation,principal)
-        args=(owner,provider,profile,conversation)+( (principal,) if principal else () )
-        await asyncio.to_thread(safely,native.reserve_conversation,*args)
-    else:
-        def check_capacity():
+    value=await body(request)
+    def grant():
+        # One thread for the whole grant: reserve-only, nothing spoken or looked up for the model here.
+        owner,provider,profile,cfg=identity(request,value.get('profile'))
+        principal=voice_principal(request,owner,provider)
+        native_home=safely(native.profile_fingerprint,profile) if principal else None
+        _client_key_mode(value)
+        requested=value['voice_provider']
+        if requested not in voice_models.PROVIDERS: raise HTTPException(400,'Unknown voice model')
+        selection=voice_models.provider_selection(mobile,owner,profile,cfg,requested)
+        conversation=value.get('conversation_id')
+        if conversation:
+            if principal:
+                # A create whose socket confirmation was lost is retired here, only on the owner's
+                # explicit call start and only from its exact native receipt.
+                safely(native.reconcile_created,mobile,owner,provider,profile,conversation,principal)
+            reject_unowned_conversation(owner,provider,profile,conversation,principal)
+            safely(native.reserve_conversation,*(owner,provider,profile,conversation)+((principal,) if principal else ()))
+        else:
             with mobile.connect() as conn:
                 if mobile.active_calls(conn,owner)>=mobile.MAX_ACTIVE_CALLS:
                     raise HTTPException(409,'Active call limit reached')
-        await asyncio.to_thread(check_capacity)
-        args=(owner,provider,profile)+((principal,) if principal else ())
-        conversation=await asyncio.to_thread(safely,native.create,*args)
-    if principal and await asyncio.to_thread(safely,native.profile_fingerprint,profile)!=native_home:
-        raise HTTPException(409,'Native profile changed before call reservation')
-    binding=(native_home,native.execution_subject(owner,provider,principal)) if principal else ()
-    result=await asyncio.to_thread(safely,mobile.reserve,owner,profile,conversation,selection,principal or '',*binding)
-    greeting=await grant_greeting(request,profile,value.get('owner_name'))
-    if greeting: result['greeting']=greeting
-    return result
-# The phone may start speaking this at once; the context call still supplies the authoritative line.
-GRANT_GREETING_TIMEOUT=1.5
-async def grant_greeting(request,profile,owner_name):
-    display=getattr(request.state.session,'display_name',None)
-    display=display[:120] if isinstance(display,str) else ''
-    try: return await feature(voice_context.grant_greeting,profile,display,owner_name,timeout=GRANT_GREETING_TIMEOUT)
-    except HTTPException: return ''  # a slow or unavailable profile never holds up the call
+            conversation=safely(native.create,*(owner,provider,profile)+((principal,) if principal else ()))
+        if principal and safely(native.profile_fingerprint,profile)!=native_home:
+            raise HTTPException(409,'Native profile changed before call reservation')
+        binding=(native_home,native.execution_subject(owner,provider,principal)) if principal else ()
+        result=safely(mobile.reserve,owner,profile,conversation,selection,principal or '',*binding)
+        # The conversation was verified just now: the call's own requests need not verify it again.
+        remember_call_authority(result['call_id'],owner,provider,principal or '',profile)
+        return result
+    return await asyncio.to_thread(grant)
 @router.get('/mobile/calls/{call_id}')
 async def get_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
@@ -548,10 +615,11 @@ async def jobs(call_id:str,request:Request):
     return await asyncio.to_thread(register)
 
 def voice_principal(request,owner,provider):
-    session=getattr(request.state,'session',None)
+    state=getattr(request,'state',None)
+    session=getattr(state,'session',None)
     if (session is None or getattr(session,'user_id',None)!=owner or getattr(session,'provider',None)!=provider
             or not isinstance(getattr(session,'issuer',None),str)
-            or getattr(request.state,'native_http_principal',None) is not None):
+            or getattr(state,'native_http_principal',None) is not None):
         return None
     from gateway.session_identity import authenticated_subject
     principal=sys.modules['beacon_gateway_tools'].request_principal(request,owner,provider)
@@ -700,7 +768,8 @@ def watch(owner,provider,profile):
                         if idle: unconfirm_job(job['id'])
                         else: watch_pending(job['id'],False,uncertain_pending)
                         continue
-                    text=final.get('text',final.get('content',''))
+                    # The call hears the file's name, never a path to read aloud.
+                    text=mobile.named_files(final.get('text',final.get('content','')),after=mobile.CALL_FILE_NOTE)
                 else: text=''
                 with mobile.LOCK,mobile.connect() as conn:
                     updated=conn.execute("UPDATE jobs SET status=?,result=?,error=?,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",(terminal,text[:65536],('Native Hermes turn failed; review the native session.' if terminal=='failed' else ''),time.time(),job['id']))
@@ -1036,7 +1105,7 @@ def _data_version(conn):
 def _visible_notice(row,owner,provider,profile,principal):
     bound=row.get('principal') or ''
     if bound and bound!=principal: return False
-    if not row.get('conversation') or row.get('kind') in ('test','app_update','phone_request'): return True
+    if not row.get('conversation') or row.get('kind') in ('test','app_update','phone_request','agent_phone_approval','agent_phone_done'): return True
     try: verify_voice_stored(owner,provider,profile,row['conversation'],bound or None)
     except Exception: return False
     return True
@@ -1049,10 +1118,12 @@ def _notices_after(owner,provider,profile,after,principal):
         rows=[dict(r) for r in conn.execute('SELECT * FROM notices WHERE owner=? AND profile=? AND seq>? ORDER BY seq LIMIT 100',(owner,profile,0 if reset else after))]
     cursor=rows[-1]['seq'] if rows else max_seq if reset else after
     return [row for row in rows if _visible_notice(row,owner,provider,profile,principal)],reset,cursor
-def notice_preview(kind):
+def notice_preview(kind,reason=''):
     if kind=='test': return 'Beacon notification test','Synthetic test. Seeing this notification confirms arrival on this phone.'
     if kind=='approval': return 'Approval needed','Open Beacon to review the request.'
     if kind=='phone_request': return 'Phone request','Open Beacon to review the request.'
+    if kind=='agent_phone_approval': return 'Approval needed','Open Beacon to review the request.'
+    if kind=='agent_phone_done': return {'payment':'Payment done','send':'Sent'}.get(reason,"Done on the assistant's phone"),'Open Beacon to see it.'
     if kind=='clarify': return 'Question for you','Answer here or open Beacon.'
     if kind=='working': return 'Beacon working','Hermes is working on your chat.'
     if kind=='activity_end': return 'Activity ended','Open Beacon to review your session.'
@@ -1072,15 +1143,18 @@ def reply_preview(messages,limit=300):
         content=message.get('display_content') or message.get('text')
         if not isinstance(content,str) or not content.strip(): return ''
         text=re.sub(r'```.*?```',' ',content,flags=re.S)
-        text=re.sub(r'[*_`#>]+','',text)
+        # A file the reply delivers reads as its name, never its MEDIA: tag or the folders on the computer (a reply of files only: "📎 a.pdf").
+        # Markdown marks go; an underscore inside a word stays (recv_notes.txt, snake_case).
+        text=mobile.named_files(text,lambda words:re.sub(r'[*`#>]+|(?<!\w)_+|_+(?!\w)','',words),mobile.FILES_MARK)
         text=' '.join(text.split())
         return text[:limit-1]+'…' if len(text)>limit else text
     return ''
 def notice_wire(row,owner,key=None):
     state='expired' if row['state']=='pending' and row['expires']<=time.time() else row['state']
-    title,body=notice_preview(row['kind'])
+    title,body=notice_preview(row['kind'],row.get('reason') or '')
     if row['kind']=='task_result' and row.get('reason'):
-        body=row['reason'][:240]+('…' if len(row['reason'])>240 else '')
+        named=mobile.named_files(row['reason'],mark=mobile.FILES_MARK)
+        body=named[:240]+('…' if len(named)>240 else '')
     visible={key:value for key,value in row.items() if key!='principal'}
     return {**visible,'event_id':row['id'],'callback_id':row['id'],'owner_id':owner,'conversation_id':row['conversation'],'session_id':row['conversation'] if row['kind']!='test' else '', 'expires_at':int(row['expires']),'state':state,'title':title,'body':body,'activity_ref':row.get('activity_key',''),'preview':{'title':title,'body':body},**mobile.refs(owner,row['profile'],row['conversation'],key)}
 @router.get('/mobile/notifications/events/{event_id}')
@@ -1093,8 +1167,12 @@ async def notice_detail(event_id:str,request:Request):
         if not found or not _visible_notice(dict(found),owner,provider,profile,principal): raise HTTPException(404,'Owned notification unavailable')
         return dict(found),notice_wire(dict(found),owner)
     row,result=await asyncio.to_thread(load)
-    # The Beacon chat's own replies are titled with the assistant's name on the phone, not with the chat's title.
-    result['assistant_chat']=bool(row['conversation']) and row['conversation']==cfg.get('scheduled_callback_conversation_id')
+    # The Beacon chat's own replies are titled with the assistant's name on the phone, not with the chat's title. After Hermes compresses the
+    # chat it finishes turns under a continuation id; that is still the Beacon chat, and the phone opens and answers it by its saved id.
+    stored=cfg.get('scheduled_callback_conversation_id')
+    if isinstance(stored,str) and row['conversation'] and (row['conversation']==stored or await asyncio.to_thread(native.continues_chat,row['profile'],stored,row['conversation'])):
+        result.update(assistant_chat=True,session_id=stored,conversation_id=stored)
+    else: result['assistant_chat']=False
     if row['kind']=='completion' and row['conversation']:
         # The notification shows what the reply says; Android's lock-screen setting still hides it when locked. The chat is read
         # under the profile the notice was stored for (the query above already requires it to be the selected one).
@@ -1105,6 +1183,9 @@ async def notice_detail(event_id:str,request:Request):
             if reply: result['preview']={'title':str(snapshot.get('title') or 'Reply ready')[:120],'body':reply}
         except Exception as exc:  # the generic text stays
             logging.getLogger(__name__).info('Beacon reply preview unavailable: %s',type(exc).__name__)
+    if row['kind']=='agent_phone_done':  # the activity row's label, read here over Hermes only: the push itself carries none
+        label=await asyncio.to_thread(sys.modules['beacon_agent_phone_api'].done_label,mobile.connect,owner,row.get('activity_key'))
+        if label: result['preview']={'title':result['preview']['title'],'body':label}
     if row['kind']=='task_result':
         def email_marks():
             with mobile.connect() as conn:
@@ -1183,6 +1264,7 @@ async def answer(invitation_id:str,action:str,request:Request):
             conn.execute("UPDATE notices SET state='answered',call_id=? WHERE id=?",(cid,invitation_id))
         return {'call_id':cid,'conversation_id':row['conversation'],'profile':profile,'recording_status':'disabled','transcript_status':'pending','callback_id':invitation_id,'kind':'incoming_call','state':'answered',**selection,**mobile.refs(owner,profile,row['conversation'])}
     result=await asyncio.to_thread(consume)
+    if action=='answer': remember_call_authority(result['call_id'],owner,provider,bound,profile)
     return result
 def activate(owner,profile):
     with mobile.LOCK:
@@ -1287,7 +1369,7 @@ def _push_devices(owner,profile):
                 attempts=(receipt['attempts'] if receipt else 0)+1
                 accepted=0;error=''
                 try:
-                    data={'type':row['kind'],'kind':row['kind'],'event_id':row['id'],'profile':profile,'owner_id':owner,'expires_at':str(int(row['expires'])),'activity_ref':row.get('activity_key',''),'title':notice_preview(row['kind'])[0],'body':notice_preview(row['kind'])[1],**mobile.refs(owner,profile,row['conversation'])}
+                    data={'type':row['kind'],'kind':row['kind'],'event_id':row['id'],'profile':profile,'owner_id':owner,'expires_at':str(int(row['expires'])),'activity_ref':row.get('activity_key',''),'title':notice_preview(row['kind'],row.get('reason') or '')[0],'body':notice_preview(row['kind'],row.get('reason') or '')[1],**mobile.refs(owner,profile,row['conversation'])}
                     created=_epoch_text(row['created'])
                     if created: data['created_at']=created  # when it happened, so a late delivery is not shown as new
                     messaging.send(messaging.Message(token=target['token'],data=data,android=messaging.AndroidConfig(priority='high',ttl=timedelta(seconds=max(1,row['expires']-time.time())))),app=app)
@@ -1331,16 +1413,27 @@ _tools_next={}
 # still served, while the next one builds, until CATALOG_STALE_TTL), so a call finds it warm, a dashboard restart included.
 TOOLS_REFRESH_SECONDS=180
 _release_next=0.0
+# Beacon on for every profile the owner may use (admin_api.turn_on_for_profiles): the first pass at start, then one a minute for a profile created later.
+_profiles_on_next=0.0
+_profiles_on=None
+def _watch_scope():
+    """The watcher's settings and profiles; profiles is None while no owner is set."""
+    cfg=mobile.settings()
+    if not (cfg.get('owner_id') and cfg.get('owner_provider')): return cfg,None
+    profiles=cfg.get('profiles')
+    return cfg,(_native_profile_names() if profiles is None else profiles)
 async def start_watcher():
     global _watch_task
     async def loop():
-        global _release_next
+        global _release_next,_profiles_on_next,_profiles_on
         while True:
             try:
-                cfg=mobile.settings()
-                if cfg.get('owner_id') and cfg.get('owner_provider'):
-                    profiles=cfg.get('profiles')
-                    if profiles is None: profiles=_native_profile_names()
+                # Settings and the profile list read SQLite under mobile.LOCK: a worker holding it must never stall this loop.
+                cfg,profiles=await asyncio.to_thread(_watch_scope)
+                if profiles is not None:
+                    if time.monotonic()>=_profiles_on_next and (_profiles_on is None or _profiles_on.done()):
+                        _profiles_on_next=time.monotonic()+admin.PROFILES_ON_SECONDS
+                        _profiles_on=asyncio.create_task(asyncio.to_thread(admin.turn_on_for_profiles,list(profiles)))
                     # First of everything this pass does, for every profile: the watch below can be slow on a large state database, and
                     # a call must not wait for it to find its tools. Each build runs on its own thread; this returns at once.
                     for profile in profiles:
@@ -1352,7 +1445,7 @@ async def start_watcher():
                     for profile in profiles:
                         profile_key=(cfg['owner_id'],profile)
                         if (profile_key not in _jobs_warming and time.monotonic()>=_jobs_retry_after.get(profile_key,0)
-                                and proactive._meta_get(mobile,proactive._key(*profile_key,'jobs-version'))!=proactive.JOBS_VERSION):
+                                and await asyncio.to_thread(proactive._meta_get,mobile,proactive._key(*profile_key,'jobs-version'))!=proactive.JOBS_VERSION):
                             # Native disable invalidates the durable version even while this dashboard stays alive.
                             _jobs_warming.add(profile_key)
                             asyncio.create_task(asyncio.to_thread(_warm_profile,cfg['owner_id'],profile))
@@ -1372,6 +1465,7 @@ async def start_watcher():
                 # Phone requests belong to no profile's watch: their private text goes once nobody can answer them.
                 try: await asyncio.to_thread(mobile.phone_requests_sweep)
                 except Exception: pass
+                await asyncio.to_thread(sys.modules['beacon_agent_phone_api'].sweep_approvals)
             except Exception:
                 pass
             await asyncio.sleep(3)
@@ -1481,8 +1575,8 @@ async def get_context(call_id:str,request:Request):
     callback=result.get('callback')
     reason=callback.get('reason','') if isinstance(callback,dict) else ''
     result['reason']=reason if isinstance(reason,str) else ''
-    if not result.get('greeting'): result['greeting']="I'm calling about your saved Hermes update." if callback else "I'm here."
     if display: result['owner_display_name']=display
+    result.update(await asyncio.to_thread(call_contract_fields,row['profile'],row.get('principal') or None,backend=='direct'))
     return result
 _SESSION_ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}')
 @router.get('/mobile/voice/context')
@@ -1501,10 +1595,181 @@ async def voice_session_context(request:Request):
     result=await feature(voice_context.session_context,*args,timeout=8)
     # A call entry is on screen: have the profile's tools ready (in the background) before the owner asks for one.
     voice_context.prefetch_tools(profile)
-    if not result.get('greeting'): result['greeting']="I'm here."
     result['reason']=''
     if display: result['owner_display_name']=display
+    result.update(await asyncio.to_thread(call_contract_fields,profile,principal))
     return result
+def _refusal(error):
+    return sys.modules['beacon_gateway_api'].refusal(error)
+_update_polls={}
+_receipt_reader=[None]
+UPDATES_WAIT_MS=20000
+UPDATES_STEP=0.1
+UPDATES_REFRESH=2.0
+def updates_cycle(row,owner,provider,after):
+    """Brings the call's update log up to date (time-based receipt changes, job changes, the close) and reads one page."""
+    updates=sys.modules['beacon_call_updates'];tools=sys.modules['beacon_gateway_tools']
+    scope=(owner,provider,row['profile'],row['id'])
+    with mobile.connect() as conn:
+        waiting=[r[0] for r in conn.execute("SELECT request_id FROM tool_receipts WHERE owner=? AND provider=? AND profile=? AND call_id=? "
+                 "AND json_extract(payload,'$.status') IN ('ready','running','needs_approval','transferred')",scope)]
+        jobs=[job_status(dict(j)) for j in conn.execute('SELECT * FROM jobs WHERE call_id=? AND owner=? ORDER BY rowid',(row['id'],owner))]
+        current=conn.execute('SELECT closed FROM calls WHERE id=? AND owner=?',(row['id'],owner)).fetchone()
+    gateway=_receipt_reader[0] or tools.Gateway(mobile,voice_context.scoped);_receipt_reader[0]=gateway
+    for request_id in waiting:
+        try: gateway._stored(scope,request_id)  # an approval that expired or a run past its deadline is saved, and so recorded
+        except HTTPException: pass
+    closed=bool(current and current['closed'])
+    with mobile.LOCK,mobile.connect() as conn:
+        conn.execute('BEGIN IMMEDIATE')
+        updates.record_jobs(conn,row['id'],jobs)
+        if closed: updates.record_closed(conn,row['id'])
+        return updates.page(conn,row['id'],after,closed)
+@router.get('/mobile/calls/{call_id}/updates')
+async def call_updates_feed(call_id:str,request:Request):
+    """Call contract v3 updates channel (CALLS-CONTRACT.md section 3): answers at once with new events, else waits for them."""
+    try:
+        owner,provider,row,_=await call(request,call_id)
+        try:
+            after=int(request.query_params.get('after','0'));wait_ms=int(request.query_params.get('wait_ms',str(UPDATES_WAIT_MS)))
+        except ValueError: raise HTTPException(400,'after and wait_ms must be integers') from None
+        if after<0 or not 0<=wait_ms<=UPDATES_WAIT_MS: raise HTTPException(400,'after must be 0 or more and wait_ms 0 to 20000')
+        await refuse_while_updating()
+    except HTTPException as error: return _refusal(error)
+    result=await asyncio.to_thread(updates_cycle,row,owner,provider,after)
+    if result['events'] or result['reset'] or result['closed'] or wait_ms==0: return result
+    # One waiting poll per call: a newer one takes over and this one answers empty at once.
+    token=object();_update_polls[call_id]=token
+    if len(_update_polls)>256: _update_polls.pop(next(iter(_update_polls)))
+    changes=sys.modules['beacon_gateway_tools'].RECEIPT_CHANGES
+    loop=asyncio.get_running_loop();deadline=loop.time()+wait_ms/1000;refreshed=loop.time()
+    probe=None
+    try:
+        probe=await asyncio.to_thread(mobile.connect,True)
+        seen=(await asyncio.to_thread(_data_version,probe),changes[0])
+        while _update_polls.get(call_id) is token:
+            remaining=deadline-loop.time()
+            if remaining<=0: break
+            await asyncio.sleep(min(UPDATES_STEP,remaining))
+            current=(await asyncio.to_thread(_data_version,probe),changes[0])
+            if current==seen and loop.time()-refreshed<UPDATES_REFRESH:
+                if await request.is_disconnected(): break
+                continue
+            seen=current;refreshed=loop.time()
+            result=await asyncio.to_thread(updates_cycle,row,owner,provider,after)
+            if result['events'] or result['reset'] or result['closed']: return result
+    finally:
+        if probe is not None:
+            try: probe.close()
+            except Exception: pass
+        if _update_polls.get(call_id) is token: _update_polls.pop(call_id,None)
+    return {**result,'events':[],'next_after':after}
+
+HANDOVER_FIELDS=frozenset({'request_id','text','mode','callback','frame_jpeg'})
+@router.post('/mobile/calls/{call_id}/handover')
+async def handover(call_id:str,request:Request):
+    """Call contract v3 hand-over (CALLS-CONTRACT.md section 4): one canonical Hermes admission into the call's own chat, with
+    the callback choice stored in the same write as the job. Answers once Hermes has admitted it, never after the work."""
+    started=time.perf_counter()
+    try:
+        value=await body(request,140000)
+        owner,provider,row,_=await call(request,call_id)
+        if set(value)-HANDOVER_FIELDS or not {'request_id','text'}<=set(value): raise HTTPException(400,'Invalid hand-over fields')
+        try: request_id=mobile.ident(value['request_id'])
+        except ValueError: raise HTTPException(400,'Invalid hand-over request id') from None
+        text=value['text'];mode=value.get('mode','background');frame=value.get('frame_jpeg')
+        if not isinstance(text,str) or not text.strip() or len(text)>16000: raise HTTPException(400,'Hand-over text must be 1 to 16000 characters')
+        if mode not in ('background','inline'): raise HTTPException(400,'Hand-over mode must be background or inline')
+        if 'callback' in value and type(value['callback']) is not bool: raise HTTPException(400,'callback must be true or false')
+        if frame is not None and (not isinstance(frame,str) or not 0<len(frame)<=65536 or not re.fullmatch(r'[A-Za-z0-9+/=]+',frame)):
+            raise HTTPException(400,'frame_jpeg must be base64 of at most 65536 characters')
+    except HTTPException as error: return _refusal(error)
+    authority_ms=(time.perf_counter()-started)*1000
+    consent='requested' if value.get('callback') is True else 'declined' if 'callback' in value else 'unset'
+    answer={'request_id':request_id,'status':'not_sent','admission_id':None,'job_id':None,'stored_session_id':row['conversation'],
+            'runtime_session_id':row['conversation'],'callback_consent':consent,'outcome':None,'server_ms':{},'error_code':None,'reason':None}
+    def finish(**fields):
+        answer.update(fields)
+        answer['server_ms']={'authority':round(authority_ms,3),**answer['server_ms'],'total':round((time.perf_counter()-started)*1000,3)}
+        return answer
+    if row['closed']: return finish(error_code='call_closed',reason='call_closed')
+    principal=voice_principal(request,owner,provider)
+    if not principal or (row.get('principal') or '')!=principal: return finish(error_code='session_unavailable',reason='session_unavailable')
+    if await asyncio.to_thread(admin.update_in_progress): return finish(error_code='hermes_updating',reason='hermes_updating')
+    canonical=sys.modules['beacon_canonical_transport'];continuation=sys.modules['beacon_voice_continuation']
+    work={'stored_session_id':row['conversation'],'runtime_session_id':row['conversation'],'request_id':request_id,'text':text,
+          **({'callback':value['callback']} if 'callback' in value else {})}
+    def prepare(seconds):
+        def verify_canonical(profile,stored,runtime): return canonical.verify_live_session(request,profile,stored,runtime,seconds)
+        job=continuation.prepare(mobile,native,owner,provider,principal,row,work,verify_canonical)
+        with mobile.LOCK,mobile.connect() as conn: conn.execute('UPDATE jobs SET work_mode=? WHERE id=?',(mode,job['job_id']))
+        return job
+    def confirm(params,receipt,media):
+        pending={'owner':owner,'provider':provider,'principal':principal,'home':native.profile_fingerprint(row['profile']),
+                 'profile':row['profile'],'session':row['conversation'],'request':request_id,
+                 'payload_digest':native._payload_fingerprint(native.remote_payload({k:v for k,v in params.items() if k!='attachments'})),
+                 'wire_digest':hashlib.sha256(json.dumps(params,sort_keys=True).encode('utf-8')).hexdigest()}
+        if not native.confirm_remote_receipt(mobile,pending,receipt,media):
+            logging.getLogger(__name__).warning('Beacon hand-over admitted but its provenance was not confirmed; the job cannot settle')
+    def discard(job):
+        if job.get('status')!='prepared': return  # only the job this try created; an earlier try's job may still be admitted
+        with mobile.LOCK,mobile.connect() as conn:
+            conn.execute("DELETE FROM jobs WHERE id=? AND status='awaiting_admission' AND admission='' AND seq IS NULL",(job['job_id'],))
+    def adopt(job):
+        # The admission Hermes holds under this request id, when its text is this request with or without the frame notice.
+        from tui_gateway import server
+        with server._profile_db({'profile':row['profile']}) as db:
+            held=native.find_admission(db,owner,provider,row['conversation'],principal,request_id) if db is not None else None
+        payload=held.get('payload') if isinstance(held,dict) else None
+        if not isinstance(payload,dict) or not continuation.matches_input(payload.get('text'),continuation.digest(text)): return None
+        params={'session_id':row['conversation'],'text':payload['text'],'submission_id':request_id,'surface':'voice-live','queued':True}
+        return held['admission_id'],params,'attachments_v1' in payload
+    admit=time.perf_counter()
+    try:
+        job,receipt=await canonical.canonical_handover(request,row['profile'],row['conversation'],text,request_id,frame,prepare,confirm,discard,adopt)
+    except canonical.HandoverNotSent as refused:
+        return finish(error_code=refused.code,reason=refused.reason,server_ms={'admit':round((time.perf_counter()-admit)*1000,3)})
+    except canonical.HandoverUnconfirmed:
+        def known_job():
+            with mobile.connect() as conn:
+                return conn.execute('SELECT id FROM jobs WHERE owner=? AND profile=? AND request=?',(owner,row['profile'],request_id)).fetchone()
+        known=await asyncio.to_thread(known_job)
+        return finish(status='uncertain',job_id=known[0] if known else None,error_code='admission_unconfirmed',reason='admission_unconfirmed',
+                      server_ms={'admit':round((time.perf_counter()-admit)*1000,3)})
+    except canonical.HandoverConflict:
+        return _refusal(HTTPException(409,'Request identity conflicts with its original hand-over'))
+    except HTTPException as error:
+        return _refusal(error)
+    except LookupError:
+        return finish(error_code='session_unavailable',reason='session_unavailable')
+    except RuntimeError:
+        # Hermes' session store or runtime could not be read: nothing was sent.
+        return finish(error_code='transport_unavailable',reason='transport_unavailable')
+    except ValueError as error:
+        if str(error)=='Canonical admission unavailable': return finish(error_code='transport_unavailable',reason='transport_unavailable')
+        if 'capacity' in str(error): return finish(error_code='capacity',reason='capacity')
+        if 'Conflicting work identity' in str(error) or 'changed before replay' in str(error):
+            return _refusal(HTTPException(409,'Request identity conflicts with its original hand-over'))
+        if 'closed' in str(error) or 'expired' in str(error): return finish(error_code='call_closed',reason='call_closed')
+        return finish(error_code='session_unavailable',reason='session_unavailable')
+    admitted=receipt or {'admission_id':job.get('admission_id'),'status':{'done':'terminal','failed':'terminal','cancelled':'terminal',
+                                                                            'working':'started','queued':'queued'}.get(job.get('status'),'unknown'),'outcome':None}
+    return finish(status=admitted.get('status') if admitted.get('status') in ('queued','started','terminal','unknown') else 'unknown',
+                  admission_id=admitted.get('admission_id'),job_id=job['job_id'],
+                  callback_consent=job.get('callback_consent') or consent,outcome=admitted.get('outcome'),
+                  server_ms={'admit':round((time.perf_counter()-admit)*1000,3)})
+
+@router.post('/mobile/call-diagnostics')
+async def call_diagnostics(request:Request):
+    """Call contract v3 (CALLS-CONTRACT.md section 5): the stages of call starts the phone could not report through a call."""
+    try:
+        value=await body(request,16384)
+        owner,_,_,_=await identity_async(request)
+        device=request.headers.get('x-beacon-device-id') or ''
+        try: return await asyncio.to_thread(mobile.store_call_diagnostics,owner,device if mobile.DEVICE_ID.fullmatch(device) else '',value)
+        except ValueError as error: raise HTTPException(400,str(error)) from None
+    except HTTPException as error: return _refusal(error)
+
 @router.post('/mobile/calls/{call_id}/search')
 async def quick_search(call_id:str,request:Request):
     owner,provider,row,query=await query_body(request,call_id,'search')
@@ -1719,4 +1984,5 @@ router.include_router(sys.modules['beacon_callback_api'].build_router(call,body,
 router.include_router(sys.modules['beacon_call_history_api'].build_router(identity,mobile,voice_principal,verify_voice_stored))
 router.include_router(sys.modules['beacon_health_api'].build_router(identity))
 router.include_router(sys.modules['beacon_email_drafts_api'].build_router(identity,body,sys.modules['beacon_email_drafts']))
+router.include_router(sys.modules['beacon_lost_turns_api'].build_router(identity))  # WEDGE-121: which chats hold a reply lost in a Hermes restart (read-only)
 

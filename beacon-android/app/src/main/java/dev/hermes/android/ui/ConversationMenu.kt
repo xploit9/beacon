@@ -6,6 +6,7 @@ import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.testTag
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -61,9 +62,14 @@ import org.json.JSONObject
 }
 
 @Composable internal fun RenameConversationDialog(vm: BeaconViewModel, id: String, profile: String, title: String, onDismiss: () -> Unit) {
-    var name by remember(id) { mutableStateOf(title) }
+    // The name opens ready to edit, with the cursor after it: typed words add to the name, not before it.
+    var field by remember(id) { mutableStateOf(androidx.compose.ui.text.input.TextFieldValue(title, androidx.compose.ui.text.TextRange(title.length))) }
+    val name = field.text
+    val focus = remember { androidx.compose.ui.focus.FocusRequester() }
+    LaunchedEffect(id) { runCatching { focus.requestFocus() } }
     AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("Rename")) },
-        text = { OutlinedTextField(name, { name = it.take(200) }, singleLine = true, modifier = Modifier.testTag("conversation-rename-field")) },
+        text = { OutlinedTextField(field, { field = if (it.text.length <= 200) it else androidx.compose.ui.text.input.TextFieldValue(it.text.take(200), androidx.compose.ui.text.TextRange(200)) }, singleLine = true,
+            modifier = Modifier.focusRequester(focus).testTag("conversation-rename-field")) },
         confirmButton = { TextButton(onClick = { onDismiss(); vm.conversationAction(id, "/api/session/rename", json("title" to name.trim()), "Renamed", profile) }, enabled = name.isNotBlank() && name.trim() != title) { Text(uiText("Save")) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }

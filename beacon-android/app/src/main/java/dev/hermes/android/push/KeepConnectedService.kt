@@ -7,13 +7,16 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
@@ -34,6 +37,7 @@ import dev.hermes.android.data.NativeAuthExpiredException
 import dev.hermes.android.data.DeviceRemovalAuthority
 import dev.hermes.android.data.authorizesPushSource
 import dev.hermes.android.data.cachedScopeFor
+import dev.hermes.android.data.requestNeverSent
 import dev.hermes.android.data.validNativeProfile
 import dev.hermes.android.voice.RelayCallback
 import dev.hermes.android.voice.RelayCallbackBinding
@@ -55,9 +59,9 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.IOException
-import java.io.InterruptedIOException
 import java.util.UUID
 
 internal data class KeepConnectedPage(val events: List<JSONObject>, val nextCursor: Long, val reset: Boolean = false)
@@ -71,6 +75,8 @@ internal const val KEEP_CONNECTED_CPU_LEASE_MILLIS = 120_000L
 internal const val KEEP_CONNECTED_CPU_RENEW_MILLIS = 30_000L
 internal const val KEEP_CONNECTED_RESPONSE_FRESH_MILLIS = 90_000L
 internal const val KEEP_CONNECTED_HELD_RETRY_MILLIS = 30_000L
+/** Bounds the no-wait poll that is the first try after a start or a failure, and the profile list read; Hermes answers both at once. */
+internal const val KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS = 15_000L
 
 /** The foreground connection also gives due update checks an opportunity while Android defers jobs. */
 internal suspend fun keepConnectedUpdateChecks(check: suspend () -> Unit) {
@@ -104,6 +110,28 @@ internal fun parseKeepConnectedPage(response: JSONObject, after: Long): KeepConn
     return KeepConnectedPage(events, next, reset)
 }
 
+internal const val KEEP_CONNECTED_EVENTS_ROUTE = "/api/plugins/beacon/mobile/notifications/events"
+
+/** One page of [profile]'s notices after [after]; with none yet, Hermes holds the answer up to [waitSeconds]. */
+internal suspend fun keepConnectedEvents(
+    client: BeaconClient,
+    profile: String,
+    profiles: List<String>,
+    after: Long,
+    waitSeconds: Int,
+    timeoutMillis: Long? = null,
+): KeepConnectedPage = parseKeepConnectedPage(
+    client.nativeGetForProfile(
+        KEEP_CONNECTED_EVENTS_ROUTE,
+        profile,
+        profiles,
+        query = mapOf("after" to after.toString(), "wait" to waitSeconds.toString(), "package" to BuildConfig.APPLICATION_ID),
+        maxBytes = 1_048_576,
+        timeoutMillis = timeoutMillis,
+    ),
+    after,
+)
+
 internal fun keepConnectedPushData(event: JSONObject): Map<String, String> =
     listOf("source_ref", "event_id", "conversation_ref", "kind", "activity_ref", "expires_at")
         .associateWith(event::optString) + eventCreatedAt(event)
@@ -116,7 +144,6 @@ internal fun keepConnectedFailureReason(profile: String, error: Throwable, profi
     is NativeAuthExpiredException -> "Hermes sign-in expired"
     is KeepConnectedPageException -> "Hermes returned an invalid notification page"
     is KeepConnectedProfilesException -> "Hermes returned no authorized profiles"
-    is InterruptedIOException -> "Hermes did not answer in time"
     is ApiFailure -> when {
         error.status == 401 -> "Hermes rejected the connection (401)"
         error.status == 403 -> "Hermes refused profile ${profileLabel.takeIf(String::isNotBlank) ?: profile.takeIf(::validNativeProfile)?.take(32) ?: "current"} (403)"
@@ -125,8 +152,49 @@ internal fun keepConnectedFailureReason(profile: String, error: Throwable, profi
         error.status in 500..599 -> "Hermes server error (${error.status})"
         else -> "Hermes request failed (${error.status})"
     }
-    is IOException -> "Could not reach Hermes"
+    // The request never left the phone (no route, no name, refused, connect timeout): the phone or Hermes' computer is unreachable.
+    is IOException -> if (requestNeverSent(error)) "Could not reach Hermes"
+        // A timeout or a dropped connection after the request left: the link or Hermes, so no blame; the next try uses a fresh connection.
+        else "Lost the connection to Hermes"
     else -> "Could not process Hermes notifications"
+}
+
+/** The path to Hermes failed (a timeout, a dropped or refused connection) rather than Hermes answering with an error. */
+internal fun keepConnectedLinkFailure(error: Throwable): Boolean = error is IOException && error !is ApiFailure &&
+    error !is KeepConnectedPageException && error !is KeepConnectedProfilesException && error !is NativeAuthExpiredException
+
+/**
+ * When a profile tries again after a lost link: the usual backoff (1 s doubling to a minute), counted from when the failed try
+ * began, so a try that already waited out its timeout is not followed by another wait. A long outage (Hermes' computer asleep or
+ * off) settles at one try a minute.
+ */
+internal fun keepConnectedLinkRetryAt(startedAtMillis: Long, completedAtMillis: Long, failures: Int): Long =
+    maxOf(completedAtMillis, startedAtMillis + keepConnectedBackoffMs(failures))
+
+/**
+ * Closes the Keep connected client's idle pooled connections. A timed-out HTTP/2 poll is cancelled with a stream reset only, so OkHttp
+ * keeps its silent connection and would send every retry into it; after a lost link the next try must open a fresh one.
+ */
+internal fun keepConnectedDropConnections(client: BeaconClient) = client.http.connectionPool.evictAll()
+
+/** At most one early try per this long, however often the phone's networks come and go or it is unlocked. */
+internal const val KEEP_CONNECTED_NUDGE_DEBOUNCE_MILLIS = 30_000L
+
+/**
+ * Whether a sign that the path may be back (a network appeared under the VPN, the owner unlocked the phone) may cut the wait short:
+ * only while Keep connected is reconnecting, and at most once per [debounceMillis], so a flapping network adds at most one try per
+ * 30 s. While connected it does nothing.
+ */
+internal class KeepConnectedNudge(private val nowMillis: () -> Long, private val debounceMillis: Long = KEEP_CONNECTED_NUDGE_DEBOUNCE_MILLIS) {
+    private var lastAt: Long? = null
+
+    @Synchronized fun allow(status: String): Boolean {
+        if (status != KeepConnectedService.STATUS_RECONNECTING) return false
+        val now = nowMillis()
+        if (lastAt?.let { now - it in 0 until debounceMillis } == true) return false
+        lastAt = now
+        return true
+    }
 }
 
 private fun logKeepConnectedFailure(error: Throwable) {
@@ -178,7 +246,8 @@ internal class KeepConnectedPoller(
     private val origin: String,
     private val owner: String,
     private val cursors: KeepConnectedCursors,
-    private val profiles: suspend () -> List<String>,
+    /** The authorized profiles. The argument is true while the link to Hermes is lost, when a reader can skip a refresh. */
+    private val profiles: suspend (linkDown: Boolean) -> List<String>,
     private val signedInProfile: suspend () -> String = { "" },
     private val nowMillis: () -> Long = { System.nanoTime() / 1_000_000L },
     private val poll: suspend (String, Long) -> KeepConnectedPage,
@@ -189,11 +258,19 @@ internal class KeepConnectedPoller(
     private val canPresent: () -> Boolean = { true },
     /** How many events wait unread because they cannot be shown now; 0 once a page is delivered. */
     private val onBacklog: (Int) -> Unit = {},
+    /** A poll Hermes answers without waiting: the first try after a start or a failure, so one answer shows the connection at once. */
+    private val probe: suspend (String, Long) -> KeepConnectedPage = poll,
+    /** Runs after a cycle that lost the link, once no poll is in flight, so the next try opens a fresh connection. */
+    private val onLinkFailure: () -> Unit = {},
 ) {
     private data class ProfileFailure(val attempts: Int, val retryAtMillis: Long, val reason: String)
-    private data class ProfilePollResult(val profile: String, val failure: Exception?, val completedAtMillis: Long)
+    private data class ProfilePollResult(val profile: String, val failure: Exception?, val completedAtMillis: Long, val startedAtMillis: Long)
 
     private val profileFailures = linkedMapOf<String, ProfileFailure>()
+    // A new poller (a start, or a restart after a network change) has not heard from Hermes yet either.
+    private var started = false
+    // The last cycle lost the link and the signed-in profile got no answer; a Connected cycle clears it, even if another profile timed out.
+    private var linkDown = false
     private var primaryProfile = ""
     private var discoveryFailures = 0
     private var discoveryRetryAtMillis = 0L
@@ -208,7 +285,7 @@ internal class KeepConnectedPoller(
         val now = nowMillis()
         if (discoveryRetryAtMillis > now) return KeepConnectedCycle.Reconnecting(discoveryRetryAtMillis - now)
         val authorized = try {
-            profiles().filter(::validNativeProfile).distinct().take(256)
+            profiles(linkDown).filter(::validNativeProfile).distinct().take(256)
         } catch (error: NativeAuthExpiredException) {
             stopped = true
             discoveryFailureReason = keepConnectedFailureReason("", error)
@@ -236,6 +313,10 @@ internal class KeepConnectedPoller(
             return KeepConnectedCycle.Reconnecting((retryAt - cycleNow).coerceAtLeast(1L))
         }
         var anySucceeded = false
+        var linkLost = false
+        // A profile that failed last time, or any profile on a new poller, asks without waiting first, so the cycle ends as soon as Hermes answers.
+        val recovering = due.filterTo(mutableSetOf()) { !started || it in profileFailures }
+        started = true
         try {
             coroutineScope {
                 // Eight keeps the normal five-profile owner concurrent while bounding larger accounts.
@@ -246,7 +327,7 @@ internal class KeepConnectedPoller(
                     var firstPoll = true
                     // Let each fast profile resume as soon as its first result is recorded, without waiting for peers.
                     while (currentCoroutineContext().isActive) {
-                        val result = pollProfile(profile, permits)
+                        val result = pollProfile(profile, permits, quick = firstPoll && profile in recovering)
                         channel.send(result)
                         if (result.failure != null) break
                         if (firstPoll) {
@@ -260,6 +341,7 @@ internal class KeepConnectedPoller(
                     while (completedProfiles.size < due.size) {
                         val result = channel.receive()
                         if (result.failure == null) anySucceeded = true
+                        if (result.failure?.let(::keepConnectedLinkFailure) == true) linkLost = true
                         recordProfileResult(result)
                         if (completedProfiles.add(result.profile) && result.failure == null && completedProfiles.size < due.size) {
                             firstPollAcks.getValue(result.profile).complete(Unit)
@@ -271,6 +353,7 @@ internal class KeepConnectedPoller(
                     while (true) {
                         val queued = channel.tryReceive().getOrNull() ?: break
                         if (queued.failure == null) anySucceeded = true
+                        if (queued.failure?.let(::keepConnectedLinkFailure) == true) linkLost = true
                         recordProfileResult(queued)
                     }
                     channel.close()
@@ -283,12 +366,25 @@ internal class KeepConnectedPoller(
         } catch (error: CancellationException) {
             throw error
         }
+        // Every worker has joined, so the silent connection is idle now and can be closed.
+        if (linkLost) onLinkFailure()
         val primaryFailure = profileFailures[primaryProfile]
+        linkDown = linkLost && primaryFailure != null
         return if (primaryFailure == null) KeepConnectedCycle.Connected
         else KeepConnectedCycle.Reconnecting(if (anySucceeded) KEEP_CONNECTED_MIN_CYCLE_MILLIS else (primaryFailure.retryAtMillis - nowMillis()).coerceAtLeast(1L))
     }
 
-    private suspend fun pollProfile(profile: String, permits: Semaphore): ProfilePollResult {
+    /**
+     * Makes every waiting retry due now and keeps each failure count, so exactly one try goes out at once and the backoff after it
+     * is what it would have been. For a sign that the path may be back (a network appeared, the owner unlocked the phone).
+     */
+    fun retryNow() {
+        val now = nowMillis()
+        for (entry in profileFailures.entries) entry.setValue(entry.value.copy(retryAtMillis = minOf(entry.value.retryAtMillis, now)))
+        discoveryRetryAtMillis = minOf(discoveryRetryAtMillis, now)
+    }
+
+    private suspend fun pollProfile(profile: String, permits: Semaphore, quick: Boolean): ProfilePollResult {
         val startedAt = nowMillis()
         return try {
             val savedCursor = cursors.readIfPresent(origin, owner, profile)
@@ -308,12 +404,12 @@ internal class KeepConnectedPoller(
                     if (pages > 1_000) throw KeepConnectedPageException()
                 }
                 cursors.reset(origin, owner, profile, after)
-                return ProfilePollResult(profile, null, nowMillis())
+                return ProfilePollResult(profile, null, nowMillis(), startedAt)
             }
             val after = savedCursor
             var held = false
             val page = permits.withPermit {
-                val result = poll(profile, after)
+                val result = if (quick) probe(profile, after) else poll(profile, after)
                 if (result.nextCursor < 0 || (!result.reset && result.nextCursor < after) || result.events.size > 100) throw KeepConnectedPageException()
                 if (result.events.isNotEmpty() && !canPresent()) {
                     // F17: alerts that cannot be shown stay on Hermes; the cursor waits so they arrive, quietly, once they can.
@@ -330,20 +426,20 @@ internal class KeepConnectedPoller(
             if (held) {
                 // The same page would return at once, so wait before asking again.
                 delay(KEEP_CONNECTED_HELD_RETRY_MILLIS)
-                return ProfilePollResult(profile, null, nowMillis())
+                return ProfilePollResult(profile, null, nowMillis(), startedAt)
             }
-            if (page.events.isEmpty() || page.nextCursor == after) {
+            if (!quick && (page.events.isEmpty() || page.nextCursor == after)) {
                 // Avoid spinning if an empty or non-advancing long poll returns before the 500 ms minimum cycle.
                 keepConnectedPollDelay(nowMillis() - startedAt).takeIf { it > 0 }?.let { delay(it) }
             }
-            ProfilePollResult(profile, null, nowMillis())
+            ProfilePollResult(profile, null, nowMillis(), startedAt)
         } catch (error: NativeAuthExpiredException) {
             throw error
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
             logKeepConnectedFailure(error)
-            ProfilePollResult(profile, error, nowMillis())
+            ProfilePollResult(profile, error, nowMillis(), startedAt)
         }
     }
 
@@ -355,7 +451,8 @@ internal class KeepConnectedPoller(
             profileFailures.remove(result.profile)
             profileFailures[result.profile] = ProfileFailure(
                 attempts,
-                result.completedAtMillis + keepConnectedBackoffMs(attempts),
+                if (keepConnectedLinkFailure(error)) keepConnectedLinkRetryAt(result.startedAtMillis, result.completedAtMillis, attempts)
+                else result.completedAtMillis + keepConnectedBackoffMs(attempts),
                 keepConnectedFailureReason(result.profile, error, profileLabel(result.profile)),
             )
         }
@@ -479,6 +576,16 @@ class KeepConnectedService : Service() {
     @Volatile private var callbackHeard = false
     private var awakeJob: kotlinx.coroutines.Job? = null
     private var updatesJob: kotlinx.coroutines.Job? = null
+    // Signs that the path may be back while reconnecting (see KeepConnectedNudge): a network under the VPN, an unlock.
+    private val nudge = KeepConnectedNudge({ SystemClock.elapsedRealtime() })
+    private val retrySignal = Channel<Unit>(Channel.CONFLATED)
+    private var underlyingCallback: ConnectivityManager.NetworkCallback? = null
+    private var unlockReceiver: BroadcastReceiver? = null
+
+    /** One early try on a fresh connection, only while reconnecting and at most once per 30 s; nothing while connected. */
+    private fun retryIfReconnecting() {
+        if (activeInstance === this && nudge.allow(status(this))) retrySignal.trySend(Unit)
+    }
 
     private fun online(): Boolean = if (callbackHeard) callbackNetwork != null else hasNetwork(this)
 
@@ -520,6 +627,12 @@ class KeepConnectedService : Service() {
     override fun onCreate() {
         super.onCreate()
         activeInstance = this
+        val unlock = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) { if (intent.action == Intent.ACTION_USER_PRESENT) retryIfReconnecting() }
+        }
+        if (runCatching { ContextCompat.registerReceiver(this, unlock, IntentFilter(Intent.ACTION_USER_PRESENT), ContextCompat.RECEIVER_NOT_EXPORTED) }.isSuccess) {
+            unlockReceiver = unlock
+        }
         val connectivity = getSystemService(ConnectivityManager::class.java) ?: return
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) { callbackNetwork = network; callbackHeard = true; networkChanged() }
@@ -543,6 +656,17 @@ class KeepConnectedService : Service() {
         }
         try { connectivity.registerDefaultNetworkCallback(callback); networkCallback = callback }
         catch (_: Exception) { /* Poll timeout still bounds recovery if Android refuses the callback. */ }
+        // With a VPN on (the owner's Tailscale) the default network is the VPN, so a 5G or Wi-Fi change under it fires nothing
+        // above. A real network appearing may mean the path is back.
+        val underlying = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = retryIfReconnecting()
+        }
+        try {
+            val request = NetworkRequest.Builder().addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN).build()
+            connectivity.registerNetworkCallback(request, underlying)
+            underlyingCallback = underlying
+        } catch (_: Exception) { /* The next try still comes within a minute. */ }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -621,6 +745,10 @@ class KeepConnectedService : Service() {
         pollJob?.cancel()
         networkCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }
         networkCallback = null
+        underlyingCallback?.let { runCatching { getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(it) } }
+        underlyingCallback = null
+        unlockReceiver?.let { runCatching { unregisterReceiver(it) } }
+        unlockReceiver = null
         pollOrigin = null
         pollOwner = null
         pollProvider = null
@@ -665,7 +793,7 @@ class KeepConnectedService : Service() {
             origin = origin,
             owner = owner,
             cursors = cursors,
-            profiles = profiles@ {
+            profiles = profiles@ { linkDown ->
                 val auth = app.auth.read(origin)
                 val cached = auth.cachedScopeFor(origin, replacingAccount = false)
                 if (cached == null || cached.owner != owner || cached.nativeProvider != nativeProvider) throw NativeAuthExpiredException()
@@ -676,8 +804,15 @@ class KeepConnectedService : Service() {
                     profilesReadAt = 0L
                 }
                 val profileClient = requireNotNull(client)
+                // While the link is lost a refresh would be one more connection attempt per try; the cached list will do.
+                if (linkDown && authorizedProfiles.isNotEmpty()) return@profiles authorizedProfiles
                 if (profilesReadAt > 0 && SystemClock.elapsedRealtime() - profilesReadAt < 300_000L) return@profiles authorizedProfiles
-                val profiles = try { profileClient.nativeGet("/api/profiles").rows("profiles") }
+                // Bounded like the probe: on a silent connection the read would otherwise wait out the client's minute, and then
+                // the polls should not go into that connection either.
+                val profiles = try {
+                    withTimeoutOrNull(KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS) { profileClient.nativeGet("/api/profiles").rows("profiles") }
+                        .also { if (it == null) keepConnectedDropConnections(profileClient) }
+                }
                 catch (error: NativeAuthExpiredException) { throw error }
                 catch (error: CancellationException) { throw error }
                 catch (error: ApiFailure) { if (error.status == 401) throw NativeAuthExpiredException() else null }
@@ -693,26 +828,18 @@ class KeepConnectedService : Service() {
                 authorizedProfiles
             },
                 poll = { profile, after ->
-                    val response = requireNotNull(client).nativeGetForProfile(
-                        "/api/plugins/beacon/mobile/notifications/events",
-                        profile,
-                        authorizedProfiles,
-                        query = mapOf("after" to after.toString(), "wait" to KEEP_CONNECTED_LONG_POLL_SECONDS.toString(), "package" to BuildConfig.APPLICATION_ID),
-                        maxBytes = 1_048_576,
-                        timeoutMillis = KEEP_CONNECTED_POLL_TIMEOUT_MILLIS,
-                    )
-                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
+                    keepConnectedEvents(requireNotNull(client), profile, authorizedProfiles, after, KEEP_CONNECTED_LONG_POLL_SECONDS, KEEP_CONNECTED_POLL_TIMEOUT_MILLIS)
+                        .also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
                 },
                 initialize = { profile, after ->
-                    val response = requireNotNull(client).nativeGetForProfile(
-                        "/api/plugins/beacon/mobile/notifications/events",
-                        profile,
-                        authorizedProfiles,
-                        query = mapOf("after" to after.toString(), "wait" to "0", "package" to BuildConfig.APPLICATION_ID),
-                        maxBytes = 1_048_576,
-                    )
-                    parseKeepConnectedPage(response, after).also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
+                    keepConnectedEvents(requireNotNull(client), profile, authorizedProfiles, after, 0)
+                        .also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
                 },
+                probe = { profile, after ->
+                    keepConnectedEvents(requireNotNull(client), profile, authorizedProfiles, after, 0, KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS)
+                        .also { prefs.edit().putLong(KEY_LAST_RESPONSE, SystemClock.elapsedRealtime()).putLong(KEY_HEARD_AT, System.currentTimeMillis()).apply() }
+                },
+                onLinkFailure = { client?.let(::keepConnectedDropConnections) },
                 signedInProfile = { client?.auth?.profile.orEmpty() },
                 onEvent = { profile, event ->
                     if (event.optString("kind") == "incoming_call") deliverIncomingCall(app, origin, owner, profile, nativeProvider, event)
@@ -733,6 +860,7 @@ class KeepConnectedService : Service() {
                 canPresent = { androidx.core.app.NotificationManagerCompat.from(this).areNotificationsEnabled() },
                 onBacklog = { held -> DeliveryLog.setHeld(this, held) },
             )
+        retrySignal.tryReceive()
         try {
             while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default", nativeProvider = nativeProvider))) {
                 val current = app.auth.read(origin)
@@ -748,11 +876,17 @@ class KeepConnectedService : Service() {
                         // Clear the stale sign-in prompt before anything can observe "Connected".
                         getSystemService(NotificationManager::class.java).cancel(SIGN_IN_NOTIFICATION_ID)
                         setStatus(this, STATUS_CONNECTED, poller.lastFailureReason)
+                        retrySignal.tryReceive()
                         delay(keepConnectedPollDelay(SystemClock.elapsedRealtime() - cycleStarted))
                     }
                     is KeepConnectedCycle.Reconnecting -> {
                         setStatus(this, STATUS_RECONNECTING, poller.lastFailureReason)
-                        delay(result.delayMillis)
+                        // A network appearing under the VPN or an unlock cuts the wait short: one try on a fresh connection. The failure
+                        // counts stay, so the wait after that try is what it would have been.
+                        if (withTimeoutOrNull(result.delayMillis) { retrySignal.receive() } != null) {
+                            client?.let(::keepConnectedDropConnections)
+                            poller.retryNow()
+                        }
                     }
                     KeepConnectedCycle.SignedOut -> {
                         setStatus(this, STATUS_SIGNED_OUT, poller.lastFailureReason)
@@ -1082,7 +1216,9 @@ internal fun keepConnectedReasonText(reason: String): String {
     return when {
         reason.isBlank() -> "Retrying…"
         reason == "Hermes sign-in expired" || status == 401 -> "Sign in again"
-        reason == "Hermes did not answer in time" -> "Hermes didn't answer. Retrying…"
+        // 1.2.0 stored "did not answer in time" for every timeout; the first cycle after an update replaces it.
+        reason == "Lost the connection to Hermes" || reason == "Hermes did not answer in time" -> "Lost the connection to Hermes. Retrying…"
+        // Also what a phone sees while Hermes' computer is asleep or off, so it does not blame the phone's connection.
         reason == "Could not reach Hermes" -> "Can't reach Hermes. Retrying…"
         status == 403 || status == 409 -> "Hermes refused the connection. Retrying…"
         status == 404 -> "Check Beacon on Hermes."

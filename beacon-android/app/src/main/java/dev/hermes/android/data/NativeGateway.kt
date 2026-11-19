@@ -6,6 +6,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.*
+import okio.ByteString
 import org.json.JSONObject
 import org.json.JSONArray
 import java.io.IOException
@@ -37,11 +38,37 @@ private data class NativeServerRequest(
 
 data class NativeSessionBinding(val scope: Scope, val storedSessionId: String, val runtimeSessionId: String)
 
-internal class NativeTurnNotSent(message: String, cause: Throwable? = null) : IOException(message, cause)
+internal open class NativeTurnNotSent(message: String, cause: Throwable? = null) : IOException(message, cause)
+/** CHATQA-121 follow-up 5: a prompt whose answer was lost; [staged] is its payload's staged attachments, so asking again re-sends them unchanged. */
+internal class NativeSubmitUnknown(val staged: org.json.JSONArray, cause: Throwable) : IOException(NATIVE_OUTCOME_UNKNOWN, cause)
+/** Follow-up 5: a refusal that names the field it is about (Hermes' error `data.field`, gateway/session_controls.py `_refusal_data`). */
+internal class NativeRefusal(status: Int, message: String, val field: String) : ApiFailure(status, message)
 internal class NativeTurnLease internal constructor(
     val binding: NativeSessionBinding, val authority: Boolean,
     internal val gateway: NativeGateway, internal val connectionToken: Any, internal val cursorToken: Any,
+    internal val attachLimits: AttachmentLimits = AttachmentLimits(),
 )
+
+/**
+ * What one file frame of this connection may carry (CHAT-121 follow-up 4), from its gateway ticket: the plugin's frame limit ([frameBytes], sent in
+ * pieces when over CANONICAL_RELAY_FRAME_BYTES) and Hermes' own caps on one file and one image ([fileBytes], [imageBytes], null when not given). A 1.2.0
+ * plugin, or a socket without the plugin, gives none: one text frame of 8 MiB, about 6 MB of file.
+ */
+internal data class AttachmentLimits(val frameBytes: Long = CANONICAL_RELAY_FRAME_BYTES.toLong(), val fileBytes: Long? = null, val imageBytes: Long? = null) {
+    val pieces get() = frameBytes > CANONICAL_RELAY_FRAME_BYTES
+}
+
+/**
+ * The limits a gateway ticket's answer gives ([AttachmentLimits]); a value of the wrong kind or out of range counts as not given. Pieces are used only in the form
+ * this phone sends ([ATTACHMENT_PIECES_FORM], `attach_pieces`): a plugin that names another form, or none (follow-up 4's), keeps one text frame.
+ */
+internal fun advertisedAttachmentLimits(admission: JSONObject): AttachmentLimits {
+    fun bytes(key: String, range: LongRange): Long? = when (val value = admission.opt(key)) { is Int -> value.toLong(); is Long -> value; else -> null }?.takeIf { it in range }
+    val gib = 1L shl 30
+    val pieces = admission.opt("attach_pieces").let { it is Int && it == ATTACHMENT_PIECES_FORM }
+    return AttachmentLimits((if (pieces) bytes("attach_frame_limit", CANONICAL_RELAY_FRAME_BYTES.toLong()..gib) else null) ?: CANONICAL_RELAY_FRAME_BYTES.toLong(),
+        bytes("attach_file_limit", 1L..gib), bytes("attach_image_limit", 1L..gib))
+}
 
 internal fun nativeSessionBinding(scope: Scope, result: JSONObject): NativeSessionBinding {
     // Create and unpersisted resume use stored_session_id; persisted resume uses session_key.
@@ -58,8 +85,45 @@ internal fun nativeConnectionTicket(value: String): String {
     return value
 }
 
+/**
+ * One file on the way per phone (JOINBFIX-121, REVIEW-JOINB-121 P2-1). The plugin keeps one file socket and one share of its memory budget per phone, and a
+ * newer file socket ends the older one, so two files sent at once ended each other's socket and both ended "Not sent". Every send runs on its own detached
+ * client with its own gateway, so the lock is the process's: a second file waits for the first, and the chat's own frames are not held.
+ */
+private val fileUploads = Mutex()
+
 /** A request whose frame may have reached Hermes; [requestNeverSent] reads this to keep such sends uncertain. */
 internal const val NATIVE_OUTCOME_UNKNOWN = "Native request outcome may be unknown; reconcile history before resending"
+
+/** The params field a file frame carries its file in, when the whole file goes in one text frame ([NativeGateway.turnRpc]). */
+private val TEXT_FILE_FIELDS = mapOf("file.attach" to "data_url", "image.attach_bytes" to "content_base64")
+
+/** The pauses before a busy admission is asked again ([admissionBusy]): about a second in all, then the refusal stands. */
+internal val NATIVE_ADMISSION_BUSY_PAUSES_MS = longArrayOf(150, 300, 600)
+/**
+ * Only a refusal this quick is asked again ([admissionBusy]). A 1.2.0 plugin's busy refusal comes at once (125-164 ms measured, CHAT-121)
+ * and so does an at-once socket refusal; an "unavailable" after a slow step (the plugin's 6 s bound, a slow exchange) is a gateway that is
+ * slow or down, and asking it four times only stacked about 25 s of waiting (REVIEW-121B P3-3).
+ */
+internal const val NATIVE_ADMISSION_QUICK_MS = 1_000L
+/** The plugin refused a canonical socket before it opened: its upgrade answered [status], never 101, [tookMs] after the upgrade was asked. */
+internal class NativeAdmissionRefused(val status: Int, cause: Throwable, val tookMs: Long = 0) : IOException("Native connection refused before it opened ($status)", cause)
+/**
+ * A 1.2.0 plugin's 503 for a ticket it turned away at once with all its admission workers taken; Hermes' gateway being down answers the
+ * same. A 1.2.1 plugin waits for a worker first and then answers "Canonical gateway busy", which is not asked again: it already waited.
+ */
+private const val NATIVE_ADMISSION_REFUSED_AT_ONCE = "Canonical gateway unavailable"
+/**
+ * The plugin turned a native connection away before anything reached Hermes, quickly, and asking again shortly may get in: its gateway ticket
+ * answered a 1.2.0 plugin's busy-or-down 503 within [NATIVE_ADMISSION_QUICK_MS] ([ticketMs], the ticket call's own time), or it refused the
+ * canonical socket's upgrade at once (403 or 503, within the same time from the upgrade's own start, [NativeAdmissionRefused.tookMs]). Only the
+ * step that failed is timed, so a slow link or a proxy's extra round trips before it do not count (REVIEW-121B FU-P3-1). Not a 1.2.1 plugin's
+ * 429, a socket that already waited for a worker, and not any other refusal.
+ */
+internal fun admissionBusy(error: Throwable, ticketMs: Long): Boolean = generateSequence(error) { it.cause }.take(8).any {
+    it is ApiFailure && it.plugin && it.status == 503 && it.detail == NATIVE_ADMISSION_REFUSED_AT_ONCE && ticketMs < NATIVE_ADMISSION_QUICK_MS ||
+        it is NativeAdmissionRefused && it.status in setOf(403, 503) && it.tookMs < NATIVE_ADMISSION_QUICK_MS
+}
 
 internal class NativeGateway(private val client: BeaconClient, private val socketFactory: WebSocket.Factory = client.http, private val rpcTimeoutMs: Long = 60000) {
     private class Connection(val identity: BeaconClient.GatewayIdentity, val canonical: Boolean, val device: String?) {
@@ -78,6 +142,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         @Volatile var capabilitiesSent = false
         @Volatile var socket: WebSocket? = null
         @Volatile var failure: IOException? = null
+        /** What a file frame may carry (its ticket's answer); in pieces, it goes on a socket of its own ([attachFile]). */
+        @Volatile var attachLimits = AttachmentLimits()
     }
     /** A binding names a runtime that lives on the socket that made it: once that socket is gone Hermes may reap the runtime. */
     private class Cursor(val binding: NativeSessionBinding, val connection: Connection?, var sequence: Long = 0, var epoch: String = "")
@@ -145,6 +211,22 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         }
         require(client.auth.backend == "hermes-dashboard" && client.auth.owner.isNotBlank() && client.auth.profile.isNotBlank()) { "Verify native dashboard identity before connecting" }
         val attempt = generation.get()
+        // A 1.2.0 plugin turns an admission away at once while its few admission workers are taken (canonical_transport.BoundedWorkers):
+        // its ticket answers 503, or the socket is refused before it opens. The app's own connections at startup met that (CHAT-121: a new
+        // chat failed with "Couldn't open the chat" before Hermes saw it). Nothing reaches Hermes before the socket is ready, so the
+        // admission is asked again after a short pause ([admissionBusy]: never a newer plugin's "busy", which has already waited); any other
+        // failure, and a refused one after the last pause, stays as it was.
+        for (pause in NATIVE_ADMISSION_BUSY_PAUSES_MS) {
+            try { return@withLock admit(attempt) }
+            catch (e: Exception) { if (e is CancellationException || !admissionBusy(e, failedTicketMs)) throw e }
+            delay(pause)
+        }
+        admit(attempt)
+    }
+    /** How long the last admission's ticket call took when it failed (read by [connect] under connectLock, which [admit] runs under). */
+    private var failedTicketMs = Long.MAX_VALUE
+    private suspend fun admit(attempt: Long): Connection {
+        failedTicketMs = Long.MAX_VALUE
         val identity = client.gatewayIdentity()
         val device = NativePairing.deviceHeader(CANONICAL_TICKET_PATH, identity.scope)
         fun current(checkAdmission: Boolean = false) = attempt == generation.get() && client.gatewayIdentityCurrent(identity, checkAdmission) &&
@@ -157,10 +239,14 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             check(current(true)) { "Native identity changed during ticket admission" }
             if (synchronized(lifecycle) { identity.scope in canonicalScopes } || client.canonicalRequired(identity)) throw e
             null
+        } catch (e: Exception) {
+            failedTicketMs = (System.nanoTime() - started) / 1_000_000
+            throw e
         }
         currentCoroutineContext().ensureActive()
         check(current(true)) { "Native identity changed during ticket admission" }
         val canonical = admission != null
+        val attachLimits = admission?.let(::advertisedAttachmentLimits) ?: AttachmentLimits()
         val ticket: String
         val deadline: Long
         if (admission != null) {
@@ -181,15 +267,16 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             deadline = Long.MAX_VALUE
         }
         currentCoroutineContext().ensureActive()
-        val mine = Connection(identity, canonical, device)
+        val mine = Connection(identity, canonical, device).also { it.attachLimits = attachLimits }
         synchronized(lifecycle) { check(current(true)) { "Native identity changed during ticket admission" }; connection = mine }
-        try {
+        return try {
             val path = if (canonical) CANONICAL_SOCKET_PATH else "/api/ws"
             val protocols = if (canonical) "beacon-canonical-v1, beacon-ticket.$ticket" else "hermes-gateway-v1, hermes-gateway-ticket.$ticket"
             check(!canonical || System.nanoTime() < deadline) { "Canonical gateway ticket expired" }
             val request = client.request(path).removeHeader("Authorization").removeHeader(HERMES_LOOPBACK_SESSION_HEADER)
                 .header("Sec-WebSocket-Protocol", protocols).build()
             check(!canonical || request.header("X-Beacon-Device-ID") == device) { "Native device changed during ticket admission" }
+            var upgradeAsked = System.nanoTime()
             val listener = object : WebSocketListener() {
                 override fun onOpen(ws: WebSocket, response: Response) {
                     HermesReach.answered(client.auth.origin)
@@ -258,13 +345,16 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                     // A connection that could not open (not one that dropped later) says Hermes is out of reach right now.
                     if (response == null) HermesReach.failed(client.auth.origin, t)
-                    terminate(mine, IOException("Native connection interrupted", t))
+                    // A socket the plugin refused before it opened (its upgrade answered, never 101): no frame of this connection reached Hermes.
+                    terminate(mine, IOException("Native connection interrupted", if (canonical && response != null && !mine.capabilitiesSent)
+                        NativeAdmissionRefused(response.code, t, (System.nanoTime() - upgradeAsked) / 1_000_000) else t))
                 }
                 override fun onClosing(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")); ws.close(code, reason) }
                 override fun onClosed(ws: WebSocket, code: Int, reason: String) { terminate(mine, IOException("Native connection closed ($code)")) }
             }
             val socket = synchronized(lifecycle) {
                 check(connection === mine && current(true) && (!canonical || System.nanoTime() < deadline)) { "Native identity changed during connection admission" }
+                upgradeAsked = System.nanoTime()
                 if (canonical) socketFactory.newWebSocket(request, listener) else {
                     var opened: WebSocket? = null
                     check(client.withLegacyCanonicalPermit(identity) { opened = socketFactory.newWebSocket(request, listener); true }) { "Canonical gateway authority is required" }
@@ -347,7 +437,14 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 }
             }
             currentCoroutineContext().ensureActive()
-            val frame = json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString()
+            sendFrame(mine, json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString(), sendGuard, sendLock)
+            val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
+            return finishRpc(method, params, response, canonicalCreate, requestScope)
+        } finally { mine.pending.remove(id) }
+    }
+
+    /** Sends one frame as text, after the same checks as always; anything that fails after it may have left the phone is an unknown outcome. */
+    private fun sendFrame(mine: Connection, frame: String, sendGuard: (() -> Unit)?, sendLock: Any?) {
             val sent = synchronized(lifecycle) {
                 val guardedSend = {
                     if (connection !== mine || mine.failure != null || !connectionIdentityCurrent(mine)) throw NativeTurnNotSent("Native connection changed before the request")
@@ -365,11 +462,164 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 if (sendLock == null) guardedSend() else synchronized(sendLock) { guardedSend() }
             }
             if (sent != true) throw unknown(IOException("Native connection unavailable"))
-            val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
+    }
+
+    /** A socket of one file (form 4, CHAT-121 follow-up 9): what its listener has seen. */
+    private class FileLink {
+        val ready = CompletableDeferred<Unit>()
+        val answers = ConcurrentHashMap<String, CompletableDeferred<JSONObject>>()
+        @Volatile var socket: WebSocket? = null
+        @Volatile var failure: IOException? = null
+        /** The plugin's latest acknowledgment of the file's pieces: the frame's request id, the base64 it holds (PIECE_ACK). */
+        @Volatile var ack: Pair<String, Long>? = null
+        fun fail(error: IOException) {
+            if (failure == null) failure = error
+            ready.completeExceptionally(error)
+            answers.values.forEach { it.completeExceptionally(error) }
+        }
+    }
+    /** One try of a file failed on the file's own socket (it could not open or join the chat, it closed, or the plugin gave up on its pieces). */
+    private class FileLinkLost(cause: Throwable) : IOException("The file's connection failed", cause)
+
+    /**
+     * Sends one frame that carries a whole file ([inline]) on a socket of its own (CHAT-121 follow-up 9, the plugin's form 4), never on the chat's [mine]: the
+     * chat's pongs never wait behind the file's data, and a file that cannot get through ends only its own socket. Each try opens that socket with its own
+     * ticket, attaches it to the chat's session (Hermes stages a file only for a session the connection is attached to), sends the frame in pieces sized
+     * and paced from the plugin's acknowledgments ([PieceSizer]), and closes it once Hermes has answered. A try whose socket fails, or that the plugin gave
+     * up on ("stalled"), goes again on a new socket in smaller pieces; after [ATTACHMENT_STALL_TRIES] the file is not sent ([AttachmentStalled]), and a
+     * queued message with it waits for the person. [bound] fails when the chat this file is for is no longer the one held: before any piece went, that ends
+     * the send as the chat's own change ([NativeTurnNotSent]); once pieces were on the way, the file may have caused it (one upload queue), so it is not
+     * sent and waits for the person ([AttachmentStalled]): a file takes the chat's socket down at most once in a row.
+     */
+    private suspend fun attachFile(mine: Connection, binding: NativeSessionBinding, method: String, params: JSONObject, inline: InlineFile, bound: () -> Unit): JSONObject {
+        val limits = mine.attachLimits
+        if (!mine.canonical || !limits.pieces) throw NativeTurnNotSent("This connection takes no file frames in pieces")
+        val requestScope = client.scope
+        val wire = params.copy().put("profile", requestScope.profile)
+        if (inlineFrameBytes(json("jsonrpc" to "2.0", "id" to UUID.randomUUID().toString(), "method" to method, "params" to wire), inline) > limits.frameBytes)
+            throw NativeTurnNotSent("The file is larger than this connection takes")
+        var sizer = PieceSizer()
+        var tries = 0
+        while (true) {
+            synchronized(lifecycle) { bound() }
+            // One try at a time holds the lock (a second file waits here, and goes between a stuck file's tries); every wait inside a try has a bound
+            // ([attachFileOnce]), so the lock is never held for ever. A cancelled wait takes nothing.
+            try { return fileUploads.withLock { finishRpc(method, params, attachFileOnce(mine, binding, method, wire, inline, sizer, bound), false, requestScope) } }
+            catch (e: FileLinkLost) {
+                if (++tries >= ATTACHMENT_STALL_TRIES) throw AttachmentStalled(e)
+                // The next try starts again from a small piece and grows only on its own acknowledgments (follow-up 10).
+                sizer = sizer.nextTry()
+            } catch (e: NativeTurnNotSent) {
+                // The chat's own socket was lost while this file's pieces were on the way. A phone's upload is one queue, so a sudden deep drop can
+                // close it with them: the file is not sent and waits for the person, as a lost one-frame file does, so it cannot happen again by itself.
+                if (sizer.largest > 0 && runCatching { synchronized(lifecycle) { bound() } }.isFailure) throw AttachmentStalled(e)
+                throw e
+            }
+        }
+    }
+
+    /** One try of [attachFile]: the file's socket opened, attached to the chat's session, the frame sent; Hermes' answer, or [FileLinkLost]. */
+    private suspend fun attachFileOnce(mine: Connection, binding: NativeSessionBinding, method: String, wire: JSONObject, inline: InlineFile,
+        sizer: PieceSizer, bound: () -> Unit): JSONObject {
+        val link = openFileLink(mine)
+        var answered = false
+        try {
+            fun live() { synchronized(lifecycle) { bound() }; link.failure?.let { throw FileLinkLost(it) } }
+            suspend fun answer(pending: CompletableDeferred<JSONObject>, timeoutMs: Long): JSONObject = try { withTimeout(timeoutMs) { pending.await() } }
+                catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw FileLinkLost(e) }
+                catch (e: IOException) { throw if (e is FileLinkLost) e else FileLinkLost(e) }
+            fun ask(id: String) = CompletableDeferred<JSONObject>().also { link.answers[id] = it }
+            // Attach this socket to the chat's session, as the chat's own resume does (omit_messages: no history).
+            val resume = UUID.randomUUID().toString()
+            val resumeAnswer = ask(resume)
+            live()
+            if (link.socket?.send(json("jsonrpc" to "2.0", "id" to resume, "method" to "session.resume", "params" to json("session_id" to binding.storedSessionId,
+                    "omit_messages" to true, "source" to "android", "profile" to client.scope.profile)).toString()) != true)
+                throw FileLinkLost(IOException("The file's connection is unavailable"))
+            val resumed = answer(resumeAnswer, 15_000).optJSONObject("result")
+            if (resumed == null || runCatching { nativeSessionBinding(binding.scope, resumed) }.getOrNull() != binding)
+                throw FileLinkLost(IOException("The file's connection could not join the chat"))
+            val id = UUID.randomUUID().toString()
+            val pending = ask(id)
+            val envelope = json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wire)
+            // The upload's own bound: a socket that stays open (it answers pings) but shows no new acknowledgment for [attachmentSilenceMs] while the file is
+            // on the way loses this try. Without it a stuck plugin would hold the one upload lock, and so every later file on this phone, for ever.
+            var acknowledged = 0L
+            var progressAt = System.nanoTime()
+            fun acks(): Long = (link.ack?.takeIf { it.first == id }?.second ?: 0L).also { if (it > acknowledged) { acknowledged = it; progressAt = System.nanoTime() } }
+            fun silent() { if ((System.nanoTime() - progressAt) / 1_000_000 > attachmentSilenceMs) throw FileLinkLost(IOException("The file's connection went silent")) }
+            val queued = try {
+                streamInlineFrame(envelope, inline, send = { piece -> live(); link.socket?.send(piece) == true },
+                    queued = { link.socket?.queueSize() ?: 0L }, pause = { live(); silent(); delay(10) },
+                    acked = ::acks, answered = { pending.isCompleted }, sizer = sizer)
+            } catch (e: CancellationException) { throw e } catch (e: NativeTurnNotSent) { throw e } catch (e: FileLinkLost) { throw e }
+            catch (e: IllegalArgumentException) { throw NativeTurnNotSent("The file could not be sent", e) }  // it changed while it was read
+            catch (e: Exception) { throw FileLinkLost(e) }
+            if (!queued && !pending.isCompleted) throw FileLinkLost(link.failure ?: IOException("The file's connection refused a piece"))
+            // The answer's wait starts once the plugin holds the whole file (or it answered first: "busy" at the header, "stalled").
+            val response = answer(pending, rpcTimeoutMs)
+            if (attachmentStalled(response)) throw FileLinkLost(ApiFailure(408, ATTACHMENT_STALLED, plugin = true))
+            answered = true
+            return response
+        } finally {
+            if (answered) link.socket?.close(1000, null) else link.socket?.cancel()
+        }
+    }
+
+    /** Opens a socket of one file ([attachFile]): its own ticket ({"purpose": "file"}), the chat's device and profile; a failure is [FileLinkLost]. */
+    private suspend fun openFileLink(mine: Connection): FileLink {
+        if (!connectionIdentityCurrent(mine)) throw NativeTurnNotSent("Native connection changed before the request")
+        val started = System.nanoTime()
+        val admission = try { client.nativeRequest(CANONICAL_TICKET_PATH, "POST", json("purpose" to "file")) }
+            catch (e: CancellationException) { throw e } catch (e: Exception) { throw FileLinkLost(e) }
+        currentCoroutineContext().ensureActive()
+        if (!connectionIdentityCurrent(mine)) throw NativeTurnNotSent("Native connection changed before the request")
+        val seconds = when (val value = admission.opt("expires_in")) { is Int -> value.toLong(); is Long -> value; else -> 0L }
+        val ticket = (admission.opt("ticket") as? String)?.let { runCatching { nativeConnectionTicket(it) }.getOrNull() }
+        if (ticket == null || seconds !in 1..25 || admission.opt("path") != CANONICAL_SOCKET_PATH || admission.opt("profile") != mine.identity.scope.profile ||
+            admission.opt("canonical") != true || admission.opt("purpose") != "file") throw FileLinkLost(IOException("Invalid file connection admission"))
+        val request = client.request(CANONICAL_SOCKET_PATH).removeHeader("Authorization").removeHeader(HERMES_LOOPBACK_SESSION_HEADER)
+            .header("Sec-WebSocket-Protocol", "beacon-canonical-v1, beacon-ticket.$ticket").build()
+        if (request.header("X-Beacon-Device-ID") != mine.device) throw NativeTurnNotSent("Native device changed before the request")
+        if (System.nanoTime() >= started + seconds * 1_000_000_000L) throw FileLinkLost(IOException("File connection ticket expired"))
+        val link = FileLink()
+        link.socket = socketFactory.newWebSocket(request, object : WebSocketListener() {
+            override fun onOpen(ws: WebSocket, response: Response) {
+                link.socket = ws
+                // It answers none of Hermes' questions (the chat's socket does), and the plugin sends it none.
+                ws.send(json("jsonrpc" to "2.0", "id" to "capabilities-${UUID.randomUUID()}", "method" to "client.capabilities",
+                    "params" to json("server_requests" to false)).toString())
+            }
+            override fun onMessage(ws: WebSocket, bytes: ByteString) { pieceAcknowledgment(bytes)?.let { link.ack = it } }
+            override fun onMessage(ws: WebSocket, text: String) {
+                val frame = runCatching { JSONObject(text) }.getOrNull() ?: return
+                val event = frame.optJSONObject("params")
+                if (frame.optString("method") == "event" && event?.optString("type") == "gateway.ready") {
+                    if (event.optJSONObject("payload")?.opt("session_authority") == true) link.ready.complete(Unit)
+                    else { link.fail(IOException("Canonical gateway did not become ready")); ws.cancel() }
+                } else if (!frame.has("method")) frame.optString("id").takeIf(String::isNotBlank)?.let { link.answers.remove(it)?.complete(frame) }
+            }
+            override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) { link.fail(IOException("The file's connection failed", t)) }
+            override fun onClosing(ws: WebSocket, code: Int, reason: String) { link.fail(IOException("The file's connection closed ($code)")); ws.close(code, reason) }
+            override fun onClosed(ws: WebSocket, code: Int, reason: String) { link.fail(IOException("The file's connection closed ($code)")) }
+        })
+        try { withTimeout(15_000) { link.ready.await() } }
+        catch (e: TimeoutCancellationException) { link.socket?.cancel(); currentCoroutineContext().ensureActive(); throw FileLinkLost(e) }
+        catch (e: CancellationException) { link.socket?.cancel(); throw e }  // the send was cancelled while the socket opened (a timeout is a CancellationException: its catch is first)
+        catch (e: IOException) { link.socket?.cancel(); throw FileLinkLost(e) }
+        return link
+    }
+
+    private fun finishRpc(method: String, params: JSONObject, response: JSONObject, canonicalCreate: Boolean, requestScope: Scope): JSONObject {
             response.optJSONObject("error")?.let {
                 // 4001: Hermes no longer holds this runtime (reaped or evicted). Nothing may keep addressing it; the next use resumes the stored conversation.
                 if (method !in setOf("session.activate", "session.resume") && it.optInt("code", 500) == 4001 && it.optString("message") == "session not found") forget(params.string("session_id"))
-                throw ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed"))
+                // The plugin's own refusal of a frame it relays (a file frame it cannot take now: "busy") says so in its data. CHATQA-121 follow-up 5:
+                // Hermes' refusal that names a field (admission_conflict on request_id) keeps it; such a refusal is Hermes', never the plugin's.
+                val data = it.optJSONObject("data")
+                val field = data?.optString("field").orEmpty()
+                throw if (field.isBlank()) ApiFailure(it.optInt("code", 500), it.optString("message", "Native operation failed"), plugin = data?.optString("source") == "beacon")
+                    else NativeRefusal(it.optInt("code", 500), it.optString("message", "Native operation failed"), field)
             }
             val output = response.optJSONObject("result") ?: JSONObject().put("value", response.opt("result"))
             if (canonicalCreate) {
@@ -386,7 +636,6 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 }
             }
             return output
-        } finally { mine.pending.remove(id) }
     }
 
     /** Stage visual evidence and submit on one socket; a legacy file reference never uses the shared image queue. */
@@ -828,12 +1077,12 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             ?: throw NativeTurnNotSent("Native gateway readiness is unavailable")
         return synchronized(lifecycle) {
             if (!bound()) throw NativeTurnNotSent("Native conversation changed before the request")
-            NativeTurnLease(snapshot.binding, authority, this, mine, snapshot)
+            NativeTurnLease(snapshot.binding, authority, this, mine, snapshot, if (mine.canonical) mine.attachLimits else AttachmentLimits())
         }
     }
 
     /** Pin every operation to the connection and cursor captured before attachment or mutation. */
-    suspend fun turnRpc(lease: NativeTurnLease, method: String, params: JSONObject): JSONObject {
+    suspend fun turnRpc(lease: NativeTurnLease, method: String, params: JSONObject, inline: InlineFile? = null): JSONObject {
         val mine = lease.connectionToken as? Connection ?: throw NativeTurnNotSent("Native operation has no connection")
         val snapshot = lease.cursorToken as? Cursor ?: throw NativeTurnNotSent("Native operation has no conversation")
         fun bound() {
@@ -869,7 +1118,20 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                 wire.put("execution_generation", generation)
             } catch (e: IllegalArgumentException) { throw NativeTurnNotSent("Native turn generation is unavailable", e) }
         }
-        return rpcOn(mine, method, wire, sendGuard = ::bound)
+        if (inline != null) return attachFile(mine, lease.binding, method, wire, inline, ::bound)
+        if (TEXT_FILE_FIELDS[method]?.let(wire::has) != true) return rpcOn(mine, method, wire, sendGuard = ::bound)
+        // A file in one text frame on the chat's own socket (a plugin without file sockets, or a gateway without the plugin): when its answer is lost
+        // (the socket closed under it, as Hermes' dashboard closes one whose pong waits too long behind the file), the file is not sent and a queued
+        // message with it waits for the person, so a link that cannot carry it never takes the chat's socket down again and again (CHAT-121 follow-up 9).
+        return try { rpcOn(mine, method, wire, sendGuard = ::bound) }
+        catch (e: IOException) { if (e !is ApiFailure && e !is NativeTurnNotSent && e.message == NATIVE_OUTCOME_UNKNOWN) throw AttachmentStalled(e) else throw e }
+    }
+
+    /** Whether this connection's chats have session authority, and what one file frame may carry on it (the picker's limit). */
+    suspend fun attachmentLimits(): Pair<Boolean, AttachmentLimits> {
+        val mine = connect()
+        val authority = withTimeoutOrNull(4000) { mine.sessionAuthority.await() } ?: throw IOException("Native gateway readiness is unavailable")
+        return authority to if (mine.canonical) mine.attachLimits else AttachmentLimits()
     }
 
     private suspend fun reconciliationHistory(mine: Connection, snapshot: Cursor): JSONObject {

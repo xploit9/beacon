@@ -1,0 +1,154 @@
+{
+  "backend": "direct",
+  "profile": "default",
+  "selected_session_id": "stored-synthetic-0001",
+  "system_instruction": "Synthetic v2 instruction text kept for 1.2.0 apps.",
+  "context_summary": "Native memory (reference data):\nSynthetic memory line.",
+  "tool_approval_choice": true,
+  "tool_catalogue": "Hermes: session search\nnotes (2): search, create",
+  "greeting": "Good afternoon, Maya. What can I do for you?",
+  "owner_first_name": "Maya",
+  "callback": {},
+  "zone": "Asia/Dubai",
+  "context": {
+    "history": [
+      {
+        "role": "user",
+        "content": "Synthetic earlier message."
+      }
+    ],
+    "personality": "Warm and brief.",
+    "memory": "Synthetic memory line.",
+    "language": "English"
+  },
+  "configured_memory_provider": "builtin",
+  "capabilities": {
+    "web_search": true,
+    "memory_recall": true,
+    "skills": true,
+    "profile_context": true
+  },
+  "capability_details": {
+    "web_search": {
+      "available": true
+    },
+    "memory_recall": {
+      "available": true,
+      "provider": "builtin",
+      "reason": null
+    }
+  },
+  "call_contract": 3,
+  "call_capabilities": {
+    "tool_declarations": true,
+    "invoke_wait": true,
+    "call_updates": true,
+    "handover": true,
+    "call_diagnostics": true,
+    "tool_receipt_cause": true
+  },
+  "tool_declarations": [
+    {
+      "name": "session_search",
+      "description": "Search past conversations of this profile.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Words to look for."
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 20
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "read_only": true,
+      "tool_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+    },
+    {
+      "name": "notes_search",
+      "description": "Find notes by words or tag.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "priority": {
+            "type": "integer",
+            "description": "Allowed values: 1, 2, 3."
+          },
+          "filter": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "done"
+                ]
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "tag": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 5
+          }
+        },
+        "required": [
+          "query"
+        ]
+      },
+      "read_only": true,
+      "tool_id": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+    },
+    {
+      "name": "t_hermes_notes_create",
+      "description": "Create a note.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "maxLength": 120
+          },
+          "body": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title"
+        ]
+      },
+      "read_only": false,
+      "tool_id": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+    }
+  ],
+  "tool_declarations_complete": false,
+  "tool_declarations_omitted": 2,
+  "tool_declarations_digest": "ffd94903819ccac6",
+  "persona": "Warm and brief.",
+  "preferred_language": "English",
+  "local_time": "Saturday 14 November 2026, 13:05 (Asia/Dubai)",
+  "reason": "",
+  "owner_display_name": "Maya Example"
+}

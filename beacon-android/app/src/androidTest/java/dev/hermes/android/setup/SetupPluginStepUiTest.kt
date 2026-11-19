@@ -118,11 +118,13 @@ class SetupPluginStepUiTest {
 
     private fun direction(language: String) = if (language == "ar") LayoutDirection.Rtl else LayoutDirection.Ltr
 
-    private fun show(install: PluginInstallController?, language: String = "en", dark: Boolean = true, fontScale: Float = 1f, widthDp: Int? = null) {
+    /** [unfoldedDp]: the window drawn this many dp wide (the unfolded phone, about 720-900 dp) by lowering the density, as the agent-phone tour does. */
+    private fun show(install: PluginInstallController?, language: String = "en", dark: Boolean = true, fontScale: Float = 1f, widthDp: Int? = null, unfoldedDp: Int? = null) {
         compose.setContent {
             val density = LocalDensity.current
+            val px = androidx.compose.ui.platform.LocalContext.current.resources.displayMetrics.widthPixels
             CompositionLocalProvider(
-                LocalDensity provides Density(density.density, fontScale),
+                LocalDensity provides Density(if (unfoldedDp == null) density.density else px.toFloat() / unfoldedDp, fontScale),
                 // The Arabic pages run in a real right-to-left layout, as the app does when the phone's language is Arabic.
                 LocalLayoutDirection provides direction(language),
                 LocalUriHandler provides object : UriHandler { override fun openUri(uri: String) { opened += uri } },
@@ -388,10 +390,12 @@ class SetupPluginStepUiTest {
     private var pageCase by mutableStateOf(tour[1])
 
     /** Draws the page itself in the given look, so each state can be set directly. [widthDp] null means the screen's own width. */
-    private fun showPage(language: String, dark: Boolean, fontScale: Float, widthDp: Int?) {
+    private fun showPage(language: String, dark: Boolean, fontScale: Float, widthDp: Int?, unfoldedDp: Int? = null) {
         compose.setContent {
             val density = LocalDensity.current
-            CompositionLocalProvider(LocalDensity provides Density(density.density, fontScale), LocalLayoutDirection provides direction(language)) {
+            val px = androidx.compose.ui.platform.LocalContext.current.resources.displayMetrics.widthPixels
+            CompositionLocalProvider(LocalDensity provides Density(if (unfoldedDp == null) density.density else px.toFloat() / unfoldedDp, fontScale),
+                LocalLayoutDirection provides direction(language)) {
                 Box(if (widthDp == null) Modifier else Modifier.width(widthDp.dp)) {
                     NativeLocalization(language) { BeaconTheme(dark = dark) {
                         SetupPluginStepPage(
@@ -422,12 +426,13 @@ class SetupPluginStepUiTest {
         }
     }
 
-    private fun tourLook(variant: String, language: String, dark: Boolean, fontScale: Float, widthDp: Int? = null) {
-        showPage(language, dark, fontScale, widthDp)
+    private fun tourLook(variant: String, language: String, dark: Boolean, fontScale: Float, widthDp: Int? = null, unfoldedDp: Int? = null) {
+        showPage(language, dark, fontScale, widthDp, unfoldedDp)
         for (case in tour + fitOnly) {
             compose.runOnUiThread { pageCase = case }
             compose.waitForIdle()
-            checkPage("$variant ${case.name}", widthDp, rtl = language == "ar")
+            // Bounds are read in the look's own (lowered) density, so the unfolded look is measured against its own width.
+            checkPage("$variant ${case.name}", widthDp ?: unfoldedDp, rtl = language == "ar")
             if (case in tour) shot("${case.name}-$variant")
         }
     }
@@ -449,15 +454,15 @@ class SetupPluginStepUiTest {
         )
     }
 
-    private fun wizardLook(variant: String, language: String, dark: Boolean, fontScale: Float) {
+    private fun wizardLook(variant: String, language: String, dark: Boolean, fontScale: Float, unfoldedDp: Int? = null) {
         state = wizardCases().first().app
-        show(null, language, dark, fontScale)
+        show(null, language, dark, fontScale, unfoldedDp = unfoldedDp)
         for (case in wizardCases()) {
             compose.runOnUiThread { state = case.app }
             // The fade between pages ends with one header on screen.
             compose.waitUntil(10_000) { compose.onAllNodesWithTag("setup-beacon-glow").fetchSemanticsNodes().size == 1 }
             compose.waitForIdle()
-            checkPage("$variant ${case.name}", null, rtl = language == "ar")
+            checkPage("$variant ${case.name}", unfoldedDp, rtl = language == "ar")
             // Pages that can be closed show the X; the last page and the signed-out first page do not.
             if (case.name != "done") compose.onNodeWithTag("setup-close").assertIsDisplayed()
             // A page in the middle of a request keeps the X, but waits to be tapped.
@@ -471,6 +476,13 @@ class SetupPluginStepUiTest {
     @Test fun theOtherWizardPagesKeepTheirLayoutInArabicDarkInARealRightToLeftLayout() = wizardLook("ar-dark", "ar", dark = true, fontScale = 1f)
 
     @Test fun theOtherWizardPagesKeepTheirLayoutInLightAtLargeText() = wizardLook("large-light", "en", dark = false, fontScale = 1.3f)
+
+    // The shared SetupShell's wide layout (AGENTUX-121 P3-6): the header starts at the top beside the card on the unfolded phone.
+    @Test fun theOtherWizardPagesOnTheUnfoldedPhoneInLight() = wizardLook("unfolded-light", "en", dark = false, fontScale = 1f, unfoldedDp = 900)
+
+    @Test fun theOtherWizardPagesOnTheUnfoldedPhoneInArabicDark() = wizardLook("unfolded-ar-dark", "ar", dark = true, fontScale = 1.3f, unfoldedDp = 720)
+
+    @Test fun everyPageFitsAndIsShotOnTheUnfoldedPhone() = tourLook("unfolded-dark", "en", dark = true, fontScale = 1f, unfoldedDp = 900)
 
     @Test fun everyPageFitsAndIsShotInDark() = tourLook("dark", "en", dark = true, fontScale = 1f)
 

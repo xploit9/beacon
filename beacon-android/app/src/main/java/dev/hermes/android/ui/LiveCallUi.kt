@@ -203,8 +203,8 @@ internal data class CallUiActions(
     }
 }
 
-@Composable internal fun CallToolChip(receipt: CallToolReceipt, modifier: Modifier = Modifier) {
-    val activity = receipt.chipLabel() ?: return
+@Composable internal fun CallToolChip(receipt: CallToolReceipt, modifier: Modifier = Modifier, unreachable: Boolean = false) {
+    val activity = receipt.chipText(unreachable) ?: return
     Surface(
         modifier.widthIn(max = 620.dp).fillMaxWidth().testTag("beacon-call-tool-chip"),
         shape = RoundedCornerShape(18.dp),
@@ -214,7 +214,8 @@ internal data class CallUiActions(
         // The one place the call screen names the tool in use; the header says only the state.
         Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Icon(Icons.Rounded.Build, null, tint = CallGoldBright)
-            Text(receipt.activityTemplate()?.let { uiText(it).replace("{0}", receipt.activitySubject()) } ?: uiText(activity), Modifier.testTag("beacon-call-tool-status"), style = MaterialTheme.typography.labelLarge)
+            Text(receipt.activityTemplate()?.takeIf { activity != HERMES_UNREACHABLE_LINE }?.let { uiText(it).replace("{0}", receipt.activitySubject()) } ?: uiText(activity),
+                Modifier.testTag("beacon-call-tool-status"), style = MaterialTheme.typography.labelLarge)
         }
     }
 }
@@ -465,7 +466,7 @@ internal fun shouldAskCallBubble(wasActive: Boolean, bubbleWasMissing: Boolean, 
     val tool = call.toolReceipts.lastOrNull { it.chipLabel() != null }
     if (tool == null && !call.screenSharing && !call.screenBusy && !call.cameraBusy && call.error.isBlank()) return
     Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        tool?.let { CallToolChip(it) }
+        tool?.let { CallToolChip(it, unreachable = call.hermesUnreachable) }
         if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
         if (call.screenBusy) Text(uiText("Starting screen share…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
         if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
