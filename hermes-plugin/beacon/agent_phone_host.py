@@ -77,6 +77,7 @@ class Folder:
         self.avd_dir = self.avd_home / f'{AVD_NAME}.avd'
         self.run = self.root / 'run'
         self.tmp = self.root / 'tmp'
+        self.frames = self.tmp / 'AndroidEmulator'
         self.state = self.run / 'state.json'
         self.keeper_conf = self.run / 'keeper.json'
         self.keeper_py = self.root / 'keeper.py'
@@ -575,12 +576,18 @@ class PhoneHost:
     def cleanup_frames(self, force=False):
         """Deletes leftover live-view frame files (§4.5). On adopt, only when no view may hold one (POSIX would unlink an open
         mapping; Windows refuses to delete a mapped file, which this tolerates)."""
-        if not force and self.view_open is not None and self.view_open():
-            return 0
         if not force and self.view_open is None and os.name != 'nt':
             return 0
+        # Snapshot before checking the lease so a new view's unique file cannot enter this sweep.
+        candidates = list(self.folder.run.glob('frames-*.bin'))
+        if self.folder.frames.is_dir():
+            # A partial installation may lack the shared selector. Leave the emulator's own directory alone in that case.
+            with contextlib.suppress(ImportError, OSError, AttributeError):
+                candidates.extend(_sibling('agent_phone_keeper').mmap_frame_files(self.folder.root, self.state()))
+        if not force and self.view_open is not None and self.view_open():
+            return 0
         removed = 0
-        for frame in self.folder.run.glob('frames-*.bin'):
+        for frame in candidates:
             try:
                 frame.unlink()
                 removed += 1

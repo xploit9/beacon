@@ -2,16 +2,20 @@ package dev.hermes.android.agentphone
 
 import dev.hermes.android.data.AgentPhoneAction
 import dev.hermes.android.data.AgentPhoneApi
+import dev.hermes.android.data.AgentPhoneDriverState
 import dev.hermes.android.data.AgentPhoneResult
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.ClientAgentPhoneEndpoint
+import dev.hermes.android.data.NativeBearerRecord
+import dev.hermes.android.data.valueOrNull
 import kotlinx.coroutines.runBlocking
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -21,17 +25,18 @@ import org.junit.Test
  * plugin would): the profile query, the methods and bodies, and the three answers whose refusal is a body with its own line.
  */
 class AgentPhoneEndpointTest {
-    private class Seen(val method: String, val path: String, val query: Map<String, String>, val body: String)
+    private class Seen(val method: String, val path: String, val query: Map<String, String>, val body: String, val authorization: String?)
 
     private fun client(seen: MutableList<Seen>, answer: (String, String) -> Pair<Int, String>): BeaconClient {
-        val auth = AuthContext("https://hermes.example", listOf("__Host-hermes_session_rt=fixture; Path=/; Secure; HttpOnly"), "alice", "default",
-            backend = "hermes-dashboard", nativeProvider = "basic")
+        val origin = "https://hermes.example"
+        val bearer = NativeBearerRecord("fixture-access", "fixture-refresh", 4_000_000_000L, origin, "alice", "default", "basic")
+        val auth = AuthContext(origin, emptyList(), "alice", "default", backend = "hermes-dashboard", nativeProvider = "basic", bearer = bearer)
         return BeaconClient(auth, null, persistContext = false) { builder ->
             builder.addInterceptor { chain ->
                 val request = chain.request()
                 val body = request.body?.let { Buffer().also(it::writeTo).readUtf8() }.orEmpty()
                 val url = request.url
-                seen += Seen(request.method, url.encodedPath, url.queryParameterNames.associateWith { url.queryParameter(it).orEmpty() }, body)
+                seen += Seen(request.method, url.encodedPath, url.queryParameterNames.associateWith { url.queryParameter(it).orEmpty() }, body, request.header("Authorization"))
                 val (code, text) = answer(request.method, url.encodedPath.removePrefix("/api/plugins/beacon/mobile/agent-phone"))
                 Response.Builder().request(request).protocol(Protocol.HTTP_1_1).code(code).message("Fixture")
                     .body(text.toResponseBody("application/json".toMediaType())).build()
@@ -75,6 +80,36 @@ class AgentPhoneEndpointTest {
             assertEquals(409, refused.status)
             assertEquals("Turn on Hermes sign-in first.", refused.line.template)
             assertEquals(AgentPhoneAction.How, refused.line.action)
+        } finally { client.closeNative() }
+    }
+
+    @Test fun phoneTasksUseTheAuthenticatedProfileAndCancelTheReturnedId() = runBlocking {
+        val seen = mutableListOf<Seen>()
+        val running = """{"id":"server-id","state":"running","steps":1}"""
+        val client = client(seen) { method, route ->
+            when ("$method $route") {
+                "GET " -> 200 to """{"control_driver":"phonedriver","installed":true,"yours":true,"driver_task":$running}"""
+                "POST /task" -> 202 to running
+                "POST /task/server-id/cancel" -> 200 to running.replace("running", "cancelled")
+                else -> 404 to """{"detail":"Not Found"}"""
+            }
+        }
+        try {
+            val api = AgentPhoneApi(ClientAgentPhoneEndpoint(client))
+            val goal = "افتح الإعدادات"
+            val requestId = "1795260000000-12345678-1234-4234-8234-123456789abc"
+            val started = requireNotNull(api.giveTask(requestId, goal).valueOrNull())
+            assertEquals(AgentPhoneDriverState.Running, started.state)
+            assertEquals(started, api.status().valueOrNull()?.first?.driverTask)
+            assertEquals(AgentPhoneDriverState.Cancelled, api.cancelTask(started.id).valueOrNull()?.state)
+            assertEquals(listOf("POST", "GET", "POST"), seen.map { it.method })
+            assertTrue(seen.all { it.query["beacon_profile"] == "default" && it.authorization == "Bearer fixture-access" })
+            assertEquals("/api/plugins/beacon/mobile/agent-phone/task", seen[0].path)
+            assertEquals("/api/plugins/beacon/mobile/agent-phone/task/server-id/cancel", seen[2].path)
+            val request = JSONObject(seen[0].body)
+            assertEquals(setOf("request_id", "task"), request.keys().asSequence().toSet())
+            assertEquals(requestId, request.getString("request_id"))
+            assertEquals(goal, request.getString("task"))
         } finally { client.closeNative() }
     }
 

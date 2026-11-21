@@ -292,7 +292,7 @@ internal fun approvalFace(p: JSONObject): ApprovalFace {
             return ApprovalFace("Confirm card payment", command, "", amount, payment = true, code = false, card = card, site = shop, shop = true, price = price)
         }
         phoneCardFill.matchEntire(command.trim())?.destructured?.let { (card, shop) ->
-            return ApprovalFace("Confirm card payment", command, "", amount, payment = true, code = false, card = card, site = shop, shop = true)
+            return ApprovalFace("The agent wants to fill your saved card.", command, "", amount, payment = true, code = false, card = card, site = shop, shop = true)
         }
         val fill = cardFillCommand.matchEntire(command.trim())
         // https:// is not said to a person; an http:// page or a port stays, because that is what the owner checks before paying.

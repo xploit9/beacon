@@ -20,7 +20,7 @@ class AgentApprovalWordsTest {
 
     /** Everything the dialog, the list and the notifications pass through the catalog. */
     private val words = (AgentApprovalWords + AgentApprovalCardWords + AgentApprovalDialogWords + AgentApprovalNoticeWords + AgentPhoneLogWords +
-        AgentPhoneLogScreenWords + listOf("Pay {0} at {1} with {2}?", "Fill {0} in {1}?")).distinct()
+        AgentPhoneLogScreenWords + listOf("The agent wants to fill your saved card.", "Pay {0} at {1} with {2}?", "Fill {0} in {1}?")).distinct()
 
     /** A word that is honestly the same in some language: German and French say "Code" too. */
     private val sameEverywhere = setOf("Code")

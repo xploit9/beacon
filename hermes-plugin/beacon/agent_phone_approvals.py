@@ -276,7 +276,11 @@ def wait(owner, record_id, seconds=WAIT_SECONDS, sleep=time.sleep):
 def ask(owner, profile, session, kind, payload, bind=None, seconds=WAIT_SECONDS, sleep=time.sleep):
     """create + wait. Returns (answer, record id); RuntimeError when the limits are reached."""
     record_id = create(owner, profile, session, kind, payload, bind)
-    return wait(owner, record_id, seconds, sleep), record_id
+    try:
+        return wait(owner, record_id, seconds, sleep), record_id
+    except Exception:
+        withdraw(owner, record_id)
+        raise
 
 
 def ask_owner_code(owner, profile, session, app, label, note=None, sleep=time.sleep):

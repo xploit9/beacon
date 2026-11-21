@@ -287,6 +287,7 @@ internal fun voiceKeyPage(
     // Anything else that went wrong (no key typed, a save that failed), in one short line.
     var status by remember(provider) { mutableStateOf("") }
     var confirmRemove by remember(provider) { mutableStateOf(false) }
+    var removing by remember(provider) { mutableStateOf(false) }
     // Words the callbacks below show are translated here, where uiText can run.
     val enterKeyFirst = uiText("Enter an API key first.")
     val keyNotSaved = uiText("That key couldn't be saved. Try again.")
@@ -294,7 +295,13 @@ internal fun voiceKeyPage(
     val keyNotRemoved = uiText("Couldn't remove the key.")
     LaunchedEffect(provider) { saved = withContext(Dispatchers.IO) { store.maskedKey(provider) } }
     // A first key typed here is saved (encrypted) when the page is left, unless the provider just refused it. A saved key is only replaced by Test key, so a stray paste cannot overwrite a working one.
-    DisposableEffect(provider) { onDispose { if (saved == null && draft.isNotBlank() && !rejected) runCatching { store.saveKey(provider, draft) } } }
+    DisposableEffect(provider) {
+        onDispose {
+            if (saved == null && draft.isNotBlank() && !rejected) runCatching {
+                if (!store.hasKey(provider)) store.saveKey(provider, draft)
+            }
+        }
+    }
     val canTest = !testing && (draft.isNotEmpty() || saved != null)
 
     fun paste() {
@@ -378,16 +385,23 @@ internal fun voiceKeyPage(
                 uiText("Calls with {0} stop until you add a key.").replace("{0}", info.short),
                 uiText("Remove key"),
                 onConfirm = {
-                    confirmRemove = false
-                    scope.launch {
-                        if (runCatchingCancellable { withContext(Dispatchers.IO) { store.removeKey(provider) } }.isSuccess) {
-                            VoiceCatalogCache.clear(provider)
-                            saved = null
-                            onRemoved()
-                        } else { status = keyNotRemoved }
+                    if (!removing) {
+                        removing = true
+                        // Leaving the page after removal must not save a replacement draft as a first key.
+                        draft = ""
+                        scope.launch {
+                            val removed = runCatchingCancellable { withContext(Dispatchers.IO) { store.removeKey(provider) } }.isSuccess
+                            removing = false
+                            confirmRemove = false
+                            if (removed) {
+                                VoiceCatalogCache.clear(provider)
+                                saved = null
+                                onRemoved()
+                            } else { status = keyNotRemoved }
+                        }
                     }
                 },
-                onDismiss = { confirmRemove = false },
+                onDismiss = { if (!removing) confirmRemove = false },
                 confirmTestTag = "voice-key-remove-confirm",
             )
         },
@@ -403,7 +417,7 @@ internal fun voiceKeyPage(
 /**
  * Page 3: Voice, Personality and Model as option cards with the current choice marked. A tap saves at once and the lists never
  * reorder (the model chosen when the page opens is listed first). A hero says which provider calls use and whether its key is
- * there; in Settings ([settingsMode]) it also offers Change, and "Add key" when none is saved.
+ * there; in Settings ([settingsMode]) it also offers Change and a way to open the provider's key page.
  */
 @Composable
 internal fun voiceChoicesPage(
@@ -415,7 +429,7 @@ internal fun voiceChoicesPage(
     onContinue: () -> Unit = {},
     onBack: () -> Unit = {},
     onChange: () -> Unit = {},
-    onAddKey: () -> Unit = {},
+    onOpenKey: (String, Boolean) -> Unit = { _, _ -> },
 ): SetupPage {
     val context = LocalContext.current.applicationContext
     val store = remember(context) { VoiceKeyStore(context) }
@@ -454,7 +468,11 @@ internal fun voiceChoicesPage(
     val heroStatus = when (hasKey) { true -> SettingsStatus.Ok; false -> SettingsStatus.Attention; null -> null }
     val heroLine = when { hasKey == null -> ""; hasKey == false -> uiText("Add a key to call"); keyWorks -> uiText("Key works"); else -> uiText("Key saved") }
     val nextCall = uiText("Applies next call")
-    val addKey = SettingsAction(uiText("Add key"), onAddKey, testTag = "voice-add-key")
+    val keyAction = when (hasKey) {
+        true -> SettingsAction(uiText("{0} API key").replace("{0}", info.short), { onOpenKey(provider, true) }, testTag = "voice-manage-key")
+        false -> SettingsAction(uiText("Add key"), { onOpenKey(provider, false) }, testTag = "voice-add-key")
+        null -> null
+    }
     val change = SettingsAction(uiText("Change"), onChange, testTag = "voice-provider-change")
     // The personalities with their words written here, each through uiText.
     val personalities = listOf(
@@ -466,7 +484,7 @@ internal fun voiceChoicesPage(
         content = {
             SettingsStatusHero(heroStatus, info.name, line = heroLine, icon = Icons.Rounded.GraphicEq,
                 meta = if (settingsMode && callActive) ({ SettingsStatusPill(SettingsStatus.Working, nextCall) }) else null,
-                primary = if (settingsMode && hasKey == false) addKey else null,
+                primary = if (settingsMode) keyAction else null,
                 secondary = if (settingsMode) change else null,
                 lineTestTag = "voice-provider-summary", testTag = "voice-hero")
             // The lists render at once from the built-in choices; only a confirmed missing key hides them (the key read can be slow).

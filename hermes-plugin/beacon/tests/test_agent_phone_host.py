@@ -125,12 +125,22 @@ def test_cleanup_deletes_only_this_phones_dead_discovery_files(folder, tmp_path)
 
 
 def test_frame_files_go_on_start_and_on_adopt_only_without_a_view(folder):
-    frame = folder.run / 'frames-5641.bin'
-    frame.write_bytes(b'\0' * 16)
-    assert host.PhoneHost(folder, view_open=lambda: True).cleanup_frames() == 0 and frame.exists()
-    assert host.PhoneHost(folder, view_open=lambda: False).cleanup_frames() == 1 and not frame.exists()
-    frame.write_bytes(b'\0')
-    assert host.PhoneHost(folder, view_open=lambda: True).cleanup_frames(force=True) == 1
+    paths = [folder.run / 'frames-5641.bin', folder.frames / 'frames-5640-0123abcd.bin']
+    other = folder.root.parent / 'another-phone' / 'tmp' / 'AndroidEmulator' / paths[0].name
+    other.parent.mkdir(parents=True)
+    other.touch()
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'frame')
+        (path.parent / 'keep.bin').touch()
+    assert host.PhoneHost(folder, view_open=lambda: True).cleanup_frames() == 0 and all(p.exists() for p in paths)
+    if os.name != 'nt':
+        assert host.PhoneHost(folder).cleanup_frames() == 0 and all(p.exists() for p in paths)
+    assert host.PhoneHost(folder, view_open=lambda: False).cleanup_frames() == 2 and not any(p.exists() for p in paths)
+    for path in paths:
+        path.touch()
+    assert host.PhoneHost(folder, view_open=lambda: True).cleanup_frames(force=True) == 2
+    assert other.exists() and all((p.parent / 'keep.bin').exists() for p in paths)
 
 
 def test_parse_focus_and_the_close_button():
@@ -730,3 +740,68 @@ def test_fu11_new_session_replaces_the_id_atomically(folder):
     first = (folder.run / 'session').read_text(encoding='utf-8')
     h.new_session()
     assert (folder.run / 'session').read_text(encoding='utf-8') != first and not (folder.run / 'session.tmp').exists()
+
+@pytest.mark.parametrize('standalone', [False, True], ids=['host', 'installed-keeper'])
+def test_shared_temp_cleanup_accepts_only_production_writer_names(folder, monkeypatch, standalone):
+    # Exercise actual mapped-file creation and release, then replay those names as synthetic crash leftovers.
+    stream = host._sibling('agent_phone_stream')
+    install = host._sibling('agent_phone_install')
+    custom_port = 41230
+    state = {'ports': {'console': custom_port}}
+    host.write_json(folder.state, state)
+    tags = [*install.CONSOLE_PORTS, custom_port, 'phone']
+    monkeypatch.setattr(stream.secrets, 'token_hex', lambda size: (b'\x93' * size).hex())
+    names = set()
+
+    class IdleClient:
+        def screenshots(self, *args, **kwargs):
+            return iter(())
+        def close(self):
+            pass
+        cancel = close
+
+    for tag in tags:
+        frames = stream.MmapFrames(IdleClient, folder.frames, tag, width=2, height=2).start()
+        try:
+            names.add(frames.path.name)
+        finally:
+            assert frames.stop()
+    assert len(names) == len(tags)
+    for name in names:
+        (folder.frames / name).touch()
+    (folder.run / 'frames-legacy.bin').touch()
+    other = folder.root.parent / 'neighbor' / 'tmp' / 'AndroidEmulator'
+    other.mkdir(parents=True)
+    (other / next(iter(names))).touch()
+    keep = ['frames-camera-0123abcd.bin', 'frames-5640-0123abc.bin', 'frames-5640-0123abcde.bin',
+            'frames-5640-0123ABCD.bin', 'frames-5640-0123abcg.bin', 'frames-05640-0123abcd.bin',
+            'frames-5641-0123abcd.bin', 'frames-99999-0123abcd.bin', 'frames-41232-0123abcd.bin',
+            'Frames-5640-abcdef12.bin', 'frames-5640-abcdef12.BIN', 'frames-5640-abcdef12.bin.bak']
+    for name in keep:
+        (folder.frames / name).write_bytes(b'keep')
+    (folder.frames / 'frames-5640-12121212.bin').mkdir()  # same spelling, but not a file made by the writer
+
+    # Record cleanup selection without deleting any fixture. Verify both deployment paths against the real writer.
+    selected = []
+    monkeypatch.setattr(Path, 'unlink', lambda path, *args, **kwargs: selected.append(path))
+    phone = host.PhoneHost(folder, view_open=lambda: False)
+    if standalone:
+        phone.install_keeper()
+        spec = importlib.util.spec_from_file_location('frame_test_keeper', folder.keeper_py)
+        installed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installed)
+        monkeypatch.setattr(installed, '_end_processes', lambda _: None)
+        installed.stop(folder.root, {}, state, 'test')
+    else:
+        phone.cleanup_frames()
+    assert set(selected) == {folder.run / 'frames-legacy.bin', *(folder.frames / name for name in names)}
+
+
+def test_shared_frame_cleanup_skips_a_redirected_emulator_directory(folder, monkeypatch):
+    keeper = host._sibling('agent_phone_keeper')
+    folder.frames.mkdir(parents=True)
+    (folder.frames / 'frames-5640-0123abcd.bin').touch()
+    resolve = Path.resolve
+    neighbor = folder.root.parent / 'neighbor'
+    monkeypatch.setattr(Path, 'resolve', lambda path: neighbor if path == folder.frames else resolve(path))
+    assert list(keeper.mmap_frame_files(folder.root, {})) == []

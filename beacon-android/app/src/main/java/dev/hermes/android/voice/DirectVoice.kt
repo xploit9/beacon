@@ -236,7 +236,7 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     private val calls=client.forCall()
     // What each function call was told, and the link state that tells it when Hermes cannot be reached.
     private val link=CallLinkState(clock,::sendToolResponse,::toolWindow,::recovered,::linkLost,later={ ms,block -> scope.launch { delay(ms);block() } },
-        settled=::changeSettled,probed=true)
+        settled=::changeSettled,probed=true,verifyOverlap=::verifyCallReach)
     /** Ends the call when Hermes stays out of reach this long (device round 1); a test may shorten it. */
     @Volatile internal var outageLimitMs=CALL_HERMES_OUTAGE_MS
     @Volatile private var outageWatch:Job?=null
@@ -419,6 +419,21 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         catch(error:CancellationException) { currentCoroutineContext().ensureActive();if(keep&&error is TimeoutCancellationException) { contextReady=true;null } else error }
         catch(error:Exception) { if(keep&&error is java.io.IOException&&error !is ApiFailure) { contextReady=true;null } else error }
     },reconnect)
+    /** One short, authenticated read to distinguish a broken stream from a broken call connection. */
+    private fun verifyCallReach(done: (Throwable?) -> Unit) {
+        scope.launch {
+            if (!callOwned()) return@launch
+            val error = try {
+                withTimeoutOrNull(CALL_REQUEST_MARGIN_MS) { calls.nativeRequest("/api/plugins/beacon/mobile/calls/$callId") }
+                    ?: throw CallRequestTimeout()
+                null
+            } catch (e: CancellationException) { throw e }
+            catch (_: ApiFailure) { null } // an HTTP refusal is also a fresh Hermes answer
+            catch (e: Exception) { e }
+            if (callOwned()) done(error)
+        }
+    }
+
     /** Hermes has been out of reach since the link was lost: the call goes on, and ends only after [outageLimitMs]. */
     private fun linkLost() {
         if(stopped) return
@@ -1192,9 +1207,26 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
                 build={ group.filter { it.id !in cancelledFunctions }.takeIf { it.isNotEmpty() }?.let(::frame) }))
         }
     }
+    private val reconcilingReceipts = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /** Until Hermes has a terminal receipt, read the original request ID. Only the invoke path submits work. */
+    private fun reconcileReceipt(requestId: String) {
+        if (gatewayReceipts.functionId(requestId) == null || !reconcilingReceipts.add(requestId)) return
+        scope.launch {
+            try {
+                var attempt = 0
+                while (callOwned() && !gatewayReceipts.settled(requestId)) {
+                    link.retryDelay(attempt++)
+                    if (callOwned() && !gatewayReceipts.settled(requestId)) readReceipt(requestId)
+                }
+            } finally { reconcilingReceipts.remove(requestId) }
+        }
+    }
+
     /** The tool window and the call's timeline hear the phone's own states; an approval card stays until Hermes decides it. */
     private fun toolWindow(id:String,name:String,result:JSONObject) {
         val status=result.optString("status");val requestId=result.optString("request_id")
+        if (status == "lost_result") reconcileReceipt(requestId)
         // The card and the tool chip say "Can't reach Hermes" until Hermes answers again (recovered).
         if(result.optString("state_source")=="phone"&&status in setOf("hermes_unreachable","lost_result")) event(JSONObject().put("type","hermes_link").put("reachable",link.link!=Link.LOST))
         if(result.optString("state_source")!="phone"||!requestId.matches(Regex("[A-Za-z0-9_-]{1,160}"))) return
@@ -1242,7 +1274,8 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
     /** What a receipt means for the function waiting on it: a final result, an approval to wait for, or still running. */
     private fun deliverReceipt(id:String,name:String,receipt:JSONObject) {
         val status=receipt.optString("status")
-        link.ran(id,if(receipt.has("ran_on_hermes")&&!receipt.isNull("ran_on_hermes")) receipt.optBoolean("ran_on_hermes") else status!="needs_approval")
+        if (!receipt.isNull("ran_on_hermes")) link.ran(id, receipt.getBoolean("ran_on_hermes"))
+        else if (status != "uncertain") link.ran(id, status != "needs_approval")
         when(status) {
             "needs_approval" -> link.state(id,"needs_approval",null,receipt)
             // Past the notice it is the same "still running" the owner heard (CallLinkState), not news again.
@@ -1345,7 +1378,13 @@ internal class DirectVoice(private val client:BeaconClient,callId:String,private
         if(error is java.io.IOException&&error !is ApiFailure) {
             // Only a request that may not be sent again gets here: after the claim, unless it never left the phone, its outcome is unknown.
             if(!claimed||dev.hermes.android.data.requestNeverSent(error)) { link.ran(id,false);link.failed(id,if(error is java.net.SocketTimeoutException) "no_response" else "connection_lost") }
-            else link.failed(id,"outcome_unknown",status="uncertain")
+            else {
+                val requestId = java.util.UUID.nameUUIDFromBytes((callId+":"+id).toByteArray(Charsets.UTF_8)).toString()
+                if (gatewayReceipts.functionId(requestId) == id) {
+                    link.state(id, "uncertain", "outcome_unknown")
+                    reconcileReceipt(requestId)
+                } else link.failed(id,"outcome_unknown",status="uncertain")
+            }
             return
         }
         // So did nothing when Hermes refused it (4xx) or was updating; a server error after the claim leaves it as known.

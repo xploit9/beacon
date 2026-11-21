@@ -70,8 +70,8 @@ class DirectGatewayTest {
         assertThrows(IllegalArgumentException::class.java) { ledger.record("request",tampered) }
         assertThrows(IllegalArgumentException::class.java) { ledger.record("request",receipt(requestId="foreign")) }
     }
-    @Test fun uncertainRequestPollsOriginalIdentityAndNeverReservesAgain() {
-        val ledger=registered();ledger.record("request",receipt("uncertain"))
+    @Test fun localUnconfirmedRequestPollsUntilAnAuthoritativeReceiptSettlesIt() {
+        val ledger=registered()
         assertEquals(listOf("request"),ledger.pending())
         assertEquals("function-id",ledger.functionId("request"))
         assertThrows(IllegalArgumentException::class.java) { ledger.reserve("request","new-function",toolId,JSONObject()) }
@@ -156,7 +156,8 @@ class DirectGatewayTest {
             assertEquals("already_requested",duplicate.getString("status"))
             assertEquals("request",duplicate.getString("request_id"))
             assertEquals(status,duplicate.getString("current_status"))
-            assertEquals(listOf("request"),ledger.pending())
+            assertEquals(if (status == "uncertain") emptyList() else listOf("request"), ledger.pending())
+            assertEquals(status == "uncertain", ledger.settled("request"))
             assertNull(ledger.receipt("duplicate"))
             assertEquals("function-id",ledger.functionId("request"))
             val response=GeminiWire.tool("second-function","invoke_tool",duplicate).getJSONObject("toolResponse").getJSONArray("functionResponses").getJSONObject(0)

@@ -22,17 +22,22 @@ import androidx.compose.ui.semantics.SemanticsActions
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.SemanticsNodeInteractionsProvider
 import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotDisplayed
 import androidx.compose.ui.test.captureToImage
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.performScrollToIndex
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
+import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.BeaconTheme
 import dev.hermes.android.data.AgentPhoneActivity
@@ -44,6 +49,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+import org.junit.runner.RunWith
 import java.io.File
 import java.time.LocalDate
 import java.time.ZoneId
@@ -56,6 +62,7 @@ import java.time.ZonedDateTime
  * each is saved as a PNG for the report. The real dialog is FLAG_SECURE (its own screenshot is black, AgentApprovalDeviceTest), so
  * these are drawn in a plain test window. Synthetic data only: example.com, made-up shops, no real card.
  */
+@RunWith(AndroidJUnit4::class)
 class AgentApprovalShotsTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 
@@ -228,11 +235,46 @@ class AgentApprovalShotsTest {
             shot("$variant-$name")
             check("$variant/$name")
         }
-        // A done notification opens the list at its own row.
+        captureNoticeRow(variant)
+    }
+
+    private fun captureNoticeRow(variant: String) {
         compose.runOnUiThread { highlight = 8; showList = LogState(rows, loading = false) }
         compose.waitForIdle()
+        compose.assertActivityRowFullyVisible(8)
         shot("$variant-35-list-at-row")
         check("$variant/35-list-at-row")
+    }
+
+    @Test fun activityNoticeAtStandardText() {
+        show("en", dark = false, fontScale = 1f, widthDp = 411, heightDp = 891)
+        compose.runOnUiThread { showList = LogState(rows, loading = false) }
+        compose.onNodeWithTag("agent-phone-log-summary").assertIsDisplayed()
+        captureNoticeRow("light")
+    }
+
+    @Test fun activityNoticeAtTwiceTextOnANarrowPhone() {
+        show("en", dark = false, fontScale = 2f, widthDp = 360, heightDp = 760)
+        captureNoticeRow("large2-narrow")
+    }
+
+    @Test fun lateActivityNoticeRevealsTheRowOnce() {
+        show("en", dark = false, fontScale = 2f, widthDp = 360, heightDp = 760)
+        val cached = (40L downTo 13L).map { rows.first().copy(seq = it, label = "Step $it", approved = false) }
+        val target = compose.onNodeWithTag("agent-phone-log-row:8")
+        compose.runOnUiThread { highlight = 8; showList = LogState(cached) }
+        compose.onNodeWithTag("agent-phone-log-summary").assertIsDisplayed()
+        target.assertDoesNotExist()
+
+        compose.runOnUiThread { showList = LogState(cached + rows, loading = false) }
+        compose.assertActivityRowFullyVisible(8)
+
+        // A refresh with a new leading day must respect a scroll back to the summary.
+        compose.onNode(activityViewport).performScrollToIndex(0)
+        val tomorrow = rows.first().copy(seq = 41, atMillis = at(18, 9, 0))
+        compose.runOnUiThread { showList = LogState(listOf(tomorrow) + cached + rows, loading = false) }
+        compose.onNodeWithTag("agent-phone-log-summary").assertIsDisplayed()
+        target.assertIsNotDisplayed()
     }
 
     @Test fun everyStateInDark() = tour("dark")
@@ -268,4 +310,18 @@ class AgentApprovalShotsTest {
         // Whose phone it is, and how many questions wait, in one line under the heading.
         assertEquals("Maya's phone · 1 of 3", compose.onAllNodesWithTag("agent-approval-count").fetchSemanticsNodes().single().config[SemanticsProperties.Text].joinToString { it.text })
     }
+}
+
+private val activityViewport = SemanticsMatcher.keyIsDefined(SemanticsProperties.VerticalScrollAxisRange)
+
+internal fun SemanticsNodeInteractionsProvider.assertActivityRowFullyVisible(seq: Long) {
+    val viewport = onNode(activityViewport).getUnclippedBoundsInRoot()
+    val row = onNodeWithTag("agent-phone-log-row:$seq")
+    val bounds = row.getUnclippedBoundsInRoot()
+    val rounding = 0.5.dp
+    assertTrue("Activity row $seq has bounds $bounds inside the scroll viewport $viewport",
+        bounds.right > bounds.left && bounds.bottom > bounds.top &&
+            bounds.left >= viewport.left - rounding && bounds.right <= viewport.right + rounding &&
+            bounds.top >= viewport.top - rounding && bounds.bottom <= viewport.bottom + rounding)
+    row.assertIsDisplayed()
 }

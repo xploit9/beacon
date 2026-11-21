@@ -1,5 +1,8 @@
 package dev.hermes.android.voice
 
+import java.io.IOException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import dev.hermes.android.data.ApiFailure
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
@@ -14,13 +17,99 @@ import org.junit.Test
 /** Calls contract v3, section 6: a stalled or lost request becomes a state for the model in time, once, and the real result still comes once. */
 class CallLinkStateTest {
     private class Told(val id: String, val result: JSONObject, val at: Long)
-    private class Ledger(scope: TestScope) {
+    private class Ledger(scope: TestScope, verify: (((Throwable?) -> Unit) -> Unit)? = null) {
         val told = mutableListOf<Told>()
         val window = mutableListOf<String>()
         var recovered = 0
         val link = CallLinkState({ scope.testScheduler.currentTime }, { replies, _ -> replies.forEach { told += Told(it.id, it.result, scope.testScheduler.currentTime) } },
-            { _, _, result -> window += result.optString("status") }, { recovered++ })
+            { _, _, result -> window += result.optString("status") }, { recovered++ }, verifyOverlap = verify)
         fun statuses(id: String) = told.filter { it.id == id }.map { it.result.getString("status") }
+    }
+
+    @Test fun stalledVerifierDoesNotOverrideNewerCallTraffic() {
+        var completion: ((Throwable?) -> Unit)? = null
+        var losses = 0
+        val link = CallLinkState({0L}, { _, _ -> }, lostLink = { losses++ },
+            verifyOverlap = { callback -> completion = callback })
+        link.open("memory", "hermes_memory", "memory", hermes = true, retrySafe = true)
+        link.answered()
+        link.connectionFailed(IOException("old stream"), sinceAnswer = 0)
+        assertNotNull(completion)
+        // The verifier stalls, but several other authenticated calls on the same call pool complete.
+        repeat(3) { link.answered() }
+        requireNotNull(completion)(CallRequestTimeout())
+        assertEquals("A single slow verification request announced a call-wide failure", 0, losses)
+        assertEquals(Link.OK, link.link)
+    }
+
+    @Test fun anOlderVerifierCannotRecoverAnOutageAfterANewerGenerationBreaks() {
+        var completion: ((Throwable?) -> Unit)? = null
+        val link = CallLinkState({ 0L }, { _, _ -> }, verifyOverlap = { completion = it })
+        link.answered()
+        link.connectionFailed(IOException("older read"), sinceAnswer = 0)
+        link.answered()
+        link.connectionFailed(IOException("new break"))
+        assertEquals(Link.LOST, link.link)
+        requireNotNull(completion)(null)
+        assertEquals(Link.LOST, link.link)
+    }
+
+    @Test fun aNewAmbiguityAfterNewEvidenceGetsOneNewCheck() {
+        val checks = mutableListOf<(Throwable?) -> Unit>()
+        var losses = 0
+        val link = CallLinkState({ 0L }, { _, _ -> }, lostLink = { losses++ }, verifyOverlap = { checks += it })
+        link.answered()
+        link.connectionFailed(IOException("old read"), sinceAnswer = 0)
+        link.answered()
+        repeat(2) { link.connectionFailed(IOException("overlapping read"), sinceAnswer = 1) }
+        assertEquals(1, checks.size)
+        checks.first()(CallRequestTimeout())
+        assertEquals(Link.OK, link.link)
+        assertEquals(2, checks.size)
+        checks.last()(IOException("new check failed"))
+        assertEquals(Link.LOST, link.link)
+        assertEquals(1, losses)
+    }
+
+    @Test fun resetAfterLastGoodAnswerStartsOutageDetection() = runTest {
+        for (stillUp in listOf(true, false)) {
+            val probes = mutableListOf<(Throwable?) -> Unit>()
+            var outages = 0
+            val link = CallLinkState({ testScheduler.currentTime }, { _, _ -> }, lostLink = { outages++ },
+                probed = true, verifyOverlap = { probes += it })
+            val disconnect = CompletableDeferred<Unit>()
+            val operations = listOf("memory", "updates").map { id ->
+                async(start = CoroutineStart.UNDISPATCHED) {
+                    runCatching { link.track(id) { disconnect.await(); throw IOException("Synthetic stream reset") } }.exceptionOrNull()
+                }
+            }
+            link.track(null) { Unit }
+            disconnect.complete(Unit)
+            for (op in operations) assertTrue(op.await() is IOException)
+            assertEquals(1, probes.size)
+            assertEquals(0, outages)
+            probes.single()(if (stillUp) null else IOException("The fresh call-bound read failed"))
+            assertEquals(if (stillUp) Link.OK else Link.LOST, link.link)
+            assertEquals(if (stillUp) 0 else 1, outages)
+        }
+    }
+
+    @Test fun anOlderBrokenReadDoesNotReportEveryToolOfflineAfterAnotherHermesAnswer() = runTest {
+        val f = Ledger(this) { complete -> complete(null) }
+        f.link.open("memory", "hermes_memory", "lookup", hermes = true, retrySafe = true)
+        val broken = async {
+            runCatching {
+                f.link.track("memory") {
+                    delay(1_000)
+                    throw java.io.IOException("Synthetic stream reset")
+                }
+            }.exceptionOrNull()
+        }
+        delay(500)
+        assertEquals("result", f.link.track(null) { "result" })
+        assertTrue(broken.await() is java.io.IOException)
+        assertEquals(Link.OK, f.link.link)
+        assertFalse("hermes_unreachable" in f.statuses("memory"))
     }
 
     @Test fun anIoFailureLosesTheLinkAndEveryPendingCallHearsItsOwnStateOnce() = runTest {

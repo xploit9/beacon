@@ -34,12 +34,12 @@ class LicensesGapsUiTest {
         // The hero names the license and the Beacon row repeats it, so the hero's own text is the one asked for.
         compose.onNode(hasText("GPL-3.0-only") and hasAnyAncestor(hasTestTag("license-hero"))).assertIsDisplayed()
         compose.onNodeWithTag("license-source").assertIsDisplayed().assertHasClickAction()
-        assertEquals(9, openSourceWorks.size)
+        assertEquals(10, openSourceWorks.size)
         for (work in openSourceWorks) {
             compose.onNodeWithTag("licenses-page").performScrollToNode(hasTestTag("license-work-${work.name}"))
             compose.onNodeWithTag("license-work-${work.name}").assertIsDisplayed().assertTextContains(work.license)
         }
-        assertEquals(12, licenseDocuments.size)
+        assertEquals(13, licenseDocuments.size)
         // The page is a lazy list: a row far down is not composed until the list is scrolled to it.
         for (document in licenseDocuments) {
             compose.onNodeWithTag("licenses-page").performScrollToNode(hasTestTag("license-document-$document"))

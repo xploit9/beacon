@@ -20,6 +20,7 @@ import dev.hermes.android.voice.liveStartCue
 import dev.hermes.android.voice.warmIdleLimitMs
 import dev.hermes.android.voice.warmRenewsWhenIdle
 import kotlinx.coroutines.*
+import kotlinx.coroutines.test.StandardTestDispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Response
@@ -85,9 +86,11 @@ class VoiceConnectTest {
         fun setups() = frames.filter { it.has("setup") }
     }
 
-    private fun client(contextStatus: Int = 200, callContextReads: AtomicInteger = AtomicInteger(), sessionReads: AtomicInteger = AtomicInteger()) =
+    private fun client(contextStatus: Int = 200, callContextReads: AtomicInteger = AtomicInteger(), sessionReads: AtomicInteger = AtomicInteger(),
+        requests: AtomicInteger = AtomicInteger()) =
         BeaconClient(AuthContext("https://voice-fixture.invalid", emptyList(), "owner", "default", backend = "hermes-dashboard"), null) { builder ->
             builder.addInterceptor { chain ->
+                requests.incrementAndGet()
                 val request = chain.request()
                 val path = request.url.encodedPath
                 val (code, body) = when {
@@ -103,9 +106,9 @@ class VoiceConnectTest {
 
     private inner class Call(val provider: Provider = Provider(), admission: Deferred<JSONObject>? = null, prefetched: JSONObject? = null,
         warm: LiveSession? = null, val client: BeaconClient = client(), streamsMicrophone: Boolean = true, now: () -> Long = { 50_400L },
-        microphoneMuted: () -> Boolean = { false },
+        microphoneMuted: () -> Boolean = { false }, dispatcher: CoroutineDispatcher = Dispatchers.Default,
         onEvent: (JSONObject) -> Unit = {}) {
-        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
         val events = CopyOnWriteArrayList<JSONObject>()
         val audio = CopyOnWriteArrayList<ByteArray>()
         val failure = CompletableDeferred<String>()
@@ -143,25 +146,48 @@ class VoiceConnectTest {
         } finally { c.close() }
     }
 
+    @OptIn(ExperimentalCoroutinesApi::class)
     @Test fun mutingAnAdmittedCallReleasesItsHeldGreetingAndUnmuteStillSendsRealFrames() = runBlocking {
         val muted = java.util.concurrent.atomic.AtomicBoolean(false)
-        val c = Call(microphoneMuted = muted::get)
+        val dispatcher = StandardTestDispatcher()
+        val scheduler = dispatcher.scheduler
+        val requests = AtomicInteger()
+        val c = Call(microphoneMuted = muted::get, dispatcher = dispatcher, client = client(requests = requests))
         try {
             c.voice.start()
-            assertTrue(waitFor { c.stage("provider_ready").isNotEmpty() })
+            assertTrue(waitFor { scheduler.runCurrent(); c.stage("provider_ready").isNotEmpty() })
             assertFalse("Unmuted startup still waits for the microphone", "listening" in c.states())
             c.provider.receive(greetingAudio())
             assertTrue(c.audio.isEmpty())
             muted.set(true); c.voice.microphoneModeChanged()
-            assertTrue(waitFor { c.audio.size == 1 })
+            assertEquals(1, c.audio.size)
             assertTrue(c.stage("mic_streaming").isEmpty())
             muted.set(false); c.voice.microphoneModeChanged(); c.microphone()
-            assertTrue(waitFor { c.stage("mic_streaming").size == 1 })
-            assertEquals(1, c.audio.size)
-            c.voice.close()
+            scheduler.runCurrent()
+            assertEquals(1, c.stage("mic_streaming").size)
+            assertEquals(1, c.stage("first_model_audio").size)
+            assertEquals(1, c.stage("playout_started").size)
+            assertEquals(3, c.provider.frames.count { it.optJSONObject("realtimeInput")?.has("audio") == true })
             val count = c.events.size
+            val frames = c.provider.frames.size
+            val reads = requests.get()
+            assertTrue(reads > 0)
+            c.voice.close()
             muted.set(true); c.voice.microphoneModeChanged()
-            assertEquals("A closed call cannot reconnect", count, c.events.size)
+            c.provider.receive(greetingAudio())
+            c.provider.receive(json("goAway" to json()))
+            assertFalse(c.voice.pcm(ByteArray(640)) { true })
+            scheduler.advanceTimeBy(60_000)
+            scheduler.runCurrent()
+            val late = c.events.drop(count).map { it.getString("type") }
+            // Cancelling the provider may report one final playback cut to the closing service.
+            assertTrue("Unexpected callbacks after close: $late", late.isEmpty() || late == listOf("interrupted"))
+            assertEquals(1, c.provider.sockets.size)
+            assertEquals(frames, c.provider.frames.size)
+            assertEquals(reads, requests.get())
+            assertTrue(c.scope.coroutineContext.job.children.none())
+            assertEquals(1, c.audio.size)
+            assertFalse(c.failure.isCompleted)
         } finally { c.close() }
     }
 

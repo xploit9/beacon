@@ -314,8 +314,9 @@ def test_the_probe_reads_androids_own_field_type_measured_on_a_fresh_phone():
 from test_agent_phone_api import PREFIX, phone_api  # noqa: E402,F401  (the fixture)
 from test_mobile import harness  # noqa: E402,F401  (the fixture)
 
-# Refusals no screen shows as a line: the app picks its own words by the status (§11.1).
-STATUS_ONLY = {'Verified native session required', 'Device removed', 'The phone changed', 'Approval not found'}
+# Refusals whose detail is not displayed (§11.1). The task dialog uses its localized fallback if policy changed after opening.
+STATUS_ONLY = {(400, 'Expected request_id and task'), (401, 'Verified native session required'), (403, 'Device removed'),
+               (403, 'The phone changed'), (403, 'Phone use is turned off'), (404, 'Approval not found')}
 
 
 def test_every_refusal_a_screen_can_show_has_its_code():
@@ -333,7 +334,8 @@ def test_every_refusal_a_screen_can_show_has_its_code():
             if line is None:
                 continue  # str(exc), the decision's expired/settled: status-only
             seen.add(line)
-            if not (line.startswith('Invalid ') or line in STATUS_ONLY or api.reason_for(line)):
+            status = getattr(node.args[0], 'value', None)
+            if not ((status == 400 and line.startswith('Invalid ')) or (status, line) in STATUS_ONLY or api.reason_for(line)):
                 uncoded.append(line)
     assert uncoded == []
     for line, code in ((api.UPDATE_LINE, 'phone.needs_update'), (api.NOT_SET_UP, 'phone.none'), (api.OTHER_PROFILE, 'phone.other_profile'),

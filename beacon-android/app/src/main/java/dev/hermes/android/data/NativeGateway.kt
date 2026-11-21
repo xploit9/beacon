@@ -279,7 +279,6 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             var upgradeAsked = System.nanoTime()
             val listener = object : WebSocketListener() {
                 override fun onOpen(ws: WebSocket, response: Response) {
-                    HermesReach.answered(client.auth.origin)
                     mine.socket = ws
                     val advertised = runCatching { synchronized(lifecycle) {
                         if (connection !== mine || mine.failure != null || !current(true) || canonical && System.nanoTime() >= deadline) false
@@ -323,7 +322,16 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                         })
                         if (canonical) mine.ready.complete(Unit)
                     }
-                    if (!frame.has("method") && id.isNotBlank()) mine.pending.remove(id)?.complete(frame)
+                    if (!frame.has("method") && id.isNotBlank()) {
+                        val pending = mine.pending.remove(id)
+                        if (pending != null) {
+                            val error = frame.optJSONObject("error")
+                            val success = frame.has("result") && !frame.has("error")
+                            val refusal = !frame.has("result") && error?.opt("code") is Number && error.opt("message") is String
+                            if (pending.complete(frame) && frame.opt("jsonrpc") == "2.0" && (success || refusal))
+                                gatewayAnswered(mine)
+                        }
+                    }
                     else if (method == "approval" || method == "clarify" || method in SECURE_SERVER_REQUESTS) {
                         if (method in SECURE_SERVER_REQUESTS) {
                             frame.put("_secure_received_ms", System.nanoTime() / 1_000_000)
@@ -340,6 +348,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                     } else {
                         retireCancelledServerRequest(mine, frame)
                         if (!mine.frames.trySend(frame).isSuccess) { terminate(mine, IOException("Native event queue overflow; reconcile history")); ws.cancel() }
+                        else if (method == "event" && !frame.has("id") && frame.opt("jsonrpc") == "2.0" && event?.opt("type") is String && event.getString("type").isNotBlank())
+                            gatewayAnswered(mine)
                     }
                 }
                 override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
@@ -1232,6 +1242,11 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             if (mine?.failure != null) mine.frames.cancel()
         }
     }
+    private fun gatewayAnswered(mine: Connection) {
+        if (mine.ready.isCompleted && connection === mine && mine.failure == null && connectionIdentityCurrent(mine))
+            HermesReach.answered(mine.identity.scope.origin)
+    }
+
     private suspend fun deliver(mine: Connection, frame: JSONObject, callback: suspend (JSONObject) -> Unit) {
         if (isServerRequest(frame)) {
             val secure = frame.optString("method") in SECURE_SERVER_REQUESTS
@@ -1250,6 +1265,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
                     secure && System.nanoTime() / 1_000_000 >= request.expiresAt) false
                 else { request.delivered = true; true }
             }
+            if (shouldDeliver) gatewayAnswered(mine)
             if (shouldDeliver) callback(if (secure) json("jsonrpc" to "2.0", "id" to request.id, "method" to request.method,
                 "params" to request.params.copy().put("secure_method", request.method).put("secure_connection", mine.secureConnection).put("secure_expires_ms", request.expiresAt)) else frame)
             return

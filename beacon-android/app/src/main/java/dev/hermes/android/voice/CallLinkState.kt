@@ -113,6 +113,7 @@ internal class CallLinkState(
     private val settled: (id: String) -> Unit = {},
     /** The call runs a probe while the link is lost (DirectVoice's): a retry then waits for the link's return ([retryDelay]). */
     private val probed: Boolean = false,
+    private val verifyOverlap: (((Throwable?) -> Unit) -> Unit)? = null,
 ) {
     private class Pending(val name: String, val requestId: String, val startedAt: Long, val hermes: Boolean, val retrySafe: Boolean) {
         var ran: Boolean? = null
@@ -157,6 +158,9 @@ internal class CallLinkState(
     /** Approvals the model was told about (by proposal id): a state saying the same approval again goes quietly (device round 3). */
     private val spokenApprovals = HashSet<String>()
     private var timeouts = 0
+    @Volatile private var answers = 0L
+    private var verifyingAt: Long? = null
+    private var lastOverlapAt: Long? = null
     /** What lost the link: the class of the failure (LINK-121: a loss raised inside the phone was recorded only as "network"). */
     private var lostCause: String? = null
     // The model was told (spoken) that Hermes cannot be reached in this outage: every other function's state of it goes quietly
@@ -264,10 +268,59 @@ internal class CallLinkState(
     }
 
     // The link: any answer from Hermes (an error status too) means it is reachable.
-    fun answered() { if (update { (link == Link.LOST).also { timeouts = 0; link = Link.OK; outageSpoken = false; if (it) { returned.complete(Unit); linkBack() } } }) recovered() }
-    fun timedOut() { if (update { ++timeouts >= 2 && lost("no_response", CallRequestTimeout::class.java.simpleName) }) lostLink() }
-    /** A request of the link failed with [cause] (an I/O error: a reset, a refused or closed connection, a failed ping). */
-    fun connectionFailed(cause: Throwable? = null) { if (update { lost("connection_lost", cause?.javaClass?.simpleName) }) lostLink() }
+    private fun markAnswered(): Boolean {
+        val back = link == Link.LOST
+        answers++
+        timeouts = 0
+        link = Link.OK
+        outageSpoken = false
+        if (back) { returned.complete(Unit); linkBack() }
+        return back
+    }
+    fun answered() { if (update { markAnswered() }) recovered() }
+    fun timedOut(sinceAnswer: Long = answers) = failedAttempt(sinceAnswer, true, CallRequestTimeout())
+    fun connectionFailed(cause: Throwable? = null, sinceAnswer: Long = answers) = failedAttempt(sinceAnswer, false, cause)
+
+    private fun failedAttempt(sinceAnswer: Long, timeout: Boolean, cause: Throwable?) {
+        var checkAt: Long? = null
+        val newlyLost = update {
+            when {
+                link == Link.LOST -> false
+                sinceAnswer != answers && verifyOverlap != null -> {
+                    lastOverlapAt = answers
+                    if (verifyingAt == null) { verifyingAt = answers; checkAt = answers }
+                    false
+                }
+                timeout && ++timeouts < 2 -> false
+                else -> lost(if (timeout) "no_response" else "connection_lost", cause?.javaClass?.simpleName)
+            }
+        }
+        if (newlyLost) lostLink()
+        checkAt?.let(::verifyGeneration)
+    }
+
+    private fun verifyGeneration(generation: Long) {
+        verifyOverlap?.invoke { error ->
+            var next: Long? = null
+            val changed = update {
+                if (verifyingAt != generation) return@update false
+                verifyingAt = null
+                val result = when {
+                    answers != generation -> {
+                        // Only ambiguity observed since the newer answer needs a new check.
+                        if (link == Link.OK && lastOverlapAt == answers) { verifyingAt = answers; next = answers }
+                        false
+                    }
+                    error == null -> markAnswered()
+                    else -> lost("connection_lost", error.javaClass.simpleName)
+                }
+                lastOverlapAt = null
+                result
+            }
+            if (changed) { if (error == null) recovered() else lostLink() }
+            next?.let(::verifyGeneration)
+        }
+    }
 
     /** True when this lost the link (it was up). */
     private fun lost(detail: String, causeClass: String?): Boolean {
@@ -298,19 +351,21 @@ internal class CallLinkState(
      * margin, or an I/O failure (a failed HTTP/2 ping fails every request on that connection) feeds the link.
      */
     suspend fun <T> track(id: String?, serverWaitMs: Long = 0, block: suspend () -> T): T {
+        // Overlapping requests can finish out of order. A later answer still proves the other tools can reach Hermes.
+        val sinceAnswer = answers
         try {
             val value = withTimeout(serverWaitMs + CALL_REQUEST_MARGIN_MS) { block() }
             answered()
             return value
         } catch (error: TimeoutCancellationException) {
-            timedOut(); throw CallRequestTimeout()
+            timedOut(sinceAnswer); throw CallRequestTimeout()
         } catch (error: ApiFailure) {
             answered(); throw error
         } catch (error: CancellationException) {
             throw error
         } catch (error: java.io.IOException) {
             if (id != null && requestNeverSent(error)) ran(id, false)
-            connectionFailed(error); throw error
+            connectionFailed(error, sinceAnswer); throw error
         }
     }
 

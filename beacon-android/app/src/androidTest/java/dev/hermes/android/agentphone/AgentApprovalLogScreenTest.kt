@@ -17,6 +17,8 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
+import java.time.LocalDate
+import java.time.ZoneId
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
@@ -30,9 +32,9 @@ class AgentApprovalLogScreenTest {
     @After fun clear() { AgentApprovals.testLink = null }
 
     @Test fun theListReadsTheRowsOpensAtTheNoticesRowAndBackCloses() {
-        val now = System.currentTimeMillis() / 1000
+        val noon = LocalDate.now().atTime(12, 0).atZone(ZoneId.systemDefault()).toEpochSecond()
         val rows = JSONArray((1..30).map { n ->
-            JSONObject().put("seq", n).put("at", now - (30 - n) * 3600).put("app", "Kanto Foods").put("action", "tap")
+            JSONObject().put("seq", n).put("at", noon - (30 - n) * 60).put("app", "Kanto Foods").put("action", "tap")
                 .put("label", "Step $n").put("approved", n == 3).put("outcome", "done")
         }.reversed())
         val routes = CopyOnWriteArrayList<String>()
@@ -44,8 +46,8 @@ class AgentApprovalLogScreenTest {
         })
         // Row 3 is old enough to sit past the first page of 20: the notice's row is still shown, and marked.
         ActivityScenario.launch<AgentPhoneLogActivity>(AgentPhoneLogActivity.intent(app, 3L)).use { scenario ->
-            // The list scrolls itself to the notice's day; the row is there (a lazy list composes only what is on screen).
             compose.waitUntil(15_000) { compose.onAllNodesWithTag("agent-phone-log-row:3").fetchSemanticsNodes().isNotEmpty() }
+            compose.assertActivityRowFullyVisible(3)
             assertEquals(listOf("GET /activity?limit=200"), routes.toList())
             assertTrue(compose.onAllNodesWithTag("agent-phone-log-title").fetchSemanticsNodes().isNotEmpty())
             compose.onNodeWithTag("agent-phone-log-back").performClick()

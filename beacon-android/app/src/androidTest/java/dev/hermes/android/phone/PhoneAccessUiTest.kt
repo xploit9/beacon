@@ -1,12 +1,28 @@
 package dev.hermes.android.phone
 
+import android.Manifest
 import android.content.Context
+import android.content.ContextWrapper
+import android.content.pm.PackageManager
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.assertHasClickAction
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.click
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.assertCountEquals
@@ -22,8 +38,16 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performSemanticsAction
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.hermes.android.BeaconApplication
+import dev.hermes.android.BeaconTheme
+import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.PhoneAccessBody
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -110,12 +134,69 @@ class PhoneAccessUiTest {
 
     @Test fun theCallsRowSaysSavedContactsAreCalledAfterThreeSecondsAndTheSectionSaysBeaconAsksFirst() {
         show()
-        // Short enough for its two lines at large text, so nothing of it is cut off; the section's line covers every other number.
         compose.onNodeWithText("Call saved contacts. 3 seconds to cancel.").performScrollTo().assertExists()
         compose.onNodeWithText("Write message drafts").performScrollTo().assertExists()
         // The section says what Approvals does now (Manual by default).
         compose.onNodeWithText("Hermes asks before it reads or changes anything").performScrollTo().assertExists()
         compose.onNodeWithText("Only what you turned on above").performScrollTo().assertExists()
+    }
+
+    @Test fun callDisclosureFitsAtOnePointEightInEnglish() = assertCallDisclosure("en", 1.8f, EnglishCallDisclosure)
+
+    @Test fun callDisclosureFitsAtTwoInEnglish() = assertCallDisclosure("en", 2f, EnglishCallDisclosure)
+
+    @Test fun callDisclosureFitsAtOnePointEightInArabic() = assertCallDisclosure("ar", 1.8f, ArabicCallDisclosure)
+
+    @Test fun callDisclosureFitsAtTwoInArabic() = assertCallDisclosure("ar", 2f, ArabicCallDisclosure)
+
+    private fun assertCallDisclosure(language: String, fontScale: Float, expected: String) {
+        // Model an already-granted permission without granting it to the app or opening Android's prompt.
+        val fixture = object : ContextWrapper(compose.activity) {
+            override fun checkPermission(permission: String, pid: Int, uid: Int): Int =
+                if (permission == Manifest.permission.CALL_PHONE) PackageManager.PERMISSION_GRANTED
+                else super.checkPermission(permission, pid, uid)
+        }
+        if (language == "ar") (context.applicationContext as BeaconApplication).readTranslations()
+        val direction = if (language == "ar") LayoutDirection.Rtl else LayoutDirection.Ltr
+        compose.setContent {
+            NativeLocalization(language) {
+                CompositionLocalProvider(
+                    LocalContext provides fixture,
+                    LocalLayoutDirection provides direction,
+                    LocalDensity provides Density(LocalDensity.current.density, fontScale),
+                ) {
+                    BeaconTheme(dark = false) {
+                        Box(Modifier.width(320.dp)) { PhoneAccessBody(Modifier.fillMaxSize()) }
+                    }
+                }
+            }
+        }
+
+        val calls = compose.onNodeWithTag("phone-access-calls").performScrollTo()
+        calls.assertIsDisplayed().assertHeightIsAtLeast(48.dp).assertWidthIsAtLeast(48.dp)
+            .assertHasClickAction().assertIsEnabled().assertIsOff().assertTextContains(expected)
+        assertEquals(Role.Switch, calls.fetchSemanticsNode().config[SemanticsProperties.Role])
+        val text = compose.onNodeWithText(expected, useUnmergedTree = true).assertIsDisplayed()
+        val layouts = mutableListOf<TextLayoutResult>()
+        text.performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+        val layout = layouts.single()
+        val last = layout.lineCount - 1
+        val scenario = "$language at $fontScale font scale"
+        assertEquals(direction, layout.layoutInput.layoutDirection)
+        assertEquals(fontScale, layout.layoutInput.density.fontScale, 0f)
+        assertEquals("$scenario: the last visible character must end the cancellation instruction",
+            expected.length, layout.getLineEnd(last, visibleEnd = true))
+        assertFalse("$scenario: the cancellation instruction must not be ellipsized",
+            (0 until layout.lineCount).any(layout::isLineEllipsized))
+        val textNode = text.fetchSemanticsNode()
+        assertTrue("$scenario: the cancellation instruction must fit inside the visible page",
+            textNode.boundsInRoot.width >= textNode.size.width - 1 &&
+                textNode.boundsInRoot.height >= textNode.size.height - 1)
+
+        calls.performTouchInput { click() }.assertIsOn()
+        assertTrue(PhoneAccess.switchedOn(fixture, PhoneCapability.Calls))
+        calls.performTouchInput { click() }.assertIsOff()
+        assertFalse(PhoneAccess.switchedOn(fixture, PhoneCapability.Calls))
     }
 
     @Test fun aSwitchWhosePermissionWasTakenAwayIsStoredOffNotJustShownOff() {
@@ -212,5 +293,10 @@ class PhoneAccessUiTest {
         compose.onAllNodesWithTag("phone-access-entry").assertCountEquals(0)
         assertTrue(log.recent().isEmpty())
         compose.onNodeWithText("Nothing yet").assertExists()
+    }
+
+    private companion object {
+        const val EnglishCallDisclosure = "Call saved contacts. 3 seconds to cancel."
+        const val ArabicCallDisclosure = "الاتصال بجهات الاتصال المحفوظة. لديك 3 ثوانٍ للإلغاء."
     }
 }

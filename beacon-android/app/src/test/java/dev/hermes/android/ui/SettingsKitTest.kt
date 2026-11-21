@@ -101,6 +101,7 @@ class SettingsKitTest {
         assertEquals(4, settingsSwatchColumns(356.dp))
         assertEquals(4, settingsSwatchColumns(312.dp))
         assertEquals(3, settingsSwatchColumns(300.dp))
+        assertEquals(2, settingsSwatchColumns(200.dp))
         assertEquals(6, settingsSwatchColumns(600.dp))
         listOf(240, 300, 356, 420, 599).forEach { width ->
             val columns = settingsSwatchColumns(width.dp)

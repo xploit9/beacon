@@ -1,5 +1,9 @@
 package dev.hermes.android.voice
 
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import dev.hermes.android.data.CALL_PING_INTERVAL_MS
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.BeaconClient
 import kotlinx.coroutines.runBlocking
@@ -19,8 +23,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
- * The call's own Hermes client (calls contract v3, section 6) on a real HTTP/2 connection: pings every 5 s, a dead connection fails
- * the request on it within about 10 s (before the request's own 12 s limit) and is never used again, a slow answer on a healthy
+ * The call's own Hermes client (calls contract v3, section 6) on a real HTTP/2 connection: pings every 12 s, a dead connection fails
+ * the request on it within two intervals and is never used again, a slow answer on a healthy
  * connection is not a failure, and neither is a phone or path that stops for a few seconds and then goes on (LINK-121).
  * A relay between the client and MockWebServer stalls chosen connections, as the owner's path did (CALLS-A-REPORT, part 1).
  */
@@ -84,7 +88,7 @@ class CallHttpClientTest {
         val source = client(server.port)
         try {
             val calls = source.forCall()
-            assertEquals(5000, calls.http.pingIntervalMillis)
+            assertEquals(CALL_PING_INTERVAL_MS.toInt(), calls.http.pingIntervalMillis)
             assertNotSame("A stalled call connection must never be shared with the app's other requests", source.http.connectionPool, calls.http.connectionPool)
             assertEquals("The app's own client is unchanged", 0, source.http.pingIntervalMillis)
             assertEquals(source.scope, calls.scope)
@@ -95,7 +99,31 @@ class CallHttpClientTest {
         } finally { source.closeNative();server.shutdown() }
     }
 
-    @Test(timeout = 30000) fun aStalledConnectionFailsItsRequestBeforeItsOwnTimeoutAndTheNextRequestOpensANewOne() = runBlocking {
+    @Test(timeout = 24000) fun memoryPostSurvivesAnEightSecondDelayAcrossAnH2Ping() = runBlocking {
+        val server = h2Server()
+        val relay = Relay(server.port)
+        val source = client(relay.port)
+        try {
+            val calls = source.forCall()
+            server.enqueue(answer())
+            calls.nativeRequest(path)
+            server.takeRequest()
+            delay(3300)
+            server.enqueue(answer().setHeadersDelay(400, TimeUnit.MILLISECONDS))
+            val started = System.nanoTime()
+            val memory = async(Dispatchers.IO) {
+                runCatching { calls.nativeRequest("/api/plugins/beacon/mobile/calls/call/memory", "POST", JSONObject().put("query","fixture")) }
+            }
+            checkNotNull(server.takeRequest(2, TimeUnit.SECONDS))
+            relay.pause(8500)
+            val result = memory.await()
+            val elapsed = (System.nanoTime() - started) / 1_000_000
+            println("MEMORY_H2 elapsed_ms=$elapsed failure=" + (result.exceptionOrNull()?.javaClass?.simpleName ?: "none"))
+            assertTrue("In-flight memory POST lost before the delayed response: ${result.exceptionOrNull()}", result.isSuccess)
+        } finally { source.closeNative(); relay.close(); server.shutdown() }
+    }
+
+    @Test(timeout = 40000) fun aStalledConnectionFailsItsRequestBeforeItsOwnTimeoutAndTheNextRequestOpensANewOne() = runBlocking {
         val server = h2Server()
         val relay = Relay(server.port)
         val source = client(relay.port)
@@ -111,12 +139,12 @@ class CallHttpClientTest {
             relay.hold()
             server.enqueue(answer().setHeadersDelay(1, TimeUnit.SECONDS))
             val started = System.nanoTime()
-            val stalled = runCatching { link.track("search", CALL_INVOKE_WAIT_MS) { calls.nativeRequest(path) } }.exceptionOrNull()
+            val stalled = runCatching { link.track("search", 30_000) { calls.nativeRequest(path) } }.exceptionOrNull()
             val elapsed = (System.nanoTime() - started) / 1_000_000
             println("CALL_STALL_DETECTED_MS=$elapsed ${stalled?.javaClass?.simpleName}")
             assertTrue("The stalled request failed as I/O: $stalled", stalled is java.io.IOException)
-            // A ping goes within 5 s of the stall and fails 5 s later: about 10 s, before the request's own 12 s limit (8 s wait + 4 s).
-            assertTrue("A failed ping is noticed within about 10 s, before the 12 s request timeout: $elapsed ms", elapsed < CALL_INVOKE_WAIT_MS + CALL_REQUEST_MARGIN_MS)
+            // A missing pong retires this connection; the long request cannot mask a dead link.
+            assertTrue("Ping loss exceeded two intervals: $elapsed ms", elapsed < 2 * CALL_PING_INTERVAL_MS + 1000 && elapsed < CALL_HERMES_OUTAGE_MS)
             assertEquals(Link.LOST, link.link)
             assertEquals("The model hears it once, as a state", listOf("hermes_unreachable"), told.map { it.getString("status") })
             assertEquals("connection_lost", told.single().getString("detail"))

@@ -21,6 +21,10 @@ class VectorsTest {
         assertEquals(Messages.PROTOCOL.toLong(), Fixtures.vectors["protocol"])
     }
 
+    @Test fun contractPinIndependentlyOfVectors() {
+        assertEquals(Fixtures.CONTRACT_SHA256, Fixtures.sha256(Fixtures.bytes("channel-v1.md")))
+    }
+
     @Test
     fun handshakeValues() {
         val t = h("T")

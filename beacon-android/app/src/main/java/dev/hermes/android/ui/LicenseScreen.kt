@@ -25,6 +25,7 @@ internal val licenseDocuments = listOf(
     "hermes-LICENSE.txt", "conduit-LICENSE.txt", "androidsvg-LICENSE.txt",
     "androidsvg-NOTICE.txt", "jlatexmath-LICENSE.txt", "jlatexmath-COPYING.txt", "rich/MERMAID-LICENSE",
     "rich/JSOUP-LICENSE", "rich/KATEX-LICENSE", "rich/CORE-JS-LICENSE", "hermes-mobile-app-LICENSE.txt", "hermes-relay-LICENSE.txt",
+    "PhoneDriver-LICENSE.txt",
 )
 
 /** A bundled work: its name, license id, and the notice exactly as the source states it. Notices are legal text, so they stay untranslated. */
@@ -41,6 +42,7 @@ internal val openSourceWorks = listOf(
     LicensedWork("Hermes Relay", "MIT", "Hermes Relay · MIT. Parts of chat, sign-in, voice, search and the sphere are adapted from it. See the source headers and the Hermes Relay MIT notice."), // verbatim
     LicensedWork("JLaTeXMath Android 0.2.0", "GPL-2.0-or-later", "Copyright 2017 Dimitry Ivanov and upstream contributors. GPL-2.0-or-later with the independent module linking exception. Full license texts are in the document list below.\nSource: https://github.com/noties/jlatexmath-android\nPinned commit: cc2a83dcf695028b5588f91a90734d94eb5bd02b"), // verbatim
     LicensedWork("AndroidSVG 1.4", "Apache-2.0", "AndroidSVG 1.4 · Apache-2.0. Copyright 2013 Paul LeBeau, Cave Rock Software Ltd. Source: https://github.com/BigBadaboom/androidsvg. Shows SVG images."), // verbatim
+    LicensedWork("PhoneDriver", "Apache-2.0", "PhoneDriver by OminousIndustries · Apache-2.0. Beacon's Hermes plugin adapts its visual task runner.\nhttps://github.com/OminousIndustries/PhoneDriver/tree/a89b1044bb551693e458f5e2a8c19395291d75f8"),
 )
 
 @Composable fun LicenseScreen(vm: BeaconViewModel) {

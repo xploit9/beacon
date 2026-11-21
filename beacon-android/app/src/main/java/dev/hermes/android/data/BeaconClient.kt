@@ -57,14 +57,8 @@ internal fun lostBotsFrom(answer: JSONObject, asked: Collection<String>): Map<St
     val bots = answer.optJSONObject("bots") ?: return emptyMap()
     return asked.filter { bots.has(it) }.associateWith { lostTurnChat(bots.optJSONObject(it)) }.filterValues { it.chat.isNotBlank() }
 }
-/**
- * How often a call's Hermes connection is pinged. OkHttp fails the whole connection, and every request on it, when the last pong has not
- * been read by the time the next ping is due, so this is also the longest the phone or its path may stall without losing a healthy link.
- * 1.5 s (8a30d432) lost healthy links in device round 3 (LINK-121): a starved phone read a pong that came back in 1 ms too late, its
- * timer ran up to 2.2 s late and its microphone stream stopped for up to 4.7 s; a mobile path that loses a packet or two is as late.
- * A dead path still fails its requests within 5-10 s, before their own limits (12 s for a tool or a hand-over, 24 s for /updates).
- */
-internal const val CALL_PING_INTERVAL_MS = 5_000L
+/** Allow a delayed mobile pong while bounding a dead HTTP/2 connection to two ping intervals. */
+internal const val CALL_PING_INTERVAL_MS = 12_000L
 internal class CanonicalRouteMissing : RuntimeException("Canonical gateway route is unavailable")
 private val GATEWAY_JSON_STRING = "\"" + """(?:[^"\\\x00-\x1f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*""" + "\""
 private val GATEWAY_JSON_VALUE = """(?:$GATEWAY_JSON_STRING|true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"""
@@ -325,7 +319,7 @@ class BeaconClient internal constructor(initial: AuthContext, private val authSt
     }
     /**
      * The client for one call's requests to Hermes (calls contract v3, section 6): connections of its own, each pinged every
-     * [CALL_PING_INTERVAL_MS], so a dead path fails the requests on it within 5-10 s and the next request opens a new connection, while
+     * [CALL_PING_INTERVAL_MS], so a dead path fails the requests on it within two intervals and the next request opens a new connection, while
      * a phone or path that stops for a few seconds keeps its link; every request says which call contract the app speaks. Same account
      * and credentials as this client.
      */

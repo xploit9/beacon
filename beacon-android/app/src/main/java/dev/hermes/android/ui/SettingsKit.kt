@@ -46,6 +46,7 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.input.ImeAction
@@ -57,6 +58,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.isSpecified
+import kotlin.math.ceil
 
 // The Settings kit (design-spec "Settings kit"): one Glass pane per section, rows with a tinted icon tile, real choice controls and
 // glyph-plus-word statuses. Every visible string arrives localized from the caller; choice option labels stay English and are
@@ -156,11 +158,10 @@ internal fun settingsOptionsShown(options: List<SettingsOption>, selected: Strin
     return options.filter { it.id in ids }
 }
 
-/** Swatches per row: six on a wide pane, four while each cell keeps 72dp, else three. */
-internal fun settingsSwatchColumns(width: Dp): Int = when {
-    width >= 600.dp -> 6
-    (width - 8.dp * 3) / 4 >= 72.dp -> 4
-    else -> 3
+/** Up to six swatches on a wide pane or four on a phone, with room for each label and touch target. */
+internal fun settingsSwatchColumns(width: Dp, labelWidth: Dp = 0.dp): Int {
+    val maxColumns = if (width >= 600.dp) 6 else 4
+    return ((width + 8.dp) / (maxOf(72.dp, labelWidth) + 8.dp)).toInt().coerceIn(1, maxColumns)
 }
 
 private fun Modifier.kitTag(tag: String): Modifier = if (tag.isBlank()) this else testTag(tag)
@@ -369,13 +370,14 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     enabled: Boolean = true,
     busy: Boolean = false,
     testTag: String = "",
+    fullSummary: Boolean = false,
 ) {
     val active = enabled && !busy
     val twoLine = summary.isNotBlank() || (status != null && statusLabel.isNotBlank())
     SettingsRowFrame(icon, if (twoLine) SettingsKit.RowMinHeightTwoLine else SettingsKit.RowMinHeight,
         modifier.toggleable(checked, enabled = active, role = Role.Switch, onValueChange = onCheckedChange).kitTag(testTag), enabled = enabled) {
-        // A summary may take a second line rather than be cut ("Calls while Beacon is cl…" at large text).
-        SettingsRowText(label, if (status != null && statusLabel.isNotBlank()) "" else summary, status, statusLabel, MaterialTheme.colorScheme.onSurface, valueMaxLines = 2)
+        SettingsRowText(label, if (status != null && statusLabel.isNotBlank()) "" else summary, status, statusLabel,
+            MaterialTheme.colorScheme.onSurface, valueMaxLines = if (fullSummary) Int.MAX_VALUE else 2)
         if (busy) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
         // A switch that is on but locked ("All sources" covers it, say) stays visibly on, dimmed; Material's own disabled look reads as off.
         Switch(checked, onCheckedChange = null, enabled = active, colors = SwitchDefaults.colors(
@@ -528,7 +530,7 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
         if (segmented && fitSegments) {
             // The row pads 16dp on both sides; the width left is what the segments share.
             BoxWithConstraints(rowModifier.fillMaxWidth()) {
-                val fits = settingsSegmentsFit(widestLabelWidth(labels), labels.size, maxWidth - 32.dp)
+                val fits = settingsSegmentsFit(widestLabelWidth(labels, MaterialTheme.typography.labelLarge), labels.size, maxWidth - 32.dp)
                 SettingsChoiceBody(label, selected, options, labels, onSelect, Modifier, icon, optionLabels, optionIcons, optionTestTags, enabled, fits, anchorTestTag, valueTestTag)
             }
         } else SettingsChoiceBody(label, selected, options, labels, onSelect, rowModifier, icon, optionLabels, optionIcons, optionTestTags, enabled, segmented, anchorTestTag, valueTestTag)
@@ -541,11 +543,13 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     }
 }
 
-/** The width of the widest label in the segment's own text style, so the fit follows the language and the text size. */
-@Composable private fun widestLabelWidth(labels: List<String>): Dp {
-    val measurer = rememberTextMeasurer()
-    val style = MaterialTheme.typography.labelLarge
-    val widest = labels.maxOfOrNull { measurer.measure(it, style, maxLines = 1, softWrap = false).size.width } ?: 0
+/** Measure the labels in their own text style and use the line-breaking width when they can wrap. */
+@Composable private fun widestLabelWidth(labels: List<String>, style: TextStyle, wrap: Boolean = false): Dp {
+    val measurer = rememberTextMeasurer(cacheSize = labels.size)
+    val widest = labels.maxOfOrNull {
+        val layout = measurer.measure(it, style, maxLines = 1, softWrap = false)
+        if (wrap) ceil(layout.multiParagraph.minIntrinsicWidth).toInt() else layout.size.width
+    } ?: 0
     return with(LocalDensity.current) { widest.toDp() }
 }
 
@@ -676,8 +680,9 @@ internal fun settingsGlyphMoves(status: SettingsStatus, signal: Boolean, motion:
     modifier: Modifier = Modifier,
     testTagPrefix: String = "skin-option:",
 ) {
+    val labelWidth = widestLabelWidth(swatches.map { it.label }, MaterialTheme.typography.labelMedium, wrap = true)
     BoxWithConstraints(modifier.fillMaxWidth().padding(12.dp)) {
-        val perRow = settingsSwatchColumns(maxWidth)
+        val perRow = settingsSwatchColumns(maxWidth, labelWidth)
         val cell = (maxWidth - 8.dp * (perRow - 1)) / perRow
         FlowRow(Modifier.fillMaxWidth().selectableGroup(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(12.dp), maxItemsInEachRow = perRow) {
             swatches.forEach { swatch -> SettingsSwatchCell(swatch, swatch.id == selected, Modifier.width(cell), "$testTagPrefix${swatch.id}") { if (swatch.id != selected) onSelect(swatch.id) } }

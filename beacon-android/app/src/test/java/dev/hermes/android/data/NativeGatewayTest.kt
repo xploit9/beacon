@@ -148,6 +148,57 @@ class NativeGatewayTest {
         fun disconnect() = requireNotNull(currentListener).onClosed(requireNotNull(currentSocket), 1001, "fixture reconnect")
     }
 
+    @Test fun onlyAcceptedChatTrafficClearsItsOwnOrigin() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        val origin = fixture.client.auth.origin
+        val other = "https://other.example.com"
+        val refused = java.net.ConnectException("synthetic fresh connection failure")
+        try {
+            fixture.client.nativeRpc("session.active_list")
+            val retired = requireNotNull(fixture.currentListener)
+            val retiredSocket = requireNotNull(fixture.currentSocket)
+            fixture.client.closeNative()
+            fixture.client.nativeRpc("session.active_list")
+            HermesReach.failed(origin, refused)
+            HermesReach.failed(other, refused)
+            retired.onMessage(retiredSocket, """{"jsonrpc":"2.0","id":"old","result":{}}""")
+            assertTrue(origin in HermesReach.origins.value)
+            fixture.client.nativeRpc("session.active_list")
+            assertFalse(origin in HermesReach.origins.value)
+            assertTrue(other in HermesReach.origins.value)
+            HermesReach.failed(origin, refused)
+            requireNotNull(fixture.currentListener).onMessage(requireNotNull(fixture.currentSocket), "{}")
+            assertTrue("An empty object acknowledged no RPC and delivered no gateway event", origin in HermesReach.origins.value)
+            val live = requireNotNull(fixture.currentListener)
+            val socket = requireNotNull(fixture.currentSocket)
+            live.onMessage(socket, """{"jsonrpc":"2.0","id":"unmatched","result":{}}""")
+            live.onMessage(socket, """{"jsonrpc":"2.0","method":"event","params":{}}""")
+            assertTrue("An unmatched reply and a typeless event cannot mark this origin reachable", origin in HermesReach.origins.value)
+            live.onMessage(socket, """{"jsonrpc":"2.0","method":"event","params":{"type":"session.activity","payload":{}}}""")
+            assertFalse(origin in HermesReach.origins.value)
+            assertTrue(other in HermesReach.origins.value)
+        } finally {
+            fixture.client.closeNative()
+            HermesReach.answered(origin)
+            HermesReach.answered(other)
+        }
+    }
+    @Test fun replyOnAnExistingChatSocketClearsTheOfflineBannerForItsOrigin() = runBlocking<Unit> {
+        val fixture = GatewayFixture()
+        val origin = fixture.client.auth.origin
+        try {
+            fixture.client.nativeRpc("session.active_list")
+            HermesReach.failed(origin, java.net.ConnectException("Synthetic second connection refused"))
+            assertTrue(origin in HermesReach.origins.value)
+            fixture.client.nativeRpc("session.active_list")
+            assertEquals(1, fixture.socketCount)
+            assertFalse(origin in HermesReach.origins.value)
+        } finally {
+            fixture.client.closeNative()
+            HermesReach.answered(origin)
+        }
+    }
+
     @Test fun newChatFirstPromptUsesTheLiveRuntimeCreatedForThatChat() = runBlocking<Unit> {
         val fixture = GatewayFixture()
         val stored = "20261019_001507_a4cbef"

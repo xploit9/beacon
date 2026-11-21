@@ -11,7 +11,7 @@ class ServerAboutLicenseTest {
     @Test fun everyBundledWorkIsListedOnce() {
         val names = openSourceWorks.map { it.name }
         assertEquals(names.distinct(), names)
-        assertEquals(9, names.size)
+        assertEquals(10, names.size)
     }
 
     @Test fun everyNoticeNamesItsLicenseAndKeepsTheLegalLines() {
@@ -22,8 +22,12 @@ class ServerAboutLicenseTest {
         assertTrue(openSourceWorks.single { it.name.startsWith("JLaTeXMath") }.notice.endsWith("cc2a83dcf695028b5588f91a90734d94eb5bd02b"))
     }
 
-    @Test fun licenseDocumentsAreUnchanged() {
-        assertEquals(12, licenseDocuments.size)
+    @Test fun licenseDocumentsIncludeThePinnedPhoneDriverLicense() {
+        assertEquals(13, licenseDocuments.size)
         assertTrue(licenseDocuments.contains("hermes-relay-LICENSE.txt"))
+        assertTrue(licenseDocuments.contains("PhoneDriver-LICENSE.txt"))
+        val driver = openSourceWorks.single { it.name == "PhoneDriver" }
+        assertEquals("Apache-2.0", driver.license)
+        assertTrue(driver.notice.endsWith("OminousIndustries/PhoneDriver/tree/a89b1044bb551693e458f5e2a8c19395291d75f8"))
     }
 }

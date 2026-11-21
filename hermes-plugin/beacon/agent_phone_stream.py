@@ -1,10 +1,11 @@
 """The agent phone's setup stream, protocol ``beacon-agent-phone-v1`` (EMU-DESIGN §4.2-§4.5).
 
-Frames (S3): the emulator draws 720x1600 frames into one owner-only file in the phone folder's ``run/`` through gRPC
+Frames (S3): the emulator draws 720x1600 frames into one owner-only file in the phone's ``tmp/AndroidEmulator/`` through gRPC
 ``streamScreenshot`` with the MMAP transport (only a ``file:///`` handle works on Windows); the server encodes the newest one as JPEG
 q70 in memory and sends it as a binary ``0x01`` message. One frame is in flight: the next goes only after the viewer's ``ack``, and
 frames in between are dropped to the newest. Sends are at least ``1 / MAX_FPS`` apart (a strict minimum interval, measured from send
-to send, so the first frame after a still screen is never held back). The file is deleted when the view closes.
+to send, so the first frame after a still screen is never held back). The file is deleted when the view closes. A keeper without
+confirmed mapped-file cleanup uses authenticated inline RGB for the whole capture.
 
 Input (S4, S5): touches and keys go to gRPC through one FIFO worker thread, so nothing interleaves; touch moves are coalesced (S4 saw
 the SystemUI ANR under fast touch streams). Text is routed per message, never per character: a message of printable ASCII is typed as
@@ -263,10 +264,11 @@ def warm():
 # -- frames through the MMAP transport ------------------------------------------------------------------------------------
 
 class Latest:
-    __slots__ = ('seq', 'width', 'height', 'rotation')
+    __slots__ = ('seq', 'width', 'height', 'rotation', 'image')
 
-    def __init__(self, seq, width, height, rotation):
+    def __init__(self, seq, width, height, rotation, image=b''):
         self.seq, self.width, self.height, self.rotation = seq, width, height, rotation
+        self.image = image
 
 
 def _abort(client):
@@ -287,13 +289,36 @@ def sweep_frame_files(run_dir):
     return removed
 
 
+def frame_directory_for_view(folder):
+    """Use mapped pixels only when the registered keeper's live worker can clean them without the plugin."""
+    try:
+        import psutil
+
+        proof = json.loads((folder.run / 'mmap-cleaner-v1.json').read_text(encoding='utf-8'))
+        if Path(proof['folder']) != folder.root.resolve():
+            return None
+        worker = psutil.Process(proof['worker'][0])
+        if proof['worker'] != [worker.pid, worker.create_time()] or worker.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+            return None
+        launcher = worker
+        if worker.pid != proof['launcher'][0]:
+            launcher = worker.parent() if os.name == 'nt' else None
+        if launcher and [launcher.pid, launcher.create_time()] == proof['launcher']:
+            conf = json.loads(folder.keeper_conf.read_text(encoding='utf-8'))
+            if [conf['pid'], conf['create_time']] == proof['launcher']:
+                return folder.frames
+    except Exception:  # health: allow BLE001 -- missing, unreadable or superseded identity selects inline pixels
+        pass
+    return None
+
+
 class MmapFrames:
     """The emulator's frames for one view. ``open_client()`` returns a connected gRPC client of its own (L1b's EmulatorGrpc), used
-    only for this stream. ``start()`` creates ``run/frames-<tag>-<random>.bin`` owner-only and starts the reader thread;
+    only for this stream. A supplied directory enables an owner-only MMAP file; None requests inline RGB without creating a file.
     ``latest()`` names the newest frame; ``pixels(latest)`` copies it out; ``stop()`` ends the stream and deletes the file."""
 
     def __init__(self, open_client, run_dir, tag, width=FRAME_WIDTH, height=FRAME_HEIGHT, on_frame=None):
-        self.open_client, self.run_dir, self.tag = open_client, Path(run_dir), str(tag)
+        self.open_client, self.run_dir, self.tag = open_client, Path(run_dir) if run_dir is not None else None, str(tag)
         self.width, self.height = width, height
         self.on_frame = on_frame
         self.path = None
@@ -305,20 +330,45 @@ class MmapFrames:
         self.frames = 0
 
     def start(self):
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        self.path = self.run_dir / f'frames-{self.tag}-{secrets.token_hex(4)}.bin'
-        size = self.width * self.height * 4  # room for RGBA, as the spike sized it (S3)
-        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
-        self._fd = os.open(self.path, flags, 0o600)
-        try:
-            os.ftruncate(self._fd, size)
-            self._mm = mmap.mmap(self._fd, size)
-        except BaseException:
-            self._release_file()
-            raise
+        if self.run_dir is not None:
+            self.run_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.path = self.run_dir / f'frames-{self.tag}-{secrets.token_hex(4)}.bin'
+            size = self.width * self.height * 4  # room for RGBA, as the spike sized it (S3)
+            flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, 'O_BINARY', 0)
+            self._fd = os.open(self.path, flags, 0o600)
+            try:
+                os.ftruncate(self._fd, size)
+                self._mm = mmap.mmap(self._fd, size)
+            except BaseException:
+                self._release_file()
+                raise
         self._thread = threading.Thread(target=self._read, name='beacon-agent-phone-frames', daemon=True)
         self._thread.start()
         return self
+
+    def _images(self, client):
+        args = dict(width=self.width, height=self.height)
+        if self.path is not None:
+            try:
+                yield from client.screenshots(RGB888, **args, mmap_path=self.path)
+                return
+            except Exception as exc:
+                status = getattr(exc, 'status', None)
+                if self.frames or self._stopping.is_set() or status not in (3, 9):
+                    raise
+                log.info('agent phone stream: mapped capture refused (grpc=%d), trying inline pixels', status)
+        for image in client.screenshots(RGB888, **args):
+            if image.get('width') and image.get('height') and len(image.get('image', b'')) != self._pixel_size(image['width'], image['height']):
+                raise ValueError('Invalid inline frame')
+            yield image
+
+    def _pixel_size(self, width, height):
+        if type(width) is not int or type(height) is not int or not (0 < width <= 65535 and 0 < height <= 65535):
+            raise ValueError('Invalid frame size')
+        size = width * height * 3
+        if size > self.width * self.height * 4:
+            raise ValueError('Invalid frame size')
+        return size
 
     def _read(self):
         client = None
@@ -326,20 +376,22 @@ class MmapFrames:
             client = self._client = self.open_client()
             if self._stopping.is_set():
                 return
-            for image in client.screenshots(RGB888, width=self.width, height=self.height, mmap_path=self.path):
+            for image in self._images(client):
                 if self._stopping.is_set():
                     break
                 if not image.get('width') or not image.get('height'):
                     continue
+                self._pixel_size(image['width'], image['height'])
                 with self._lock:
                     self.frames += 1
-                    self._latest = Latest(self.frames, int(image['width']), int(image['height']), rotation_of(image.get('rotation')))
+                    self._latest = Latest(self.frames, int(image['width']), int(image['height']), rotation_of(image.get('rotation')), image.get('image', b''))
                 if self.on_frame is not None:
                     self.on_frame()
         except Exception as exc:  # health: allow BLE001 -- the view reports "frames stopped"; nothing of the error is shown
             if not self._stopping.is_set():
                 self.failed = type(exc).__name__
-                log.info('agent phone stream: frames stopped (%s)', self.failed)
+                status = getattr(exc, 'status', None)
+                log.info('agent phone stream: frames stopped (%s, grpc=%s)', self.failed, status if type(status) is int else '-')
                 if self.on_frame is not None:
                     self.on_frame()
         finally:
@@ -352,7 +404,11 @@ class MmapFrames:
             return self._latest
 
     def pixels(self, latest):
-        n = latest.width * latest.height * 3
+        n = self._pixel_size(latest.width, latest.height)
+        if latest.image:
+            if len(latest.image) != n:
+                raise ValueError('Invalid inline frame')
+            return latest.image
         if self._mm is None or n > len(self._mm):
             raise ValueError('frame larger than the map')
         return self._mm[:n]

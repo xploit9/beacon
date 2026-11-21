@@ -13,3 +13,5 @@ jsoup, Mermaid, KaTeX and core-js use the MIT License; their licenses are bundle
 Build dependencies and their versions are listed in `app/build.gradle.kts`. No upstream brand assets or proprietary system font are copied into this app.
 
 The direct Gemini wire patterns are adapted from [Hermes Conduit](https://github.com/kaishi00/hermes-conduit), revision `c13e234ff597756fc4511381ebbb1c998dd5ab66`, Copyright (c) 2026 kaishi00, under the MIT License. Its complete license is bundled at `app/src/main/assets/licenses/conduit-LICENSE.txt` and retained in this corresponding source. The Android transport, native dashboard extension and device media lifecycle are implemented in this project.
+
+Beacon's Hermes plugin adapts the visual task runner from OminousIndustries' [PhoneDriver](https://github.com/OminousIndustries/PhoneDriver/tree/a89b1044bb551693e458f5e2a8c19395291d75f8), licensed under Apache-2.0. The Android app connects to the plugin and includes the upstream license at `app/src/main/assets/licenses/PhoneDriver-LICENSE.txt` and in Settings › Licenses.

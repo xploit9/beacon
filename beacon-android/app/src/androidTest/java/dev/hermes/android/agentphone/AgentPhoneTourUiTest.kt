@@ -358,7 +358,9 @@ class AgentPhoneTourUiTest {
         if (case.name == "setup-checks-container") {
             val line = words("This computer can't run a virtual phone.")
             if (nodes(hasText(line)).size != 1) problems += "$where: \"$line\" shows ${nodes(hasText(line)).size} times"
-            if (nodes(hasText(words("Give the container read and write access to /dev/kvm, or run Hermes on a computer instead."))).isEmpty())
+            val fix = words("Give the container read and write access to /dev/kvm, or run Hermes on a computer instead.")
+            val shownFix = nodes(hasText("/dev/kvm", substring = true)).flatMap { it.config.getOrNull(SemanticsProperties.Text).orEmpty() }
+            if (shownFix.none { it.text.replace("\u2068", "").replace("\u2069", "") == fix })
                 problems += "$where: the container row hides its /dev/kvm fix"
         }
         // The other setup pages keep their Not now.

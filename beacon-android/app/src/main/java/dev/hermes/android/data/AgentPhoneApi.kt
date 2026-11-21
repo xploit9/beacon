@@ -115,6 +115,12 @@ internal data class AgentPhoneFacts(val google: Boolean? = null, val chrome: Int
 
 internal data class AgentPhoneLease(val human: Boolean, val you: Boolean, val away: Boolean)
 
+internal enum class AgentPhoneDriverState(val wire: String, val label: String) {
+    Running("running", "Running"), Completed("completed", "Done"), Failed("failed", "Failed"), Cancelled("cancelled", "Cancelled"),
+}
+
+internal data class AgentPhoneDriverTask(val id: String, val state: AgentPhoneDriverState, val steps: Int, val message: String?)
+
 internal data class AgentPhoneStatus(
     val installed: Boolean = false,
     val profile: String? = null,
@@ -135,7 +141,15 @@ internal data class AgentPhoneStatus(
     val warningCode: String? = null,
     val errorCode: String? = null,
     val errorArgs: Map<String, String> = emptyMap(),
+    /** The plugin implements the PhoneDriver task route. Its runtime readiness comes from a task result. */
+    val supportsPhoneDriver: Boolean = false,
+    val driverTask: AgentPhoneDriverTask? = null,
 )
+
+private val DRIVER_TASK_ID = Regex("[A-Za-z0-9_-]{1,80}")
+
+internal fun validAgentPhoneTask(task: String): Boolean =
+    task.isNotBlank() && task.codePointCount(0, task.length) <= 2_000
 
 internal enum class AgentPhoneCheckStatus { Ready, Warn, Fail, Unknown }
 
@@ -217,12 +231,25 @@ internal fun parseAgentPhoneStatus(body: JSONObject): AgentPhoneStatus {
         "missing" -> AgentPhoneHelper.Missing
         else -> null
     }
+    val installed = body.flag("installed") == true
+    val yours = body.flag("yours") == true
+    val supportsPhoneDriver = body.opt("control_driver") == "phonedriver"
     return AgentPhoneStatus(
-        installed = body.flag("installed") == true, profile = body.text("profile", 64), yours = body.flag("yours") == true, power = power, lease = lease,
+        installed = installed, profile = body.text("profile", 64), yours = yours, power = power, lease = lease,
         warning = body.text("warning"), error = body.text("error"), install = parseAgentPhoneInstall(body.optJSONObject("install")),
         facts = facts, storageBytes = body.whole("storage_bytes"), helper = helper, inUse = body.flag("in_use"),
         warningCode = body.code("warning_reason"), errorCode = body.code("error_reason"), errorArgs = body.lineArgs("error_args"),
+        supportsPhoneDriver = supportsPhoneDriver,
+        driverTask = if (supportsPhoneDriver && installed && yours) body.optJSONObject("driver_task")?.let(::parseAgentPhoneDriverTask) else null,
     )
+}
+
+internal fun parseAgentPhoneDriverTask(body: JSONObject): AgentPhoneDriverTask? {
+    val id = (body.opt("id") as? String)?.takeIf(DRIVER_TASK_ID::matches) ?: return null
+    val state = AgentPhoneDriverState.entries.firstOrNull { it.wire == body.opt("state") } ?: return null
+    val count = (body.opt("steps") as? Number)?.toDouble() ?: return null
+    val steps = count.toInt().takeIf { it >= 0 && it.toDouble() == count } ?: return null
+    return AgentPhoneDriverTask(id, state, steps, body.text("message", 240))
 }
 
 internal fun parseAgentPhoneChecks(body: JSONObject): AgentPhoneChecks {
@@ -448,6 +475,20 @@ internal class AgentPhoneApi(private val endpoint: AgentPhoneEndpoint) {
     }
 
     suspend fun stop(): AgentPhoneResult<AgentPhonePower> = ask("POST", "/stop", null, CALL_MS, wentWrong) { AgentPhonePower.Stopping }
+
+    suspend fun giveTask(requestId: String, task: String): AgentPhoneResult<AgentPhoneDriverTask> {
+        require(DRIVER_TASK_ID.matches(requestId) && validAgentPhoneTask(task))
+        return ask("POST", "/task", json("request_id" to requestId, "task" to task), CALL_MS, wentWrong) {
+            parseAgentPhoneDriverTask(it.body)
+        }
+    }
+
+    suspend fun cancelTask(id: String): AgentPhoneResult<AgentPhoneDriverTask> {
+        require(DRIVER_TASK_ID.matches(id))
+        return ask("POST", "/task/$id/cancel", null, CALL_MS, wentWrong) {
+            parseAgentPhoneDriverTask(it.body)?.takeIf { task -> task.id == id }
+        }
+    }
 
     /** The host checks take up to two minutes on the server (the virtualisation query and the network check are slow). */
     suspend fun checks(): AgentPhoneResult<AgentPhoneChecks> = ask("POST", "/checks", null, CHECKS_MS, wentWrong) { parseAgentPhoneChecks(it.body) }

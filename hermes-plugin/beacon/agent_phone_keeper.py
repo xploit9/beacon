@@ -157,6 +157,29 @@ def _end_processes(state):
             pass
 
 
+def mmap_frame_files(folder, state):
+    """Regular files matching the view writer in this phone's emulator-owned temp directory."""
+    import re
+
+    root = Path(folder)
+    directory = root / 'tmp' / 'AndroidEmulator'
+    try:
+        if directory.resolve() != root.resolve() / 'tmp' / 'AndroidEmulator':
+            return
+    except (OSError, RuntimeError):
+        return
+    # The allocated console pool, the route's missing-port fallback, and a valid alternate console recorded for this phone.
+    tags = {'phone', *map(str, range(5640, 5681, 2))}
+    ports = state.get('ports') if isinstance(state, dict) else None
+    saved = str(ports.get('console')) if isinstance(ports, dict) else ''
+    if re.fullmatch(r'[1-9][0-9]{0,4}', saved) and int(saved) in range(2, 65535, 2):
+        tags.add(saved)
+    for path in directory.glob('frames-*.bin'):
+        match = re.fullmatch(r'frames-([^-]+)-[0-9a-f]{8}\.bin', path.name)
+        if match and match[1] in tags and not path.is_symlink() and path.is_file():
+            yield path
+
+
 def stop(folder, conf, state, reason):
     plugin = conf.get('plugin_dir')
     if plugin and Path(plugin).is_dir():
@@ -166,11 +189,12 @@ def stop(folder, conf, state, reason):
         except Exception:  # health: allow BLE001 -- a broken plugin must not keep the phone running
             pass
     _end_processes(state)
-    for frame in (Path(folder) / 'run').glob('frames-*.bin'):
-        try:
-            frame.unlink()  # the frame file; the masks kept for the gateway stay: this hard kill keeps the old Quick Boot snapshot
-        except OSError:
-            pass
+    for files in (mmap_frame_files(folder, state), (Path(folder) / 'run').glob('frames-*.bin')):
+        for frame in files:
+            try:
+                frame.unlink()  # keep the masks for the old Quick Boot snapshot
+            except OSError:
+                pass
     return 'ended'
 
 
@@ -368,10 +392,31 @@ def _watch(folder, tick, clock, sleep, max_ticks, held, python):
     return None
 
 
+def announce_frame_cleanup(folder):
+    """Only the loaded watcher advertises standalone cleanup of the emulator's MMAP directory."""
+    path = Path(folder) / 'run' / 'mmap-cleaner-v1.json'
+    tmp = path.with_suffix(f'.{os.getpid()}.tmp')
+    try:
+        import psutil
+
+        worker = launcher = psutil.Process()
+        # A Windows venv redirector stays alive as the parent of the Python worker.
+        if os.name == 'nt' and venv_of(sys.executable) and not _same(worker.exe(), sys.executable):
+            parent = worker.parent()
+            if parent and _same(parent.exe(), sys.executable):
+                launcher = parent
+        tmp.write_text(json.dumps({'folder': str(Path(folder).resolve()), 'worker': [worker.pid, worker.create_time()],
+                                   'launcher': [launcher.pid, launcher.create_time()]}), encoding='utf-8')
+        os.replace(tmp, path)
+    except Exception:  # health: allow BLE001 -- without a live capability the dashboard uses file-free capture
+        pass
+
+
 def main(argv):
     if len(argv) >= 2 and argv[0] == 'spawn':
         return spawn(argv[1])
     if len(argv) >= 2 and argv[0] == 'watch':
+        announce_frame_cleanup(argv[1])
         watch(argv[1], python=sys.executable)
         return 0
     print('usage: keeper.py spawn <spec.json> | watch <phone folder>', file=sys.stderr)

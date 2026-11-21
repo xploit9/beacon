@@ -112,7 +112,7 @@ internal fun agentPhoneEntryStage(status: AgentPhoneStatus?): AgentPhoneStage = 
 
 /**
  * Whether the checks let the owner go on: no row failed (Hermes sign-in among them), and every amber row that asks for it got its
- * own Continue ([continued]).
+ * acknowledgement ([continued]).
  */
 internal fun agentPhoneChecksPass(checks: AgentPhoneChecks?, continued: Boolean): Boolean =
     checks != null && checks.ok && checks.rows.none { it.status == AgentPhoneCheckStatus.Fail } && (!checks.needsContinue || continued)
@@ -333,6 +333,12 @@ internal class AgentPhoneSetupActions(
 /** `{name}` in a translated line, as the owner named the assistant. */
 @Composable internal fun String.named(): String = replace("{name}", LocalAssistantName.current)
 
+private val setupSizeGap = Regex("""(\p{Nd}) (?=(?:GB|Go|ГБ|غيغابايت)(?![\p{L}\p{N}]))""")
+
+/** Keep the path's leading slash with the Latin text and each size on one line. */
+internal fun agentPhoneSetupDisplayText(text: String): String =
+    text.replace("/dev/kvm", isolateBidi("/dev/kvm")).replace(setupSizeGap, "$1\u00A0")
+
 /** A size as the phone writes it ("1.3 GB"), isolated so it keeps its own order inside right-to-left text. */
 @Composable private fun bytes(value: Long?): String = if (value == null) "" else agentPhoneSize(LocalContext.current, value)
 
@@ -345,14 +351,12 @@ internal class AgentPhoneSetupActions(
         val tag = Modifier.testTag("agent-phone-stage:${state.stage.name}")
         when (state.stage) {
             AgentPhoneStage.Before -> SetupShell(step, uiText("Before you start"), modifier.then(tag), uiText("{name}'s phone runs on your Hermes computer. It needs:").named(),
-                content = {
-                    BeforeContent()
-                    // The confirmation scrolls with what it confirms, so at large text the pinned buttons leave the loopback line in view.
+                content = { BeforeContent() },
+                actions = {
+                    // Keep the required choice clear of the scroll fade, beside the action it enables.
                     ConfirmRow(state, actions)
-                },
-                // One pinned button, so the needs and the loopback line stay in view at 2x text; the header's X (the same actions.close)
-                // is this page's way out (Root, REVIEW-FIX-UI-121). The other pages keep their Not now.
-                actions = { SetupPrimaryButton(uiText("Check this computer"), actions.check, Modifier.testTag("agent-phone-check"), enabled = state.confirmed) })
+                    SetupPrimaryButton(uiText("Check this computer"), actions.check, Modifier.testTag("agent-phone-check"), enabled = state.confirmed)
+                })
             AgentPhoneStage.Checks -> ChecksPage(state, actions, modifier.then(tag), step)
             AgentPhoneStage.Terms -> TermsPage(state, actions, modifier.then(tag), step)
             AgentPhoneStage.Download -> DownloadPage(state, actions, modifier.then(tag), step)
@@ -403,15 +407,17 @@ internal class AgentPhoneSetupActions(
 
 /** The prerequisites the owner confirms (§8 Before you start; the owner's disclaimer), three short rows, and the plain loopback fact. */
 @Composable private fun BeforeContent() {
-    SetupContainer(Modifier.testTag("agent-phone-needs")) {
-        NeedRow(Icons.Rounded.Computer, uiText("A real computer with about 16 GB free space and 8 GB memory"))
-        NeedRow(Icons.Rounded.PowerSettingsNew, uiText("Hermes stays on, with sign-in turned on"))
-        NeedRow(Icons.Rounded.AccountBalance, uiText("Bank and wallet apps don't work on it"))
-    }
-    Row(Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-        Icon(Icons.Rounded.Lan, null, Modifier.padding(top = 2.dp).size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-        Text(uiText("Apps on the phone can reach programs on your Hermes computer that don't ask for a sign-in."), Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        SetupContainer(Modifier.testTag("agent-phone-needs")) {
+            NeedRow(Icons.Rounded.Computer, agentPhoneSetupDisplayText(uiText("A real computer with about 16 GB free space and 8 GB memory")))
+            NeedRow(Icons.Rounded.PowerSettingsNew, uiText("Hermes stays on, with sign-in turned on"))
+            NeedRow(Icons.Rounded.AccountBalance, uiText("Bank and wallet apps don't work on it"))
+        }
+        Row(Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Icon(Icons.Rounded.Lan, null, Modifier.padding(top = 2.dp).size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(uiText("Apps on the phone can reach programs on your Hermes computer that don't ask for a sign-in."), Modifier.weight(1f),
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
     }
 }
 
@@ -486,8 +492,8 @@ internal class AgentPhoneSetupActions(
             }
         }
         // The reason and its one fix, at body size: these are the lines the owner acts on.
-        line?.let { Text(agentPhoneText(it), Modifier.padding(start = 32.dp), style = MaterialTheme.typography.bodyMedium) }
-        fix?.let { Text(agentPhoneText(it), Modifier.padding(start = 32.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        line?.let { Text(agentPhoneSetupDisplayText(agentPhoneText(it)), Modifier.padding(start = 32.dp), style = MaterialTheme.typography.bodyMedium) }
+        fix?.let { Text(agentPhoneSetupDisplayText(agentPhoneText(it)), Modifier.padding(start = 32.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         // A shortened line keeps the host's whole reason one tap away (the developer-tools line's why, say).
         val detailed = listOfNotNull(line, fix).filter { it.hasDetails }
         var details by rememberSaveable(row.id) { mutableStateOf(false) }
@@ -497,7 +503,7 @@ internal class AgentPhoneSetupActions(
             if (how != null && row.status != AgentPhoneCheckStatus.Ready) TextButton({ actions.openLink(how) }, Modifier.heightIn(min = 48.dp).testTag("agent-phone-how:${row.id}")) { Text(uiText("How")) }
             if (warned) {
                 TextButton(actions.check, Modifier.heightIn(min = 48.dp).testTag("agent-phone-recheck:${row.id}")) { Text(uiText("Check now")) }
-                if (!continued) TextButton(actions.continueWarning, Modifier.heightIn(min = 48.dp).testTag("agent-phone-continue:${row.id}")) { Text(uiText("Continue")) }
+                if (!continued) TextButton(actions.continueWarning, Modifier.heightIn(min = 48.dp).testTag("agent-phone-continue:${row.id}")) { Text(uiText("I understand")) }
             }
             if (detailed.isNotEmpty()) TextButton({ details = !details }, Modifier.heightIn(min = 48.dp).testTag("agent-phone-details:${row.id}")) { Text(uiText(if (details) "Hide details" else "Details")) }
         }
@@ -568,8 +574,10 @@ private val TERMS_BODY = AgentPhoneLines.templates.getValue("install.licences")
                 // Under "The download stopped", the line says only what to do (P3-7: not "Download stopped" twice).
                 ?.let { if (failed && it.template == AgentPhoneLines.templates["install.offline"]) it.copy(template = AgentPhoneLines.templates.getValue("check.network_fix")) else it }
             // The failed page's one action is its primary button, so the line stands alone; a running install's line ("A download was damaged…") is news, not an error.
-            line?.let { SetupStatusLine(agentPhoneText(it), error = failed, modifier = Modifier.testTag("agent-phone-line")) }
-            if (failed) agentPhoneLine(install.fix, code = install.fixCode)?.let { Text(agentPhoneText(it), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+            line?.let { SetupStatusLine(agentPhoneSetupDisplayText(agentPhoneText(it)), error = failed, modifier = Modifier.testTag("agent-phone-line")) }
+            if (failed) agentPhoneLine(install.fix, code = install.fixCode)?.let {
+                Text(agentPhoneSetupDisplayText(agentPhoneText(it)), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         },
         actions = {
             when (install.state) {

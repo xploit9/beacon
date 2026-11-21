@@ -9,6 +9,7 @@ import struct
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -257,16 +258,18 @@ class FakeStreamClient:
 
 
 def test_mmap_frames_request_720x1600_in_an_owner_only_file_that_is_gone_after(tmp_path):
+    directory = tmp_path / 'tmp' / 'AndroidEmulator'
     client = FakeStreamClient()
     seen = threading.Event()
-    frames = stream.MmapFrames(lambda: client, tmp_path / 'run', 5640, width=72, height=160,
+    frames = stream.MmapFrames(lambda: client, directory, 5640, width=72, height=160,
                                on_frame=lambda: seen.set() if frames.latest() and frames.latest().seq == 2 else None)
     frames.start()
     assert seen.wait(5)
     path = frames.path
-    assert path.parent == tmp_path / 'run' and path.match('frames-*.bin') and path.name.startswith('frames-5640-')
+    assert path.parent == directory and path.match('frames-*.bin') and path.name.startswith('frames-5640-')
     if os.name != 'nt':
         assert path.stat().st_mode & 0o077 == 0
+        assert directory.stat().st_mode & 0o077 == 0
     call = client.calls[0]
     assert call['fmt'] == stream.RGB888 and call['width'] == 72 and call['height'] == 160 and call['mmap_path'] == str(path)
     latest = frames.latest()
@@ -276,7 +279,40 @@ def test_mmap_frames_request_720x1600_in_an_owner_only_file_that_is_gone_after(t
     assert frames.stop() is True
     assert time.monotonic() - started < 3  # the still stream was aborted, not waited out
     assert client.closed and not path.exists()
-    assert list((tmp_path / 'run').glob('frames-*.bin')) == []
+    assert list(directory.glob('frames-*.bin')) == []
+
+
+@pytest.mark.parametrize('status,expected_channels', [(3, [True, False]), (9, [True, False]), (7, [True]), (16, [True])])
+def test_capture_uses_inline_pixels_when_shared_memory_is_refused(tmp_path, status, expected_channels, caplog):
+    caplog.set_level(logging.INFO, logger='beacon.agent_phone.stream')
+    grpc = _load('agent_phone_grpc')
+    client = FakeStreamClient()
+    channels = []
+    pixels = b'\x05\x06\x07' * 32
+
+    def screenshots(fmt, width, height, mmap_path=None):
+        channels.append(mmap_path is not None)
+        if mmap_path:
+            raise grpc.GrpcError(status, 'synthetic capture refusal')
+        yield {'width': width, 'height': height, 'image': pixels}
+        client.blocked.wait(5)
+
+    client.screenshots = screenshots
+    seen = threading.Event()
+    frames = stream.MmapFrames(lambda: client, tmp_path, 'test', width=4, height=8, on_frame=seen.set)
+    try:
+        frames.start()
+        assert seen.wait(3)
+        assert channels == expected_channels
+        if status in (7, 16):
+            assert frames.failed and frames.latest() is None
+        else:
+            assert frames.pixels(frames.latest()) == pixels
+        messages = [record.getMessage() for record in caplog.records if record.name == 'beacon.agent_phone.stream']
+        assert any(f'grpc={status}' in message for message in messages)
+        assert all('synthetic capture refusal' not in message for message in messages)
+    finally:
+        assert frames.stop()
 
 
 def test_default_frame_request_is_720x1600():
@@ -883,3 +919,68 @@ def test_nothing_typed_or_drawn_reaches_a_log(tmp_path, caplog):
     joined = '\n'.join(records)
     assert secret_text not in joined and 'SyntheticPaste' not in joined and 'ABC' not in joined
     assert secret_text not in json.dumps(socket.texts)
+
+
+@pytest.mark.parametrize(("codes", "modes"), [([7], [True]), ([16], [True]), ([14], [True]),
+    ([3, 7], [True, False]), ([9, 9], [True, False])])
+def test_capture_denial_or_final_error_reaches_reader(tmp_path, codes, modes):
+    grpc = _load('agent_phone_grpc')
+    used = []
+    def screenshots(fmt, width, height, mmap_path=None):
+        used.append(mmap_path is not None)
+        raise grpc.GrpcError(codes[len(used) - 1], "synthetic")
+        yield
+    frames = stream.MmapFrames(lambda: None, tmp_path, "capture", width=2, height=2)
+    frames.path = tmp_path / "map.bin"  # assigned by start() before invoking _images()
+    with pytest.raises(grpc.GrpcError) as e:
+        list(frames._images(SimpleNamespace(screenshots=screenshots)))
+    assert e.value.status == codes[-1] and used == modes
+
+def test_map_failure_after_first_valid_frame_is_terminal(tmp_path):
+    grpc = _load('agent_phone_grpc')
+    modes = []
+    def screenshots(fmt, width, height, mmap_path=None):
+        modes.append(mmap_path is not None)
+        yield {"width": 2, "height": 2}
+        raise grpc.GrpcError(3, "synthetic after first image")
+    closed = []
+    client = SimpleNamespace(screenshots=screenshots, cancel=lambda: None, close=lambda: closed.append(True))
+    frames = stream.MmapFrames(lambda: client, tmp_path, "capture", width=2, height=2)
+    try:
+        frames.start()
+        frames._thread.join(3)
+        assert frames.frames == 1 and modes == [True] and frames.failed == "GrpcError"
+    finally:
+        assert frames.stop()
+
+@pytest.mark.parametrize('width,height,pixels', [(2, 2, b'x'), (4, 4, b'x' * 48), (2, 2, b''), (1, -1, b'')])
+def test_file_free_capture_rejects_invalid_rgb_or_dimensions(tmp_path, width, height, pixels):
+    client = FakeStreamClient()
+    modes = []
+    def screenshots(fmt, **args):
+        modes.append(args.get('mmap_path'))
+        yield {'width': width, 'height': height, 'image': pixels}
+    client.screenshots = screenshots
+    frames = stream.MmapFrames(lambda: client, None, 'phone', width=2, height=2)
+    try:
+        frames.start()
+        frames._thread.join(3)
+        assert frames.failed == 'ValueError' and frames.latest() is None
+        assert modes == [None] and frames.path is None
+    finally:
+        assert frames.stop()
+
+@pytest.mark.parametrize('bad_size', [(5, 4), (65536, 1), (-1, 2)])
+def test_mapped_capture_rejects_invalid_dimensions_before_publication(tmp_path, bad_size):
+    client = FakeStreamClient()
+    def screenshots(fmt, **args):
+        assert args['mmap_path'] is not None
+        yield {'width': bad_size[0], 'height': bad_size[1], 'image': b''}
+    client.screenshots = screenshots
+    frames = stream.MmapFrames(lambda: client, tmp_path, 'phone', width=2, height=2)
+    try:
+        frames.start()
+        frames._thread.join(3)
+        assert frames.failed == 'ValueError' and frames.latest() is None
+    finally:
+        assert frames.stop()

@@ -232,4 +232,5 @@ See [docs/preview.md](docs/preview.md) for the debug preview, stable build and s
 ## Licensing
 
 Beacon keeps its GPLv3 license (`LICENSE`). Adapted Hermes Relay code keeps its MIT notice
-(`licenses/Hermes-Relay-MIT.txt`). Android library notices are in `beacon-android/THIRD-PARTY-NOTICES.md`.
+(`licenses/Hermes-Relay-MIT.txt`). The virtual-phone planner adapts OminousIndustries' PhoneDriver under
+[Apache 2.0](hermes-plugin/beacon/licenses/PhoneDriver-LICENSE.txt). Android library notices are in `beacon-android/THIRD-PARTY-NOTICES.md`.

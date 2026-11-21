@@ -20,7 +20,10 @@ import androidx.test.runner.lifecycle.Stage
 import dev.hermes.android.BeaconActivity
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.BeaconViewModel
+import dev.hermes.android.core.json
 import dev.hermes.android.core.string
+import dev.hermes.android.data.NativePairing
+import kotlinx.coroutines.delay
 import dev.hermes.android.journey.ownerRuntimeOptIn
 import dev.hermes.android.loginLiveTest
 import kotlinx.coroutines.Dispatchers
@@ -62,7 +65,7 @@ class AgentPhoneViewLiveTest {
     // -- the record ----------------------------------------------------------------------------------------------------------------------
     private fun now() = SystemClock.elapsedRealtime()
 
-    private fun note(step: String, vararg fields: Pair<String, Any?>) {
+    @Synchronized private fun note(step: String, vararg fields: Pair<String, Any?>) {
         val line = JSONObject().put("step", step).put("t", (now() - started) / 1000.0)
         fields.forEach { (k, v) -> line.put(k, v ?: JSONObject.NULL) }
         File(dir, "steps.jsonl").appendText(line.toString() + "\n")
@@ -115,7 +118,7 @@ class AgentPhoneViewLiveTest {
     }
 
     /** Opens the view the way L4's phone page does (by class name, no extras) and waits for the first picture. */
-    private fun openView(label: String): Boolean {
+    private fun openView(label: String, capture: Boolean = true): Boolean {
         val t0 = now()
         val from = beacon()
         main { from.startActivity(Intent(from, AgentPhoneActivity::class.java)) }
@@ -126,7 +129,7 @@ class AgentPhoneViewLiveTest {
         val u = ui()
         note("$label:first_frame", "ms" to first?.let { now() - t0 }, "phase" to u.phase.name, "helper" to u.helper, "keyboard" to u.keyboard,
             "frame" to shown()?.let { "${it.width}x${it.height}" })
-        snap("$label-first")
+        if (capture) snap("$label-first")
         fullScreenNotice(label)
         return first != null
     }
@@ -288,7 +291,7 @@ class AgentPhoneViewLiveTest {
 
     private fun begin(part: String) {
         assumeTrue(args.getString("beaconAgentPhoneLive") == part)
-        dir = File(app.getExternalFilesDir(null), "l5-live").apply { mkdirs() }
+        dir = File(app.getExternalFilesDir(null), if (part in setOf("remote", "voiceTools")) "live-$part" else "l5-live").apply { mkdirs() }
         // One run's record only: the host clears its own requests and answers before it starts watching.
         dir.listFiles()?.filter { it.isFile && !it.name.startsWith("need-") && !it.name.startsWith("ack-") }?.forEach { it.delete() }
         started = now()
@@ -299,6 +302,57 @@ class AgentPhoneViewLiveTest {
     }
 
     // -- G7: the main path, then everything else that needs no restart ---------------------------------------------------------------
+    @Test(timeout = 240_000) fun remoteVoiceTools() {
+        begin("voiceTools")
+        runBlocking { checkRemoteVoiceTools(checkNotNull(vm.client), args.getString("runId").orEmpty(), args) { step, value -> note(step, "value" to value) } }
+    }
+
+    @Test(timeout = 240_000) fun remoteFrameCadence() {
+        begin("remote")
+        val client = checkNotNull(vm.client)
+        val origin = client.auth.origin
+        runBlocking {
+            checkNotNull(NativePairing.link(app, client))
+            client.nativeRpc("session.active_list")
+            dev.hermes.android.data.HermesReach.failed(origin, java.net.ConnectException("Synthetic second connection refused"))
+            client.nativeRpc("session.active_list")
+            check(origin !in dev.hermes.android.data.HermesReach.origins.value)
+        }
+        note("remote:chat_replied")
+        val roundTrips = (1..3).map {
+            val at = now()
+            runBlocking { client.nativeRpc("session.active_list") }
+            now() - at
+        }
+        check(openView("remote", capture = false))
+        try {
+            if (args.getString("wideView") == "1") {
+                val activity = checkNotNull(viewActivity())
+                val (widthDp, heightDp) = main { activity.resources.configuration.run { screenWidthDp to screenHeightDp } }
+                val steps = shownText("Setup steps")
+                note("remote:layout", "width_dp" to widthDp, "height_dp" to heightDp, "steps_visible" to steps)
+                check(widthDp >= 600 && heightDp >= 480 && widthDp >= heightDp * .75 && steps)
+            }
+            var previous = version()
+            val times = mutableListOf<Long>()
+            val start = now()
+            note("remote:cadence_start", "run_id" to args.getString("runId"))
+            var actions = 0
+            while (now() - start < 20_000) {
+                if (now() - start >= actions * 2_000L) {
+                    val key = if (actions++ % 2 == 0) "recents" else "home"
+                    check(main { model.session.key(key) })
+                }
+                val current = version()
+                if (current != previous) { times += now(); previous = current }
+                Thread.sleep(16)
+            }
+            note("remote:cadence", "round_trip_ms" to org.json.JSONArray(roundTrips),
+                "frame_times_ms" to org.json.JSONArray(times.map { it - start }), "frames" to times.size)
+            check(times.size >= 3 && times.last() - start > 12_000 && ui().phase == ViewPhase.Live)
+        } finally { click("Done") }
+    }
+
     @Test(timeout = 1_500_000) fun main() {
         begin("main")
         val fx = args.getString("emailX")!!.toDouble()

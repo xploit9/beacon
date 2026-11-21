@@ -25,7 +25,9 @@ def _sleeper(env=None):
 
 
 @pytest.fixture
-def phone(tmp_path):
+def phone(tmp_path, monkeypatch):
+    # The standalone keeper registers the host it imports, including a partially loaded broken host.
+    monkeypatch.setitem(sys.modules, 'beacon_agent_phone_host', None)
     (tmp_path / 'run').mkdir()
     p, birth = _sleeper()
     state = {'running': True, 'pid': p.pid, 'create_time': birth, 'started_at_epoch': NOW - 3600}
@@ -79,14 +81,18 @@ def test_without_beacon_it_ends_the_emulator_tree_and_the_frame_file(phone):
     folder, state, plugin = phone
     child, child_birth = _sleeper()
     state.update(qemu_pid=child.pid, qemu_create_time=child_birth)
-    (folder / 'run' / 'frames-5555.bin').write_bytes(b'x')
+    frames = [folder / 'run' / 'frames-5555.bin', folder / 'tmp' / 'AndroidEmulator' / 'frames-phone-deadbeef.bin']
+    for path in frames:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'x')
+        (path.parent / 'keep.bin').touch()
     assert keeper.stop(folder, {'plugin_dir': str(folder / 'gone')}, state, 'beacon-removed') == 'ended'
     assert child.wait(timeout=10) is not None
     deadline = time.time() + 10
     while keeper._alive(state['pid'], state['create_time']) and time.time() < deadline:
         time.sleep(0.1)
     assert not keeper._alive(state['pid'], state['create_time'])
-    assert not (folder / 'run' / 'frames-5555.bin').exists()
+    assert all(not p.exists() and (p.parent / 'keep.bin').is_file() for p in frames)
 
 
 def test_a_broken_plugin_never_keeps_the_phone_running(phone):

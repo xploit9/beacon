@@ -29,7 +29,7 @@ log = logging.getLogger('beacon.agent_phone.tools')
 
 NAME = 'agent_phone'
 TOOLSET = 'beacon-agent-phone'
-ACTIONS = ('status', 'capture', 'tap', 'long_press', 'type', 'key', 'swipe', 'open_app', 'list_apps', 'open_link', 'wait',
+ACTIONS = ('task', 'status', 'capture', 'tap', 'long_press', 'type', 'key', 'swipe', 'open_app', 'list_apps', 'open_link', 'wait',
            'vault_list', 'fill', 'save_login', 'new_login', 'code')
 INPUTS = ('tap', 'long_press', 'swipe', 'type', 'key')
 KEYS = {'back': 'GoBack', 'home': 'GoHome', 'recents': 'AppSwitch', 'enter': 'Enter', 'delete': 'Backspace', 'tab': 'Tab'}
@@ -57,8 +57,9 @@ PROFILE_LINE = "Only the phone's own profile can use it."
 
 DESCRIPTION = (
     "Your own Android phone, set up by the owner on the Hermes computer: apps, sign-ins and payments. Not the owner's phone "
-    "(phone_* tools). Workflow: action='capture' (a screenshot with numbered elements and the screen's text), "
-    "then act by `element` number; capture again after anything that changes the screen. Input actions (tap, long_press, swipe, "
+    "(phone_* tools). For an owner's phone task, pass their goal once in `task`. PhoneDriver operates the virtual phone "
+    "and verifies the result using the profile's vision model. Stop on refusal or uncertainty. For an explicitly requested "
+    "primitive, capture shows numbered elements. Input actions (tap, long_press, swipe, "
     "type, key) need a short `purpose`. Payments, sends, deletes, installs and account changes ask the owner on their phone "
     "first and wait up to 2 minutes; if they decline, do not retry or ask again this turn. Some things are never allowed "
     "(Android's USB debugging prompt, factory reset, removing accounts, security or developer settings, installing apps from "
@@ -80,10 +81,11 @@ _POINT = {'type': 'array', 'items': {'type': 'integer', 'minimum': 0, 'maximum':
 SCHEMA = {
     'name': NAME, 'description': DESCRIPTION,
     'parameters': {
-        'type': 'object', 'additionalProperties': False, 'required': ['action'],
+        'type': 'object', 'additionalProperties': False,
         'properties': {
+            'task': _str(2000, "The owner's goal on Beacon's own virtual Android phone. Defaults to action=task."),
             'action': {'type': 'string', 'enum': list(ACTIONS),
-                       'description': '`status` and `capture` change nothing. `wait` pauses up to 10 s.'},
+                       'description': 'Optional for a task. Give an explicit action for a primitive.'},
             'element': {'type': 'integer', 'minimum': 1, 'maximum': 500,
                         'description': 'The element number from the last capture. Preferred over coordinate.'},
             'coordinate': _POINT,
@@ -701,14 +703,21 @@ class Phone:
     def long_press(self, x, y):
         self.grpc().tap(int(x), int(y), hold=0.9)
 
-    def swipe(self, start, end, seconds=0.35, steps=12):
+    def swipe(self, start, end, seconds=0.35, steps=12, check=None):
         g = self.grpc()
-        for i in range(steps + 1):
-            x = start[0] + (end[0] - start[0]) * i / steps
-            y = start[1] + (end[1] - start[1]) * i / steps
-            g.touch([(int(x), int(y), 1, 1024)])
-            time.sleep(seconds / steps)
-        g.touch([(int(end[0]), int(end[1]), 1, 0)])
+        last = None
+        try:
+            for i in range(steps + 1):
+                if check:
+                    check()
+                x = int(start[0] + (end[0] - start[0]) * i / steps)
+                y = int(start[1] + (end[1] - start[1]) * i / steps)
+                g.touch([(x, y, 1, 1024)])
+                last = (x, y, 1, 0)
+                time.sleep(seconds / steps)
+        finally:
+            if last:
+                g.touch([last])
 
     def key(self, name):
         self.grpc().key(key=name)
@@ -911,6 +920,8 @@ def validate(args):
     unknown = set(args) - set(props)
     if unknown:
         raise ValueError('unknown field ' + sorted(map(str, unknown))[0])
+    if 'task' in args:
+        args = {'action': 'task', **args}
     action = args.get('action')
     if action not in ACTIONS:
         raise ValueError('action must be one of ' + ', '.join(ACTIONS))
@@ -921,7 +932,8 @@ def validate(args):
             longest = schema.get('maxLength', 40)
             if not isinstance(value, str) or not schema.get('minLength', 0) <= len(value) <= longest:
                 raise ValueError(f"{name} must be text of {schema.get('minLength', 0)} to {longest} characters")
-            if any(ord(c) < 32 or ord(c) == 127 for c in value):
+            if any((ord(c) < 32 and not (name == 'task' and c in '\n\r\t')) or ord(c) == 127
+                   or 0xd800 <= ord(c) <= 0xdfff for c in value):
                 raise ValueError(name + ' has control characters')
             if 'enum' in schema and value not in schema['enum']:
                 raise ValueError(name + ' must be one of ' + ', '.join(schema['enum']))
@@ -937,6 +949,9 @@ def validate(args):
         elif kind == 'array':
             if (not isinstance(value, list) or len(value) != 2 or any(type(v) is not int or not 0 <= v <= 10000 for v in value)):
                 raise ValueError(name + ' must be [x, y]')
+    if 'task' in args or action == 'task':
+        if set(args) != {'task', 'action'} or action != 'task' or not args['task'].strip():
+            raise ValueError('give the owner goal in task, alone or with action=task')
     if action in INPUTS and not args.get('purpose'):
         raise ValueError('purpose is required for ' + action)
     if action in ('tap', 'long_press') and ('element' in args) == ('coordinate' in args):
@@ -985,6 +1000,7 @@ class Call:
         self.redact = _sibling('agent_phone_redact')
         self.masks = _masks_for(profile, folder)
         self.epoch = None
+        self.visual = None
 
     # -- helpers --
     def _screen(self):
@@ -1004,6 +1020,8 @@ class Call:
         return _labels[package]
 
     def _lease_ok(self):
+        if self.visual is not None:
+            self.visual.check()
         now = lease(self.folder)
         if now['holder'] != 'agent':
             raise Refusal('busy', BUSY_LINE)
@@ -1015,7 +1033,7 @@ class Call:
     def _target(self, screen):
         """(node index or None, device point, by coordinate) for this call's element or coordinate."""
         args = self.args
-        view = _views.get(self.key)
+        view = self.visual.frame if self.visual else _views.get(self.key)
         if 'element' in args:
             if not view or view['package'] != screen.package:
                 raise Refusal('invalid', 'Capture the screen first, then use its element numbers.')
@@ -1030,7 +1048,7 @@ class Call:
             return index, ((box[0] + box[2]) // 2, (box[1] + box[3]) // 2), False
         if 'coordinate' in args:
             scale = view['scale'] if view else 1.0
-            x, y = int(args['coordinate'][0] * scale), int(args['coordinate'][1] * scale)
+            x, y = self.visual.point if self.visual else (int(args['coordinate'][0] * scale), int(args['coordinate'][1] * scale))
             if not (0 <= x < screen.size[0] and 0 <= y < screen.size[1]):
                 raise Refusal('invalid', 'That point is outside the screen.')
             return screen.hit(x, y), (x, y), True
@@ -1069,13 +1087,16 @@ class Call:
         """Asks the owner (once more if the screen changes) and returns the fresh (screen, target, point) to act on, or raises."""
         if self.approvals.declined_for(self.task) > 0:
             raise Refusal('denied', 'The owner declined a moment ago. Nothing was done. Ask them first; do not retry.')
+        if self.visual:
+            self.visual.before_effect()
         for attempt in range(2):
             payload = self._payload(screen, risk, action, target, pin)
             bind = self._bind(screen, target)
             label = screen.masked_label(target) if target is not None else None
             box = _bounds(screen.nodes[target]) if target is not None else None
             try:
-                answer, _ = self.approvals.ask(self.owner, self.profile, self.session, 'agent_phone_action', payload, bind)
+                options = {'sleep': self.visual.pause} if self.visual else {}
+                answer, _ = self.approvals.ask(self.owner, self.profile, self.session, 'agent_phone_action', payload, bind, **options)
             except RuntimeError:
                 raise Refusal('busy', 'Too many questions are waiting for the owner. Try again in a moment.') from None
             if answer == 'denied':
@@ -1085,6 +1106,8 @@ class Call:
             if answer != 'approved':
                 raise Refusal('expired', 'The owner did not answer in time. Nothing was done.')
             self._lease_ok()
+            if self.visual:
+                self.visual.before_effect()
             fresh = self._screen()
             index = self._still_bound(bind, fresh, box, label)
             if index is not None:
@@ -1179,7 +1202,7 @@ class Call:
                         return fresh, index, ((b[0] + b[2]) // 2, (b[1] + b[3]) // 2), True
         try:
             fresh, target, point = self._approve(screen, risk, action, target, point)
-        except Refusal:
+        except Exception:  # a visual cancellation or stale frame also voids consent
             if risk in ('payment', 'unlabeled'):
                 # The owner said no, did not answer, or the screen moved: nothing was done, and the card's earlier yes must not place this
                 # order the next time its amount or its page host can be read.
@@ -1264,10 +1287,7 @@ class Call:
         self._lease_ok()
         self.phone = running_phone(self.folder)
         _phones[(self.owner, self.profile)] = self.phone
-        try:
-            self.phone.host.note_activity(agent=True)  # also the phone page's "{name} is using it"
-        except Exception:  # health: allow BLE001 -- the idle clock is a convenience
-            pass
+        self.note_activity()
         try:
             self.debugging = None
             self._guard(before=True)
@@ -1289,6 +1309,12 @@ class Call:
             _phones.pop((self.owner, self.profile), None)
             self.phone.close()
 
+    def note_activity(self):
+        try:
+            self.phone.host.note_activity(agent=True)
+        except Exception:  # health: allow BLE001 -- the idle clock is a convenience
+            pass
+
     # -- Android's own questions --
     def _guard(self, before):
         """Android's "Allow USB debugging?" (or wireless) is answered No at once (Root, 17 Nov); never tapped, never left up.
@@ -1308,11 +1334,13 @@ class Call:
                 self.debugging = 'answered no'
         return kind
 
-    def _tap(self, x, y, hold=False):
+    def _tap(self, x, y, hold=False, verify=None):
         """Every tap the tool makes (inputs, focus taps, the driver's, Save): the lease is still the agent's, and the debugging
         prompt is answered before and after."""
         self._lease_ok()
         self._guard(before=True)
+        if verify:
+            verify()
         if hold:
             self.phone.long_press(x, y)
         else:
@@ -1376,8 +1404,11 @@ class Call:
         phone = running_phone(self.folder, start=False)
         holder = lease(self.folder)['holder']
         state = 'owner_setting_up' if holder != 'agent' else ('on' if phone else 'off')
-        return {'success': True, 'phone': state,
+        return {'success': True, 'phone': state, 'control_driver': 'phonedriver',
                 'note': 'Any action starts the phone when it is off (about 20 seconds).' if state == 'off' else None}
+
+    def do_task(self):
+        return self.visual.loop(self.args['task'])
 
     def do_capture(self):
         from PIL import ImageDraw
@@ -1452,12 +1483,14 @@ class Call:
         if beside:
             image = self.redact.mask_image(image, beside, size)
         root = _bounds(screen.nodes[0]) if screen.nodes else None
+        outside = []
         if root and (root[0] > BOUNDS_SLACK or root[1] > BOUNDS_SLACK or root[2] < size[0] - BOUNDS_SLACK or root[3] < size[1] - BOUNDS_SLACK):
             # The tree is one window that does not cover the screen (a dialog): what is outside it has no boxes, so it is not shown.
             black = ImageDraw.Draw(image)
             for x0, y0, x1, y1 in ((0, 0, size[0], root[1]), (0, root[3], size[0], size[1]), (0, root[1], root[0], root[3]),
                                    (root[2], root[1], size[0], root[3])):
                 if x1 > x0 and y1 > y0:
+                    outside.append((x0, y0, x1 - 1, y1 - 1))
                     black.rectangle([x0, y0, x1 - 1, y1 - 1], fill=(0, 0, 0))
         scale = size[0] / CAPTURE_WIDTH
         shown = image.resize((CAPTURE_WIDTH, max(1, round(image.height * CAPTURE_WIDTH / image.width))))
@@ -1476,7 +1509,11 @@ class Call:
             draw.rectangle([x0, y0, x1, y1], outline=(255, 0, 64), width=2)
             draw.rectangle([x0, y0, x0 + 8 + 8 * len(str(number)), y0 + 14], fill=(255, 0, 64))
             draw.text((x0 + 3, y0 + 1), str(number), fill=(255, 255, 255))
-        _views[self.key] = {'elements': elements, 'scale': scale, 'package': package, 'at': time.monotonic()}
+        view = {'elements': elements, 'scale': scale, 'package': package, 'at': time.monotonic()}
+        if self.visual:
+            self.visual.captured(view, screen, size, shown, (boxes_after or []) + beside, outside)
+        else:
+            _views[self.key] = view
         texts = [' '.join(_own_text(n).split()) for n in screen.masked_nodes if _own_text(n).strip()][:80]
         buffer = io.BytesIO()
         shown.save(buffer, format='JPEG', quality=80)
@@ -1540,7 +1577,10 @@ class Call:
     def do_tap(self):
         screen, target, point, approved = self._input('tap')
         self._mark_submit(screen, target, 'tap')
-        self._tap(*point)
+        if self.visual:
+            self._tap(*point, verify=self.visual.before_effect)
+        else:
+            self._tap(*point)
         return self._done(screen, 'tap', target, approved)
 
     def do_long_press(self):
@@ -1556,10 +1596,18 @@ class Call:
         dx, dy = {'up': (0, -1), 'down': (0, 1), 'left': (-1, 0), 'right': (1, 0)}[self.args['direction']]
         reach_x, reach_y = int((box[2] - box[0]) * 0.35), int((box[3] - box[1]) * 0.3)
         start, end = (cx - dx * reach_x, cy - dy * reach_y), (cx + dx * reach_x, cy + dy * reach_y)
+        if self.visual:
+            start, end = self.visual.point, self.visual.end
+            cx, cy = start
+            self.visual.check_swipe(screen, start, end)
         screen, target, _, approved = self._gate(screen, 'swipe', target, (cx, cy), coordinate)
         self._lease_ok()
         self._guard(before=True)
-        self.phone.swipe(start, end)
+        if self.visual:
+            self.visual.before_effect()
+            self.phone.swipe(start, end, check=self._lease_ok)
+        else:
+            self.phone.swipe(start, end)
         self._guard(before=False)
         return self._done(screen, 'swipe', target, approved)
 
@@ -1589,6 +1637,8 @@ class Call:
         if target is None:
             raise Refusal('no_field', 'No text field is selected. Tap the field first, or give its element number.')
         screen, target, _, approved = self._gate(screen, 'type', target, None, False)
+        if self.visual:
+            self.visual.before_effect()
         self._lease_ok()
         if all(32 <= ord(c) < 127 for c in text):
             self.phone.type_ascii(text, check=self._lease_ok)
@@ -1610,6 +1660,8 @@ class Call:
                 raise Refusal('unavailable', "Your phone's helper couldn't type that text.")
             try:
                 time.sleep(0.2)
+                if self.visual:
+                    self.visual.before_effect()
                 self.phone.paste()
                 time.sleep(0.3)
             finally:
@@ -1997,12 +2049,15 @@ def call(args, session_id=None, task_id=None):
         owner, profile = _authorize(session_id)
         found = pointer()
         if not found:
-            return _error('off', SET_UP_LINE)
+            return _error('off', SET_UP_LINE, **({'control_driver': 'phonedriver'} if args['action'] == 'status' else {}))
         if profile != found['profile']:
             return _error('unavailable', PROFILE_LINE)
         if not _approvals().policy(owner)['enabled']:
             return _error('off', OFF_LINE)
-        return Call(args, owner, profile, found['profile'], Path(found['folder']), session_id, task_id).run()
+        step = Call(args, owner, profile, found['profile'], Path(found['folder']), session_id, task_id)
+        if args['action'] == 'task':
+            return _sibling('phonedriver').run(step)
+        return step.run()
     except Refusal as exc:
         return _error(exc.code, exc.message, **exc.extra)
     except Exception as exc:  # health: allow BLE001 -- one fixed line; the text could carry screen text or an address

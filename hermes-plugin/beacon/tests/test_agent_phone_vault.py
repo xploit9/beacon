@@ -11,8 +11,9 @@ import os
 import sys
 import threading
 import time
+from itertools import product
 from pathlib import Path
-from types import SimpleNamespace
+from types import FunctionType, MethodType, SimpleNamespace
 
 import pytest
 
@@ -119,7 +120,7 @@ def hermes(monkeypatch):
 
 
 @pytest.fixture
-def world(tmp_path, hermes):
+def world(tmp_path, hermes, monkeypatch):
     notes, registered, clock = [], [], Clock()
     statements = {}
     vault = V.PhoneVault.for_dashboard('default', R.MaskSet(), home=tmp_path / 'owner-home',
@@ -129,6 +130,26 @@ def world(tmp_path, hermes):
     real_register = vault.h.register
     vault.h.register = lambda value: (registered.append(value), real_register(value))
     store = vault.source.store
+    # Rebind the native method only for this fixture store. Its unique hex IDs cannot contain the numeric canary.
+    ids = product('abcdef', repeat=12)
+
+    def fixture_uuid():
+        return SimpleNamespace(hex=''.join(next(ids)) + '0' * 20)
+
+    add_item = store.add_item.__func__
+    local = dict(add_item.__globals__, uuid=SimpleNamespace(uuid4=fixture_uuid))
+    add_fixture_item = FunctionType(add_item.__code__, local, argdefs=add_item.__defaults__)
+    monkeypatch.setattr(store, 'add_item', MethodType(add_fixture_item, store))
+
+    # Pending decisions share the same canary in notifications and pending().
+    held_ids = product('abcdef', repeat=16)
+    hold = vault._hold
+
+    def hold_fixture(held):
+        held.id = 'held_' + ''.join(next(held_ids))
+        hold(held)
+
+    monkeypatch.setattr(vault, '_hold', hold_fixture)
     return SimpleNamespace(vault=vault, store=store, notes=notes, registered=registered, clock=clock, statements=statements,
                            home=tmp_path / 'owner-home')
 

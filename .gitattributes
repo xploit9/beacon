@@ -2,3 +2,9 @@
 beacon-android/app/src/main/assets/rich/mermaid-*.min.js binary
 # Vendored upstream sources (hermes-plugin/beacon/vendor/README.md pins their bytes): no whitespace checks.
 hermes-plugin/beacon/vendor/**/*.py -whitespace
+
+# The helper verifies these exact protocol bytes at test time.
+docs/agent-phone/channel-v1.md text eol=lf
+beacon-agentphone-helper/src/test/resources/channel-v1/channel-v1.md text eol=lf
+hermes-plugin/beacon/tests/fixtures/agent_phone_channel_v1_vectors.json text eol=lf
+beacon-agentphone-helper/src/test/resources/channel-v1/agent_phone_channel_v1_vectors.json text eol=lf

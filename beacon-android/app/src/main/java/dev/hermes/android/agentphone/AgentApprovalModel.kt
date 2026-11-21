@@ -113,6 +113,7 @@ private const val MAX_WAIT_SECONDS = 24 * 3600L
  */
 private const val CREATE_LOGIN = "Create a login for {0} with {1}? It's saved to your vault."
 private const val CHANGE_PASSWORD = "Change the {0} password?"
+private const val CHANGE_PASSWORD_TITLE = "{name} wants to change the password"
 
 internal val AgentPhoneServerLines: List<String> = listOf(
     "Enter the code for {0}.",
@@ -265,9 +266,11 @@ internal fun approvalFace(record: AgentApproval): ApprovalFace = when (record.ki
     ApprovalKind.NewLogin -> {
         // "Change the Amazon password?" for a reset; otherwise the contract's own sentence from the label and identifier.
         val question = recordLine(record) ?: PhoneLine(CREATE_LOGIN, listOf(record.label, record.identifier))
+        val changingPassword = question.template == CHANGE_PASSWORD
         ApprovalFace(
-            title = "{name} wants to make a login", glyph = ApprovalGlyph.Login, question = question,
-            buttons = if (question.template == CHANGE_PASSWORD) ApprovalButtons.ChangeNotNow else ApprovalButtons.CreateNotNow,
+            title = if (changingPassword) CHANGE_PASSWORD_TITLE else "{name} wants to make a login",
+            glyph = ApprovalGlyph.Login, question = question,
+            buttons = if (changingPassword) ApprovalButtons.ChangeNotNow else ApprovalButtons.CreateNotNow,
         )
     }
     ApprovalKind.Save, ApprovalKind.Update -> ApprovalFace(
@@ -365,7 +368,7 @@ internal fun answeredLine(record: AgentApproval, approved: Boolean): String = wh
 /** Every fixed English string of the card and its states that reaches uiText through a variable; the words test checks each one. */
 internal val AgentApprovalWords: List<String> by lazy {
     ApprovalRisk.entries.flatMap { listOf(riskTitle(it, true), riskTitle(it, false)) }.distinct() + listOf(
-        "{name} wants to use a saved login", "{name} wants to make a login", "{name} found a login", "{name} needs a code", "{name} needs you",
+        "{name} wants to use a saved login", "{name} wants to make a login", CHANGE_PASSWORD_TITLE, "{name} found a login", "{name} needs a code", "{name} needs you",
     ) + ApprovalButtons.entries.flatMap { listOf(it.yes, it.no) } + AgentPhoneServerLines + DecisionResult.entries.mapNotNull { decisionLine(it, false) } +
         listOf("Check the code and try again.", "Opening the phone…", "Dismissed", "Code sent", "Nothing was entered.", "Allowed",
             "Nothing was paid.", "Nothing was done.", "Not saved")

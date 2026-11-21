@@ -142,6 +142,7 @@ class AgentApprovalModelTest {
         assertEquals(PhoneLine("Create a login for {0} with {1}? It's saved to your vault.", listOf("Kanto Foods", "agent${'@'}example.com")), newLogin.question)
         assertEquals("Create" to "Not now", newLogin.buttons.yes to newLogin.buttons.no)
         val reset = approvalFace(parse(record("vault_new_login", 1, 100, "label" to "Amazon", "line" to "Change the Amazon password?")).single())
+        assertEquals("{name} wants to change the password", reset.title)
         assertEquals(PhoneLine("Change the {0} password?", listOf("Amazon")), reset.question)
         assertEquals("Change" to "Not now", reset.buttons.yes to reset.buttons.no)
 

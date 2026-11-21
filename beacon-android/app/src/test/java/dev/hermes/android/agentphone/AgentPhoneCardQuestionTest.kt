@@ -37,7 +37,9 @@ class AgentPhoneCardQuestionTest {
 
     @Test fun withoutAnAmountItAsksToFillTheCardInTheShop() {
         val face = approvalFace(consent("Fill Visa in Kanto Foods?"))
-        assertTrue(face.shop)
+        assertTrue(face.payment && face.shop)
+        assertEquals("The agent wants to fill your saved card.", face.title)
+        assertEquals("", face.amount)
         assertEquals("" to "Visa", face.price to face.card)
         assertEquals("Kanto Foods", face.site)
     }
@@ -45,6 +47,7 @@ class AgentPhoneCardQuestionTest {
     @Test fun theBrowserFillStillReadsAsBefore() {
         val face = approvalFace(consent("Fill payment card 'Visa' on https://shop.example"))
         assertFalse(face.shop)
+        assertEquals("Confirm card payment", face.title)
         assertEquals("Visa" to "shop.example", face.card to face.site)
     }
 
@@ -52,5 +55,6 @@ class AgentPhoneCardQuestionTest {
         // The same words from the agent or an MCP server, without Hermes' vault-payment surface, never borrow the card look.
         val face = approvalFace(consent("Pay £12.40 at Kanto Foods with Visa?", surface = null))
         assertFalse(face.payment || face.shop)
+        assertEquals("Approval needed", face.title)
     }
 }

@@ -190,6 +190,89 @@ class CallToolFlowV3Test {
         } finally { call.close() }
     }
 
+    @Test(timeout = 14000) fun aFinalNativeUncertaintySettlesTheModelOnce() = runBlocking {
+        val call = Call(v3())
+        val reads = java.util.concurrent.atomic.AtomicInteger()
+        try {
+            // Matches gateway_tools.receipt_v3 for a dispatched mutation with an unknown outcome.
+            fun terminal(id: String) = json("request_id" to id, "tool_id" to fixture("invoke_running").getString("tool_id"),
+                "tool_name" to "notes_search", "tool" to "notes_search", "read_only" to false,
+                "status" to "uncertain", "ran_on_hermes" to true, "error_code" to "outcome_unknown",
+                "reason" to "Tool outcome unavailable", "server_ms" to JSONObject())
+            call.hermes.invoke = { body, _ -> call.hermes.ok(terminal(body.getString("request_id"))) }
+            call.hermes.status = { id -> reads.incrementAndGet(); terminal(id) }
+            call.start()
+            call.model("server-unknown", "notes_search", json("query" to "fixture"))
+            call.until { call.told("server-unknown").any { it.optString("status") == "uncertain" } }
+            delay(2200)
+            val requestId = call.requestId("server-unknown")
+            val duplicate = terminal(requestId).put("type", "receipt").put("seq", 1)
+            call.hermes.pages.put(json("call_id" to "call", "events" to JSONArray().put(duplicate), "next_after" to 1, "closed" to false))
+            delay(400)
+            val final = call.told("server-unknown").count { !it.getBoolean("will_update") }
+            assertEquals(0, reads.get())
+            assertEquals(1, call.hermes.bodies("/tools/invoke").size)
+            assertEquals("An authoritative native terminal outcome must settle the function", 1, final)
+        } finally { call.close() }
+    }
+
+    @Test(timeout = 24000) fun uncertainGatewayReceiptIsReadUntilHermesSettlesTheSameRequestOnce() = runBlocking {
+        for (terminal in listOf("completed", "failed")) {
+            val call = Call(v3())
+            val release = java.util.concurrent.atomic.AtomicBoolean()
+            try {
+                fun receipt(id: String, status: String) = fixture(if (status == "completed") "invoke_completed" else "invoke_running")
+                    .put("request_id", id).put("status", status).apply {
+                        if (status == "failed") put("result", json("error" to "Synthetic native refusal"))
+                    }
+                call.hermes.invoke = { body, _ -> call.hermes.ok(receipt(body.getString("request_id"), "running")).setHeadersDelay(250, TimeUnit.MILLISECONDS) }
+                call.hermes.status = { id -> receipt(id, if (release.get()) terminal else "running") }
+                call.start()
+                call.model("late-read", "notes_search", json("query" to "fixture"))
+                call.until { call.told("late-read").any { it.optString("status") == "running" } }
+                call.hermes.down = true
+                call.until(7000) { call.told("late-read").any { it.optString("status") == "lost_result" } }
+                release.set(true)
+                call.hermes.down = false
+                call.until(6000) { call.told("late-read").any { it.optString("status") == terminal } }
+                delay(250)
+                val replies = call.told("late-read")
+                assertTrue(replies.first().getBoolean("will_update"))
+                assertEquals(listOf(terminal), replies.filter { !it.getBoolean("will_update") }.map { it.getString("status") })
+                val answer = replies.single { !it.getBoolean("will_update") }
+                assertEquals(call.requestId("late-read"), answer.getString("request_id"))
+                assertEquals(receipt(call.requestId("late-read"), terminal).getJSONObject("result").toString(), answer.getJSONObject("result").toString())
+                assertEquals(1, call.hermes.bodies("/tools/invoke").size)
+            } catch (failure: AssertionError) {
+                throw AssertionError("terminal=$terminal, replies=${call.told("late-read")}, requests=${call.hermes.paths().distinct()}", failure)
+            } finally { call.close() }
+        }
+    }
+
+    @Test(timeout = 22000) fun aLostResultIsReadAgainIfTheFirstRecoveryReadIsStillRunning() = runBlocking {
+        val call = Call(v3())
+        val ready = java.util.concurrent.atomic.AtomicBoolean()
+        val statusReads = java.util.concurrent.atomic.AtomicInteger()
+        try {
+            call.hermes.invoke = { body, _ -> call.hermes.ok(fixture("invoke_running").put("request_id", body.getString("request_id"))) }
+            call.hermes.status = { id ->
+                statusReads.incrementAndGet()
+                fixture(if (ready.get()) "invoke_completed" else "invoke_running").put("request_id", id)
+            }
+            call.start()
+            call.model("lost-read", "notes_search", json("query" to "fixture"))
+            call.until { call.told("lost-read").any { it.optString("status") == "running" } }
+            call.hermes.down = true
+            call.until(7000) { call.told("lost-read").any { it.optString("status") == "lost_result" } }
+            call.hermes.down = false
+            call.until(6000) { statusReads.get() >= 1 }
+            ready.set(true)
+            call.until(6000) { call.told("lost-read").any { it.optString("status") == "completed" } }
+            assertEquals(1, call.hermes.bodies("/tools/invoke").size)
+            assertEquals(1, call.told("lost-read").count { !it.getBoolean("will_update") })
+        } finally { call.close() }
+    }
+
     @Test(timeout = 15000) fun aToolStillRunningIsAStateAndItsLateResultComesOnceOverTheUpdates() = runBlocking {
         val call = Call(v3())
         try {

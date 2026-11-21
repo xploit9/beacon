@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import APIRouter, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse
@@ -271,6 +272,8 @@ def reason_for(line):
     from (L1b's PhoneError lines, L1a's install and check lines). None for a line no table holds: the app then shows ``line``."""
     if not isinstance(line, str):
         return None
+    if line == 'The owner has the phone':
+        return 'phone.busy'
     if line in API_REASONS:
         return API_REASONS[line]
     host = sibling('agent_phone_host')
@@ -617,7 +620,7 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
     def status_of(profile, viewer):
         home = deps.home()
         pointer = read_pointer(home)
-        out = {'installed': False, 'profile': None, 'yours': False, 'phone': 'off', 'lease': None, 'warning': None,
+        out = {'control_driver': 'phonedriver', 'installed': False, 'profile': None, 'yours': False, 'phone': 'off', 'lease': None, 'warning': None,
                'warning_reason': None, 'error': None, 'error_reason': None, 'error_args': None, 'install': dict(jobs.install),
                'setup': {'google': None, 'chrome': None, 'chrome_autofill': None, 'logins': None}, 'storage_bytes': None,
                'helper': None, 'helper_line': None, 'helper_reason': None, 'in_use': None}
@@ -673,7 +676,68 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
         owner, provider, profile, _ = await identity_async(request)
         await bounded(deps.keep_dashboard, deps.home(), dashboard_address(request))
         value = await bounded(status_of, profile, viewer_for(owner, provider, request))
+        if value['yours'] and value['installed']:
+            def latest():
+                _, _, folder = phone_of(profile)
+                return task_store(folder, owner, provider, profile).latest()
+            summary = await bounded(latest)
+            if summary:
+                value['driver_task'] = summary
         return JSONResponse(value, headers=NO_STORE)
+
+    def task_store(folder, owner, provider, profile):
+        return need('phonedriver_mobile').Tasks(folder, owner, provider, profile, need('agent_phone_approvals'))
+
+    @router.post('/mobile/agent-phone/task')
+    async def submit_phone_task(request: Request):
+        await refuse_while_updating()
+        owner, provider, profile, _ = await identity_async(request)
+        payload = await body(request, 28_672)
+        if not isinstance(payload, dict) or set(payload) != {'request_id', 'task'}:
+            raise HTTPException(400, 'Expected request_id and task')
+        tools = need('agent_phone_tools')
+        try:
+            args = tools.validate({'task': payload['task']})
+        except ValueError:
+            raise HTTPException(400, 'Invalid phone task') from None
+        device = await bounded(linked_device, request, owner, provider, profile)
+        expires = getattr(getattr(request.state, 'session', None), 'expires_at', None)
+        if type(expires) is not int or expires <= time.time():
+            raise HTTPException(401, 'Verified native session required')
+        _, _, folder = await bounded(phone_of, profile)
+        binding = dict(owner=owner, provider=provider, profile=profile, device=device, folder=str(folder), expires=expires)
+        # Retain only device/profile metadata for revalidation; the request carries credentials and the original body.
+        subject = SimpleNamespace(headers={'x-beacon-device-id': device}, query_params=request.query_params)
+        def authorize():
+            revalidate(subject, binding)
+            return owner, profile
+        def admit():
+            authorize()
+            if not need('agent_phone_approvals').policy(owner)['enabled']:
+                raise HTTPException(403, 'Phone use is turned off')
+            current = lease_mod.PhoneLease(folder).get()
+            if current.holder != lease_mod.AGENT:
+                raise HTTPException(409, 'The owner has the phone')
+            return current.epoch
+        driver = need('phonedriver')
+        task_id = payload['request_id']
+        def execute(epoch, cancelled, progress):
+            step = tools.Call(args, owner, profile, profile, folder, None, 'mobile-phone-' + task_id)
+            step.epoch = epoch
+            return driver.run(step, authorize=authorize, cancelled=cancelled, progress=progress)
+        summary = await bounded(task_store(folder, owner, provider, profile).submit, task_id, args['task'],
+                                admit, execute, driver.TASK_SECONDS)
+        return JSONResponse(summary, status_code=202 if summary['state'] == 'running' else 200, headers=NO_STORE)
+
+    @router.post('/mobile/agent-phone/task/{task_id}/cancel')
+    async def cancel_phone_task(task_id: str, request: Request):
+        owner, provider, profile, _ = await identity_async(request)
+        if await body(request, 256) or not re.fullmatch(r'[A-Za-z0-9_-]{1,80}', task_id):
+            raise HTTPException(400, 'Invalid phone task cancellation')
+        await bounded(linked_device, request, owner, provider, profile)
+        _, _, folder = await bounded(phone_of, profile)
+        summary = await bounded(task_store(folder, owner, provider, profile).cancel, task_id)
+        return JSONResponse(summary, headers=NO_STORE)
 
     def run_start(folder, lease):
         try:
@@ -731,6 +795,7 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
         with jobs.lock:
             if jobs.phone:
                 return JSONResponse({'phone': jobs.phone}, status_code=409, headers=NO_STORE)
+            lease.interrupt()
             jobs.phone = 'stopping'
         threading.Thread(target=run_stop, args=(folder, lease), name='beacon-agent-phone-stop', daemon=True).start()
         return JSONResponse({'phone': 'stopping'}, status_code=202, headers=NO_STORE)
@@ -839,8 +904,8 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
                 await socket.close(code=stream.CLOSE_DONE)
                 return
             viewer = binding['viewer']
+            await asyncio.to_thread(host.cleanup_frames)
             await asyncio.to_thread(lease.acquire, viewer, 'setup')
-            await asyncio.to_thread(stream.sweep_frame_files, folder / 'run')
             session = None
 
             def notice(kind, payload):
@@ -851,7 +916,8 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
             guard = deps.guard()  # L3's agent_phone_guard: Android's debugging prompt answered No while the owner holds the phone
             session = stream.ViewSession(
                 socket, lease, viewer,
-                open_frames=lambda on_frame: stream.MmapFrames(lambda: host.grpc(state, timeout=15.0).connect(), folder / 'run', port,
+                open_frames=lambda on_frame: stream.MmapFrames(lambda: host.grpc(state, timeout=15.0).connect(),
+                                                               stream.frame_directory_for_view(host.folder), port,
                                                                on_frame=on_frame),
                 open_control=lambda: host.grpc(state, timeout=10.0).connect(),
                 open_channel=lambda: deps.channel(host, state, notice),

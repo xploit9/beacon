@@ -31,6 +31,8 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.relocation.BringIntoViewRequester
+import androidx.compose.foundation.relocation.bringIntoViewRequester
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
@@ -63,6 +65,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -104,6 +107,7 @@ import dev.hermes.android.ui.nativeLanguageFor
 import dev.hermes.android.ui.uiLocale
 import dev.hermes.android.ui.named
 import dev.hermes.android.ui.uiText
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -253,10 +257,18 @@ private fun actionIcon(row: AgentPhoneLogRow): ImageVector = when (row.action) {
     val visible = matching.take(PAGE * maxOf(pages, needed))
     val days = remember(visible, zone) { groupLogByDay(visible, zone) }
     val list = rememberLazyListState()
-    LaunchedEffect(highlight, days.isNotEmpty()) {
-        if (highlight == null || days.isEmpty()) return@LaunchedEffect
-        val index = days.indexOfFirst { day -> day.rows.any { it.seq == highlight } }
-        if (index >= 0) list.animateScrollToItem(index + LIST_HEAD)
+    var revealed by rememberSaveable(highlight) { mutableStateOf(false) }
+    val targetDay = if (highlight == null || revealed) -1 else days.indexOfFirst { day -> day.rows.any { it.seq == highlight } }
+    val requester = remember(highlight) { BringIntoViewRequester() }
+    val rowPlaced = remember(highlight, targetDay) { CompletableDeferred<Unit>() }
+    val revealModifier = Modifier.bringIntoViewRequester(requester).onGloballyPositioned { rowPlaced.complete(Unit) }
+    LaunchedEffect(highlight, targetDay) {
+        if (targetDay < 0) return@LaunchedEffect
+        // A lazy item is a whole day. Wait for the marked row's placement before asking the list to reveal it.
+        list.scrollToItem(targetDay + LIST_HEAD)
+        rowPlaced.await()
+        requester.bringIntoView()
+        revealed = true
     }
     Column(Modifier.fillMaxSize().testTag("agent-phone-log")) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -298,7 +310,8 @@ private fun actionIcon(row: AgentPhoneLogRow): ImageVector = when (row.action) {
                     SettingsSection(dayLabel(day, today), Modifier.widthIn(max = 720.dp), testTag = "agent-phone-log-day") {
                         day.rows.forEachIndexed { index, row ->
                             if (index > 0) SettingsDivider()
-                            LogRow(row, zone, marked = row.seq == highlight)
+                            val marked = row.seq == highlight
+                            LogRow(row, zone, marked, if (marked && targetDay >= 0) revealModifier else Modifier)
                         }
                     }
                 }
@@ -315,10 +328,10 @@ private fun actionIcon(row: AgentPhoneLogRow): ImageVector = when (row.action) {
  * any text size (the settings row stops its label at two lines; a row here is the owner's record, read whole). A done notice's row is
  * marked. TalkBack reads the row as one item.
  */
-@Composable private fun LogRow(row: AgentPhoneLogRow, zone: ZoneId, marked: Boolean) {
+@Composable private fun LogRow(row: AgentPhoneLogRow, zone: ZoneId, marked: Boolean, modifier: Modifier) {
     val (title, value) = rowText(row, zone)
     val scheme = MaterialTheme.colorScheme
-    Row(Modifier.fillMaxWidth().then(if (marked) Modifier.background(scheme.primary.copy(alpha = .10f)) else Modifier)
+    Row(modifier.fillMaxWidth().then(if (marked) Modifier.background(scheme.primary.copy(alpha = .10f)) else Modifier)
         .semantics(mergeDescendants = true) {}.heightIn(min = SettingsKit.RowMinHeightTwoLine).padding(horizontal = 16.dp, vertical = 12.dp)
         .testTag("agent-phone-log-row:${row.seq}"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsIconTile(actionIcon(row))

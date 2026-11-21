@@ -16,9 +16,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsActions
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.SavedStateHandle
@@ -315,6 +321,154 @@ class SettingsMigrationUiTest {
             }
         }
     }
+
+    private fun withOfflineSettings(
+        widthDp: Float = PhoneWidthDp,
+        fontScale: Float = 1f,
+        direction: LayoutDirection = LayoutDirection.Ltr,
+        verify: (VoiceKeyStore) -> Unit,
+    ) {
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        check(BuildConfig.DEBUG && app.packageName.endsWith(".debug")) { "Use an isolated debug install" }
+        check(runBlocking { app.preferences.data.first()[stringPreferencesKey("origin")] }.isNullOrBlank()) {
+            "Use a debug fixture without a saved connection"
+        }
+        val prefix = "settings-offline-${UUID.randomUUID()}"
+        val context = object : ContextWrapper(app) {
+            override fun getApplicationContext(): Context = this
+            override fun getSharedPreferences(name: String, mode: Int) = super.getSharedPreferences("$prefix-$name", mode)
+        }
+        val store = ViewModelStore()
+        var mounted by mutableStateOf(true)
+        try {
+            lateinit var vm: BeaconViewModel
+            compose.runOnUiThread {
+                vm = ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
+            }
+            compose.setContent {
+                NativeLocalization(if (direction == LayoutDirection.Rtl) "ar" else "en") {
+                    BoxWithConstraints(Modifier.fillMaxSize()) {
+                        CompositionLocalProvider(
+                            LocalContext provides context,
+                            LocalDensity provides Density(constraints.maxWidth / widthDp, fontScale),
+                            LocalLayoutDirection provides direction,
+                        ) {
+                            BeaconTheme(dark = true) {
+                                Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                                    if (mounted) MoreScreen(vm)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            compose.waitUntil(5_000) { vm.ui.value.origin.isBlank() && !vm.ui.value.restoringSession }
+            compose.runOnIdle { vm.tab("More") }
+            verify(VoiceKeyStore(context))
+        } finally {
+            try {
+                compose.runOnIdle { mounted = false }
+                compose.waitForIdle()
+            } finally {
+                compose.runOnUiThread { store.clear() }
+                app.deleteSharedPreferences("$prefix-${VoiceKeyStore.PREFS}")
+            }
+        }
+    }
+
+    @Test fun savedVoiceKeyCanBeManagedAndRemovedFromSettings() {
+        val previousLoader = VoiceCatalogCache.loader
+        try {
+            VoiceCatalogCache.loader = { _, _ -> VoiceCatalog() }
+            withOfflineSettings { keys ->
+                val other = keys.settings("grok").copy(model = "fixture-voice-model", voice = "ara", personality = "warm")
+                keys.setSelection(other)
+                keys.saveKey("grok", "synthetic-other-provider-key")
+                val selected = keys.settings("gemini").copy(voice = "Kore", personality = "concise")
+                keys.setSelection(selected)
+                fun click(tag: String) { reach(compose.onNodeWithTag(tag)).performClick() }
+                fun back() { compose.onNodeWithContentDescription("Back").performClick() }
+                fun switchProvider(provider: String, name: String) {
+                    click("voice-provider-change")
+                    click("voice-model-$provider")
+                    click("setup-voice-continue")
+                    compose.onNodeWithTag("voice-hero-title").assertTextEquals(name)
+                }
+
+                tap("Voice & calls")
+                click("voice-add-key")
+                compose.onNodeWithTag("voice-provider-key").performTextReplacement("synthetic-gemini-key")
+                back()
+                compose.waitUntil(5_000) { keys.hasKey("gemini") }
+                back()
+                shown("Voice & calls").assertTextContains("Key saved")
+                tap("Voice & calls")
+                switchProvider("grok", "Grok")
+                switchProvider("gemini", "Gemini Live")
+
+                click("voice-manage-key")
+                compose.onNodeWithText("Saved").assertIsDisplayed()
+                compose.onNodeWithTag("voice-provider-key").performTextReplacement("synthetic-unsaved-replacement")
+                androidx.test.espresso.Espresso.closeSoftKeyboard()
+                click("voice-key-remove")
+                compose.onNodeWithText("Cancel").performClick()
+                assertEquals("synthetic-gemini-key", keys.key("gemini"))
+                click("voice-key-remove")
+                compose.onNodeWithTag("voice-key-remove-confirm").performClick()
+                reach(compose.onNodeWithTag("voice-add-key"))
+                back()
+                shown("Voice & calls").assertTextContains("Add key")
+                tap("Voice & calls")
+                reach(compose.onNodeWithTag("voice-add-key")).assertTextEquals("Add key")
+                compose.onNodeWithTag("voice-manage-key").assertDoesNotExist()
+                compose.onNodeWithTag("voice-provider-summary").assertTextEquals("Add a key to call")
+                assertNull(keys.session())
+                assertEquals(selected, keys.settings())
+                assertEquals(other, keys.settings("grok"))
+                assertEquals("synthetic-other-provider-key", keys.key("grok"))
+            }
+        } finally {
+            VoiceCatalogCache.loader = previousLoader
+        }
+    }
+
+    @Test fun colorStyleNamesFitAtLargeTextOnAPhone() = verifyColorStyleNames(411f, 1.8f, LayoutDirection.Ltr)
+    @Test fun colorStyleNamesFitAtMaximumTextOnANarrowPhone() = verifyColorStyleNames(320f, 2f, LayoutDirection.Ltr)
+    @Test fun colorStyleNamesFitAtLargeTextInRtl() = verifyColorStyleNames(411f, 1.8f, LayoutDirection.Rtl)
+    @Test fun colorStyleNamesFitAtMaximumTextOnANarrowRtlPhone() = verifyColorStyleNames(320f, 2f, LayoutDirection.Rtl)
+
+    private fun verifyColorStyleNames(widthDp: Float, fontScale: Float, direction: LayoutDirection) =
+        withOfflineSettings(widthDp, fontScale, direction) {
+            tap("Appearance")
+            val page = compose.onNodeWithTag("appearance-settings")
+            val radio = SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.RadioButton)
+            val textLayout = SemanticsMatcher.keyIsDefined(SemanticsActions.GetTextLayoutResult)
+            for (skin in NativeSkins) {
+                val tag = "skin-option:$skin"
+                page.performScrollToNode(hasTestTag(tag))
+                compose.onNodeWithTag(tag).assertIsDisplayed().assert(radio).assertHasClickAction()
+                val layouts = mutableListOf<TextLayoutResult>()
+                compose.onNode(textLayout and hasAnyAncestor(hasTestTag(tag)), useUnmergedTree = true)
+                    .assertIsDisplayed().performSemanticsAction(SemanticsActions.GetTextLayoutResult) { it(layouts) }
+                val layout = layouts.single()
+                val text = layout.layoutInput.text.text
+                val lastLine = layout.lineCount - 1
+                val label = "$text at ${widthDp}dp, font $fontScale, $direction"
+                // The layout reconstructed from semantics can report overflow for text that fits.
+                assertFalse("$label ends in an ellipsis", layout.isLineEllipsized(lastLine))
+                assertEquals("$label shows every character", text.length, layout.getLineEnd(lastLine, visibleEnd = true))
+                for (line in 1 until layout.lineCount) {
+                    val start = layout.getLineStart(line)
+                    assertTrue("$label breaks inside a word at $start", text[start - 1].isWhitespace() || text[start].isWhitespace())
+                }
+            }
+            if (direction == LayoutDirection.Rtl && widthDp == 411f) {
+                page.performScrollToNode(hasTestTag("skin-option:default"))
+                val first = compose.onNodeWithTag("skin-option:default").getUnclippedBoundsInRoot()
+                val second = compose.onNodeWithTag("skin-option:ares").getUnclippedBoundsInRoot()
+                assertTrue("The first row starts on the right", first.top == second.top && first.left > second.left)
+            }
+        }
 
     @Test fun settingsPagesShowTheirTitleOnlyInTheTopBar() {
         val app = ApplicationProvider.getApplicationContext<BeaconApplication>()

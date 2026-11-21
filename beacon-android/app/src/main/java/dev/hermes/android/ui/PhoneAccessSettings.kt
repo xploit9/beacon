@@ -229,6 +229,7 @@ private fun capabilityIcon(capability: PhoneCapability) = when (capability) {
                         icon = capabilityIcon(capability), summary = uiText(capabilitySummary(capability)),
                         status = if (needsFix) SettingsStatus.Attention else null, statusLabel = if (needsFix) uiText("Needs permission") else "",
                         testTag = "phone-access-${capability.key}",
+                        fullSummary = capability == PhoneCapability.Calls,
                     )
                     if (capability.key in blocked && !on) {
                         SettingsDivider()

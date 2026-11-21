@@ -88,8 +88,9 @@ class FakeAdb:
 
 
 class FakeHost:
-    def __init__(self, folder):
-        self.folder = Path(folder)
+    def __init__(self, real_host):
+        self.folder = real_host.folder
+        self.cleanup_frames = real_host.cleanup_frames
         self.is_running = True
         self.started = self.stopped = 0
         self.start_error = None
@@ -145,7 +146,11 @@ def phone_api(harness, monkeypatch):  # noqa: F811
     pointer = tmp / 'plugin-data' / 'beacon' / 'agent-phone.json'
     pointer.parent.mkdir(parents=True, exist_ok=True)
     pointer.write_text(json.dumps({'version': 1, 'folder': str(folder), 'profile': 'default', 'dashboard': 'http://127.0.0.1:9119'}))
-    host = FakeHost(folder)
+    host = FakeHost(apimod.need('agent_phone_host').PhoneHost(folder, view_open=lease_mod.PhoneLease(folder).view_open))
+    host.folder.run.mkdir(exist_ok=True)
+    apimod.need('agent_phone_keeper').announce_frame_cleanup(folder)
+    current = json.loads((host.folder.run / 'mmap-cleaner-v1.json').read_text())['launcher']
+    host.folder.keeper_conf.write_text(json.dumps({'pid': current[0], 'create_time': current[1]}))
     gate = {'value': (True, None)}
     updating = {'value': False}
 
@@ -477,7 +482,23 @@ def test_hermes_ws_client_check_runs_on_the_socket(phone_api, monkeypatch):
 
 # -- the open view ---------------------------------------------------------------------------------------------------------------
 
-def test_the_view_takes_the_lease_streams_and_hands_back(phone_api):
+def test_the_view_takes_the_lease_streams_and_hands_back(phone_api, monkeypatch):
+    import io
+    from PIL import Image
+
+    approved = phone_api.folder / 'tmp' / 'AndroidEmulator'
+    legacy = phone_api.folder / 'run'
+    for directory in (approved, legacy):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / 'frames-5640-deadbeef.bin').touch()
+        (directory / 'keep.bin').touch()
+    screenshot = FakeGrpc.screenshots
+    grpc = phone_api.apimod.need('agent_phone_grpc')
+    def allowed(client, fmt, width=0, height=0, mmap_path=None):
+        if mmap_path is None or Path(mmap_path).parent != approved:
+            raise grpc.GrpcError(7, 'Synthetic frame directory refusal')
+        yield from screenshot(client, fmt, width, height, mmap_path)
+    monkeypatch.setattr(FakeGrpc, 'screenshots', allowed)
     issued = ticket(phone_api)
     viewer = phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.device)
     with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
@@ -486,14 +507,19 @@ def test_the_view_takes_the_lease_streams_and_hands_back(phone_api):
         assert phone_api.lease.holds(viewer)
         with pytest.raises(phone_api.lease_mod.OwnerHasPhone):
             phone_api.lease.assert_agent_may_act()
-        first = read_until(ws, lambda m: isinstance(m, bytes))
+        first = read_until(ws, lambda m: isinstance(m, bytes) or m.get('t') == 'bye')
         frame = first[-1]
+        assert isinstance(frame, bytes), 'No MMAP frame from the emulator-approved directory'
         if not any(isinstance(m, dict) and m.get('helper') == 'off' for m in first):
             assert read_until(ws, lambda m: isinstance(m, dict))[-1]['helper'] == 'off'  # no helper channel in this fake
         seq, width, height, rotation, jpeg = phone_api.stream.read_frame_message(frame)
         assert (seq, width, height, rotation) == (1, 720, 1600, 0) and jpeg[:2] == b'\xff\xd8'
         path = phone_api.host.frame_paths[0]
-        assert path.parent == phone_api.folder / 'run' and path.name.startswith('frames-5640-') and path.exists()
+        assert path.parent == approved and path.name.startswith('frames-5640-') and path.is_file()
+        with Image.open(io.BytesIO(jpeg)) as image:
+            assert all(abs(a - b) <= 3 for a, b in zip(image.getpixel((10, 10)), (40, 90, 200)))
+        for directory in (approved, legacy):
+            assert not (directory / 'frames-5640-deadbeef.bin').exists() and (directory / 'keep.bin').exists()
         ws.send_json({'t': 'ack', 'seq': 1})
         ws.send_json({'t': 'touch', 'points': [{'id': 0, 'x': 0.5, 'y': 0.25, 'phase': 'down'}]})
         ws.send_json({'t': 'touch', 'points': [{'id': 0, 'x': 0.5, 'y': 0.25, 'phase': 'up'}]})
@@ -507,7 +533,7 @@ def test_the_view_takes_the_lease_streams_and_hands_back(phone_api):
         ws.send_json({'t': 'done'})
         assert read_until(ws, lambda m: isinstance(m, dict) and m['t'] == 'bye')[-1] == {'t': 'bye', 'reason': 'done'}
     assert phone_api.lease.get().holder == 'agent'
-    assert not path.exists() and list((phone_api.folder / 'run').glob('frames-*.bin')) == []
+    assert not path.exists() and not list(approved.glob('frames-*.bin')) and not list(legacy.glob('frames-*.bin'))
     assert phone_api.host.activity >= 1
 
 
@@ -565,6 +591,22 @@ def test_a_phone_that_is_off_says_so(phone_api):
     with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
         assert ws.receive_json() == {'t': 'bye', 'reason': 'off'}
     assert phone_api.lease.get().holder == 'agent'
+
+
+def test_opening_a_replacement_view_preserves_files_of_the_previous_view(phone_api):
+    prior = [phone_api.folder / d / 'frames-5640-12345678.bin' for d in ('run', 'tmp/AndroidEmulator')]
+    for path in prior:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'previous')
+    phone_api.lease.acquire(phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.other_device), 'setup')
+    issued = ticket(phone_api)
+    with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
+        read_until(ws, lambda message: isinstance(message, bytes))
+        assert all(path.is_file() for path in prior)
+        own = phone_api.host.frame_paths[-1]
+        ws.send_json({'t': 'done'})
+        read_until(ws, lambda message: isinstance(message, dict) and message.get('t') == 'bye')
+    assert not own.exists() and all(path.read_bytes() == b'previous' for path in prior)
 
 
 def test_a_second_phone_opening_the_view_replaces_the_first(phone_api):
@@ -1180,4 +1222,71 @@ def test_p3_2_the_setup_sessions_masks_are_kept_in_the_phone_folders_run(phone_a
     deps.home = lambda: phone_api.tmp
     assert deps.channel(phone_api.host, phone_api.host.state(), lambda kind, payload: None) == 'linked'
     # the setup session's fills register into the set the gateway's own set reads: one file in the phone folder's run/, digests only
-    assert seen['store'] == phone_api.host.folder / 'run' / 'masks.json' and seen['masks'] == 'masks'
+    assert seen['store'] == phone_api.folder / 'run' / 'masks.json' and seen['masks'] == 'masks'
+
+def test_view_with_unconfirmed_keeper_delivers_inline_pixels_without_a_frame_file(phone_api, monkeypatch):
+    import io
+    from PIL import Image
+
+    p = phone_api
+    p.host.folder.run.mkdir(parents=True, exist_ok=True)
+    p.host.folder.keeper_conf.write_text('{}')
+    modes = []
+    def capture(client, fmt, width, height, mmap_path=None):
+        modes.append('inline' if mmap_path is None else 'mapped')
+        pixels = bytes((28, 95, 198)) * (width * height)
+        if mmap_path is not None:
+            with Path(mmap_path).open('r+b') as file:
+                file.write(pixels)
+        yield {'width': width, 'height': height, 'image': pixels if mmap_path is None else b''}
+        client.blocked.wait(5)
+    monkeypatch.setattr(FakeGrpc, 'screenshots', capture)
+    issued = ticket(p)
+    with p.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
+        frame = read_until(ws, lambda m: isinstance(m, bytes) or m.get('t') == 'bye')[-1]
+        assert isinstance(frame, bytes)
+        seq, width, height, _, jpeg = p.stream.read_frame_message(frame)
+        with Image.open(io.BytesIO(jpeg)) as image:
+            assert image.size == (width, height) == (720, 1600)
+            assert max(abs(a-b) for a,b in zip(image.getpixel((8, 12)), (28, 95, 198))) <= 3
+        assert modes == ['inline'] and not list(p.folder.rglob('frames-*.bin'))
+        ws.send_json({'t':'ack','seq':seq})
+        ws.send_json({'t':'done'})
+        read_until(ws, lambda m: isinstance(m, dict) and m.get('t') == 'bye')
+
+@pytest.mark.parametrize('status', [3, 9, 7, 16])
+def test_unconfirmed_keeper_inline_refusal_is_terminal(phone_api, monkeypatch, status):
+    p = phone_api
+    p.host.folder.keeper_conf.write_text('{}')
+    modes = []
+    def refused(client, fmt, width, height, mmap_path=None):
+        modes.append(mmap_path)
+        raise p.apimod.need('agent_phone_grpc').GrpcError(status, 'synthetic inline refusal')
+        yield
+    monkeypatch.setattr(FakeGrpc, 'screenshots', refused)
+    issued = ticket(p)
+    with p.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
+        first = read_until(ws, lambda m: isinstance(m, bytes) or m.get('t') == 'bye')[-1]
+        assert first == {'t': 'bye', 'reason': 'error'} and modes == [None]
+    assert not list(p.folder.rglob('frames-*.bin'))
+
+
+def test_capture_capability_needs_the_registered_live_generation(phone_api):
+    p = phone_api
+    folder = p.host.folder
+    proof_path = folder.run / 'mmap-cleaner-v1.json'
+    receipt = json.loads(proof_path.read_text())
+    assert p.stream.frame_directory_for_view(folder) == folder.frames
+    prior = json.loads(folder.keeper_conf.read_text())
+    folder.keeper_conf.write_text(json.dumps(dict(prior, create_time=prior['create_time'] + 0.01)))
+    assert p.stream.frame_directory_for_view(folder) is None
+    folder.keeper_conf.write_text(json.dumps(prior))
+    proof_path.write_text(json.dumps(dict(receipt, folder=str(p.tmp / 'other-phone'))))
+    assert p.stream.frame_directory_for_view(folder) is None
+    stale = [receipt['worker'][0], receipt['worker'][1] + 0.01]
+    proof_path.write_text(json.dumps(dict(receipt, worker=stale)))
+    assert p.stream.frame_directory_for_view(folder) is None
+    proof_path.write_text('{')
+    assert p.stream.frame_directory_for_view(folder) is None
+    proof_path.unlink()
+    assert p.stream.frame_directory_for_view(folder) is None

@@ -12,6 +12,7 @@ internal class DirectGatewayReceipts {
     private class Request(val functionId: String, val tool: String, val arguments: JSONObject, var receipt: JSONObject) {
         /** When Hermes' receipt said completed, on the monotonic clock. */
         var completedAt = 0L
+        var settled = false
         /** A completed read whose result may answer the same request again, until anything that is not a read happens (REVIEW-E3 finding 2). */
         var reusable = false
         // A v3 plugin resolves a name to its tool_id: the first receipt that carries one pins it.
@@ -48,8 +49,9 @@ internal class DirectGatewayReceipts {
             val shown = proposal.getJSONObject("arguments")
             require(owned.arguments.keys().asSequence().all { key -> shown.has(key) && sameArgument(owned.arguments.opt(key), shown.opt(key)) })
         }
-        if (owned.receipt.optString("status") in FINAL_RECEIPTS) return JSONObject(owned.receipt.toString())
+        if (owned.settled) return JSONObject(owned.receipt.toString())
         owned.receipt = JSONObject(value.toString())
+        owned.settled = value.getString("status") in FINAL_RECEIPTS
         // A request that is not read-only may change what a read returns: no earlier read answers again.
         if (!value.optBoolean("read_only")) forgetReads()
         else if (value.optString("status") == "completed") { owned.completedAt = System.nanoTime() / 1_000_000; owned.reusable = true }
@@ -64,7 +66,8 @@ internal class DirectGatewayReceipts {
     }
     @Synchronized fun receipt(requestId: String): JSONObject? = requests[requestId]?.receipt?.let { JSONObject(it.toString()) }
     @Synchronized fun functionId(requestId: String): String? = requests[requestId]?.functionId
-    @Synchronized fun pending(): List<String> = requests.filterValues { it.receipt.optString("status") in setOf("ready","running","needs_approval","transferred","uncertain") }.keys.toList()
+    @Synchronized fun settled(requestId: String) = requests[requestId]?.settled == true
+    @Synchronized fun pending(): List<String> = requests.filterValues { !it.settled }.keys.toList()
     /** One argument as the model gave it and as Hermes will run it: equal, or the same plain value after Hermes typed it ("5" and 5). */
     private fun sameArgument(given: Any?, shown: Any?): Boolean = canonical(given) == canonical(shown) ||
         (given !is JSONObject && given !is JSONArray && shown !is JSONObject && shown !is JSONArray && given.toString() == shown.toString())
@@ -82,7 +85,7 @@ internal class DirectGatewayReceipts {
 }
 
 /** Receipt statuses after which nothing about that request changes (contract v3, section 2). */
-internal val FINAL_RECEIPTS = setOf("completed","failed","denied","expired","cancelled")
+private val FINAL_RECEIPTS = setOf("completed","failed","denied","expired","cancelled","uncertain")
 
 /** A closed channel means the call ended while the writer waited, so the writer ends like a cancellation, not a crash. */
 internal suspend fun <T> nextDirectFrame(controls: kotlinx.coroutines.channels.Channel<T>, microphone: kotlinx.coroutines.channels.Channel<T>, visual: kotlinx.coroutines.channels.Channel<T>): T =

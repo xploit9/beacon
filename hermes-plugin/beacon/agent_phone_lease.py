@@ -200,6 +200,10 @@ class PhoneLease:
         """The lease as of now, after the timeouts."""
         return self._transition(None)
 
+    def interrupt(self):
+        """Fence in-flight input immediately when the owner requests a stop, even with an agent-held lease."""
+        return self._transition(lambda lease, now: 'stopping')
+
     def on_change(self, listener):
         self._listeners.append(listener)
         return lambda: self._listeners.remove(listener) if listener in self._listeners else None
@@ -275,6 +279,11 @@ class PhoneLease:
     def view_open(self):
         """For L1b's ``PhoneHost(view_open=…)``: a setup view may be using the live-view frame file while a human holds."""
         return self.get().holder == HUMAN
+
+
+def task_slot(folder):
+    """One visual loop at a time on this virtual phone, including across gateway processes."""
+    return _FileLock(Path(folder) / 'run' / 'phonedriver.lock', seconds=0)
 
 
 def read(folder):

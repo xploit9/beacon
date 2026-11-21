@@ -590,36 +590,42 @@ internal fun ownerNameDraft(raw: String): String = raw.filter { it.isLetter() ||
     val call by vm.app.calls.state.collectAsStateWithLifecycle()
     val page by vm.voicePage.collectAsStateWithLifecycle()
     var keyProvider by rememberSaveable { mutableStateOf("") }
-    var keyWorks by remember { mutableStateOf(false) }
+    var managingKey by rememberSaveable { mutableStateOf(false) }
+    var verifiedProvider by remember { mutableStateOf<String?>(null) }
+    fun openKey(provider: String, saved: Boolean = false) {
+        keyProvider = provider
+        managingKey = saved
+        vm.setVoicePage("key")
+    }
     // A call, an incoming call or a screen share that is waiting for a key opens straight on the key page.
     LaunchedEffect(Unit) {
         val requested = vm.pendingVoiceKeyProvider() ?: return@LaunchedEffect
         val provider = requested.ifBlank { store.settings().provider }
-        if (!withContext(Dispatchers.IO) { store.hasKey(provider) }) { keyProvider = provider; vm.setVoicePage("key") }
+        if (!withContext(Dispatchers.IO) { store.hasKey(provider) }) openKey(provider)
     }
     DisposableEffect(Unit) { onDispose { vm.setVoicePage("home") } }
     BackHandler(page != "home") { vm.setVoicePage("home") }
     val keyFor = keyProvider.ifBlank { store.settings().provider }
     val voicePage = when (page) {
         "provider" -> voiceProviderPage(
-            onContinue = { provider, hasKey -> if (hasKey) vm.setVoicePage("home") else { keyProvider = provider; vm.setVoicePage("key") } },
+            onContinue = { provider, hasKey -> if (hasKey) vm.setVoicePage("home") else openKey(provider) },
             onBack = { vm.setVoicePage("home") },
         )
         "key" -> voiceKeyPage(
             provider = keyFor, onKeySaved = vm::voiceKeyConfigured,
-            onVerified = { keyWorks = true; vm.setVoicePage("home") }, onContinueAnyway = { vm.setVoicePage("home") },
-            onBack = { vm.setVoicePage("home") }, removable = true, onRemoved = { vm.setVoicePage("home") },
+            onVerified = { verifiedProvider = keyFor; vm.setVoicePage("home") }, onContinueAnyway = { vm.setVoicePage("home") },
+            onBack = { vm.setVoicePage("home") }, removable = true, onRemoved = { verifiedProvider = null; vm.setVoicePage("home") },
         )
         else -> voiceChoicesPage(
-            settingsMode = true, keyWorks = keyWorks, callActive = call.active,
-            onChange = { vm.setVoicePage("provider") }, onAddKey = { keyProvider = store.settings().provider; vm.setVoicePage("key") },
+            settingsMode = true, keyWorks = verifiedProvider == store.settings().provider, callActive = call.active,
+            onChange = { vm.setVoicePage("provider") }, onOpenKey = ::openKey,
         )
     }
     Column(Modifier.fillMaxSize().imePadding().verticalScroll(rememberScrollState()).padding(start = SettingsKit.PagePadding, end = SettingsKit.PagePadding, top = 8.dp, bottom = 32.dp),
         verticalArrangement = Arrangement.spacedBy(SettingsKit.SectionGap)) {
         when (page) {
             "provider" -> Text(uiText("Choose a voice provider"), Modifier.padding(start = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleLarge)
-            "key" -> Text(uiText("Add your {0} key").replace("{0}", voiceProviderInfo(keyFor).short), Modifier.padding(start = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleLarge)
+            "key" -> if (!managingKey) Text(uiText("Add your {0} key").replace("{0}", voiceProviderInfo(keyFor).short), Modifier.padding(start = 4.dp).semantics { heading() }, style = MaterialTheme.typography.titleLarge)
             else -> VoiceSettingsPluginNote(pluginAbsent)
         }
         voicePage.content(this)

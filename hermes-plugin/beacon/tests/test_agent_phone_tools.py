@@ -747,7 +747,7 @@ def test_busy_while_the_owner_sets_up_the_phone(phone):
         result = run(tools, **args)
         assert result['error'] == 'busy' and result['message'] == tools.BUSY_LINE
     assert world.calls == [] and world.inputs == []
-    assert run(tools, action='status') == {'success': True, 'phone': 'owner_setting_up', 'note': None}
+    assert run(tools, action='status') == {'success': True, 'phone': 'owner_setting_up', 'note': None, 'control_driver': 'phonedriver'}
 
 
 def test_a_broken_lease_reads_as_the_owners(phone, monkeypatch):
@@ -1807,9 +1807,9 @@ def test_p2_3_the_tools_grant_is_bound_to_the_task_and_session_that_got_the_yes(
     assert result == {'success': True, 'action': 'tap', 'approved_by_owner': True} and len(taps(world)) == 1
 
 
-def test_p3_8_the_tool_description_names_no_one_owners_tool(phone):
+def test_description_identifies_the_builtin_driver_and_distinguishes_the_owners_phone(phone):
     tools, approvals, world, api = phone
-    assert 'PhoneDriver' not in tools.DESCRIPTION and 'PhoneDriver' not in json.dumps(tools.SCHEMA)
+    assert 'PhoneDriver' in tools.DESCRIPTION and 'task' in tools.SCHEMA['parameters']['properties']
     assert '(phone_* tools)' in tools.DESCRIPTION  # the generic boundary stays
 
 

@@ -4,6 +4,7 @@ import dev.hermes.android.data.AgentPhoneLineStrings
 import dev.hermes.android.ui.AGENT_PHONE_ROUTE
 import dev.hermes.android.ui.AgentPhonePageStrings
 import dev.hermes.android.ui.AgentPhoneSetupStrings
+import dev.hermes.android.ui.agentPhoneSetupDisplayText
 import dev.hermes.android.ui.normalized
 import dev.hermes.android.ui.settingsDescriptions
 import dev.hermes.android.ui.settingsKeywordsOf
@@ -14,6 +15,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.text.Bidi
 
 /**
  * The words of {name}'s phone (§0.1, §8, §10 "words snapshot"): no SDK/AVD/adb/emulator/container/KVM/gRPC word on any screen outside
@@ -93,6 +95,39 @@ class AgentPhoneWordsTest {
         // English shows the code's own words and never reads the catalog; older entries may differ in case only ("on" for On).
         val off = words().filter { !catalog.getJSONObject("en").optString(normalized(it)).equals(it, ignoreCase = true) }
         assertTrue("en entries differ from the code: $off", off.isEmpty())
+    }
+
+    @Test fun theWarningAcknowledgementHasItsOwnLabelInEveryLanguage() {
+        val corrupted = mutableListOf<String>()
+        for (language in languages) {
+            val dictionary = catalog.getJSONObject(language)
+            val acknowledgement = dictionary.optString(normalized("I understand"))
+            assertTrue("$language must have a warning acknowledgement", acknowledgement.isNotBlank())
+            if (acknowledgement.any { it == '?' || it == '\uFFFD' }) corrupted += "$language: $acknowledgement"
+            assertFalse("$language must distinguish the acknowledgement from Continue",
+                normalized(acknowledgement) == normalized(dictionary.getString(normalized("Continue"))))
+        }
+        assertTrue("Encoding replacements in the warning acknowledgement: $corrupted", corrupted.isEmpty())
+    }
+
+    @Test fun theArabicContainerRemedyKeepsThePathLeftToRight() {
+        val path = "/dev/kvm"
+        val key = normalized(AgentPhoneLines.templates.getValue("check.container"))
+        val line = catalog.getJSONObject("ar").getString(key)
+        val formatted = agentPhoneSetupDisplayText(line)
+        assertEquals(line.replace(path, "\u2068$path\u2069"), formatted)
+        val originalDirection = Bidi(line, Bidi.DIRECTION_DEFAULT_RIGHT_TO_LEFT)
+        assertEquals("The candidate's leading slash joins the surrounding RTL run", 1, originalDirection.getLevelAt(line.indexOf(path)) % 2)
+        val direction = Bidi(formatted, Bidi.DIRECTION_DEFAULT_RIGHT_TO_LEFT)
+        assertEquals(1, direction.baseLevel)
+        assertTrue(path.indices.all { direction.getLevelAt(formatted.indexOf(path) + it) % 2 == 0 })
+    }
+
+    @Test fun setupStorageUnitsStayWithTheirNumbersInLocalizedCopy() {
+        assertEquals("16\u00A0GB free, 8\u00A0GB memory", agentPhoneSetupDisplayText("16 GB free, 8 GB memory"))
+        assertEquals("أفرغ 3\u00A0GB أو ٣\u00A0غيغابايت", agentPhoneSetupDisplayText("أفرغ 3 GB أو ٣ غيغابايت"))
+        assertEquals("1.5\u00A0Go, 16\u00A0ГБ, 8GB의", agentPhoneSetupDisplayText("1.5 Go, 16 ГБ, 8GB의"))
+        assertEquals("3 MB, 8 GBx", agentPhoneSetupDisplayText("3 MB, 8 GBx"))
     }
 
     @Test fun googlesTermsNeverGoThroughTheTranslator() {

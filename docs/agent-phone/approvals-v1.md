@@ -112,7 +112,8 @@ Words L6 shows (§8; `{name}` is the assistant's name, which the app knows):
 | risk `account` | {name} wants to change an account | as send |
 | risk `other` | {name} wants to use its phone | as send ("Every action" is on) |
 | any with `pin` | as its risk; for `fill`: {name} wants to use a saved login | `pin` |
-| `vault_new_login` | {name} wants to make a login | "Create a login for `<label>` with `<identifier>`? It's saved to your vault." |
+| `vault_new_login` (new login) | {name} wants to make a login | "Create a login for `<label>` with `<identifier>`? It's saved to your vault." |
+| `vault_new_login` (password change) | {name} wants to change the password | "Change the `<label>` password?" |
 | `vault_save`, `vault_update` | {name} found a login | `line` |
 | `vault_code` | {name} needs a code | `line`, a code field |
 | `needs_you` | {name} needs you | `line` · Open the phone |
@@ -146,7 +147,8 @@ These five sentences are what the tests pin. Every rule below follows from them;
 A purchase with a card from the vault is one question, and it is Hermes' own card consent inside L9's `fill` (surface
 `vault-payment`): "Pay £12.40 at Kanto Foods with Visa?". The tool passes `shop` and `amount` read from the screen (the app's
 label, the order button's amount or else the screen's total), never from the model; for a fill that has a site the question names
-the site (the vault's `web_domain`) instead of the app or browser. On a yes, L9 puts the card in, and only once the card went in
+the site (the vault's `web_domain`) instead of the app or browser. Without an amount, the chat title is "The agent wants to fill
+your saved card." and the question is "Fill Visa in Kanto Foods?" On a yes, L9 puts the card in, and only once the card went in
 calls `on_card_approved(package, handle, amount, certs, task, session, web_domain)`: L9's grant carries the task and the session of
 the call that asked (`fill`'s `session_id`), never a slot another chat can change, and the site of every fill that has one. A yes
 whose fill never happened (no entry, a timeout, nothing filled, a record of the fill that could not be written), a decline and a

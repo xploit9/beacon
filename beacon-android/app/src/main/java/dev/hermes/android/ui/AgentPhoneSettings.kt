@@ -14,7 +14,9 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.*
 import androidx.compose.material3.*
@@ -58,9 +60,12 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
+import java.util.UUID
 
 // Settings › {name}'s phone (EMU-DESIGN rev 4 §8 "Phone page"): the intro card while there is no phone, the journey that sets it up
 // (AgentPhoneSetup.kt), and then one page for everything about it. The controller below holds what the page shows; every value comes
@@ -87,7 +92,8 @@ internal const val PAGE_NEEDS_YOU = "page_needs_you"
 /** The status answer with the page's other answers beside it: one copy per account and profile. */
 internal fun agentPhonePageCopy(status: JSONObject, kept: JSONObject?, policy: JSONObject? = null, activity: JSONObject? = null,
                                 needsYou: JSONObject? = null): JSONObject {
-    val copy = JSONObject(status.toString())
+    // Task state must be read live before offering to cancel that task.
+    val copy = JSONObject(status.toString()).apply { remove("driver_task") }
     for ((key, value) in listOf(PAGE_POLICY to policy, PAGE_ACTIVITY to activity, PAGE_NEEDS_YOU to needsYou)) {
         (value ?: kept?.optJSONObject(key))?.let { copy.put(key, it) }
     }
@@ -171,8 +177,23 @@ internal fun agentPhoneHeroActions(hero: AgentPhoneHero, cardStarts: Boolean, on
 
 /** Fixed page words that reach uiText through a variable, for the translation checks. */
 internal val AgentPhonePageStrings: List<String> by lazy {
-    AgentPhoneHero.entries.map(::agentPhoneHeroTitle) + listOf("Payments and sends", "Every action")
+    AgentPhoneHero.entries.map(::agentPhoneHeroTitle) + AgentPhoneDriverState.entries.map { it.label } + phoneDriverFailureWords +
+        listOf("Payments and sends", "Every action")
 }
+
+// The fixed public failure lines from the plugin. Task or screen text is never used as a status label.
+private val phoneDriverFailureWords = setOf(
+    "Configure a working vision model for this Hermes profile.",
+    "The owner declined the action.",
+    "Approval expired.",
+    "The phone screen changed.",
+    "Control of the phone changed.",
+    "The phone screen is protected.",
+    "The phone task timed out.",
+    "The phone task could not be verified.",
+    "The phone task was interrupted.",
+    "The phone task could not start.",
+)
 
 /** One action is running; the page shows it on its own button. */
 internal enum class AgentPhoneBusy { Start, Stop, Policy, Remove, Helper, Notice }
@@ -192,7 +213,16 @@ internal data class AgentPhoneUi(
     val setup: AgentPhoneSetupState = AgentPhoneSetupState(),
     /** Bumped when the live view should open; the page launches it. */
     val openRequest: Int = 0,
-)
+    val driverTaskBusy: Boolean = false,
+    val driverTaskLine: AgentPhoneLine? = null,
+) {
+    val driverTaskRunning: Boolean get() = status?.driverTask?.state == AgentPhoneDriverState.Running
+    val canGiveTask: Boolean get() = loaded && loadLine == null && busy == null && !driverTaskBusy && policy?.enabled == true &&
+        status?.let { it.hasOwnedDriver && !it.install.working && it.lease?.human != true &&
+            it.power in setOf(AgentPhonePower.Off, AgentPhonePower.On) && !driverTaskRunning } == true
+}
+
+private val AgentPhoneStatus.hasOwnedDriver: Boolean get() = supportsPhoneDriver && installed && yours
 
 /** How long a helper update may take (L2 installs the file, sets the autofill service and reads the phone again) before the page gives up. */
 private const val HELPER_WAIT_MS = 180_000L
@@ -223,6 +253,7 @@ internal class AgentPhoneController(
     private var openWhenOn = false
     private var startWatch = false
     private var lastFull = 0L
+    private var driverTaskVersion = 0L
 
     private fun update(change: (AgentPhoneUi) -> AgentPhoneUi) = _state.update(change)
     private fun setup(change: (AgentPhoneSetupState) -> AgentPhoneSetupState) = _state.update { it.copy(setup = change(it.setup)) }
@@ -231,14 +262,18 @@ internal class AgentPhoneController(
 
     /** The status, and with a phone also its policy, activity and Needs-you notices. */
     suspend fun refresh(all: Boolean = true) {
+        val version = ++driverTaskVersion
         when (val read = api.status()) {
             is AgentPhoneResult.Done -> {
                 val (status, body) = read.value
                 keep(agentPhonePageCopy(body, kept))
-                applyStatus(status)
+                // An overlapping poll can have sampled the task before the last start or cancel receipt.
+                val latest = if (version == driverTaskVersion && !_state.value.driverTaskBusy) status
+                    else status.copy(driverTask = _state.value.status?.driverTask?.takeIf { status.hasOwnedDriver })
+                applyStatus(latest)
                 if (all && status.installed && status.yours) readMore(status)
             }
-            is AgentPhoneResult.Refused -> update { it.copy(loaded = true, loadLine = read.line) }
+            is AgentPhoneResult.Refused -> if (version == driverTaskVersion) update { it.copy(loaded = true, loadLine = read.line) }
         }
     }
 
@@ -302,8 +337,15 @@ internal class AgentPhoneController(
             startWatch || status?.power == AgentPhonePower.Starting || status?.power == AgentPhonePower.Stopping -> 2_000
             ui.busy == AgentPhoneBusy.Helper -> 3_000
             status?.install?.working == true -> 3_000
+            ui.driverTaskRunning -> 2_000
             else -> 15_000
         }
+    }
+
+    suspend fun awaitPoll() {
+        val interval = pollMillis()
+        if (_state.value.driverTaskRunning) delay(interval)
+        else withTimeoutOrNull(interval) { state.first { it.driverTaskRunning } }
     }
 
     /** One poll: the install while the journey is on its download, else the status (with the rest at most once a minute). */
@@ -489,6 +531,41 @@ internal class AgentPhoneController(
         }
     }
 
+    suspend fun giveTask(requestId: String, task: String): AgentPhoneResult<AgentPhoneDriverTask> {
+        if (!_state.value.canGiveTask || !validAgentPhoneTask(task)) {
+            return AgentPhoneResult.Refused(AgentPhoneLine(AGENT_PHONE_WENT_WRONG), 0)
+        }
+        return changeDriverTask { api.giveTask(requestId, task) }
+    }
+
+    fun cancelTask(id: String) {
+        scope.launch {
+            val ui = _state.value
+            if (!ui.loaded || ui.driverTaskBusy || ui.loadLine != null || !ui.driverTaskRunning || ui.status?.driverTask?.id != id) return@launch
+            val result = changeDriverTask { api.cancelTask(id) }
+            if (result is AgentPhoneResult.Refused) update { it.copy(driverTaskLine = result.line) }
+        }
+    }
+
+    private suspend fun changeDriverTask(call: suspend () -> AgentPhoneResult<AgentPhoneDriverTask>): AgentPhoneResult<AgentPhoneDriverTask> {
+        ++driverTaskVersion
+        update { it.copy(driverTaskBusy = true, driverTaskLine = null) }
+        val result = try {
+            call()
+        } finally {
+            ++driverTaskVersion
+            update { it.copy(driverTaskBusy = false) }
+        }
+        when (result) {
+            is AgentPhoneResult.Done -> update { ui ->
+                ui.copy(status = ui.status?.let { status -> status.copy(driverTask = result.value.takeIf { status.hasOwnedDriver }) })
+            }
+            // A lost reply may still have started or cancelled the task.
+            is AgentPhoneResult.Refused -> scope.launch { refresh(all = false) }
+        }
+        return result
+    }
+
     fun setEnabled(enabled: Boolean) = savePolicy(_state.value.policy?.copy(enabled = enabled) ?: AgentPhonePolicy(enabled = enabled)) { api.setPolicy(enabled = enabled) }
     fun setAsk(ask: AgentPhoneAsk) = savePolicy(_state.value.policy?.copy(ask = ask) ?: AgentPhonePolicy(ask = ask)) { api.setPolicy(ask = ask) }
 
@@ -574,9 +651,11 @@ internal class AgentPhonePageActions(
     val vaultName: (String) -> String? = { null },
     /** L6's whole activity list (joined 17 Nov). */
     val seeAll: () -> Unit = {},
+    val giveTask: (suspend (String, String) -> AgentPhoneResult<AgentPhoneDriverTask>)? = null,
+    val cancelTask: (String) -> Unit = {},
 ) {
     fun copyWithLine(line: (AgentPhoneLine) -> Unit) = AgentPhonePageActions(getStarted, notNow, showProgress, open, start, stop, refresh, line, setEnabled, setAsk,
-        openVault, updateHelper, notice, tick, remove, profileLabel, vaultName, seeAll)
+        openVault, updateHelper, notice, tick, remove, profileLabel, vaultName, seeAll, giveTask, cancelTask)
 }
 
 /**
@@ -615,7 +694,7 @@ internal fun agentPhoneVaultName(profileId: String, profiles: List<org.json.JSON
         val owner = controller ?: return@LaunchedEffect
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
             owner.refresh()
-            while (true) { delay(owner.pollMillis()); owner.poll() }
+            while (true) { owner.awaitPoll(); owner.poll() }
         }
     }
     val live = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { controller?.returnedFromLiveView() }
@@ -652,20 +731,23 @@ internal fun agentPhoneVaultName(profileId: String, profiles: List<org.json.JSON
     BackHandler { vm.backFromSettings() }
     Column(Modifier.fillMaxSize()) {
         Header(uiText("{name}'s phone").named(), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
-        AgentPhonePage(
-            state, profileName = profile,
-            actions = AgentPhonePageActions(
-                getStarted = { controller?.openFlow() }, notNow = { vm.backFromSettings() }, showProgress = { controller?.openFlow() },
-                open = { controller?.open() }, start = { controller?.start() }, stop = { controller?.stop() }, refresh = { controller?.refreshNow() },
-                line = ::onLine, setEnabled = { controller?.setEnabled(it) }, setAsk = { controller?.setAsk(it) }, openVault = { vm.more("Vault") },
-                updateHelper = { controller?.updateHelper() }, notice = { notice, open -> controller?.answerNotice(notice, open) },
-                tick = { task, done -> controller?.tick(task, done) }, remove = { confirmRemove = true },
-                seeAll = { runCatching { context.startActivity(dev.hermes.android.agentphone.AgentPhoneLogActivity.intent(context, null)) } },
-                profileLabel = { id -> profileDisplayName(id, profileRows).takeIf { it != id } ?: readableProfileId(id) },
-                vaultName = { id -> agentPhoneVaultName(id, profileRows) },
-            ),
-            modifier = Modifier.weight(1f),
-        )
+        key(controller) {
+            AgentPhonePage(
+                state, profileName = profile,
+                actions = AgentPhonePageActions(
+                    getStarted = { controller?.openFlow() }, notNow = { vm.backFromSettings() }, showProgress = { controller?.openFlow() },
+                    open = { controller?.open() }, start = { controller?.start() }, stop = { controller?.stop() }, refresh = { controller?.refreshNow() },
+                    line = ::onLine, setEnabled = { controller?.setEnabled(it) }, setAsk = { controller?.setAsk(it) }, openVault = { vm.more("Vault") },
+                    updateHelper = { controller?.updateHelper() }, notice = { notice, open -> controller?.answerNotice(notice, open) },
+                    tick = { task, done -> controller?.tick(task, done) }, remove = { confirmRemove = true },
+                    seeAll = { runCatching { context.startActivity(dev.hermes.android.agentphone.AgentPhoneLogActivity.intent(context, null)) } },
+                    profileLabel = { id -> profileDisplayName(id, profileRows).takeIf { it != id } ?: readableProfileId(id) },
+                    vaultName = { id -> agentPhoneVaultName(id, profileRows) },
+                    giveTask = controller?.let { it::giveTask }, cancelTask = { controller?.cancelTask(it) },
+                ),
+                modifier = Modifier.weight(1f),
+            )
+        }
     }
     if (confirmRemove) AgentPhoneRemoveDialog(
         freedBytes = state.status?.storageBytes, removing = state.busy == AgentPhoneBusy.Remove,
@@ -761,6 +843,7 @@ internal fun agentPhoneSize(context: Context, bytes: Long): String = isolateBidi
 /** The page itself, from [state] alone, so the tour can show every state of it. */
 @Composable internal fun AgentPhonePage(state: AgentPhoneUi, profileName: String, actions: AgentPhonePageActions, modifier: Modifier = Modifier) {
     val status = state.status
+    var enteringTask by remember(status?.hasOwnedDriver) { mutableStateOf(false) }
     // No phone yet: the welcome fills the page (follow-up 1), not a card in the list.
     if (status != null && !status.installed && !status.install.working && !status.install.resumable) {
         AgentPhoneWelcome(actions, modifier)
@@ -770,8 +853,12 @@ internal fun agentPhoneSize(context: Context, bytes: Long): String = isolateBidi
         when {
             status == null && state.loadLine != null -> item { LoadProblem(state.loadLine, actions) }
             status == null -> item { SettingsSection(testTag = "agent-phone-loading") { SettingsSkeletonRows(3) } }
-            else -> phonePage(state, status, profileName, actions)
+            else -> phonePage(state, status, profileName, actions, enterTask = { enteringTask = true })
         }
+    }
+    val giveTask = actions.giveTask
+    if (enteringTask && status?.hasOwnedDriver == true && giveTask != null) {
+        AgentPhoneTaskDialog(state.canGiveTask, giveTask) { enteringTask = false }
     }
 }
 
@@ -792,7 +879,9 @@ internal fun agentPhoneSize(context: Context, bytes: Long): String = isolateBidi
     else -> ""
 }
 
-private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(state: AgentPhoneUi, status: AgentPhoneStatus, profileName: String, actions: AgentPhonePageActions) {
+private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(
+    state: AgentPhoneUi, status: AgentPhoneStatus, profileName: String, actions: AgentPhonePageActions, enterTask: () -> Unit,
+) {
     val hero = agentPhoneHero(status, state.needsYou.size)
     val busy = state.busy
     // The last start's error shows only while the phone is off and the server still reports one.
@@ -830,6 +919,9 @@ private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(state: Agen
                 }
             }
         }
+    }
+    if (status.hasOwnedDriver && actions.giveTask != null) item(key = "driver-task") {
+        AgentPhoneTaskSection(state, enterTask, actions.cancelTask)
     }
     if (!status.installed) return
     val rows = agentPhoneChecklist(status.facts, state.setup.ticks, state.setup.chromeSeenBelow)
@@ -893,6 +985,80 @@ private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(state: Agen
             SettingsDestructiveRow(uiText("Remove phone"), actions.remove, enabled = busy != AgentPhoneBusy.Remove, testTag = "agent-phone-remove")
         }
     }
+}
+
+@Composable private fun AgentPhoneTaskSection(state: AgentPhoneUi, enterTask: () -> Unit, cancelTask: (String) -> Unit) {
+    val task = state.status?.driverTask
+    SettingsSection(title = if (task == null) "" else uiText("Task"), testTag = "agent-phone-driver-task") {
+        if (task != null) {
+            Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Column(Modifier.semantics(mergeDescendants = true) { liveRegion = LiveRegionMode.Polite }.testTag("agent-phone-driver-state")) {
+                    Text(uiText(task.state.label), style = MaterialTheme.typography.titleMedium)
+                    task.message?.takeIf { it in phoneDriverFailureWords }?.let {
+                        Text(uiText(it), style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                (state.driverTaskLine ?: state.loadLine)?.let {
+                    Text(agentPhoneText(it), Modifier.semantics { liveRegion = LiveRegionMode.Polite }, color = MaterialTheme.colorScheme.error)
+                }
+                if (state.driverTaskRunning) {
+                    TextButton(onClick = { cancelTask(task.id) }, enabled = state.loaded && !state.driverTaskBusy && state.loadLine == null,
+                        modifier = Modifier.heightIn(min = 48.dp).testTag("agent-phone-cancel-task")) { Text(uiText("Cancel task")) }
+                }
+            }
+        }
+        if (!state.driverTaskRunning) SettingsNavRow(uiText("Give a task"), enterTask, icon = Icons.Rounded.PlayArrow,
+            enabled = state.canGiveTask, testTag = "agent-phone-give-task")
+    }
+}
+
+@Composable private fun AgentPhoneTaskDialog(
+    enabled: Boolean, giveTask: suspend (String, String) -> AgentPhoneResult<AgentPhoneDriverTask>, close: () -> Unit,
+) {
+    var text by remember { mutableStateOf("") }
+    val task = text.trim()
+    var requestId by remember(task) { mutableStateOf<String?>(null) }
+    var sending by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<AgentPhoneLine?>(null) }
+    val scope = rememberCoroutineScope()
+    val tooLong = task.isNotEmpty() && !validAgentPhoneTask(task)
+    AlertDialog(
+        onDismissRequest = { if (!sending) close() },
+        title = { Text(uiText("Give a task"), Modifier.semantics { heading() }) },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(text, { text = it; error = null }, Modifier.fillMaxWidth().testTag("agent-phone-task-goal"),
+                    label = { Text(uiText("Task")) }, enabled = !sending, maxLines = 4, isError = tooLong)
+                if (tooLong) Text(uiText("This message is too long. Shorten it."), color = MaterialTheme.colorScheme.error)
+                error?.let {
+                    Text(agentPhoneText(it), Modifier.semantics { liveRegion = LiveRegionMode.Polite }.testTag("agent-phone-task-send-problem"),
+                        color = MaterialTheme.colorScheme.error)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = {
+                    val id = requestId ?: "${System.currentTimeMillis()}-${UUID.randomUUID()}".also { requestId = it }
+                    sending = true
+                    error = null
+                    scope.launch {
+                        try {
+                            when (val result = giveTask(id, task)) {
+                                is AgentPhoneResult.Done -> close()
+                                is AgentPhoneResult.Refused -> error = result.line
+                            }
+                        } finally { sending = false }
+                    }
+                },
+                enabled = enabled && !sending && task.isNotEmpty() && !tooLong,
+                modifier = Modifier.heightIn(min = 48.dp).testTag("agent-phone-send-task"),
+            ) { Text(uiText(if (sending) "Sending…" else "Send")) }
+        },
+        dismissButton = {
+            TextButton(onClick = close, enabled = !sending, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Cancel")) }
+        },
+    )
 }
 
 /**
