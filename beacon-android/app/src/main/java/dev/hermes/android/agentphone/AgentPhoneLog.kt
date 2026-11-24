@@ -29,13 +29,22 @@ internal const val ACTIVITY_REF_PREFIX = "agent_phone_activity:"
 internal val AgentPhoneLogVerbs: Map<String, String> = linkedMapOf(
     "tap" to "Tapped", "long_press" to "Pressed and held", "swipe" to "Swiped", "type" to "Typed", "key" to "Pressed a key",
     "fill" to "Filled", "save" to "Saved a login", "answer" to "Answered",
+    // D2b: a link's row never names its address; the navigation keys use the words of the phone view's own bar.
+    "open_link" to "Opened a link", "back" to "Back", "home" to "Home screen", "recents" to "Recent apps",
 )
+
+/** The plugin's name for the phone's home screen (its launcher, R3-F3): the row word "Home screen", shown in the owner's language. */
+internal const val HOME_SCREEN = "Home screen"
+
+/** An app as a row or a card names it: the home screen in the owner's words, any other app by the name its phone shows. */
+internal fun appWords(app: String, translate: (String) -> String): String = if (app == HOME_SCREEN) translate(HOME_SCREEN) else app
 
 /** How the row ended, by the plugin's outcomes (approvals-v1 §6b and L3's tool); "" for an outcome this app does not know. */
 internal fun logOutcomeWords(outcome: String): String = when (outcome) {
     "done" -> "Done"
     "declined" -> "Not allowed"
     "blocked" -> "Blocked"
+    "phone_in_use" -> "You're using the phone"
     "said_no" -> "{name} said no"
     "asked_owner" -> "Asked you"
     "not_saved" -> "Not saved"
@@ -68,6 +77,9 @@ private val DoneSentences = mapOf("tap" to "Tapped {0} at {1}", "long_press" to 
 /** A row that didn't run names only the control and where; its outcome says what happened. */
 private const val NOT_RUN = "{0} at {1}"
 
+/** An app the agent opened from its list ("Opened Clock"): the plugin's row carries the app's name, never its package when it knows it. */
+private const val OPENED_APP = "Opened {0}"
+
 /** Android's own debugging question, answered No for the owner (P3-4: said without "debugging"). */
 private const val BLOCKED_TAKEOVER = "Blocked an app that tried to take control"
 
@@ -90,6 +102,8 @@ internal fun logLine(row: AgentPhoneLogRow): LogLine {
         }
         row.action == "answer" -> LogLine(PhoneLine(BLOCKED_TAKEOVER), "", if (row.outcome == "blocked" || row.outcome == "said_no") "" else outcome)
         row.action == "fill" -> LogLine(PhoneLine(fillTitle(row.label)), "", if (row.outcome == "filled" || row.outcome == "done") "" else outcome)
+        row.action == "open_app" && row.app.isNotBlank() ->
+            LogLine(PhoneLine(OPENED_APP, listOf(plainLabel(row.app))), "", if (row.outcome == "done") "" else outcome, appInTitle = true)
         row.label.isNotBlank() && row.app.isNotBlank() && (row.outcome != "done" || row.action in DoneSentences) -> {
             val names = listOf(plainLabel(row.label), plainLabel(row.app))
             if (row.outcome == "done") LogLine(PhoneLine(DoneSentences.getValue(row.action), names), "", "", appInTitle = true)
@@ -135,5 +149,5 @@ internal fun logDayName(day: LocalDate, today: LocalDate): PhoneDayName = phoneD
 internal val AgentPhoneLogWords: List<String> by lazy {
     AgentPhoneLogVerbs.values.toList() + listOf("done", "declined", "blocked", "said_no", "asked_owner", "not_saved", "saved", "filled").map(::logOutcomeWords) +
         LogResult.entries.map { it.words } + listOf("Filled a saved card", "Filled a saved address", "Filled a saved login", "Used the phone") +
-        DoneSentences.values + listOf(NOT_RUN, BLOCKED_TAKEOVER)
+        DoneSentences.values + listOf(NOT_RUN, BLOCKED_TAKEOVER, OPENED_APP)
 }

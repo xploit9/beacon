@@ -28,6 +28,8 @@ class ChatDeliveryTest {
         var replay = JSONArray()
         var latest = 3L
         var truncatedAtZero = false
+        /** The session's surface in Hermes' info (session_local.local_session_info `source`); null leaves it out. */
+        var source: String? = null
         var historyReads = 0
         var history = JSONArray().put(json("id" to 1, "role" to "user", "content" to "Synthetic task"))
         var afterHistoryRead: (() -> Unit)? = null
@@ -72,7 +74,7 @@ class ChatDeliveryTest {
                     val result = when (method) {
                         "session.resume" -> json("session_id" to "stored-a", "stored_session_id" to "stored-a", "messages" to history, "message_count" to history.length(),
                             "running" to running, "execution_generation" to 7, "replay_epoch" to epoch, "last_sequence" to latest, "pending" to pending,
-                            "info" to json("profile_name" to "default", "profile_id" to "synthetic-profile"))
+                            "info" to json("profile_name" to "default", "profile_id" to "synthetic-profile").apply { source?.let { put("source", it) } })
                         "session.active_list" -> json("sessions" to JSONArray().put(json("id" to "stored-a", "session_key" to "stored-a", "status" to if (running) "working" else "idle")))
                         "session.events.since" -> {
                             val missing = strictEpoch && p.string("replay_epoch") != epoch || truncatedAtZero && p.optLong("last_seen") == 0L
@@ -516,6 +518,36 @@ class ChatDeliveryTest {
             assertEquals("completed", receipt.string("outcome"))
             assertEquals(1, wire.calls.count { it.string("method") == "prompt.submit" })
         } finally { wire.client.closeNative() }
+    }
+
+    // R3-F5: Hermes folds a steer in only after a tool step. One that comes during a plain-text reply is left over when the turn ends; on a
+    // classic-CLI surface (every chat Beacon creates: a canonical create without a source is 'cli', gateway/session_policy.build_policy) Hermes
+    // moves it to the turn's receipt for the client to send as its own next turn (gateway/session_cli_turn.take_cli_result_fields).
+    private fun steerReceipt(source: String?, leftover: Any?): JSONObject = runBlocking {
+        val wire = Wire().apply { this.source = source }
+        try {
+            NativeOperations(wire.client).call("/api/chat/start", emptyMap(), "POST",
+                json("session_id" to "stored-a", "message" to "Synthetic story", "client_request_id" to "submission-a"), 1024 * 1024)
+            wire.receipts.getValue("admitted-a").put("status", "terminal").put("outcome", "completed")
+                .put("result", json("final_response" to "Synthetic story", "pending_steer" to leftover))
+            NativeOperations(wire.client).call("/api/mobile/receipts/submission-a",
+                mapOf("session_id" to "stored-a", "admission_id" to "admitted-a", "completed_proof" to "1"), "GET", null, 1024 * 1024)
+        } finally { wire.client.closeNative() }
+    }
+
+    @Test(timeout = 10_000) fun aSteerHermesHandsBackComesWithTheFinishedTurnsReceipt() {
+        val receipt = steerReceipt("cli", "Synthetic steer")
+        assertEquals("The leftover steer reaches the phone", "Synthetic steer", receipt.opt("pending_steer"))
+        assertFalse(receipt.has("result"))
+        assertEquals("No leftover reads as an empty one", "", steerReceipt("cli", JSONObject.NULL).opt("pending_steer"))
+    }
+
+    @Test(timeout = 10_000) fun aSurfaceWhereHermesRunsTheLeftoverItselfSaysSo() {
+        val receipt = steerReceipt("tui", "Synthetic steer")
+        assertFalse("Hermes sends it as its own follow-up there", receipt.has("pending_steer"))
+        assertTrue(receipt.optBoolean("steer_followup"))
+        val unknown = steerReceipt(null, "Synthetic steer")
+        assertFalse(unknown.has("pending_steer") || unknown.has("steer_followup"))
     }
 
     @Test(timeout = 10_000) fun aLiveEpochChangeDoesNotDiscardNewSequenceOne() = runBlocking {

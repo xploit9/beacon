@@ -8,6 +8,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material.icons.rounded.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -68,17 +71,19 @@ internal const val SECURE_SEND_FAILED_LINE = "Couldn't confirm it was sent."
     val submit by rememberUpdatedState(onSubmit)
     val send by rememberUpdatedState(onSend)
     val values = remember(identity) { mutableStateMapOf<String, String>().apply { fields.forEach { put(it.key, it.initial) } } }
+    // Which secret fields the person chose to show. Nothing is remembered: every open starts hidden and it is cleared whenever the values are.
+    val shown = remember(identity) { mutableStateListOf<String>() }
     var settled by remember(identity) { mutableStateOf(false) }
     var error by remember(identity) { mutableStateOf("") }
     fun close(byPerson: Boolean = true) {
-        if (!settled) { settled = true; values.clear(); if (byPerson) cancel() else suspend() }
+        if (!settled) { settled = true; values.clear(); shown.clear(); if (byPerson) cancel() else suspend() }
     }
     DisposableEffect(identity, lifecycle, context) {
         val observer = LifecycleEventObserver { _, event -> if (event == Lifecycle.Event.ON_PAUSE) close(byPerson = false) }
         val screenOff = object : BroadcastReceiver() { override fun onReceive(context: Context, intent: Intent) { close(byPerson = false) } }
         lifecycle.addObserver(observer)
         val registered = runCatching { ContextCompat.registerReceiver(context, screenOff, IntentFilter(Intent.ACTION_SCREEN_OFF), ContextCompat.RECEIVER_NOT_EXPORTED) }.isSuccess
-        onDispose { lifecycle.removeObserver(observer); if (registered) runCatching { context.unregisterReceiver(screenOff) }; close(byPerson = false); values.clear() }
+        onDispose { lifecycle.removeObserver(observer); if (registered) runCatching { context.unregisterReceiver(screenOff) }; close(byPerson = false); values.clear(); shown.clear() }
     }
     LaunchedEffect(identity, expiresAt) {
         if (locked) close(byPerson = false)
@@ -114,8 +119,13 @@ internal const val SECURE_SEND_FAILED_LINE = "Couldn't confirm it was sent."
                                 },
                                 modifier = Modifier.fillMaxWidth().testTag("vault-field:${field.key}"), singleLine = true,
                                 label = { Text(uiText(field.label)) },
-                                visualTransformation = if (field.masked) PasswordVisualTransformation() else VisualTransformation.None,
+                                visualTransformation = if (field.masked && field.key !in shown) PasswordVisualTransformation() else VisualTransformation.None,
                                 keyboardOptions = KeyboardOptions(keyboardType = if (field.masked) KeyboardType.Password else KeyboardType.Text, autoCorrectEnabled = false),
+                                trailingIcon = if (!field.masked) null else ({
+                                    val visible = field.key in shown
+                                    SettingsIconButton(if (visible) Icons.Rounded.VisibilityOff else Icons.Rounded.Visibility, uiText(if (visible) "Hide {field}" else "Show {field}").replace("{field}", uiText(field.label).let { if (it == field.label) it.lowercase() else it }),
+                                        { if (visible) shown.remove(field.key) else shown.add(field.key) }, Modifier.testTag("vault-eye:${field.key}"))
+                                }),
                             )
                         }
                     }
@@ -133,9 +143,9 @@ internal const val SECURE_SEND_FAILED_LINE = "Couldn't confirm it was sent."
                                 else if (sender != null) {
                                     val taken = try { sender(answer) } catch (_: Exception) { false }
                                     answer.keys().asSequence().toList().forEach(answer::remove)
-                                    if (taken) { settled = true; values.clear() } else error = SECURE_SEND_FAILED_LINE
+                                    if (taken) { settled = true; values.clear(); shown.clear() } else error = SECURE_SEND_FAILED_LINE
                                 }
-                                else { settled = true; values.clear(); submit(answer) }
+                                else { settled = true; values.clear(); shown.clear(); submit(answer) }
                             }
                         }, enabled = fields.all { !it.required || values[it.key].orEmpty().isNotBlank() }, modifier = Modifier.testTag("vault-submit")) { Text(uiText("Continue")) }
                     }

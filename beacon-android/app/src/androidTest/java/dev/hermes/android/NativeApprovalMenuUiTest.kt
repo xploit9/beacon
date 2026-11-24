@@ -33,14 +33,19 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import androidx.test.core.app.ApplicationProvider
 import dev.hermes.android.core.*
+import dev.hermes.android.data.AuthStore
+import dev.hermes.android.data.screenRequest
 import dev.hermes.android.ui.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import org.json.JSONArray
 import org.junit.Assert.assertArrayEquals
@@ -103,6 +108,7 @@ class NativeApprovalMenuUiTest {
             block(vm, fixture)
         } finally {
             fixture.releaseHistoryList.countDown()
+            fixture.releaseReasoningOptions.countDown()
             fixture.releaseCreateAcknowledgement()
             compose.runOnUiThread { store.clear(); fixture.client.closeNative(); app.calls.ownerScope = null }
             runBlocking {
@@ -136,7 +142,7 @@ class NativeApprovalMenuUiTest {
     @Test fun yoloRequiresConfirmationAndAskFirstOnlyClearsThisChatsBypass() = withFixture { vm, fixture ->
         open(vm)
         compose.onNodeWithText("Ask before actions", useUnmergedTree = true).assertDoesNotExist()
-        compose.onNodeWithText("Always ask", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask for risky ones", useUnmergedTree = true).assertIsDisplayed()
         // The chat menu only changes this chat: no profile-wide shortcuts in it.
         compose.onNodeWithText("Profile default", useUnmergedTree = true).assertDoesNotExist()
         compose.onNodeWithText("Change for all chats").assertDoesNotExist()
@@ -158,7 +164,7 @@ class NativeApprovalMenuUiTest {
         assertEquals(listOf("1", "0"), writes.map { it.string("value") })
         assertTrue(writes.all { it.string("key") == "yolo" && it.string("scope") == "session" && it.string("session_id") == "runtime-chat-a" })
         assertEquals("manual", fixture.approvalMode)
-        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
     }
 
     // Live 2026-10-26: enabling YOLO in a just-created chat showed "Approvals: Unknown" for about 5 s while Hermes saved it.
@@ -186,9 +192,9 @@ class NativeApprovalMenuUiTest {
 
     @Test fun autoLoadsBeforeTheMenuIsOpenedInsteadOfDefaultingToManual() = withFixture(prepare = { _, fixture -> fixture.approvalMode = "smart" }) { vm, fixture ->
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
-        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Hermes decides").assertIsDisplayed()
         open(vm)
-        compose.onNodeWithText("Ask for risky ones", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Hermes decides", useUnmergedTree = true).assertIsDisplayed()
         compose.onNodeWithText("Ask only for risky actions", useUnmergedTree = true).assertDoesNotExist()
         val resumes = fixture.requests.filter { it.string("method") == "session.resume" }
         assertTrue(resumes.isNotEmpty() && resumes.all { it.getJSONObject("params").optBoolean("lazy") && it.getJSONObject("params").optBoolean("omit_messages") })
@@ -199,7 +205,7 @@ class NativeApprovalMenuUiTest {
     }) { vm, fixture ->
         // A browsed chat shows its own saved choice (not YOLO), so the shield shows the profile's mode instead of Unknown.
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "manual" }
-        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
         assertTrue("Browsing never resumes, creates or sends", fixture.requests.none {
             it.string("method") in setOf("session.resume", "session.history", "session.create", "prompt.submit")
         })
@@ -413,7 +419,7 @@ class NativeApprovalMenuUiTest {
         open(vm)
         compose.onNodeWithTag("approval-ask").assert(isNotSelected())
         compose.onNodeWithTag("approval-yolo").assert(isNotSelected())
-        compose.onNodeWithText("Always ask", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithText("Ask for risky ones", useUnmergedTree = true).assertIsDisplayed()
         fixture.omitResumeYolo = false
         compose.onNodeWithTag("approval-ask").performClick()
         await { fixture.requests.any { it.string("method") == "config.set" && it.getJSONObject("params").string("key") == "yolo" } }
@@ -422,7 +428,7 @@ class NativeApprovalMenuUiTest {
         assertEquals("session", reset.string("scope"))
         assertEquals("runtime-chat-a", reset.string("session_id"))
         await { vm.data.value["picker:approvals"]?.optBoolean("session_status_known") == true && vm.conversationPending.value.isEmpty() && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
     }
 
     // Without the plugin an unsent chat stays unsaved: YOLO on is taken from Hermes' own confirmation, but YOLO off cannot be proven
@@ -442,7 +448,7 @@ class NativeApprovalMenuUiTest {
         compose.onNodeWithTag("approval-ask").performScrollTo().performClick()
         await { vm.ui.value.error.isNotBlank() && vm.conversationPending.value.isEmpty() }
         assertTrue(vm.ui.value.error, vm.ui.value.error.contains("approvals", ignoreCase = true))
-        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Approvals: Hermes decides").assertDoesNotExist()
         compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
     }
 
@@ -483,7 +489,7 @@ class NativeApprovalMenuUiTest {
         flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(messages = emptyList())
     }) { vm, _ ->
         await { vm.data.value["picker:approvals"]?.string("profile_mode") == "smart" }
-        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Approvals: Hermes decides").assertIsDisplayed()
         open(vm)
         compose.onNodeWithTag("approval-ask").assert(isSelected())
         compose.onNodeWithTag("approval-yolo").assert(isNotSelected())
@@ -511,7 +517,7 @@ class NativeApprovalMenuUiTest {
         // A cached chat B also sets projectionReady; wait for its live read.
         await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.data.value["picker:approvals"]?.string("session_id") == "chat-b" && vm.chat.value.raw.string("model") == "chat-b-model" }
         assertEquals("low", vm.chat.value.sessionReasoningEffort)
-        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed()  // chat B keeps its own setting: not YOLO
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed()  // chat B keeps its own setting: not YOLO
         val writes = fixture.requests.filter { it.string("method") == "config.set" }.map { it.getJSONObject("params") }
         assertEquals(setOf("model", "reasoning", "yolo"), writes.map { it.string("key") }.toSet())
         assertTrue(writes.all { it.string("scope") == "session" && it.string("session_id") == "runtime-chat-a" })
@@ -541,8 +547,8 @@ class NativeApprovalMenuUiTest {
         await { vm.data.value["profile:approvals"] != null }
         // The segments say what they do themselves, so the line that explained Manual and Auto is gone.
         compose.onAllNodesWithTag("profile-approvals-caption").assertCountEquals(0)
-        assertTrue(compose.onAllNodesWithText("Always ask").fetchSemanticsNodes().isNotEmpty())
         assertTrue(compose.onAllNodesWithText("Ask for risky ones").fetchSemanticsNodes().isNotEmpty())
+        assertTrue(compose.onAllNodesWithText("Hermes decides").fetchSemanticsNodes().isNotEmpty())
         compose.onNodeWithTag("profile-approval-smart").performClick()
         await { fixture.approvalMode == "smart" && vm.data.value["profile:approvals"]?.string("value") == "smart" }
         compose.onNodeWithTag("profile-approval-smart").assert(isSelected())
@@ -581,17 +587,52 @@ class NativeApprovalMenuUiTest {
         withFixture(
             content = { vm -> val base = androidx.compose.ui.platform.LocalDensity.current
                 CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(base.density, scale)) { ProfileApprovalSettings(vm) } },
-            prepare = { _, fixture -> fixture.approvalMode = "smart" },
+            prepare = { _, fixture -> fixture.approvalMode = "manual" },
         ) { vm, _ ->
-            await { vm.data.value["profile:approvals"]?.string("value") == "smart" }
+            await { vm.data.value["profile:approvals"]?.string("value") == "manual" }
             for (size in listOf(1f, 1.3f, 2f)) {
                 compose.runOnIdle { scale = size }
                 compose.waitForIdle()
                 assertWhole("Ask for risky ones")
             }
             // At the largest font the two words cannot sit side by side: it is the dropdown row, whose option tags appear only when it opens.
-            compose.onNodeWithTag("profile-approval-smart").assertDoesNotExist()
+            compose.onNodeWithTag("profile-approval-manual").assertDoesNotExist()
         }
+    }
+
+    @Test fun approvalAndModelRemainSeparateTalkBackControlsInArabicAtLargeText() {
+        var width by mutableIntStateOf(360)
+        withFixture(content = { vm ->
+            androidx.compose.foundation.layout.BoxWithConstraints {
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                val scaled = androidx.compose.ui.unit.Density(maxWidth.value * density.density / width, 1.6f)
+                CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides scaled,
+                    androidx.compose.ui.platform.LocalLayoutDirection provides androidx.compose.ui.unit.LayoutDirection.Rtl) {
+                    NativeLocalization("ar") { ChatScreen(vm) }
+                }
+            }
+        }, prepare = { _, fixture -> fixture.approvalMode = "manual" }) { vm, _ ->
+            await { vm.data.value["picker:approvals"]?.string("profile_mode") == "manual" }
+            for (dpWidth in listOf(360, 720)) {
+                compose.runOnIdle { width = dpWidth }
+                val approval = compose.onNodeWithContentDescription("الموافقات: السؤال عند الإجراءات الخطرة").assertIsDisplayed()
+                val model = compose.onNodeWithTag("composer-model-effort", useUnmergedTree = true).assertIsDisplayed()
+                val shieldBounds = approval.fetchSemanticsNode().boundsInRoot
+                val modelBounds = model.fetchSemanticsNode().boundsInRoot
+                assertTrue("Separate touch targets at ${dpWidth}dp", !shieldBounds.overlaps(modelBounds))
+            }
+        }
+    }
+
+    @Test fun reconnectKeepsTheVisibleReasoningSheetOnlyForTheSameChat() = withFixture(content = { NativeCatalog(it) }) { vm, _ ->
+        compose.runOnIdle { vm.openCatalog("Reasoning") }
+        await { vm.catalog.value == "Reasoning" && vm.data.value["picker:reasoning"]?.has("options") == true }
+        compose.runOnIdle { vm.selectSession("chat-a", reopen = true) }
+        runBlocking { vm.awaitSelection() }
+        assertEquals("Reasoning", vm.catalog.value)
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        runBlocking { vm.awaitSelection() }
+        assertEquals("", vm.catalog.value)
     }
 
     // The F9 G3 crash: under this v1 rule a composition scope's coroutine resumes on the thread that woke it, so state written after a network call
@@ -663,9 +704,252 @@ class NativeApprovalMenuUiTest {
         await { vm.modelSaving.value.isBlank() && vm.catalog.value.isBlank() }
     }
 
+    private fun refreshEffort(vm: BeaconViewModel) = runBlocking { withContext(Dispatchers.Main) { vm.refreshChatEffort() } }
+
+    private fun effortRequest(vm: BeaconViewModel) = screenRequest("/api/reasoning", mapOf(
+        "session_id" to vm.chat.value.sessionId, "model" to vm.chat.value.raw.string("model"), "provider" to vm.chat.value.raw.string("model_provider")))
+
+    @Test fun unboundLegacyInventoryDoesNotCacheAnotherProfilesEffort() = withFixture(content = {}) { vm, fixture ->
+        val request = effortRequest(vm)
+        runBlocking { vm.screens.open(fixture.scope); vm.screens.remove(fixture.scope, "picker:reasoning", request) }
+        // Only the other profile's copy of chat-a is live. Legacy rows omit their owning profile.
+        val foreign = "runtime-other-profile"
+        fixture.legacyInventory = JSONArray().put(json("session_key" to "chat-a", "id" to foreign, "status" to "idle"))
+        fixture.sessionReasoning["other-profile"] = "xhigh"
+        refreshEffort(vm)
+        assertTrue(fixture.requests.any { it.string("method") == "session.active_list" })
+        assertFalse("queried another profile's runtime", fixture.requests.any { it.string("method") == "config.get" && it.optJSONObject("params")?.string("session_id") == foreign })
+        assertNull(vm.screens.exact(fixture.scope, "picker:reasoning", request))
+        assertEquals("", vm.chat.value.sessionReasoningEffort)
+    }
+
+    private fun overlappingEffortReads(pickerFinishesFirst: Boolean) = withFixture(content = {}) { vm, fixture ->
+        fixture.canonicalAuthority = true
+        fixture.sessionReasoning["chat-a"] = "low"
+        val request = effortRequest(vm)
+        fixture.holdReasoningOptions.set(true)
+        compose.runOnIdle { vm.openCatalog("Reasoning") }
+        await { fixture.reasoningOptionsHeld.count == 0L } // The picker has Low, but still needs its options.
+        fixture.sessionReasoning["chat-a"] = "high"
+        fixture.holdNextReasoningRead.set(pickerFinishesFirst)
+        val passive = compose.runOnIdle { vm.viewModelScope.launch { vm.refreshChatEffort() } }
+        if (pickerFinishesFirst) {
+            await { fixture.reasoningReadHeld.count == 0L }
+            fixture.releaseReasoningOptions.countDown()
+            await { "picker:reasoning" !in vm.refreshing.value }
+            fixture.releaseCreateAcknowledgement()
+        } else {
+            runBlocking { passive.join() }
+            assertEquals("high", vm.chat.value.sessionReasoningEffort)
+            fixture.releaseReasoningOptions.countDown()
+        }
+        runBlocking { passive.join() }
+        await { "picker:reasoning" !in vm.refreshing.value }
+        assertEquals("newer effort on chip", "high", vm.chat.value.sessionReasoningEffort)
+        val sheet = vm.data.value.getValue("picker:reasoning")
+        assertEquals("high", sheet.getString("value"))
+        assertEquals(fixture.reasoningOptions, sheet.getJSONArray("options").strings())
+        assertEquals("high", vm.screens.exact(fixture.scope, "picker:reasoning", request)?.value?.string("value"))
+    }
+
+    @Test fun slowPickerCannotOverwriteTheForegroundEffort() = overlappingEffortReads(false)
+    @Test fun foregroundEffortArrivingAfterPickerKeepsTheOptions() = overlappingEffortReads(true)
+
+    @Test fun reloadingANewModelOrProviderLeavesEffortUnknownUntilItsOwnRead() = withFixture(content = {}) { vm, fixture ->
+        fixture.canonicalAuthority = true
+        fixture.sessionReasoning["chat-a"] = "xhigh"
+        runBlocking { vm.screens.clear(fixture.scope); vm.screens.open(fixture.scope) }
+        val info = fixture.sessions.getValue("chat-a").getJSONObject("info")
+        for ((fieldName, value) in listOf("model" to "r5-model", "provider" to "r5-provider")) {
+            compose.runOnIdle { vm.selectSession("chat-a", reopen = true) }
+            runBlocking { vm.awaitSelection() }
+            refreshEffort(vm)
+            assertEquals("xhigh", vm.chat.value.sessionReasoningEffort)
+            info.put(fieldName, value)
+            compose.runOnIdle { vm.selectSession("chat-a", reopen = true) }
+            runBlocking { vm.awaitSelection() }
+            assertEquals(value, vm.chat.value.raw.string(if (fieldName == "provider") "model_provider" else fieldName))
+            assertEquals("effort after changing $fieldName", "", vm.chat.value.sessionReasoningEffort)
+        }
+    }
+
+    @Test fun confirmedEffortSurvivesLeavingTheChatBeforeReadback() = withFixture(content = {}) { vm, fixture ->
+        fixture.canonicalAuthority = true
+        fixture.persistReasoningInRow = false
+        fixture.sessionReasoning["chat-a"] = "low"
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        runBlocking { vm.awaitSelection() }
+        refreshEffort(vm)
+        val request = effortRequest(vm)
+        assertEquals("low", vm.chat.value.sessionReasoningEffort)
+        fixture.holdNextReasoningRead.set(true)
+        compose.runOnIdle { vm.setReasoning("high") }
+        await { fixture.reasoningReadHeld.count == 0L && fixture.sessionReasoning["chat-a"] == "high" }
+        compose.runOnIdle { vm.selectSession("chat-b") }
+        runBlocking { vm.awaitSelection() }
+        val other = vm.chat.value.sessionReasoningEffort
+        fixture.releaseCreateAcknowledgement()
+        await { vm.conversationPending.value.isEmpty() }
+        assertEquals("chat-b", vm.chat.value.sessionId)
+        assertEquals(other, vm.chat.value.sessionReasoningEffort)
+        val cache = runBlocking { app.cache.read(fixture.scope.copy(profile = ""), "screens") }
+        val saved = cache?.let(::JSONObject)?.rows("e")?.singleOrNull { it.string("p") == fixture.scope.profile && it.string("r") == request }
+        assertEquals("durable chat A effort", "high", saved?.optJSONObject("d")?.string("value"))
+        compose.runOnIdle {
+            field(vm, "cachedOwnerScope", fixture.scope)
+            field(vm, "client", null)
+            flow<AppState>(vm, "_ui").value = vm.ui.value.copy(connected = false)
+            vm.selectSession("chat-a")
+        }
+        runBlocking { vm.awaitSelection() }
+        assertEquals("high", vm.chat.value.sessionReasoningEffort)
+    }
+
+    @Test fun coldPassiveRefreshReadsSavedSignInOffTheMainThread() = withFixture(content = {}) { vm, fixture ->
+        fixture.canonicalAuthority = true
+        val mainThread = android.os.Looper.getMainLooper().thread
+        val reads = java.util.concurrent.CopyOnWriteArrayList<Boolean>()
+        val prefs = app.getSharedPreferences("r5-synthetic-auth", android.content.Context.MODE_PRIVATE)
+        val context = object : android.content.ContextWrapper(app) {
+            override fun getSharedPreferences(name: String, mode: Int) = object : android.content.SharedPreferences by prefs {
+                override fun getString(key: String?, defValue: String?): String? {
+                    reads += Thread.currentThread() === mainThread
+                    return prefs.getString(key, defValue)
+                }
+            }
+        }
+        val store = AuthStore(context, app.cipher)
+        val auth = fixture.client.auth.copy(cookies = listOf("__Host-hermes_session_rt=fixture-cookie; Path=/; Secure; HttpOnly"))
+        runBlocking { store.persist(auth) }
+        val cold = fixture.clientFor(auth, store)
+        try {
+            compose.runOnIdle { field(vm, "client", cold) }
+            reads.clear()
+            refreshEffort(vm)
+            assertEquals(fixture.reasoningEffort, vm.chat.value.sessionReasoningEffort)
+            assertTrue("cold admission read the encrypted record", reads.isNotEmpty())
+            assertFalse("saved sign-in read on the main thread", true in reads)
+        } finally {
+            cold.closeNative()
+            runBlocking { store.remove(auth.origin) }
+        }
+    }
+
+    @Test fun readbackFromAnEarlierSignInCannotChangeTheNewSignInsCache() = withFixture(content = {}) { vm, fixture ->
+        fixture.canonicalAuthority = true
+        fixture.persistReasoningInRow = false
+        val auth = fixture.client.auth.copy(cookies = listOf("__Host-hermes_session_rt=fixture-cookie; Path=/; Secure; HttpOnly"))
+        runBlocking { app.auth.persist(auth) }
+        fixture.sessionReasoning["chat-a"] = "low"
+        refreshEffort(vm)
+        fixture.holdNextReasoningRead.set(true)
+        compose.runOnIdle { vm.setReasoning("high") }
+        await { fixture.reasoningReadHeld.count == 0L }
+        runBlocking { app.auth.persist(auth) } // A fresh sign-in to the same account gets its own admission.
+        fixture.releaseCreateAcknowledgement()
+        await { vm.conversationPending.value.isEmpty() }
+        assertEquals("high", fixture.sessionReasoning["chat-a"])
+        assertEquals("low", vm.chat.value.sessionReasoningEffort)
+        assertEquals("low", vm.screens.exact(fixture.scope, "picker:reasoning", effortRequest(vm))?.value?.string("value"))
+    }
+
+    @Test fun passiveComposerWaitsForTheLegacyRuntimeBeforeShowingAnEffort() = withFixture(
+        content = { ChatScreen(it) }, prepare = { vm, fixture ->
+            fixture.reasoningEffort = "max"
+            fixture.sessionReasoning["chat-a"] = "xhigh"
+            runBlocking { fixture.client.nativeSession("chat-a") }
+            fixture.requests.clear()
+            fixture.unseenTurns += "chat-a"
+            fixture.holdActiveListAcknowledgement = true
+            val raw = vm.chat.value.raw.copy().put("model_config", """{"provider":"fixture"}""").apply { remove("runtime_session_id") }
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(raw = raw)
+        },
+    ) { vm, fixture ->
+        await { fixture.requests.any { it.string("method") == "session.active_list" } && vm.data.value["profile-defaults"]?.string("reasoning_effort") == "max" }
+        compose.onNodeWithTag("composer-model-effort").assert(!hasText("Max"))
+        fixture.releaseCreateAcknowledgement()
+        await { vm.chat.value.sessionReasoningEffort == "xhigh" }
+        compose.onNodeWithTag("composer-model-effort").assert(hasText("Extra high"))
+        assertTrue(fixture.requests.any { it.string("method") == "config.get" && it.getJSONObject("params").let { p -> p.string("key") == "reasoning" && p.string("session_id") == "runtime-chat-a" } })
+        assertFalse(fixture.requests.any { it.string("method") in setOf("session.resume", "prompt.submit") })
+    }
+
+    @Test fun runtimeEffortSurvivesAProviderOnlyHistoryRowAndAnOfflineColdOpen() {
+        var restarted by mutableStateOf<BeaconViewModel?>(null)
+        val store = ViewModelStore()
+        withFixture(content = { ChatScreen(restarted ?: it) }, prepare = { _, fixture ->
+            fixture.canonicalAuthority = true
+            fixture.reasoningEffort = "max"
+            fixture.reasoningOptions = listOf("high", "xhigh", "max")
+            fixture.persistReasoningInRow = false
+            fixture.sessions.getValue("chat-a").put("model_config", """{"provider":"fixture"}""")
+            fixture.sessionReasoning["chat-a"] = "high"
+        }) { vm, fixture ->
+            fun chip(label: String) = compose.onNodeWithTag("composer-model-effort").assert(hasText(label))
+            try {
+                compose.runOnIdle { vm.selectSession("chat-a") }
+                await { vm.chat.value.sessionReasoningEffort == "high" }
+                chip("High").performClick()
+                await { vm.data.value["picker:reasoning"]?.has("options") == true }
+                compose.onNodeWithTag("reasoning-level:high").assert(isSelected())
+                compose.onNodeWithTag("reasoning-level:xhigh").performClick()
+                await { !vm.reasoningSaving.value && vm.chat.value.sessionReasoningEffort == "xhigh" }
+                compose.onNodeWithTag("reasoning-level:xhigh").assert(isSelected())
+                compose.runOnIdle { vm.closeCatalog() }
+                chip("Extra high")
+                assertEquals("max", fixture.reasoningEffort)
+                assertEquals("xhigh", fixture.sessionReasoning["chat-a"])
+                assertEquals("""{"provider":"fixture"}""", fixture.sessions.getValue("chat-a").getString("model_config"))
+
+                compose.runOnIdle { vm.selectSession("chat-a", reopen = true) }
+                runBlocking { vm.awaitSelection() }
+                chip("Extra high")
+                compose.runOnIdle { vm.selectSession("chat-b") }
+                await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.sessionReasoningEffort == "max" }
+                chip("Max")
+                compose.runOnIdle { vm.selectSession("chat-a") }
+                runBlocking { vm.awaitSelection() }
+                chip("Extra high")
+                val diskRow = JSONObject(requireNotNull(runBlocking { app.cache.read(fixture.scope.session("chat-a"), "session") }))
+                assertTrue((diskRow.optJSONObject("session") ?: diskRow).string("reasoning_effort").isBlank())
+
+                val fresh = compose.runOnIdle {
+                    ViewModelProvider(store, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java]
+                }
+                // A new view model reads the encrypted screen cache with its connection still down.
+                runBlocking { fresh.screens.open(fixture.scope) }
+                compose.runOnIdle {
+                    field(fresh, "cachedOwnerScope", fixture.scope)
+                    flow<AppState>(fresh, "_ui").value = vm.ui.value.copy(connected = false)
+                    restarted = fresh
+                    fresh.selectSession("chat-a")
+                }
+                runBlocking { fresh.awaitSelection() }
+                assertNull(fresh.client)
+                chip("Extra high")
+                fixture.sessionReasoning["chat-a"] = "high"
+                val before = fixture.requests.size
+                compose.runOnIdle {
+                    field(fresh, "client", fixture.client)
+                    flow<AppState>(fresh, "_ui").value = fresh.ui.value.copy(connected = true)
+                    fresh.selectSession("chat-a", reopen = true)
+                }
+                await { fresh.chat.value.sessionReasoningEffort == "high" }
+                chip("High")
+                val reads = fixture.requests.toList().drop(before)
+                assertTrue(reads.any { it.string("method") == "config.get" && it.getJSONObject("params").let { p -> p.string("key") == "reasoning" && p.string("session_id") == "chat-a" } })
+                assertFalse(reads.any { it.string("method") in setOf("session.resume", "prompt.submit", "config.set") })
+            } finally { compose.runOnUiThread { store.clear() } }
+        }
+    }
+
     @Test fun reasoningPickerExplainsExtraHighAndMax() = withFixture(
         content = { NativeCatalog(it) }, prepare = { vm, _ ->
-            vm.storeData("picker:reasoning", json("value" to "xhigh", "options" to JSONArray(listOf("xhigh", "max"))))
+            // The sheet shows only a read made for this chat and model (the saved one counts), so the levels are seeded the way a first read leaves them.
+            val raw = vm.chat.value.raw
+            runBlocking { vm.screens.open(vm.client!!.scope) }
+            vm.screens.set(vm.client!!.scope, "picker:reasoning", json("value" to "xhigh", "options" to JSONArray(listOf("xhigh", "max"))),
+                dev.hermes.android.data.screenRequest("/api/reasoning", mapOf("session_id" to "chat-a", "model" to raw.string("model"), "provider" to raw.string("model_provider"))))
             flow<String>(vm, "_catalog").value = "Reasoning"
         },
     ) { _, _ ->

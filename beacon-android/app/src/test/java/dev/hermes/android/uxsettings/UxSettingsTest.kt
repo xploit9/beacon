@@ -144,9 +144,9 @@ class UxSettingsTest {
 
     @Test fun theSectionUsesTheOwnersWordsAndOneTermForTheServerPart() {
         val code = source("PluginHealth.kt")
-        for (label in listOf("Beacon plugin", "Health", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "Beacon isn't installed on this Hermes"))
+        for (label in listOf("Beacon plugin", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "Beacon isn't installed on this Hermes"))
             assertTrue(label, code.contains("uiText(\"$label\")"))
-        // Rows in the owner's order: Health, Version, dashboard, gateway, Calls, Notifications, Check now.
+        // Rows in the owner's order: the verdict (named "Beacon plugin" since the 1.2.3 UX pass, so it does not read as Hermes' own health), Version, dashboard, gateway, Calls, Notifications, Check now.
         val order = listOf("plugin-health-status", "plugin-health-version", "plugin-health-dashboard", "plugin-health-gateway", "plugin-health-calls", "plugin-health-notifications", "plugin-health-check")
         val at = order.map { code.indexOf("\"$it\"") }
         assertTrue(at.toString(), at.all { it > 0 } && at == at.sorted())

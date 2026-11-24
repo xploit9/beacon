@@ -204,14 +204,14 @@ class KeepConnectedUiTest {
         return took
     }
 
-    private class LifecycleGate {
+    internal class LifecycleGate {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         fun block() { entered.countDown(); check(release.await(10, TimeUnit.SECONDS)) { "Fixture gate was not released" } }
     }
 
     /** The Application is never started; only the real Android Service is started by its explicit component. */
-    private class LifecycleFixture : AutoCloseable {
+    internal class LifecycleFixture : AutoCloseable {
         val real = ApplicationProvider.getApplicationContext<Context>()
         val app = BeaconApplication()
         val prefix = "lifecycle-${UUID.randomUUID()}"

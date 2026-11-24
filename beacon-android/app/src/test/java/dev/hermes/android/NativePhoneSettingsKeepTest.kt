@@ -5,6 +5,7 @@ import dev.hermes.android.core.*
 import dev.hermes.android.data.*
 import dev.hermes.android.ui.serverHasCache
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Response
@@ -36,6 +37,25 @@ class NativePhoneSettingsKeepTest {
     }
     private fun editor(active: AtomicReference<BeaconClient?>, authorize: suspend (BeaconClient, String) -> Unit = { _, _ -> }) =
         NativePhoneSettings(jobs, SavedStateHandle(), screens = cache, authorizeProfile = authorize) { active.get() }
+
+    @Test fun savedSkillAndLogSummaryBelongToTheRestoredProfile() = runBlocking {
+        val owner = client().scope
+        val other = owner.copy(profile = "other")
+        val restored = AtomicReference(owner)
+        val editor = NativePhoneSettings(jobs, SavedStateHandle(), screens = cache, cachedScope = restored::get) { null }
+        val skill = NativeSkill("travel", "", "", true, "")
+        saveFor(owner, "skill-content:travel" to json("name" to "travel", "content" to "Scoped directions", "revision" to "1".repeat(64)),
+            "settings:logs:errors" to json("count" to 7))
+        editor.bind()
+        editor.openSkill(skill)
+        withTimeout(5_000) { editor.skills.first { it.selected?.name == skill.name } }
+        assertEquals("Scoped directions", editor.skills.value.content?.content)
+        assertEquals(7, editor.server.value.savedLogCount)
+        assertTrue(editor.server.value.logs.isEmpty())
+        restored.set(other); editor.bind(); editor.openSkill(skill)
+        assertTrue(editor.skills.value.content == null)
+        assertTrue(editor.server.value.savedLogCount == null)
+    }
 
     @Test fun theSavedSkillsAndNotesShowTheMomentThePagesBind() = runBlocking {
         val a = client()

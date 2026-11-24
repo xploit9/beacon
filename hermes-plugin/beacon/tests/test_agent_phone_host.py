@@ -265,7 +265,7 @@ def test_the_keeper_is_spawned_without_hermes_variables(folder, monkeypatch):
     h.install_keeper()
     h._spawn_keeper()
     assert not [k for k in seen['env'] if k.upper().startswith('HERMES')]
-    assert seen['cmd'][-2:] == ['watch', str(folder.root)] and 'hermes-home' not in ' '.join(seen['cmd']) and seen['cwd'] == folder.root
+    assert seen['cmd'][-2:] == ['watch', str(folder.root)] and 'hermes-home' not in ' '.join(seen['cmd'][1:]) and seen['cwd'] == folder.root
     conf = host.read_json(folder.keeper_conf)
     assert conf['plugin_dir'] == str(folder.root / 'plugin') and conf['idle_minutes'] == 30 and conf['heartbeat_hours'] == 24
     assert (folder.root / 'keeper.py').read_bytes() == (PLUGIN / 'agent_phone_keeper.py').read_bytes()

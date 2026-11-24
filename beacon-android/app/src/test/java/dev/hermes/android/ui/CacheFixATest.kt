@@ -24,11 +24,29 @@ class CacheFixATest {
             .forEach { assertTrue("$it keeps its saved copy", savedPageHasCopy(it, saved)) }
     }
     @Test fun aPageWithNothingSavedKeepsTheReconnectPage() {
-        val saved = mapOf("crons" to answer("jobs" to 1), "native-mcp" to answer("servers" to 1))
-        // MCP, Health, Logs, updates and backups keep nothing on the phone, whatever else is saved.
+        val saved = mapOf("crons" to answer("jobs" to 1))
         listOf("MCP servers", "Health", "Logs", "Server updates", "Session checkpoints", "Session usage").forEach { assertFalse("$it has no copy", savedPageHasCopy(it, saved)) }
         assertFalse(savedPageHasCopy("Skills", saved))
         assertFalse(savedPageHasCopy("Projects", emptyMap()))
+    }
+    @Test fun redactedMcpAndServerSummariesCanOpenOfflineEvenAfterAnEmptyAnswer() {
+        mapOf("MCP servers" to "native-mcp", "Health" to "settings:health", "Logs" to "settings:logs:errors", "Server updates" to "settings:update-check",
+            "Session checkpoints" to "settings:backups").forEach { (page, key) ->
+            assertTrue(page, savedPageHasCopy(page, mapOf(key to JSONObject())))
+            assertFalse(page, savedPageHasCopy(page, mapOf("unrelated" to JSONObject())))
+        }
+    }
+
+    @Test fun callHistoryDiskPageContainsOnlyFieldsRenderedByTheList() {
+        val row = answer("id" to "call-one", "conversation_id" to "one", "started_at" to 12L, "reason" to "Test call",
+            "transcript" to "Private detail", "payload" to answer("data" to "Other detail"))
+        val page = callHistoryPage(answer("calls" to org.json.JSONArray().put(row).put(answer("reason" to "invalid row")), "next" to "older"))
+        val calls = page.getJSONArray("calls")
+        assertEquals(1, calls.length())
+        assertEquals("Test call", CallHistoryEntry.from(calls.getJSONObject(0))?.reason)
+        assertFalse(calls.getJSONObject(0).has("transcript"))
+        assertFalse(calls.getJSONObject(0).has("payload"))
+        assertEquals("older", page.getString("next"))
     }
     @Test fun anErrorOrALoadingMarkIsNotASavedCopy() {
         assertFalse(savedPageHasCopy("Tasks", mapOf("crons" to answer("_error" to "Reconnect to refresh this page."))))

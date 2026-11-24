@@ -75,7 +75,7 @@ import kotlinx.coroutines.delay
             onEdit = { editing -> if (editing) editor.skillEdit(true) else leave { editor.skillEdit(false) } },
             onDraft = editor::skillDraft, onSave = editor::saveSkill,
             onRetry = { if (skills.editing) leave { editor.skillEdit(false); skills.selected?.let(editor::openSkill) } else skills.selected?.let(editor::openSkill) ?: editor.loadSkills() },
-            renderInstructions = { Markdown(skillInstructionBody(it), vm) }, readOnly = offlineCopy)
+            renderInstructions = { Markdown(skillInstructionBody(it), vm) }, readOnly = offlineCopy, hasSavedContent = editor::hasSavedSkill)
         else NativeMemoryScreen(memory, editor::editMemory, editor::memoryDraft, editor::saveMemory,
             onCancel = { leave { editor.editMemory("") } }, renderNotes = { Markdown(it, vm) }, readOnly = offlineCopy)
     }

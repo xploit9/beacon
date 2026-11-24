@@ -13,7 +13,13 @@ import java.util.UUID
  * chat and show two blue ticks. `cancelled` is reached only by cancelling a queued admission that never started (cancel_session_input). A refusal before any admission
  * never gets a settled state on the phone: the send returns to "queued" and waits in the box (BeaconViewModel.send and sendSteer).
  */
-internal val NOT_SENT_OUTCOMES = setOf("cancelled")
+internal val NOT_SENT_OUTCOMES = setOf("cancelled", CHAT_GONE_OUTCOME)
+
+/**
+ * H1b P0-1 (Root msg_f2774c2f5936): a box message carried from a chat Hermes deleted into the chat that replaces it. It is Not sent until the
+ * owner's Retry sends it there: nothing goes into a new conversation by itself.
+ */
+internal const val CHAT_GONE_OUTCOME = "not_sent_chat_gone"
 
 /** The outcomes Hermes settles only for a turn it started (settle_session_input): the message was started, whether the turn went well or not. */
 internal val STARTED_OUTCOMES = setOf("completed", "interrupted", "rejected", "failed")
@@ -52,6 +58,18 @@ internal fun queuedHoldLine(queued: List<QueuedMessage>): String = queued.firstO
  * and one whose file could not get through (chat join). A message merely waiting says nothing.
  */
 internal fun queueBoxSaysNotSent(item: QueuedMessage): Boolean = item.state != "queued" || item.waitingForConnection() || item.fileNotSent()
+
+/**
+ * P2-14: why a box row was not sent, in the owner's words (shown with "Not sent"): what its stored outcome says; "" when the row says nothing.
+ * Hermes not taking it covers a refusal, a cancel and a steer it never folded in. A held row's own sentence is the line above the box ([queuedHoldLine]), not repeated here.
+ */
+internal fun notSentReason(item: QueuedMessage): String = when {
+    item.waitingForConnection() -> "Offline"
+    item.fileNotSent() -> "Upload failed"
+    item.notSent() && item.outcome == CHAT_GONE_OUTCOME -> "Its chat was deleted"
+    item.notSent() -> "Didn’t arrive"
+    else -> ""
+}
 
 /** In the box: waiting to be sent, or not sent. */
 internal fun QueuedMessage.inBox(): Boolean = state == "queued" || notSent()

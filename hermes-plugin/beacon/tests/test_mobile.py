@@ -1445,7 +1445,9 @@ def test_registered_native_completion_and_callback_tools_are_real(harness):
     plugin.register(ctx)
     assert time.perf_counter()-started<10,'Native registration must remain bounded and nonblocking'
     # The saved-card tool also listens for Hermes' pre_approval_request / post_approval_response (test_any_site_card covers them).
-    assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call','pre_approval_request','post_approval_response'}
+    # Hermes' waits on the owner (on_human_input_*) become phone alerts (test_canonical_notices covers them).
+    assert {name for name,handler in hooks}=={'on_session_end','pre_llm_call','post_tool_call','pre_tool_call','pre_approval_request','post_approval_response',
+                                             'on_human_input_request','on_human_input_resolved'}
     # The phone-access tools are registered here too, each in the beacon-phone toolset (test_phone_requests covers them), and the saved-card tool in the browser toolset (test_any_site_card covers it).
     assert {tool['name'] for tool in tools}=={'beacon_call_user','beacon_continue_call_work','beacon_create_proactive_request',
                                             'beacon_event_notice','beacon_events_checked','beacon_email_notice','beacon_email_checked','beacon_pay_with_card','agent_phone',
@@ -1526,15 +1528,15 @@ def test_voice_skill_reads_are_current_enabled_scoped_and_bounded(harness, monke
     assert set(seen) == {'coder'}
 
 
-def test_voice_memory_reports_a_missing_external_provider_as_failed(harness, monkeypatch):
+def test_voice_memory_reports_an_empty_fallback_as_empty(harness, monkeypatch):
     api, _, _, tmp, _ = harness
     (tmp / 'config.yaml').write_text('memory:\n  provider: mnemosyne-bridge\n', encoding='utf-8')
     monkeypatch.setattr(api.voice_context, 'scoped', lambda profile,fn,**kwargs: fn(tmp))
     monkeypatch.setattr(api.voice_context, 'external_provider', lambda *args: (None, 'mnemosyne-bridge'))
     monkeypatch.setattr(api.voice_context, 'builtin_memory', lambda *args: '')
     result = api.voice_context.recall('owner', 'basic', 'default', 'native-stored', 'current question')
-    assert result['status'] == 'unavailable'
-    assert result['summary'] == 'Memory lookup failed.' and result['sources'] == []
+    assert result['status'] == 'empty'
+    assert result['summary'] == 'No saved memories matched.' and result['sources'] == []
 
 
 def test_project_assignment_can_reserve_only_an_owned_existing_draft(harness, monkeypatch):
@@ -1623,7 +1625,7 @@ def test_phone_delivery_uses_owned_assistant_chat_for_cron_owner_rows(harness, m
                 row = db.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
             return dict(row) if row else None
 
-    server = SimpleNamespace(_profile_db=lambda scope: nullcontext(ProfileDb()))
+    server = SimpleNamespace(_profile_db=lambda scope: nullcontext(ProfileDb()), _profile_home=lambda profile: tmp)
     monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=server))
     monkeypatch.setattr(api.proactive, 'current_profile', lambda cfg: 'default')
     monkeypatch.syspath_prepend(str(Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home()/'AppData'/'Local'/'hermes'/'hermes-agent')))

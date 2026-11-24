@@ -104,4 +104,58 @@ class SteeredTurnTest {
         val proven = proveFinishedTurn(identity, "runtime-1", done(), true, "", rows(), lookup = null, retry = null, failed = { _, _ -> fail("no lookup is made") })
         assertEquals("done_event", proven.step)
     }
+
+    // R3-F5: a steer sent while Beacon wrote a plain-text reply never reached the turn, and the phone showed it delivered.
+    @Test fun aSteerHermesHandedBackGoesAsTheNextTurnByItself() {
+        val copy = steerCopy("  Make it shorter ")
+        val next = steerAfterTurn(copy, json("pending_steer" to "Make it shorter"))
+        assertEquals("queue" to "queued", next.kind to next.state)
+        assertTrue("a send of its own", next.submissionId != copy.submissionId && next.admissionId.isBlank())
+        assertEquals("Make it shorter", next.text.trim())
+        // Hermes joins every leftover steer with a newline; each copy is found as a whole line, never inside other words.
+        assertEquals("queued", steerAfterTurn(steerCopy("Second"), json("pending_steer" to "First\nSecond")).state)
+        assertTrue(steerAfterTurn(steerCopy("ok"), json("pending_steer" to "look at this")).notSent())
+    }
+
+    @Test fun aSteerHermesDidNotTakeWaitsAsNotSentAndNeverShowsDelivered() {
+        // A stopped turn drops it; an unreadable receipt cannot show Hermes holds it.
+        listOf(json("pending_steer" to ""), null, JSONObject()).forEach { receipt ->
+            val after = steerAfterTurn(steerCopy(), receipt)
+            assertTrue(after.notSent() && after.inBox())
+        }
+        assertTrue(steerAfterTurn(steerCopy(state = "unknown"), json("pending_steer" to "")).notSent())
+    }
+
+    // Two Send now during one tool step: Hermes saves them as ONE steer row, joined with a newline. Both copies are that row, never Not sent.
+    @Test fun twoSteersHermesSavedAsOneRowAreThatRow() {
+        val joined = listOf("13450" to "Only reply with the word REDIRECTED\nAnd keep it short")
+        val first = steerAfterTurn(steerCopy(), json("pending_steer" to ""), joined)
+        val second = steerAfterTurn(steerCopy("And keep it short", at = 2), json("pending_steer" to ""), joined)
+        listOf(first, second).forEach { assertEquals("sent" to "13450", it.state to it.rowId) }
+        assertTrue("a part of a line is not the message", steerAfterTurn(steerCopy("keep it"), json("pending_steer" to ""), joined).notSent())
+        // The row's own words, as the chat reads them from the saved marker.
+        val row = json("row_id" to 13450L, "role" to "user", "display_kind" to "steer",
+            "content" to "[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position]\nFirst ask\nSecond ask\n[/OUT-OF-BAND USER MESSAGE]")
+        assertTrue(steerLine(steerRowText(row), "Second ask"))
+    }
+
+    // The same words steered in an earlier turn are that turn's row, never this copy: only this turn's steer rows count, and a leftover wins.
+    @Test fun anEarlierTurnsSteerWithTheSameWordsNeverSwallowsALeftover() {
+        val older = listOf(
+            json("row_id" to 13400L, "role" to "user", "content" to "Earlier ask"),
+            json("row_id" to 13401L, "role" to "user", "display_kind" to "steer", "content" to "[OUT-OF-BAND USER MESSAGE note]\nOnly reply with the word REDIRECTED\n[/OUT-OF-BAND USER MESSAGE]"),
+            json("row_id" to 13402L, "role" to "assistant", "content" to "REDIRECTED"))
+        val thisTurn = listOf(json("row_id" to 13460L, "role" to "user", "content" to "Write a story"), json("row_id" to 13461L, "role" to "assistant", "content" to "Once"))
+        assertEquals("only this turn's steer rows", emptyList<Pair<String, String>>(), turnSteerRows(older + thisTurn, emptyList()))
+        assertEquals(listOf("13441"), turnSteerRows(rows(), listOf(prompt, steer)).map { it.first })
+        val leftover = steerAfterTurn(steerCopy(), json("pending_steer" to "Only reply with the word REDIRECTED"), listOf("13401" to "Only reply with the word REDIRECTED"))
+        assertEquals("queued", leftover.state)
+    }
+
+    @Test fun aSteerHermesRunsItselfKeepsItsCopy() {
+        val copy = steerCopy()
+        assertSame(copy, steerAfterTurn(copy, json("steer_followup" to true, "pending_steer" to "")))
+        assertTrue(copy.openSteer())
+        assertFalse(copy.copy(rowId = "13441").openSteer())
+    }
 }

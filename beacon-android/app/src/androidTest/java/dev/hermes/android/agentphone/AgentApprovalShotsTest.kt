@@ -110,6 +110,8 @@ class AgentApprovalShotsTest {
         // (REVIEW-FIX-UI-121), with the amount still large.
         Case("26-checkout-sign-in", card(action(26, ApprovalRisk.Payment, label = "Sign in", amount = "£12.40"))),
         Case("27-reset-password", card(AgentApproval(id(27), ApprovalKind.NewLogin, far, label = "Amazon", line = "Change the Amazon password?"))),
+        // R2-F12 (D2b): the plugin now sends the app's own name, "Clock", where it used to send com.google.android.deskclock.
+        Case("28-delete-in-clock", card(action(28, ApprovalRisk.Delete, app = "Clock", label = "Delete", purpose = "Delete the 7:00 alarm"))),
     )
 
     private var shown by mutableStateOf(cases.first())
@@ -138,6 +140,14 @@ class AgentApprovalShotsTest {
         "32-list-empty" to LogState(emptyList(), loading = false),
         "33-list-offline" to LogState(null, failed = true, loading = false),
         "34-list-loading" to LogState(null),
+        // D2b: an opened app, a link (never its address) and the navigation keys, in the words of the phone view's bar.
+        "35-list-opened-and-keys" to LogState(listOf(
+            AgentPhoneActivity(at(17, 20, 5), "", "recents", "", false, "done", 5),
+            AgentPhoneActivity(at(17, 20, 4), "", "home", "", false, "done", 4),
+            AgentPhoneActivity(at(17, 20, 3), "", "back", "", false, "done", 3),
+            AgentPhoneActivity(at(17, 20, 2), "", "open_link", "", false, "done", 2),
+            AgentPhoneActivity(at(17, 20, 1), "Clock", "open_app", "", false, "done", 1),
+        ), loading = false),
     )
 
     /**
@@ -276,6 +286,22 @@ class AgentApprovalShotsTest {
         compose.onNodeWithTag("agent-phone-log-summary").assertIsDisplayed()
         target.assertIsNotDisplayed()
     }
+
+    /** UX P1-8: the tap Beacon can't read says what Allow lets it do, verb first, and keeps the checkout's amount line. */
+    private fun unreadableTap(variant: String, language: String, fontScale: Float, says: String) {
+        show(language, dark = true, fontScale = fontScale, widthDp = 411, heightDp = 891)
+        compose.runOnUiThread { showList = null; shown = cases.first { it.name == "02-payment-screen-tap" } }
+        compose.waitForIdle()
+        val title = compose.onNodeWithTag("agent-approval-title").fetchSemanticsNode().config[SemanticsProperties.Text].joinToString { it.text }
+            .filterNot { it in '\u2066'..'\u2069' }
+        assertEquals(says, title)
+        compose.onNodeWithTag("agent-approval-amount").assertIsDisplayed()
+        shot("$variant-02-payment-screen-tap")
+        check("$variant/02-payment-screen-tap")
+    }
+
+    @Test fun theUnreadableTapSaysWhatAllowDoesInDark() = unreadableTap("h2b-dark", "en", 1f, "Maya wants to tap an unreadable button")
+    @Test fun theUnreadableTapSaysWhatAllowDoesInArabicAtTwiceText() = unreadableTap("h2b-ar-large2", "ar", 2f, "يريد Maya النقر على زر غير مقروء")
 
     @Test fun everyStateInDark() = tour("dark")
     @Test fun everyStateInLight() = tour("light", dark = false)

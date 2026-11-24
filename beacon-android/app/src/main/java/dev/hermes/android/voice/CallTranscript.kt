@@ -125,6 +125,7 @@ internal fun List<CallTranscript>.acceptTranscript(event: CallTranscript): List<
 
 /** Saved call turns sit where they happened among text messages; untimed (live) turns stay at the end. */
 internal fun interleaveCallMessages(messages: List<Message>, calls: List<Message>): List<Message> {
+    if (calls.isEmpty()) return messages
     val out = ArrayList<Message>(messages.size + calls.size); var next = 0
     for (message in messages) {
         while (next < calls.size && calls[next].recordedAt > 0 && message.recordedAt > 0 && calls[next].recordedAt < message.recordedAt) out += calls[next++]

@@ -131,12 +131,14 @@ class CallsSetupTest {
 
     // ---- Call bubble question ----
 
-    @Test fun theBubbleIsAskedOnceAfterACallThatRanWithoutIt() {
-        assertTrue(shouldAskCallBubble(wasActive = true, bubbleWasMissing = true, active = false, alreadyAsked = false))
-        assertFalse("still in the call", shouldAskCallBubble(true, true, active = true, alreadyAsked = false))
-        assertFalse("the permission was there", shouldAskCallBubble(true, false, false, false))
-        assertFalse("asked before", shouldAskCallBubble(true, true, false, alreadyAsked = true))
-        assertFalse("no call happened", shouldAskCallBubble(false, true, false, false))
+    @Test fun theBubbleIsAskedOnceOnComingBackToACallMinimizedWithoutIt() {
+        assertTrue(shouldAskCallBubble(wasMinimized = true, bubbleWasMissing = true, minimized = false, active = true, alreadyAsked = false))
+        assertFalse("never after the call ended", shouldAskCallBubble(wasMinimized = true, bubbleWasMissing = true, minimized = false, active = false, alreadyAsked = false))
+        assertFalse("never after a hang-up that came straight from the minimized call", shouldAskCallBubble(wasMinimized = true, bubbleWasMissing = true, minimized = true, active = false, alreadyAsked = false))
+        assertFalse("still minimized", shouldAskCallBubble(true, true, minimized = true, active = true, alreadyAsked = false))
+        assertFalse("the permission was there", shouldAskCallBubble(true, false, false, true, false))
+        assertFalse("asked before", shouldAskCallBubble(true, true, false, true, alreadyAsked = true))
+        assertFalse("never minimized", shouldAskCallBubble(false, true, false, true, false))
     }
 
     // ---- Incoming call sheet ----

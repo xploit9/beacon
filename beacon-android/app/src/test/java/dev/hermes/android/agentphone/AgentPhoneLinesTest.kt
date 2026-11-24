@@ -70,10 +70,10 @@ class AgentPhoneLinesTest {
 
     /** The exact lines the host's stream sends (json.dumps with compact separators, test_agent_phone_fu2.py pins the same bytes). */
     @Test fun theHostsOwnStateLinesReachTheSession() {
-        val prompt = """{"t":"state","helper":"ready","keyboard":false,"rotation":0,"prompt":"usb_debugging","lease":"you"}"""
-        val password = """{"t":"state","helper":"ready","keyboard":"password","rotation":0,"prompt":null,"lease":"you"}"""
-        assertEquals(ServerText.State(false, 0, "ready", "usb_debugging"), parseServerText(prompt))
-        assertEquals(ServerText.State(true, 0, "ready", null, password = true), parseServerText(password))
+        val prompt = """{"t":"state","helper":"ready","keyboard":false,"rotation":0,"prompt":"usb_debugging","lease":"you","epoch":1}"""
+        val password = """{"t":"state","helper":"ready","keyboard":"password","rotation":0,"prompt":null,"lease":"you","epoch":1}"""
+        assertEquals(ServerText.State(false, 0, "ready", "usb_debugging", controlEpoch = 1), parseServerText(prompt))
+        assertEquals(ServerText.State(true, 0, "ready", null, password = true, controlEpoch = 1), parseServerText(password))
     }
 
     // -- the join (EMU-JOIN fu2): the codes on L4's page and in L6's card and list ------------------------------------------------

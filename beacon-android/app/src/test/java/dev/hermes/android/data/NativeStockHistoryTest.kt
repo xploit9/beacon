@@ -347,6 +347,22 @@ class NativeStockHistoryTest {
         } finally { ThreadMarks.reset() }
     }
 
+    // R2-F19: Hermes' single-chat read returns the stored 0/1; a pinned marked thread read that way must still list as pinned.
+    @Test fun aMarkedThreadReadByIdListsAsPinned() = runBlocking<Unit> {
+        ThreadMarks.reset()
+        val stock = Stock().apply {
+            active = Stock.rows("active", 2) + json("id" to "pinned-thread", "title" to "Pinned", "message_count" to 0)
+            withoutThreadSources { r -> if (r.url.encodedPath == "/api/sessions/pinned-thread")
+                200 to json("id" to "pinned-thread", "session_id" to "pinned-thread", "profile" to "work", "title" to "Pinned", "message_count" to 0, "last_active" to 5, "pinned" to 1).toString() else null }
+        }
+        val c = client(stock)
+        try {
+            ThreadMarks.add(c.scope, "pinned-thread")
+            val row = threadLane(c).getJSONArray("sessions").let { rows -> (0 until rows.length()).map { rows.getJSONObject(it) }.first { it.getString("session_id") == "pinned-thread" } }
+            assertTrue(row.optBoolean("pinned"))
+        } finally { ThreadMarks.reset() }
+    }
+
     @Test fun aMarkedThreadWithNoMessagesYetJoinsTheMainListButAnEmptyChatDoesNot() = runBlocking<Unit> {
         ThreadMarks.reset()
         val stock = Stock().apply {

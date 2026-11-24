@@ -18,6 +18,23 @@ class NotificationContentTest {
         assertEquals(notificationFallback(""), notificationFallback("forged title"))
         assertFalse(notificationFallback("task_result").second.contains("finished"))
     }
+    @Test fun everyActivityFallbackAndReviewActionHasALocalizedEntry() {
+        val file = java.io.File("src/main/assets/native-locales.json")
+        val catalogs = JSONObject(file.readText())
+        val keys = ActivityNotificationStrings.toMutableSet()
+        keys += listOf("Open Beacon to answer.", "Open Beacon to review the request.", "Review notification action",
+            "Beacon activity", "Open Beacon to review.", "Open Beacon to view private activity.", "Your turn", "Your answer", "Answer")
+        for (kind in listOf("working", "failure", "completion", "approval", "clarify", "task_result", "test", "incoming_call", "")) {
+            notificationFallback(kind) { keys += it; it }
+        }
+        for (lang in dev.hermes.android.ui.NativeLanguages.keys) {
+            val words = catalogs.getJSONObject(lang)
+            for (key in keys) assertTrue("$lang: $key", words.optString(dev.hermes.android.ui.normalized(key)).isNotBlank())
+        }
+        // Arabic alert wording is unverified pending native-speaker review.
+        val arabic = catalogs.getJSONObject("ar")
+        assertNotEquals(arabic.getString("review"), arabic.getString("review notification action"))
+    }
     @Test fun boundedArabicTextAndUnicodeRemainReadable() {
         assertEquals("مرحبا بالعالم", boundedNotificationText("مرحبا\n\tبالعالم\u0000", 120))
         val long = boundedNotificationText("موضوع ".repeat(200), 120)
@@ -47,9 +64,12 @@ class NotificationContentTest {
         assertFalse(isEmailAlertNotificationRoute(route(), "other", "event", scope, "chat"))
     }
     @Test fun completionNotificationIsSilentOnlyWhileBeaconIsVisible() {
-        assertTrue(silentPushNotification("completion", true))
-        assertFalse(silentPushNotification("completion", false))
-        listOf("failure", "approval", "clarify", "task_result", "test", "incoming_call").forEach {
+        // R3-F4: a thread post is a chat's message too: quiet while Beacon is open, like a reply.
+        listOf("completion", "task_result").forEach {
+            assertTrue(it, silentPushNotification(it, true))
+            assertFalse(it, silentPushNotification(it, false))
+        }
+        listOf("failure", "approval", "clarify", "test", "incoming_call").forEach {
             assertFalse(it, silentPushNotification(it, true))
         }
     }

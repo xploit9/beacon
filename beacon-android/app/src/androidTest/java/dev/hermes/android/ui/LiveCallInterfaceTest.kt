@@ -286,14 +286,14 @@ class LiveCallInterfaceTest {
         shell("wm density 440")
         shell("settings put system font_scale 1.3")
         rule.waitForIdle()
-        for (label in listOf("Camera", "Mute", "Speaker", "Share screen", "Hang up")) rule.onNodeWithContentDescription(label).assertExists()
+        for (label in listOf("Camera", "Mute", "Speaker", "Share screen", "End call")) rule.onNodeWithContentDescription(label).assertExists()
         rule.onNodeWithTag("beacon-call-status").assertExists()
         capture("call-unfolded-large-text")
 
         shell("wm size 2352x1080")
         rule.activityRule.scenario.onActivity { it.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE }
         rule.waitForIdle()
-        for (label in listOf("Camera", "Mute", "Speaker", "Share screen", "Hang up")) rule.onNodeWithContentDescription(label).assertExists()
+        for (label in listOf("Camera", "Mute", "Speaker", "Share screen", "End call")) rule.onNodeWithContentDescription(label).assertExists()
         rule.onNodeWithTag("beacon-call-status").assertExists()
         capture("call-landscape-large-text")
     }

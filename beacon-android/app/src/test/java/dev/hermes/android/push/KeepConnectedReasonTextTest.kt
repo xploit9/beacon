@@ -40,8 +40,17 @@ class KeepConnectedReasonTextTest {
         assertEquals("Hermes had a problem. Retrying…", keepConnectedReasonText("Hermes returned no authorized profiles"))
     }
 
-    @Test fun noStoredReasonJustSaysRetrying() {
-        assertEquals("Retrying…", keepConnectedReasonText(""))
+    /** K2 (22 Nov 2026): the owner's phone sat on a reason-less "Retrying…". Every reconnecting state now says why. */
+    @Test fun everyReconnectingStateSaysWhy() {
+        // No stored reason: a "Connected" that heard nothing from Hermes for 90 s.
+        assertEquals("Lost the connection to Hermes. Retrying…", keepConnectedReasonText(""))
+        assertEquals("Network changed. Retrying…", keepConnectedReasonText("Network changed"))
+        assertEquals("Android paused Beacon. Retrying…", keepConnectedReasonText(KEEP_CONNECTED_PAUSED))
+        assertEquals("Open Beacon to reconnect.", keepConnectedReasonText(KEEP_CONNECTED_NOT_STARTED))
+        for (reason in listOf("", "Network changed", KEEP_CONNECTED_PAUSED, KEEP_CONNECTED_NOT_STARTED)) {
+            val (_, body) = keepConnectedNotificationText(KeepConnectedService.STATUS_RECONNECTING, "Cypher", reason, online = true)
+            assertTrue("'$reason' -> '$body'", body != "Retrying…" && body.substringBefore(". ").length > 3)
+        }
     }
 
     @Test fun aProfileNameCannotPassForAStatusOrASentence() {

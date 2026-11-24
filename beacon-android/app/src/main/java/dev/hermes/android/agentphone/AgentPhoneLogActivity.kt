@@ -218,7 +218,9 @@ private fun actionIcon(row: AgentPhoneLogRow): ImageVector = when (row.action) {
 
 /** A row as the owner reads it: what was done in plain words, then the app (when the sentence doesn't name it), the [time] and (when it
  *  didn't simply run) how it ended. The phone page's Recent activity reads its rows the same way. */
-@Composable internal fun logRowText(row: AgentPhoneLogRow, time: String): Pair<String, String> {
+@Composable internal fun logRowText(record: AgentPhoneLogRow, time: String): Pair<String, String> {
+    val home = uiText(HOME_SCREEN)
+    val row = record.copy(app = appWords(record.app) { home })
     val line = logLine(row)
     val title = PhoneLine(uiText(line.title.template), line.title.args).shown().named()
     val value = listOf(

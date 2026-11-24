@@ -61,8 +61,8 @@ class UxChatCoreTest {
 
     @Test fun skipApprovalsIsTheOnlyNameForTheYoloMode() {
         assertEquals("Don't ask", approvalChoiceLabel("yolo"))
-        assertEquals("Always ask", approvalChoiceLabel("manual"))
-        assertEquals("Ask for risky ones", approvalChoiceLabel("smart"))
+        assertEquals("Ask for risky ones", approvalChoiceLabel("manual"))
+        assertEquals("Hermes decides", approvalChoiceLabel("smart"))
     }
 
     @Test fun theChatMenuKeepsDailyActionsAndTucksTheRestUnderMore() {

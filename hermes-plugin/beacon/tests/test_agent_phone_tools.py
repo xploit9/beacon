@@ -96,7 +96,7 @@ class FakeAdb:
             if not self.world.prompt_sticky:
                 self.world.focus_override = None
             return Done('')
-        if text.startswith('dumpsys window') and self.world.focus_override:
+        if text.startswith('dumpsys window') and not text.startswith('dumpsys window windows') and self.world.focus_override:
             return Done(f'  mCurrentFocus=Window{{77aa u0 {self.world.focus_override}}}\n')
         if text.startswith('dumpsys window') and not text.startswith('dumpsys window windows') and self.world.xml == SAVE_PROMPT_XML:
             # Android's own save prompt, as measured: the window `android` over the app that asked
@@ -107,7 +107,11 @@ class FakeAdb:
         if text.startswith('dumpsys window windows'):
             # The input method window as measured on the agent phone: its touchable region while it is on screen.
             region = ''.join('(%d,%d,%d,%d)' % r for r in (self.world.keyboard or []))
-            return Done('  Window #7 Window{16dee7b u0 InputMethod}:\n    mIsImWindow=true\n'
+            return Done(f'  Window #1 Window{{4f2a u0 {self.world.package}/{self.world.package}.{self.world.activity}}}:\n'
+                        '    mAttrs={ty=BASE_APPLICATION\n      fl=HARDWARE_ACCELERATED\n    }\n'
+                        '  Window #3 Window{a1 u0 StatusBar}:\n    mAttrs={(0,0)(fillx63) ty=STATUS_BAR}\n'
+                        '    Frames: frame=[0,0][1080,63]\n'
+                        '  Window #7 Window{16dee7b u0 InputMethod}:\n    mIsImWindow=true\n'
                         f'    touchable region=SkRegion({region})\n    isOnScreen={str(bool(self.world.keyboard)).lower()}\n'
                         f'    isVisible={str(bool(self.world.keyboard)).lower()}\n  Window #8 Window{{1 u0 NavigationBar0}}:\n')
         if text.startswith('dumpsys input_method'):
@@ -435,10 +439,280 @@ def test_payment_labels_in_several_languages(phone, label):
     assert tools.assess(screen, 'tap', index_of(screen, label))[0] == 'payment'
 
 
-def test_currency_amount_alone_makes_a_payment_button(phone):
+def test_currency_amount_alone_pays_on_a_checkout_and_opens_a_product_on_a_list(phone):
+    """D2c: an amount on the control pays where an order can be placed (here a total is on screen); on a list it opens the product."""
     tools, approvals, world, api = phone
+    screen = screen_of(tools, screen_xml(node(text='١٢٫٤٠ ر.س'), node('android.widget.TextView', text='الإجمالي ١٢٫٤٠ ر.س', clickable=False,
+                                                                    bounds=(63, 1100, 1017, 1180))))
+    assert tools.assess(screen, 'tap', index_of(screen, '١٢٫٤٠ ر.س'))[0] == 'payment'
+    # The only priced control anywhere still asks (it may be the pay button in any language); one of a list of priced tiles doesn't.
     screen = screen_of(tools, screen_xml(node(text='١٢٫٤٠ ر.س')))
     assert tools.assess(screen, 'tap', index_of(screen, '١٢٫٤٠ ر.س'))[0] == 'payment'
+    screen = screen_of(tools, screen_xml(node(text='١٢٫٤٠ ر.س'), node(text='٨٫٥٠ ر.س', bounds=(63, 1100, 1017, 1226))))
+    assert tools.assess(screen, 'tap', index_of(screen, '١٢٫٤٠ ر.س'))[0] is None
+
+
+# -- D2c: browsing and searching a shop is not paying ---------------------------------------------------------------------------------
+# Owner, 22 Nov: "it asks for permission as if it is payments, like it counts searching for a product as payment". Synthetic screens
+# shaped like the owner's shop app (prices on every tile, "Delivery fee", a cart badge id, a Share button, a code-box sign-in).
+
+def _group(cls, children, bounds, rid='', clickable=True, scrollable=False):
+    from xml.sax.saxutils import quoteattr
+    return (f'<node class="{cls}" package="{PKG}" text="" content-desc="" resource-id={quoteattr(rid and PKG + ":id/" + rid)} '
+            f'clickable="{str(clickable).lower()}" enabled="true" focusable="{str(clickable).lower()}" focused="false" '
+            f'scrollable="{str(scrollable).lower()}" long-clickable="false" password="false" checkable="false" '
+            f'bounds="[%d,%d][%d,%d]" hint="">' % bounds + ''.join(children) + '</node>')
+
+
+def _tile(name, price, bounds):
+    x0, y0, x1, y1 = bounds
+    return _group('android.widget.LinearLayout', [
+        node('android.widget.ImageView', clickable=False, bounds=(x0 + 20, y0 + 20, x1 - 20, y0 + 180), rid='product_image'),
+        node('android.widget.TextView', text=name, clickable=False, bounds=(x0 + 20, y0 + 190, x1 - 20, y0 + 250)),
+        node('android.widget.TextView', text=price, clickable=False, bounds=(x0 + 20, y0 + 260, x1 - 20, y0 + 320))], bounds, rid='product_card')
+
+
+SHOP_HOME = screen_xml(
+    node('android.widget.EditText', hint='Search for any product', bounds=(40, 380, 1040, 480), rid='search_field', focused=True),
+    node('android.widget.TextView', text='Delivery fee AED 5', clickable=False, bounds=(40, 500, 700, 560)),
+    node('android.widget.ImageButton', desc='Cart', bounds=(900, 500, 1040, 600), rid='cart_button'),
+    node('android.widget.TextView', text='2', clickable=False, bounds=(990, 500, 1040, 540), rid='tv_total_items'),
+    node('android.widget.ImageButton', desc='Share', bounds=(760, 500, 880, 600), rid='share'),
+    _group('androidx.recyclerview.widget.RecyclerView', [_tile('Golden Eggs', 'AED 12.50', (40, 700, 520, 1050)),
+                                                         _tile('Fresh Milk', 'AED 6.75', (560, 700, 1040, 1050))],
+           (0, 650, 1080, 2300), rid='products', clickable=False, scrollable=True),
+    title='Kanto Foods')
+CODE_SCREEN = screen_xml(
+    node('android.widget.TextView', text='Enter the 4-digit code we sent to ' + ADDRESS, clickable=False, bounds=(63, 400, 1017, 520)),
+    _group('android.widget.LinearLayout', [node('android.widget.EditText', bounds=(80 + 240 * i, 600, 280 + 240 * i, 760))
+                                           for i in range(4)], (63, 580, 1017, 780), rid='digits_linear_layout'),
+    node(text='Send confirmation code', bounds=(63, 900, 1017, 1026)),
+    title='Verify your number')
+CART = screen_xml(_tile('Golden Eggs', 'AED 12.50', (40, 400, 1040, 750)),
+                  node('android.widget.TextView', text='Total AED 12.50', clickable=False, bounds=(63, 1800, 1017, 1880)),
+                  node(text='Checkout', bounds=(63, 2000, 1017, 2126)), title='Your cart')
+CHECKOUT = screen_xml(node('android.widget.EditText', hint='Search for an address', bounds=(40, 380, 1040, 480), focused=True),
+                      node('android.widget.TextView', text='Total AED 12.50', clickable=False, bounds=(63, 1800, 1017, 1880)),
+                      node('android.widget.ImageButton', bounds=(63, 1900, 300, 1980)),
+                      node(text='Place order', bounds=(63, 2000, 1017, 2126)), title='Checkout')
+WEB_PAGE = screen_xml(node('android.webkit.WebView', desc='Kanto Foods', bounds=(0, 300, 1080, 2400), scrollable=True, clickable=False),
+                      title='Kanto Foods')
+
+
+def _centre(screen, i):
+    b = _bounds_of(screen, i)
+    return (b[0] + b[2]) // 2, (b[1] + b[3]) // 2
+
+
+def _bounds_of(screen, i):
+    import re as _re
+    return tuple(int(v) for v in _re.findall(r'-?\d+', screen.nodes[i].get('bounds')))
+
+
+def _rid(screen, rid, nth=0):
+    return [i for i, n in enumerate(screen.nodes) if (n.get('resource-id') or '').rsplit('/', 1)[-1] == rid][nth]
+
+
+def test_d2c_a_shop_home_with_prices_is_no_payment_screen_and_searching_or_opening_a_product_asks_nothing(phone):
+    tools, approvals, world, api = phone
+    home = screen_of(tools, SHOP_HOME)
+    assert not home.checkout()  # prices, "Delivery fee", a cart badge id: a list, not a checkout
+    search = index_of(home, 'Search for any product')
+    assert tools.assess(home, 'type', search, submit=True)[0] is None  # the owner's 4 "payment" searches
+    assert tools.assess(home, 'key', search, key='enter')[0] is None  # Enter searches, and the Share on screen doesn't make it a send
+    eggs = _rid(home, 'product_card')
+    assert tools.assess(home, 'tap', eggs)[0] is None  # the tile shows a price, no pay word: it opens the product
+    assert tools.assess(home, 'tap', home.hit(*_centre(home, eggs)), coordinate=True)[0] is None
+    picture = _rid(home, 'product_image')
+    assert tools.assess(home, 'tap', home.hit(*_centre(home, picture)), coordinate=True)[0] is None  # lands on the tile the tree knows
+    # Where the tree is blind a coordinate tap still asks: the list between tiles, a web page.
+    assert tools.assess(home, 'tap', home.hit(540, 2000), coordinate=True)[0] == 'unlabeled'
+    web = screen_of(tools, WEB_PAGE)
+    assert tools.assess(web, 'tap', web.hit(540, 1200), coordinate=True)[0] == 'unlabeled'
+    # A control the tree knows nothing of (no words, no id: a canvas or a surface) is blind too; an icon with an id is known.
+    canvas = screen_of(tools, screen_xml(node('android.view.SurfaceView', bounds=(0, 600, 1080, 1800)),
+                                         node('android.widget.ImageButton', bounds=(900, 400, 1040, 540), rid='favorite')))
+    assert tools.assess(canvas, 'tap', canvas.hit(540, 1200), coordinate=True)[0] == 'unlabeled'
+    assert tools.assess(canvas, 'tap', canvas.hit(970, 470), coordinate=True)[0] is None
+
+
+def test_d2c_tapping_a_sign_in_codes_boxes_asks_nothing(phone):
+    tools, approvals, world, api = phone
+    code = screen_of(tools, CODE_SCREEN)
+    boxes = _rid(code, 'digits_linear_layout')
+    assert not code.checkout()
+    assert tools.assess(code, 'tap', boxes)[0] is None
+    assert tools.assess(code, 'tap', code.hit(*_centre(code, boxes + 1)), coordinate=True)[0] is None
+    assert tools.assess(code, 'tap', index_of(code, 'Send confirmation code'))[0] == 'send'  # unchanged
+    assert "action='code' fills a one-time code" in tools.DESCRIPTION
+
+
+def test_d2c_a_real_checkout_and_its_way_in_still_ask(phone):
+    tools, approvals, world, api = phone
+    cart = screen_of(tools, CART)
+    assert cart.checkout() and tools.assess(cart, 'tap', index_of(cart, 'Checkout'))[0] == 'payment'
+    pay = screen_of(tools, CHECKOUT)
+    field = index_of(pay, 'Search for an address')
+    assert tools.assess(pay, 'tap', index_of(pay, 'Place order'))[0] == 'payment'
+    assert tools.assess(pay, 'key', field, key='enter')[0] == 'payment'  # Enter on a checkout may place the order
+    assert tools.assess(pay, 'type', field, submit=True)[0] == 'payment'  # a search field on a real checkout still asks
+    icon = [i for i, n in enumerate(pay.nodes) if n.get('class') == 'android.widget.ImageButton'][0]
+    assert tools.assess(pay, 'tap', pay.hit(*_centre(pay, icon)), coordinate=True)[0] == 'unlabeled'
+    slide = screen_of(tools, screen_xml(node(text='Slide to pay', bounds=(63, 2000, 1017, 2126))))
+    assert tools.assess(slide, 'swipe', index_of(slide, 'Slide to pay'), direction='right')[0] == 'payment'
+    blank = screen_of(tools, '<hierarchy><node class="android.view.View" bounds="[0,0][1080,2400]" clickable="true"/></hierarchy>')
+    assert tools.assess(blank, 'tap', 0)[0] == 'unlabeled'
+
+
+def test_d2c_a_checkout_in_any_language_still_asks(phone):
+    """Root msg_0f6ef9fd9461: the app's 16 languages by their words (Polish here); any other by the net: the one priced control on the
+    screen asks, and a card field makes the screen a checkout, so Enter asks."""
+    tools, approvals, world, api = phone
+    notes = node('android.widget.EditText', hint='Uwagi do zamówienia', bounds=(63, 1500, 1017, 1600), focused=True)
+    pl = screen_of(tools, screen_xml(node('android.widget.TextView', text='Razem 45,00 €', clickable=False, bounds=(63, 1700, 1017, 1780)),
+                                     notes, node(text='Dalej', bounds=(63, 1850, 1017, 1950)),
+                                     node(text='Zapłać 45,00 €', bounds=(63, 2000, 1017, 2126)), title='Podsumowanie zamówienia'))
+    assert pl.checkout()
+    assert [tools.assess(pl, 'tap', index_of(pl, 'Zapłać 45,00 €'))[0], tools.assess(pl, 'key', index_of(pl, 'Uwagi do zamówienia'), key='enter')[0],
+            tools.assess(pl, 'tap', index_of(pl, 'Dalej'))[0]] == ['payment', 'payment', 'payment']
+    # Dutch, which no list holds: the lone priced button asks; Enter asks once a card field is on the screen.
+    remark = node('android.widget.EditText', hint='Opmerking', bounds=(63, 1500, 1017, 1600), focused=True)
+    pay = node(text='Betalen 45,00 €', bounds=(63, 2000, 1017, 2126))
+    nl = screen_of(tools, screen_xml(remark, pay, title='Overzicht'))
+    assert not nl.checkout() and tools.assess(nl, 'tap', index_of(nl, 'Betalen 45,00 €'))[0] == 'payment'
+    assert tools.assess(nl, 'key', index_of(nl, 'Opmerking'), key='enter')[0] is None  # the gap Root accepted: no words, no card field
+    card = node('android.widget.EditText', hint='Kaartnummer', rid='card_number', bounds=(63, 1300, 1017, 1400))
+    nl_card = screen_of(tools, screen_xml(card, remark, pay, title='Overzicht'))
+    assert nl_card.checkout() and tools.assess(nl_card, 'key', index_of(nl_card, 'Opmerking'), key='enter')[0] == 'payment'
+
+
+def test_d2c_an_add_to_cart_button_with_a_price_places_no_order_but_a_lone_unknown_one_asks(phone):
+    tools, approvals, world, api = phone
+    product = screen_of(tools, screen_xml(node('android.widget.TextView', text='Golden Eggs, 12 pieces', clickable=False, bounds=(63, 400, 1017, 480)),
+                                          node(text='Add to cart · AED 12', bounds=(63, 2000, 1017, 2126))))
+    assert tools.assess(product, 'tap', index_of(product, 'Add to cart · AED 12'))[0] is None
+    arabic = screen_of(tools, screen_xml(node(text='أضف إلى السلة · ١٢ د.إ', bounds=(63, 2000, 1017, 2126))))
+    assert tools.assess(arabic, 'tap', index_of(arabic, 'أضف إلى السلة · ١٢ د.إ'))[0] is None
+    dutch = screen_of(tools, screen_xml(node(text='In winkelwagen · AED 12', bounds=(63, 2000, 1017, 2126))))
+    assert tools.assess(dutch, 'tap', index_of(dutch, 'In winkelwagen · AED 12'))[0] == 'payment'  # an unknown language: fail-closed
+    # The false positive Root accepted: a search with one priced result asks before opening it.
+    one = screen_of(tools, screen_xml(node('android.widget.EditText', hint='Search for any product', bounds=(40, 380, 1040, 480)),
+                                      _tile('Golden Eggs', 'AED 12.50', (40, 700, 520, 1050))))
+    assert tools.assess(one, 'tap', _rid(one, 'product_card'))[0] == 'payment'
+
+
+def test_d2c_the_owners_product_tap_runs_without_a_question_and_an_unreadable_tap_off_checkout_carries_no_amount(phone, monkeypatch):
+    """The owner's card: "Cypher wants to tap on a payment screen ... For: Open the Golden Eggs product page". It now just taps; and an
+    ask off a checkout (a blind web page) carries no amount and sends no payment notice, so the card can't read as a payment."""
+    tools, approvals, world, api = phone
+    world.xml = SHOP_HOME
+    asked = []
+    monkeypatch.setattr(approvals, 'ask', lambda owner, profile, session, kind, payload, *a, **k: (asked.append(payload), ('approved', 'x'))[1])
+    home = screen_of(tools, SHOP_HOME)
+    x, y = _centre(home, _rid(home, 'product_card'))
+    capture(tools)  # the model taps a point of the picture it was shown (720 px wide)
+    result = run(tools, action='tap', coordinate=[int(x / 1.5), int(y / 1.5)], purpose='Open the Golden Eggs product page')
+    assert result['success'] and result['approved_by_owner'] is False and asked == []
+    world.xml = WEB_PAGE.replace('content-desc="Kanto Foods"', 'content-desc="Kanto Foods · Golden Eggs AED 12.50"')
+    notices = []
+    monkeypatch.setattr(approvals, 'notify_done', lambda *a: notices.append(a))
+    result = run(tools, action='tap', coordinate=[360, 800], purpose='Open the Golden Eggs product page')
+    assert result['success'] and asked[0]['risk'] == 'unlabeled' and asked[0]['amount'] is None and notices == []
+
+
+# -- F1 (R2 review): words are a checkout's only sign now, so every shipped language is checked ---------------------------------------
+# lang: (checkout title, total, order button, step button), (back, search, add to cart, price). Synthetic screens.
+F1_LANGUAGES = {
+    'en': (('Checkout', 'Total $45.00', 'Place order', 'Continue'), ('Back', 'Search', 'Add to cart', '$12.50')),
+    'ar': (('الدفع', 'الإجمالي 45.00 د.إ', 'إتمام الطلب', 'متابعة'), ('رجوع', 'بحث', 'أضف إلى السلة', '12.50 د.إ')),
+    'fr': (('Récapitulatif', 'Total 45,00 €', 'Commander', 'Continuer'), ('Retour', 'Rechercher', 'Ajouter au panier', '12,50 €')),
+    'es': (('Resumen del pedido', 'Total 45,00 €', 'Realizar pedido', 'Continuar'), ('Atrás', 'Buscar', 'Añadir a la cesta', '12,50 €')),
+    'pt': (('Resumo do pedido', 'Total R$ 45,00', 'Finalizar pedido', 'Continuar'), ('Voltar', 'Pesquisar', 'Adicionar ao carrinho', 'R$ 12,50')),
+    'de': (('Übersicht', 'Gesamtsumme 45,00 €', 'Bestellung abschicken', 'Weiter'), ('Zurück', 'Suchen', 'In den Warenkorb', '12,50 €')),
+    'it': (('Riepilogo ordine', 'Totale € 45,00', 'Conferma ordine', 'Continua'), ('Indietro', 'Cerca', 'Aggiungi al carrello', '€ 12,50')),
+    'ru': (('Оформление', 'Итого 4 500 ₽', 'Оформить заказ', 'Продолжить'), ('Назад', 'Поиск', 'В корзину', '1 250 ₽')),
+    'tr': (('Sepetim', 'Toplam 45,00 TL', 'Siparişi onayla', 'Devam'), ('Geri', 'Ara', 'Sepete ekle', '12,50 TL')),
+    'pl': (('Podsumowanie', 'Razem 45,00 zł', 'Zamawiam i płacę', 'Dalej'), ('Wstecz', 'Szukaj', 'Do koszyka', '12,50 zł')),
+    'cs': (('Shrnutí', 'Celkem 450 Kč', 'Objednat', 'Pokračovat'), ('Zpět', 'Hledat', 'Do košíku', '125 Kč')),
+    'vi': (('Thanh toán', 'Tổng cộng 450.000 ₫', 'Đặt hàng', 'Tiếp tục'), ('Quay lại', 'Tìm kiếm', 'Thêm vào giỏ hàng', '125.000 ₫')),
+    'ja': (('ご注文内容', '合計 ¥4,500', '注文を確定する', '次へ'), ('戻る', '検索', 'カートに入れる', '¥1,250')),
+    'ko': (('주문서', '합계 45,000원', '주문하기', '다음'), ('뒤로', '검색', '장바구니 담기', '12,500원')),
+    'zh': (('确认订单', '合计 ¥45.00', '提交订单', '继续'), ('返回', '搜索', '加入购物车', '¥12.50')),
+    'zh-Hant': (('確認訂單', '合計 NT$450', '提交訂單', '繼續'), ('返回', '搜尋', '加入購物車', 'NT$125')),
+}
+
+
+def _f1_checkout(tools, title, total, order, step):
+    return screen_of(tools, screen_xml(node('android.widget.TextView', text=total, bounds=(63, 1700, 1017, 1780), clickable=False),
+                                       node(text=step, bounds=(63, 1820, 1017, 1946)), node(text=order, bounds=(63, 2000, 1017, 2126)),
+                                       title=title))
+
+
+def _f1_product(tools, back, search, add, price):
+    return screen_of(tools, screen_xml(node('android.widget.ImageButton', desc=back, bounds=(0, 100, 120, 220)),
+                                       node('android.widget.ImageButton', desc=search, bounds=(940, 100, 1060, 220)),
+                                       node('android.widget.TextView', text=price, bounds=(63, 500, 1017, 560), clickable=False),
+                                       node('android.widget.ImageButton', desc='+', bounds=(800, 600, 900, 700)),
+                                       node(text=add, bounds=(63, 2000, 1017, 2126)), title='Golden Eggs'))
+
+
+def _f1_taps(tools, screen, label):
+    """(by element, by coordinate) for the control named [label]."""
+    i = index_of(screen, label)
+    return tools.assess(screen, 'tap', i)[0], tools.assess(screen, 'tap', screen.hit(*_centre(screen, i)), coordinate=True)[0]
+
+
+def test_f1_the_table_holds_every_language_the_app_ships():
+    locales = ROOT.parents[1] / 'beacon-android' / 'app' / 'src' / 'main' / 'assets' / 'native-locales.json'
+    assert set(F1_LANGUAGES) == set(json.loads(locales.read_text(encoding='utf-8')))
+
+
+@pytest.mark.parametrize('lang', sorted(F1_LANGUAGES))
+def test_f1_every_shipped_language_asks_on_its_checkout_and_not_on_its_product_page(phone, lang):
+    """Base (df540d1e) asked wherever a price showed; D2c kept only words, and Italian and German checkouts stopped asking. Everything base
+    asked on asks again, by element and by coordinate, and the product page base also asked on stays quiet (the owner's complaint)."""
+    tools, approvals, world, api = phone
+    (title, total, order, step), (back, search, add, price) = F1_LANGUAGES[lang]
+    pay = _f1_checkout(tools, title, total, order, step)
+    assert pay.checkout()
+    assert _f1_taps(tools, pay, order)[0] == 'payment' and _f1_taps(tools, pay, step)[0] == 'payment'
+    assert all(risk in ('payment', 'unlabeled') for risk in _f1_taps(tools, pay, order) + _f1_taps(tools, pay, step))
+    shop = _f1_product(tools, back, search, add, price)
+    assert [_f1_taps(tools, shop, label) for label in (back, search, '+', add)] == [(None, None)] * 4
+
+
+@pytest.mark.parametrize('typed', ['Müsait olunca beni ara', 'Musím hledat nový byt', 'Szukaj mnie w biurze', 'Mình đang tìm kiếm quà',
+                                   'Can you find my keys'])
+def test_f2_a_message_with_a_search_word_in_it_still_asks_before_enter_sends_it(phone, typed):
+    """R3 review: the search field's exemption from the send ask reads the field's hint, description and id, never what is typed in it."""
+    tools, approvals, world, api = phone
+    wa = 'com.whatsapp'
+    chat = screen_of(tools, screen_xml(
+        node('android.widget.EditText', text=typed, hint='Message', bounds=(63, 2200, 690, 2300), focused=True, package=wa, rid=wa + ':id/entry'),
+        node('android.widget.ImageButton', desc='Send', bounds=(920, 2200, 1060, 2300), package=wa, rid=wa + ':id/send'),
+        package=wa, title='Ahmet'), package=wa)
+    field = index_of(chat, typed)
+    assert tools.assess(chat, 'key', field, key='enter')[0] == 'send' and tools.assess(chat, 'type', field, submit=True)[0] == 'send'
+
+
+@pytest.mark.parametrize('total, add, tile', [('Gesamtpreis: 45,98 €', 'In den Einkaufswagen', 'Bio Eier 10er 6,99 €'),
+                                              ('Prezzo totale: 45,98 €', 'Aggiungi al carrello', 'Uova bio 10 pz 6,99 €'),
+                                              ('Toplam fiyat: 459,98 TL', 'Sepete ekle', 'Organik yumurta 10lu 69,99 TL'),
+                                              # R4: the two words may be split by a no-break space, two spaces or a line break.
+                                              ('Prezzo\u00a0totale: 45,98 €', 'Aggiungi al carrello', 'Uova bio 10 pz 6,99 €'),
+                                              ('Prezzo  totale: 45,98 €', 'Aggiungi al carrello', 'Uova bio 10 pz 6,99 €'),
+                                              ('Prezzo\ntotale: 45,98 €', 'Aggiungi al carrello', 'Uova bio 10 pz 6,99 €'),
+                                              ('Toplam\u00a0fiyat: 459,98 TL', 'Sepete ekle', 'Organik yumurta 10lu 69,99 TL'),
+                                              ('Toplam  fiyat: 459,98 TL', 'Sepete ekle', 'Organik yumurta 10lu 69,99 TL'),
+                                              ('Toplam\nfiyat: 459,98 TL', 'Sepete ekle', 'Organik yumurta 10lu 69,99 TL')])
+def test_f2_a_bundle_price_on_a_product_page_is_no_checkout(phone, total, add, tile):
+    """R3 review: a "bought together" box prices its bundle with the total words' price compounds; the page stays a product page."""
+    tools, approvals, world, api = phone
+    page = screen_of(tools, screen_xml(
+        node('android.widget.TextView', text='12,50 €', bounds=(63, 500, 1017, 560), clickable=False), node(text=add, bounds=(63, 700, 1017, 826)),
+        node('android.widget.TextView', text=total, bounds=(63, 1300, 1017, 1360), clickable=False), node(text=tile, bounds=(63, 1500, 1017, 1626)),
+        node(text='Golden Eggs 6 pack 3,99 €', bounds=(63, 1700, 1017, 1826)), title='Golden Eggs'))
+    assert not page.checkout() and _f1_taps(tools, page, tile) == (None, None)
 
 
 def test_icon_only_cart_button_on_a_payment_screen_asks_like_a_payment(phone):
@@ -704,6 +978,75 @@ def test_unanswered_question_expires_and_nothing_runs(phone, monkeypatch):
     assert result['error'] == 'expired' and taps(world) == []
 
 
+def test_an_unanswered_question_ends_the_request_and_is_not_asked_again_this_turn(phone, monkeypatch):
+    """R2-F13 (Q2, 22 Nov): a delete's question expired at 10:25:07 and the same delete was asked again at 10:25:22. An expiry
+    ends the request as a no does: the result tells the model to offer a retry in words, and a retry in the same turn asks nothing."""
+    tools, approvals, world, api = phone
+    monkeypatch.setattr(approvals, 'WAIT_SECONDS', 0.05)
+    first = run(tools, action='tap', element=element(capture(tools), 'Pay £12.40'), purpose='dinner')
+    assert first['error'] == 'expired' and 'Do not ask again this turn' in first['message'] and 'offer to try again' in first['message']
+    asked = []
+    monkeypatch.setattr(approvals, 'ask', lambda *a, **k: (asked.append(a), ('approved', 'synthetic'))[1])
+    again = run(tools, action='tap', element=element(capture(tools), 'Pay £12.40'), purpose='dinner')
+    assert again['error'] == 'expired' and again['message'] == first['message'] and asked == [] and taps(world) == []
+    assert "don't answer in time, do not retry or ask again this turn" in tools.DESCRIPTION
+    assert run(tools, task='task-2', action='capture')['_multimodal']  # another turn is not held back by it
+
+
+CLOCK = 'com.google.android.deskclock'
+CLOCK_ENTRY = ('  ActivityInfo:\n    name=com.android.deskclock.DeskClock\n    labelRes=0x7f1401ec nonLocalizedLabel=null icon=0x7f110000\n'
+               '    ApplicationInfo:\n      labelRes=0x7f1401ec nonLocalizedLabel=null icon=0x7f110000 banner=0x0\n')  # API 36, as measured
+
+
+def test_app_label_is_the_apps_own_string_checked_against_its_label_resource(phone):
+    """R2-F12: Clock's launcher entry has no plain label (nonLocalizedLabel=null), so the card said com.google.android.deskclock.
+    Its own label string, found by a stock name and taken only when its id is the entry's labelRes, names it ("Clock", as measured
+    on API 36); when no name does, it stays the package, never a guess."""
+    tools, approvals, world, api = phone
+    world.shell_answers += [(r'query-activities -a android.intent.action.MAIN .* ' + CLOCK, CLOCK_ENTRY),
+                            (r'^sh -c for n in app_label .*case " 0x7f1401ec " in', 'LABEL:Clock\n')]
+    phone_now = tools.Phone(FakeHost(world), {})
+    assert tools.app_label(phone_now, CLOCK) == 'Clock'
+    script = [c[1][2] for c in world.calls if c[0] == 'shell' and c[1][:2] == ['sh', '-c']][-1]
+    assert f'cmd overlay lookup --verbose {CLOCK} {CLOCK}:string/$n' in script and '[ -n "$id" ]' in script
+    world.shell_answers[-1] = (r'^sh -c ', '')  # no stock name resolves to the label's id
+    assert tools.app_label(phone_now, CLOCK) == CLOCK
+    world.shell_answers[-1] = (r'^sh -c ', 'LABEL:Error: failed to get the resource\n')
+    assert tools.app_label(phone_now, CLOCK) == CLOCK
+    calls = len(world.calls)
+    assert tools.app_label(phone_now, 'x; reboot') == 'x; reboot' and len(world.calls) == calls  # never put in a script
+
+
+LAUNCHER = 'com.google.android.apps.nexuslauncher'
+
+
+def test_r3_f3_the_home_screen_app_is_named_home_screen_never_its_package(phone):
+    """Q2 R3-F3: rows read "com.google.android.apps.nexuslauncher · swipe". The launcher has no LAUNCHER entry of its own; the phone's
+    HOME handler is named by the fixed word the app translates (D2b's "Home screen"). Settings' fallback home is not the HOME handler."""
+    tools, approvals, world, api = phone
+    world.shell_answers += [(r'resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME',
+                             'priority=0 preferredOrder=0 match=0x108000 specificIndex=-1 isDefault=false\n'
+                             f'{LAUNCHER}/.NexusLauncherActivity\n'),
+                            (r'query-activities -a android.intent.action.MAIN ', '')]
+    phone_now = tools.Phone(FakeHost(world), {})
+    assert tools.app_label(phone_now, LAUNCHER) == tools.HOME_SCREEN == 'Home screen'
+    assert tools.app_label(phone_now, 'com.android.settings') == 'com.android.settings'
+
+
+def test_the_approval_and_its_activity_row_name_the_app_not_its_package(phone, monkeypatch):
+    """R2-F12: "Clock: Delete", not "com.google.android.deskclock: Delete"; the declined row says Clock too (labels only)."""
+    tools, approvals, world, api = phone
+    world.xml = screen_xml(node(text='Delete', package=CLOCK, bounds=(63, 1300, 1017, 1400)), package=CLOCK, title='Alarms')
+    world.package, world.activity = CLOCK, 'DeskClock'
+    world.shell_answers += [(r'query-activities -a android.intent.action.MAIN .* ' + CLOCK, CLOCK_ENTRY),
+                            (r'^sh -c for n in app_label ', 'LABEL:Clock\n')]
+    payloads = []
+    monkeypatch.setattr(approvals, 'ask', lambda owner, profile, session, kind, payload, *a, **k: (payloads.append(payload), ('denied', 'x'))[1])
+    result = run(tools, action='tap', element=element(capture(tools), 'Delete'), purpose='Delete the 7:00 alarm')
+    assert result['error'] == 'denied' and payloads[0]['app'] == 'Clock' and payloads[0]['risk'] == 'delete'
+    assert approvals.activity('owner')[0]['app'] == 'Clock' and CLOCK not in json.dumps(payloads)
+
+
 def test_amount_changes_during_the_wait_and_the_tool_asks_again(phone):
     tools, approvals, world, api = phone
     summary = capture(tools)
@@ -746,6 +1089,9 @@ def test_busy_while_the_owner_sets_up_the_phone(phone):
     for args in ({'action': 'capture'}, {'action': 'tap', 'coordinate': [1, 1], 'purpose': 'x'}, {'action': 'list_apps'}):
         result = run(tools, **args)
         assert result['error'] == 'busy' and result['message'] == tools.BUSY_LINE
+        assert result.get('not_started') is True and result['message'] == "You're using the phone"
+        row = approvals.activity('owner')[0]
+        assert (row['action'], row['outcome']) == (args['action'], 'phone_in_use')
     assert world.calls == [] and world.inputs == []
     assert run(tools, action='status') == {'success': True, 'phone': 'owner_setting_up', 'note': None, 'control_driver': 'phonedriver'}
 
@@ -929,6 +1275,29 @@ def test_open_app_through_its_launcher_entry(phone):
     assert ('shell', ['am', 'start', '-n', 'dev.beacon.fixture.shop/.LoginActivity']) in world.calls
     world.shell_answers[:] = [(r'resolve-activity', 'No activity found\n')]
     assert run(tools, action='open_app', package='com.example.none')['error'] == 'not_found'
+
+
+def test_opening_an_app_or_link_and_nav_keys_leave_an_activity_row(phone):
+    """Q2 call 5 (22 Nov): open_app ran and the phone's activity list showed no row. Each effect writes one row, labels only: the
+    app's own name, never a link's address or the model's words; looking (capture, list_apps, status) writes none."""
+    tools, approvals, world, api = phone
+    url = 'https://kanto.example.com/menu?promo=SECRET-TOKEN'
+    world.shell_answers += [(r'resolve-activity', 'priority=0 preferredOrder=0\ndev.beacon.fixture.shop/.LoginActivity\n'),
+                            (r'query-activities -a android.intent.action.MAIN', '  nonLocalizedLabel=Kanto Foods icon=0x0\n'),
+                            (r'query-activities --brief', 'dev.beacon.fixture.shop/.LoginActivity\n'),
+                            (r'^am start -a android.intent.action.VIEW', 'Starting: Intent { act=android.intent.action.VIEW }')]
+    assert run(tools, action='list_apps')['success'] and run(tools, action='status')['success']
+    assert capture(tools) and approvals.activity('owner') == []
+    assert run(tools, action='open_app', package=PKG, purpose='Open the shop')['success']
+    assert run(tools, action='open_link', url=url)['success']
+    assert run(tools, action='key', key='home', purpose='Go home')['success']
+    rows = [{k: row[k] for k in ('app', 'action', 'label', 'approved', 'outcome')} for row in approvals.activity('owner')]
+    assert rows == [{'app': '', 'action': 'home', 'label': '', 'approved': False, 'outcome': 'done'},
+                    {'app': '', 'action': 'open_link', 'label': '', 'approved': False, 'outcome': 'done'},
+                    {'app': 'Kanto Foods', 'action': 'open_app', 'label': '', 'approved': False, 'outcome': 'done'}]
+    assert 'kanto.example' not in json.dumps(approvals.activity('owner')) and 'Open the shop' not in json.dumps(approvals.activity('owner'))
+    world.shell_answers[:] = [(r'resolve-activity', 'No activity found\n')]
+    assert run(tools, action='open_app', package='com.example.none')['error'] == 'not_found' and len(approvals.activity('owner')) == 3
 
 
 def test_list_apps_hides_the_helper(phone):
@@ -1549,6 +1918,26 @@ def test_the_vault_card_order_raises_a_done_notice(phone):
     summary = capture(tools)
     assert run(tools, action='tap', element=element(summary, 'Pay £12.40'), purpose='dinner')['approved_by_owner'] is True
     assert [n['reason'] for n in done_notices(api)] == ['payment']
+
+
+def test_a_step_that_paid_nothing_raises_a_done_notice_that_claims_no_payment(phone):
+    """Q2 R5-F2: on the shop checkout a scroll and the terms ticked box were both approved, and each posted "Payment done".
+    Neither step paid; each notice says only that it ran. A tap on the pay button still says payment."""
+    tools, approvals, world, api = phone
+    terms = node('android.widget.CheckBox', text='I agree with the terms of service', bounds=(63, 1300, 1017, 1400))
+    world.xml = screen_xml(node('android.widget.TextView', text='Total £12.40', clickable=False, bounds=(63, 500, 1017, 600)), terms,
+                            node(text='Pay £12.40', bounds=(63, 2000, 1017, 2126)))
+    summary = capture(tools)
+    thread, _ = owner_answers(approvals, True, times=2)
+    assert run(tools, action='swipe', direction='up', purpose='scroll')['success'] is True
+    assert run(tools, action='tap', element=element(summary, 'I agree with the terms of service'), purpose='accept the terms')['success'] is True
+    thread.join()
+    assert [n['reason'] for n in done_notices(api)] == ['', '']  # no "Payment done" for a scroll or a ticked box
+    summary = capture(tools)
+    thread, _ = owner_answers(approvals, True)
+    assert run(tools, action='tap', element=element(summary, 'Pay £12.40'), purpose='dinner')['success'] is True
+    thread.join()
+    assert [n['reason'] for n in done_notices(api)] == ['', '', 'payment']
 
 
 def test_a_submit_with_no_prompt_does_not_cover_a_later_one(phone):
@@ -2362,6 +2751,24 @@ def _web_review(host_name, button='Place order', **kw):
                  node(text=button, bounds=(63, 2000, 1017, 2126), package=CHROME), **kw)
 
 
+def test_r3_f11_a_review_page_whose_order_button_is_below_the_fold_keeps_the_cards_one_yes(phone):
+    """R3-F11's shown-only rule tells a checkout apart; the card's one yes still reads the whole page, as before: after a Continue, a review
+    page whose order button is below the fold (empty bounds in Chrome's tree) has the order ahead, so the order asks nothing more."""
+    tools, approvals, world, api = phone
+    owner = Owner(approvals)
+    _web_card_filled(tools, world)
+    world.xml = _web_review('shop-a.example', button='Continue')
+    below = _site('shop-a.example', node('android.widget.TextView', text='Order total £12.40', clickable=False, bounds=(63, 500, 1017, 600), package=CHROME),
+                  node(text='Place order', bounds=(0, 2337, 1080, 2337), package=CHROME))
+    summary = capture(tools)
+    world.after_input = below
+    assert run(tools, action='tap', element=element(summary, 'Continue'), purpose='next step')['approved_by_owner'] is True
+    assert approvals.GRANTS.owned(CHROME, 'task-1', 'chat'), 'the order button below the fold is still ahead'
+    world.xml = _web_review('shop-a.example')  # scrolled: the order button shows
+    order = press(tools, world, 'Place order')
+    assert owner.stop() == [] and order.get('approved_by_owner') is True, 'one purchase asked the owner twice'
+
+
 def test_f5_a_card_yes_on_one_site_does_not_cover_a_pay_on_another_site(phone):
     tools, approvals, world, api = phone
     owner = Owner(approvals)
@@ -2569,13 +2976,13 @@ def test_f3_a_menu_of_the_filled_app_itself_is_shown_not_refused(phone, monkeypa
     assert run(tools, action='capture').get('_multimodal') is True
 
 
-def _webview_page(host_name, *nodes):
+def _webview_page(host_name, *nodes, accessory=''):
     """Chrome's tree: the toolbar's address bar, then the page inside a WebView (the page's own elements are the WebView's children)."""
     page = ('<node class="android.webkit.WebView" package="com.android.chrome" resource-id="" text="" content-desc="" clickable="false" '
             'enabled="true" focusable="true" focused="false" scrollable="true" password="false" bounds="[0,300][1080,2400]" hint="">'
             + ''.join(nodes) + '</node>')
     bar = node('android.widget.EditText', text=host_name, rid=CHROME + ':id/url_bar', bounds=(150, 100, 900, 200), package=CHROME) if host_name else ''
-    return screen_xml(bar, page, package=CHROME, title='page')
+    return screen_xml(bar, page, accessory, package=CHROME, title='page')
 
 
 def test_f5_a_page_that_draws_its_own_url_bar_id_does_not_name_the_host(phone):
@@ -2730,9 +3137,14 @@ def test_r2_2_a_missed_question_ends_the_grant_too(phone, monkeypatch):
         assert press(tools, world, 'Place order').get('error') == 'expired'
     owner = Owner(approvals)
     world.xml = REVIEW
+    asked, real_ask = [], approvals.ask
+    monkeypatch.setattr(approvals, 'ask', lambda *a, **k: asked.append(a) or real_ask(*a, **k))
+    # R2-F13: the unanswered question ends the request like a no, so the same turn asks nothing again at once.
+    assert press(tools, world, 'Place order').get('error') == 'expired' and asked == []
+    approvals._declined.clear()  # a minute later: the card's yes still does not place the order, the owner is asked
     second = press(tools, world, 'Place order')
     owner.stop()
-    assert second.get('error') == 'denied' and taps(world) == []
+    assert second.get('error') == 'denied' and len(asked) == 1 and taps(world) == []
 
 
 # R2-9: an approved tap with no pay word and no amount keeps the grant
@@ -3445,6 +3857,112 @@ def test_r4_3_the_owners_no_to_a_sideways_swipe_ends_the_card_yes_too(phone):
     world.xml = REVIEW
     assert press(tools, world, 'Place order').get('error') == 'denied'  # not run on the card's yes
     assert len(owner.stop()) == 1 and taps(world) == []
+
+
+def _shop_page(*below):
+    """Q2 R3-F11's store as Chrome's tree holds it (state.db captures of 23 Nov): the header, the search box and the CATEGORIES menu
+    on screen, and the rest of the page below the fold with empty bounds (in the text, not among the elements), down to the footer."""
+    fold = (0, 2337, 1080, 2337)
+    return _webview_page(None, node(text='SHOPPING CART (0)', bounds=(600, 320, 1017, 400), package=CHROME),
+                         node('android.widget.EditText', hint='Search store', bounds=(63, 600, 800, 700), package=CHROME),
+                         node(text='SEARCH', bounds=(820, 600, 1017, 700), package=CHROME),
+                         node(text='CATEGORIES', bounds=(63, 1150, 1017, 1260), package=CHROME),
+                         node('android.widget.TextView', text='$1,500.00', clickable=False, bounds=fold, package=CHROME),
+                         node(text='ADD TO CART', bounds=fold, package=CHROME), *below)
+
+
+def test_r4_store_search_ignores_page_copy_and_browser_payment_shortcuts_but_checkout_asks(phone):
+    tools, _, _, _ = phone
+    field = node('android.widget.EditText', hint='Search store', focused=True, package=CHROME)
+    intro = node('android.view.View', text='Online shopping is the process consumers go through to purchase products or services.',
+                 clickable=False, package=CHROME)
+    shortcut = node('android.widget.ImageButton', desc='Show saved payment methods', package=CHROME)
+    for page in (_webview_page(None, field, intro), _webview_page(None, field, intro, accessory=shortcut)):
+        screen = tools.Screen(page, package=CHROME)
+        assert screen.focused() is not None
+        assert tools.assess(screen, 'type', screen.focused(), submit=True)[0] is None
+        assert tools.assess(screen, 'key', screen.focused(), key='enter')[0] is None
+        assert tools.assess(screen, 'swipe', None, direction='down')[0] is None
+    checkout = tools.Screen(_webview_page(None, field, node(text='Checkout', package=CHROME)), package=CHROME)
+    assert checkout.checkout() and tools.assess(checkout, 'type', checkout.focused(), submit=True)[0] == 'payment'
+    purchase = tools.Screen(_webview_page(None, field, node(text='Purchase', package=CHROME)), package=CHROME)
+    assert purchase.checkout() and tools.assess(purchase, 'tap', len(purchase.nodes) - 1)[0] == 'payment'
+    assert tools.Screen(_webview_page(None, field, shortcut), package=CHROME).checkout()  # the page's own payment control
+
+
+@pytest.mark.parametrize('label', ['Order', 'Confirm'])
+def test_r5_a_saved_card_shortcut_still_requires_approval_to_commit(phone, label):
+    tools, approvals, world, _ = phone
+    world.package = CHROME
+    notes = node('android.widget.EditText', hint='Delivery notes', text='Find the side door', focused=True,
+                 bounds=(60, 400, 800, 550), package=CHROME)
+    shortcut = node('android.widget.ImageButton', desc='Show saved payment methods', package=CHROME)
+    world.xml = _webview_page(None, notes, node(text=label, package=CHROME), accessory=shortcut)
+    owner = Owner(approvals)
+    try:
+        result = press(tools, world, label)
+    finally:
+        asked = owner.stop()
+    assert result.get('error') == 'denied' and len(asked) == 1 and not taps(world)
+    screen = tools.Screen(world.xml, package=CHROME)
+    assert tools.assess(screen, 'key', screen.focused(), key='enter')[0] == 'payment'
+    assert tools.assess(screen, 'type', screen.focused(), submit=True)[0] == 'payment'
+    assert tools.assess(screen, 'swipe', index_of(screen, label), direction='up')[0] is not None
+
+
+def test_r3_f11_a_shop_page_is_no_checkout_for_a_control_below_the_fold_and_its_scrolls_never_ask(phone):
+    """Q2 R3-F11: every scroll and blind tap on a shop's pages asked ("Beacon can't read this button", 4 in 12 min). A vertical swipe on the
+    labeled CATEGORIES button asks only on a checkout, so the page counted as one: the footer's newsletter SUBSCRIBE (a pay word), below
+    the fold, was taken for the order button. A control the screen doesn't show makes no checkout; a scroll pays for nothing off one."""
+    tools, approvals, world, api = phone
+    footer = node(text='SUBSCRIBE', rid='newsletter-subscribe-button', bounds=(0, 2337, 1080, 2337), package=CHROME)
+    world.xml = _shop_page(footer)
+    world.package = CHROME
+    assert not tools.Screen(world.xml, package=CHROME).checkout()
+    owner = Owner(approvals)
+    assert run(tools, action='swipe', direction='up', purpose='Scroll down to search results').get('success') is True
+    assert run(tools, action='swipe', direction='down', purpose='Back up').get('success') is True
+    assert owner.stop() == []
+    # A pay control the screen shows still makes a checkout, and its tap still asks.
+    shown = node(text='CHECKOUT', bounds=(63, 1800, 1017, 1900), package=CHROME)
+    world.xml = _shop_page(footer, shown)
+    assert tools.Screen(world.xml, package=CHROME).checkout()
+    owner = Owner(approvals)
+    assert press(tools, world, 'CHECKOUT').get('error') == 'denied'
+    assert [r['kind'] for r in owner.stop()] == ['agent_phone_action']
+
+
+def test_r3_f11_a_checkout_link_off_screen_or_in_a_collapsed_menu_makes_no_checkout_but_a_real_checkout_still_is_one(phone):
+    """Root's mirror case: a header "Checkout" link scrolled away (its words on a child, as Chrome gives a link) or a collapsed mini-cart's
+    "Cart total" must not turn every product page into a checkout. A real one stays one: its title, its words anywhere, its order button."""
+    tools = phone[0]
+    gone = (0, 2337, 1080, 2337)
+    link = ('<node class="android.view.View" package="com.android.chrome" resource-id="" text="" content-desc="" clickable="true" '
+            'enabled="true" focusable="true" focused="false" scrollable="false" password="false" bounds="[0,2337][1080,2337]" hint="">'
+            + node('android.widget.TextView', text='Checkout', clickable=False, bounds=gone, package=CHROME) + '</node>')
+    mini_cart = node(text='Cart total $1,500.00', bounds=(0, 0, 0, 0), package=CHROME)
+    page = _shop_page(link, mini_cart)
+    assert not tools.Screen(page, package=CHROME).checkout()
+    shown_link = node(text='Checkout', bounds=(600, 320, 1017, 400), package=CHROME)
+    assert tools.Screen(_shop_page(shown_link), package=CHROME).checkout()  # shown, it is the way in
+    heading = node('android.widget.TextView', text='Order total', clickable=False, bounds=gone, package=CHROME)
+    assert tools.Screen(_shop_page(heading), package=CHROME).checkout()  # the page's own words count wherever they are
+    titled = _shop_page().replace('content-desc="" clickable="false" enabled="true" focusable="true" focused="false" scrollable="true"',
+                                  'content-desc="Checkout" clickable="false" enabled="true" focusable="true" focused="false" scrollable="true"', 1)
+    assert 'content-desc="Checkout"' in titled and tools.Screen(titled, package=CHROME).checkout()
+
+
+def test_r3_f11_a_vertical_scroll_off_a_checkout_never_asks_even_where_the_tree_is_blind(phone):
+    """A scroll pays for nothing: on a screen the tree can't read, a vertical swipe runs; a sideways slide on no labeled control still asks
+    (a slide-to-pay drawn in a page)."""
+    tools, approvals, world, api = phone
+    world.xml = screen_xml(node('android.view.View', clickable=False, bounds=(0, 300, 1080, 2400)), title='')
+    assert not tools.Screen(world.xml).readable
+    owner = Owner(approvals)
+    assert run(tools, action='swipe', direction='up', purpose='scroll')['success'] is True
+    assert run(tools, action='swipe', direction='left', purpose='next').get('error') == 'denied'
+    seen = owner.stop()
+    assert len(seen) == 1 and seen[0]['risk'] == 'unlabeled'
 
 
 def test_r4_3_a_vertical_scroll_of_the_same_carousel_never_asks(phone):

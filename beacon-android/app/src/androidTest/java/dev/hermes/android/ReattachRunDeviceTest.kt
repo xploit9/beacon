@@ -77,7 +77,7 @@ class ReattachRunDeviceTest {
     }
     private fun marked(fixture: NativeExperienceFixture, id: String) = runBlocking { app.cache.read(fixture.scope.session(id), marker) } != null
     private fun forgetChats(fixture: NativeExperienceFixture) = runBlocking {
-        listOf("chat-a", "chat-b").forEach { id -> listOf(marker, "live:runtime-$id", "session", "draft", "pending").forEach { app.cache.delete(fixture.scope.session(id), it) } }
+        listOf("chat-a", "chat-b").forEach { id -> listOf(marker, "live-turn", "live:runtime-$id", "session", "draft", "pending").forEach { app.cache.delete(fixture.scope.session(id), it) } }
     }
     private fun await(vm: BeaconViewModel, fixture: NativeExperienceFixture, what: String, condition: () -> Boolean) {
         try { compose.waitUntil(15_000, condition) }
@@ -172,6 +172,112 @@ class ReattachRunDeviceTest {
         assertEquals("Following a reply never sends the prompt again", 1, promptSubmits(fixture))
     }
 
+    /**
+     * R2C (owner, 22 Nov): back from another app while Hermes runs the turn. Every chat state from the stop on shows the turn running: never a blank
+     * stream (before R2C the history read on return, which already held the running step, ended the shown turn and the chat drew idle until a later
+     * look) and never the saved-copy line. The stream is subscribed again before that history read, and the words Hermes streamed meanwhile come back.
+     */
+    @Test fun aWarmReturnMidTurnShowsTheTurnOnEveryFrameAndItsWordsGoOn() = withFixture { fixture ->
+        fixture.persistTerminalMessages = true
+        val vm = newViewModel(ViewModelStore(), fixture, fixture.client, "chat-a")
+        val subscriptions = fixture.streamSubscriptions.get()
+        compose.runOnIdle { shown.value = vm; vm.composer(TextFieldValue("Write while I look at another app.")); vm.send() }
+        await(vm, fixture, "Prompt not delivered") { promptSubmits(fixture) == 1 && vm.chat.value.streamId == runtime }
+        await(vm, fixture, "Reply not followed") { fixture.streamSubscriptions.get() > subscriptions }
+        fixture.nativeTurnStatus = "working"
+        fixture.emitNativeEvent("message.delta", json("text" to "The boat came out"))
+        fixture.emitNativeEvent("tool.start", json("tool_call_id" to "r2c-step", "name" to "terminal", "context" to ""))
+        await(vm, fixture, "Step not shown") { vm.chat.value.liveTools.any { toolIdentity(it) == "r2c-step" } }
+        // Hermes saved the turn so far: the person's row and the step that is still running (the history stops inside the turn).
+        fixture.sessions.getValue("chat-a").getJSONArray("messages")
+            .put(json("role" to "user", "text" to "Write while I look at another app.", "row_id" to 20))
+            .put(json("role" to "assistant", "text" to "The boat came out", "row_id" to 21,
+                "tool_calls" to JSONArray().put(json("id" to "r2c-step", "function" to json("name" to "terminal", "arguments" to "{}")))))
+        val seen = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val watch = CoroutineScope(Dispatchers.Main.immediate).launch { vm.chat.collect { seen += "${it.streamId}|${it.status}" } }
+        var mark = 0
+        try {
+            compose.runOnIdle { vm.foreground(false) }
+            compose.waitForIdle()
+            // While Beacon is away the reply goes on; Hermes keeps the words for replay.
+            fixture.retainNativeEvent(runtime, "message.delta", json("text" to " of Dingle at eleven."))
+            mark = fixture.requests.size
+            val back = SystemClock.elapsedRealtime()
+            compose.runOnIdle { vm.foreground(true) }
+            await(vm, fixture, "The words streamed while away are not shown") { vm.chat.value.liveText.contains("of Dingle at eleven.") }
+            println("R2C_WARM_RETURN words_back_ms=${SystemClock.elapsedRealtime() - back} requests=${fixture.requests.drop(mark).map { it.string("method").ifBlank { it.string("path") } }}")
+            // Whatever reads follow the return land too (before R2C the history read on return ended the turn).
+            SystemClock.sleep(1_500)
+            compose.waitForIdle()
+        } finally { watch.cancel() }
+        assertTrue("The chat drew the running turn without its stream after the return: $seen", seen.none { it.startsWith("|") })
+        assertTrue("The saved-copy line showed on a warm return: $seen", seen.none { it.contains("Saved copy") })
+        val after = fixture.requests.drop(mark)
+        // The turn is asked about (and its stream started from there) before the history read; before R2C the read went first and ended the turn.
+        val looked = after.indexOfFirst { it.string("method") in setOf("session.resume", "session.active_list") }
+        val read = after.indexOfFirst { it.string("path") == "/api/sessions/chat-a/messages" }
+        assertTrue("The turn is looked at before any history read: ${after.map { it.string("path").ifBlank { it.string("method") } }}", looked >= 0 && (read == -1 || looked < read))
+        assertTrue("The stream was subscribed again", after.any { it.string("method") == "session.events.since" })
+        compose.onNodeWithTag("message-stop").assertIsDisplayed()
+        assertEquals("Following the turn again never sends the prompt again", 1, promptSubmits(fixture))
+    }
+
+    /** R2C: back from another app after the turn ended meanwhile. It settles from what Hermes saved: the reply shows once, Stop goes, and no turn line is left behind. */
+    @Test fun aWarmReturnAfterTheTurnEndedSettlesOnceWithNoLineLeft() = withFixture { fixture ->
+        fixture.persistTerminalMessages = true
+        val vm = newViewModel(ViewModelStore(), fixture, fixture.client, "chat-a")
+        val subscriptions = fixture.streamSubscriptions.get()
+        compose.runOnIdle { shown.value = vm; vm.composer(TextFieldValue("Answer while I am away.")); vm.send() }
+        await(vm, fixture, "Prompt not delivered") { promptSubmits(fixture) == 1 && vm.chat.value.streamId == runtime }
+        await(vm, fixture, "Reply not followed") { fixture.streamSubscriptions.get() > subscriptions }
+        fixture.nativeTurnStatus = "working"
+        fixture.emitNativeEvent("message.delta", json("text" to "Finished while"))
+        await(vm, fixture, "Words not shown") { vm.chat.value.liveText.contains("Finished while") }
+        compose.runOnIdle { vm.foreground(false) }
+        compose.waitForIdle()
+        // The turn ends while Beacon is away: Hermes keeps the rest of its frames and saves the reply.
+        fixture.retainNativeEvent(runtime, "message.delta", json("text" to " Beacon was gone"))
+        fixture.retainNativeEvent(runtime, "message.complete", json("text" to reply))
+        fixture.nativeTurnStatus = "idle"
+        compose.runOnIdle { vm.foreground(true) }
+        await(vm, fixture, "Reply not settled") { vm.chat.value.streamId.isBlank() && vm.chat.value.messages.any { it.text == reply } }
+        SystemClock.sleep(1_500)
+        compose.waitForIdle()
+        val chat = vm.chat.value
+        assertEquals("The reply shows once: ${chat.messages.map { it.text }} live='${chat.liveText}'", 1, chat.messages.count { it.text == reply } + (if (chat.liveText.isNotBlank()) 1 else 0))
+        assertEquals("No turn line is left once the turn settled", "", chat.status)
+        compose.onAllNodesWithTag("message-stop").assertCountEquals(0)
+        assertEquals("Settling never sends the prompt again", 1, promptSubmits(fixture))
+    }
+
+    /**
+     * R2C: the quick look a return makes first is only a head start. When Hermes refuses it once (a 22 Nov screen-off return showed "Sign in with Hermes
+     * again" and left the turn unfollowed), the return goes on as before R2C: the history read, then the look again, and the words come back.
+     */
+    @Test fun aWarmReturnWhoseFirstLookIsRefusedStillFollowsTheTurn() = withFixture { fixture ->
+        fixture.persistTerminalMessages = true
+        val vm = newViewModel(ViewModelStore(), fixture, fixture.client, "chat-a")
+        val subscriptions = fixture.streamSubscriptions.get()
+        compose.runOnIdle { shown.value = vm; vm.composer(TextFieldValue("Keep going while I check something.")); vm.send() }
+        await(vm, fixture, "Prompt not delivered") { promptSubmits(fixture) == 1 && vm.chat.value.streamId == runtime }
+        await(vm, fixture, "Reply not followed") { fixture.streamSubscriptions.get() > subscriptions }
+        fixture.nativeTurnStatus = "working"
+        fixture.emitNativeEvent("message.delta", json("text" to "The ferry left"))
+        await(vm, fixture, "Words not shown") { vm.chat.value.liveText.contains("The ferry left") }
+        compose.runOnIdle { vm.foreground(false) }
+        compose.waitForIdle()
+        fixture.retainNativeEvent(runtime, "message.delta", json("text" to " at dawn."))
+        fixture.resumeFailureCode = 403
+        fixture.failingResumes.set(1)
+        compose.runOnIdle { vm.foreground(true) }
+        await(vm, fixture, "The turn was not followed after the refused look") { vm.chat.value.liveText.contains("at dawn.") }
+        compose.waitForIdle()
+        assertEquals("The refused look was made", 0, fixture.failingResumes.get())
+        assertEquals("A refusal the next look got past leaves no error", "", vm.ui.value.error)
+        compose.onNodeWithTag("message-stop").assertIsDisplayed()
+        assertEquals("Following the turn again never sends the prompt again", 1, promptSubmits(fixture))
+    }
+
     @Test fun aReplyStillRunningWhenBeaconWasKilledComesBackWithItsStatusAndStop() = withFixture { fixture ->
         sendThenDie(fixture)
         fixture.nativeTurnStatus = "working"
@@ -192,6 +298,60 @@ class ReattachRunDeviceTest {
         compose.onAllNodesWithTag("message-stop").assertCountEquals(0)
         compose.onAllNodesWithTag("live-status", useUnmergedTree = true).assertCountEquals(0)
         assertEquals("Settling reads history; it never sends the prompt again", 1, promptSubmits(fixture))
+    }
+
+    /**
+     * S1 x R2C (R2 review, Root msg_4132eb778306): the owner's 17:09 shape. Hermes ended the turn while Beacon was gone (reaped: no terminal frame) and
+     * its saved history stops inside the turn: an assistant row that called a tool, and no tool row. R2C keeps a shown turn through such a read, so only
+     * the turn lookup can end it: once Hermes says idle, the chat shows the turn over (no Stop, no live line) and the message waiting in the box goes.
+     */
+    @Test fun aTurnHermesReapedWhileBeaconWasGoneEndsThroughTheLookupThenTheBoxDrains() = withFixture { fixture ->
+        fixture.persistTerminalMessages = true
+        val store = ViewModelStore()
+        val first = newViewModel(store, fixture, fixture.client, "chat-a")
+        compose.runOnIdle { first.composer(TextFieldValue("Plan the trip while I am away.")); first.send() }
+        await(first, fixture, "Prompt not delivered") { promptSubmits(fixture) == 1 && first.chat.value.streamId == runtime }
+        val queued = "Also check the weather there."
+        compose.runOnIdle { first.composer(TextFieldValue(queued)); first.queue() }
+        await(first, fixture, "Queued message missing") { first.chat.value.queued.size == 1 }
+        runBlocking { first.checkpointNow() }
+        compose.runOnUiThread { store.clear(); fixture.client.closeNative() }
+        fixture.sessions["chat-a"]?.optJSONArray("messages")?.put(json("role" to "assistant", "text" to "", "content" to "", "row_id" to 9001,
+            "finish_reason" to "tool_calls", "tool_calls" to JSONArray().put(json("id" to "call-1", "type" to "function",
+                "function" to json("name" to "clarify", "arguments" to "{}")))))
+        fixture.nativeTurnStatus = "idle"
+        val mark = fixture.requests.size
+        val vm = restart(fixture) { it.selectSession("chat-a") }
+        await(vm, fixture, "The reaped turn was not ended by the lookup") { vm.chat.value.streamId.isBlank() && resumed(fixture, mark, "chat-a") }
+        // Then the waiting message goes: by itself once Hermes says idle (its new turn then shows Working and Stop, rightly), or, while the app holds it
+        // behind a turn that ended without its reply, the chat rests idle with it waiting (no Stop, no working line) and the owner's Send sends it.
+        fun idleWithItWaiting() = vm.chat.value.streamId.isBlank() && vm.chat.value.queued.any { it.text == queued && it.state == "queued" } &&
+            compose.onAllNodesWithTag("message-stop").fetchSemanticsNodes().isEmpty() && compose.onAllNodesWithTag("live-status", useUnmergedTree = true).fetchSemanticsNodes().isEmpty()
+        await(vm, fixture, "Neither sent nor resting idle with the message waiting") { promptSubmits(fixture) == 2 || idleWithItWaiting() }
+        if (promptSubmits(fixture) == 1) compose.onNodeWithTag("queue-send:${vm.chat.value.queued.single { it.text == queued }.id}").performClick()
+        await(vm, fixture, "The box was not sent after the turn ended") { promptSubmits(fixture) == 2 }
+        assertEquals(queued, fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params").string("text"))
+    }
+
+    /** The same reaped turn with nothing waiting: once the lookup ends it, it stays ended. No look or settle shows it running again (no phantom Working). */
+    @Test fun aTurnHermesReapedWhileBeaconWasGoneStaysEndedOnceTheLookupEndsIt() = withFixture { fixture ->
+        sendThenDie(fixture)
+        fixture.sessions["chat-a"]?.optJSONArray("messages")?.put(json("role" to "assistant", "text" to "", "content" to "", "row_id" to 9001,
+            "finish_reason" to "tool_calls", "tool_calls" to JSONArray().put(json("id" to "call-1", "type" to "function",
+                "function" to json("name" to "clarify", "arguments" to "{}")))))
+        fixture.nativeTurnStatus = "idle"
+        val mark = fixture.requests.size
+        val vm = restart(fixture) { it.selectSession("chat-a") }
+        await(vm, fixture, "The reaped turn was not ended by the lookup") { vm.chat.value.streamId.isBlank() && resumed(fixture, mark, "chat-a") }
+        val until = SystemClock.elapsedRealtime() + 15_000
+        while (SystemClock.elapsedRealtime() < until) {
+            compose.waitForIdle()
+            assertEquals("The ended turn came back as running", "", vm.chat.value.streamId)
+            compose.onAllNodesWithTag("message-stop").assertCountEquals(0)
+            Thread.sleep(250)
+        }
+        compose.onAllNodesWithTag("live-status", useUnmergedTree = true).assertCountEquals(0)
+        assertEquals("Ending it never sends anything", 1, promptSubmits(fixture))
     }
 
     @Test fun queuedMessagesResumeFifoAfterColdSettleAndAuthoritativeIdle() = withFixture { fixture ->

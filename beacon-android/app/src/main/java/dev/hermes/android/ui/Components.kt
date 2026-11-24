@@ -63,9 +63,9 @@ import org.json.JSONObject
 import java.util.UUID
 
 enum class FieldType { TEXT, MULTILINE, SECRET, INTEGER, DECIMAL, BOOLEAN, CHOICE, LIST, MAP }
-data class Field(val key: String, val label: String = key.replace('_', ' ').replaceFirstChar { it.titlecase() }, val type: FieldType = FieldType.TEXT, val required: Boolean = false, val options: List<String> = emptyList(), val help: String = "", val inverse: Boolean = false, val optionLabels: Map<String, String> = emptyMap(), val section: String = "")
+data class Field(val key: String, val label: String = key.replace('_', ' ').replaceFirstChar { it.titlecase() }, val type: FieldType = FieldType.TEXT, val required: Boolean = false, val options: List<String> = emptyList(), val help: String = "", val inverse: Boolean = false, val optionLabels: Map<String, String> = emptyMap(), val section: String = "", val ltr: Boolean = false, val errorHere: Boolean = false)
 internal fun busyLabel(action: String) = when (action) { "Save" -> "Saving…"; "Run" -> "Running…"; else -> "Working…" }
-data class ActionForm(val title: String, val path: String, val fields: List<Field>, val seed: JSONObject = JSONObject(), val method: String = "POST", val values: Map<String, String> = emptyMap(), val explanation: String = "", val actionLabel: String = "Save", val id: String = UUID.randomUUID().toString(), val onResult: (suspend (JSONObject) -> Unit)? = null, val error: String = "", val destructive: Boolean = false)
+data class ActionForm(val title: String, val path: String, val fields: List<Field>, val seed: JSONObject = JSONObject(), val method: String = "POST", val values: Map<String, String> = emptyMap(), val explanation: String = "", val actionLabel: String = "Save", val id: String = UUID.randomUUID().toString(), val onResult: (suspend (JSONObject) -> Unit)? = null, val error: String = "", val destructive: Boolean = false, val shape: ((JSONObject) -> JSONObject)? = null)
 
 fun fieldValue(seed: JSONObject, key: String): Any? { var value: Any? = seed; key.split('.').forEach { value = (value as? JSONObject)?.opt(it) }; return value?.takeUnless { it == JSONObject.NULL } }
 fun formValues(form: ActionForm): Map<String, String> = form.fields.associate { f -> f.key to when (val v = fieldValue(form.seed, f.key)) { is JSONArray -> v.strings().joinToString("\n"); is JSONObject -> if (f.type == FieldType.MAP) v.keys().asSequence().joinToString("\n") { "$it=${v.opt(it)}" } else v.toString(); else -> v?.toString().orEmpty() } }
@@ -85,7 +85,7 @@ fun formBody(form: ActionForm): JSONObject {
     }
     if (form.path == "/api/settings" && result.optBoolean("virtualize_transcript")) require(result.optBoolean("virtualize_transcript_optin")) { "Enable experimental rendering before efficient transcript rendering." }
     if (form.path.startsWith("/api/mcp/servers/") && form.method == "PUT") require(result.optString("url").isNotBlank() != result.optString("command").isNotBlank()) { "Use either an HTTP URL or a stdio command, not both." }
-    return result
+    return form.shape?.invoke(result) ?: result
 }
 
 @Composable fun Glass(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
@@ -369,14 +369,14 @@ internal fun resolveChoiceStyle(style: ChoiceStyle, labels: List<String>, fontSc
     val longForm = form.fields.size > 4 || form.fields.any { it.section.isNotBlank() || it.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP) }
     val error: @Composable () -> Unit = { if (form.error.isNotBlank()) Text(uiText(form.error), color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }
     val fields: @Composable () -> Unit = {
-        if (!longForm) error()
+        if (!longForm && form.fields.none { it.errorHere }) error()
         if (form.explanation.isNotBlank()) Text(uiText(form.explanation), style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
         val renderField: @Composable (Field) -> Unit = { field ->
             val value = form.values[field.key].orEmpty()
             when (field.type) {
                 FieldType.BOOLEAN -> LabeledToggle(uiText(field.label), displayedBoolean(field, value), { vm.formValue(field.key, storedBoolean(field, it)) }, uiText(field.help), enabled = !busy)
                 FieldType.CHOICE -> Column(verticalArrangement = Arrangement.spacedBy(8.dp)) { Choice(field.label, value, field.options, { vm.formValue(field.key, it) }, optionLabels = field.optionLabels, enabled = !busy); if (field.help.isNotBlank()) Text(uiText(field.help), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                else -> OutlinedTextField(value, { vm.formValue(field.key, it) }, enabled = !busy, label = { Text(uiText(field.label) + if (field.required) " *" else "") }, modifier = Modifier.fillMaxWidth(), minLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 3 else 1, maxLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 12 else 1, visualTransformation = if (field.type == FieldType.SECRET) PasswordVisualTransformation() else VisualTransformation.None, keyboardOptions = KeyboardOptions(keyboardType = when (field.type) { FieldType.INTEGER -> KeyboardType.Number; FieldType.DECIMAL -> KeyboardType.Decimal; FieldType.SECRET -> KeyboardType.Password; else -> KeyboardType.Text }), supportingText = if (field.help.isBlank()) null else ({ Text(uiText(field.help), style = MaterialTheme.typography.bodyMedium) }))
+                else -> OutlinedTextField(value, { vm.formValue(field.key, it) }, enabled = !busy, label = { Text(uiText(field.label) + if (field.required) " *" else "") }, modifier = Modifier.fillMaxWidth(), isError = field.errorHere && form.error.isNotBlank(), textStyle = if (field.ltr) LocalTextStyle.current.copy(textDirection = androidx.compose.ui.text.style.TextDirection.Ltr) else LocalTextStyle.current, minLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 3 else 1, maxLines = if (field.type in setOf(FieldType.MULTILINE, FieldType.LIST, FieldType.MAP)) 12 else 1, visualTransformation = if (field.type == FieldType.SECRET) PasswordVisualTransformation() else VisualTransformation.None, keyboardOptions = KeyboardOptions(keyboardType = when (field.type) { FieldType.INTEGER -> KeyboardType.Number; FieldType.DECIMAL -> KeyboardType.Decimal; FieldType.SECRET -> KeyboardType.Password; else -> KeyboardType.Text }), supportingText = if (field.errorHere && form.error.isNotBlank()) ({ Text(uiText(form.error), color = MaterialTheme.colorScheme.error, modifier = Modifier.semantics { liveRegion = androidx.compose.ui.semantics.LiveRegionMode.Polite }) }) else if (field.help.isBlank()) null else ({ Text(uiText(field.help), style = MaterialTheme.typography.bodyMedium) }))
             }
         }
         if (visibleFields.any { it.section.isNotBlank() }) visibleFields.groupBy { it.section }.forEach { (section, fields) ->
@@ -411,7 +411,7 @@ internal fun resolveChoiceStyle(style: ChoiceStyle, labels: List<String>, fontSc
                     }
                     Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 12.dp), verticalArrangement = Arrangement.spacedBy(20.dp)) { fields() }
                     Surface(shadowElevation = 4.dp) { Column(Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        error()
+                        if (form.fields.none { it.errorHere }) error()
                         Button(onClick = vm::submitForm, enabled = !busy, colors = confirmColors, modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp)) { Text(uiText(if (busy) busyLabel(form.actionLabel) else form.actionLabel)) }
                     } }
                 }

@@ -77,6 +77,21 @@ internal const val KEEP_CONNECTED_RESPONSE_FRESH_MILLIS = 90_000L
 internal const val KEEP_CONNECTED_HELD_RETRY_MILLIS = 30_000L
 /** Bounds the no-wait poll that is the first try after a start or a failure, and the profile list read; Hermes answers both at once. */
 internal const val KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS = 15_000L
+/** A loop that started no try for this long is stuck: a try ends within 35 s, and a wait between tries within a minute. */
+internal const val KEEP_CONNECTED_STALL_MILLIS = 90_000L
+internal const val KEEP_CONNECTED_PAUSED = "Android paused Beacon"
+internal const val KEEP_CONNECTED_NOT_STARTED = "Android stopped Keep connected"
+
+/**
+ * Why the poll loop must start over, or null while it is fine; checked on each 30 s tick of the CPU lease. Both times come from the
+ * clock that keeps counting while the phone sleeps, which the poll's own timeouts do not use, so a try stuck on a dead connection while
+ * Android paused Beacon cannot hide. A tick that came late means Android paused Beacon (froze it, or let the phone sleep).
+ */
+internal fun keepConnectedRestartReason(loopAlive: Boolean, sinceBeatMillis: Long, sinceTickMillis: Long): String? = when {
+    loopAlive && sinceBeatMillis in 0..KEEP_CONNECTED_STALL_MILLIS -> null
+    sinceTickMillis > KEEP_CONNECTED_CPU_RENEW_MILLIS + KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS -> KEEP_CONNECTED_PAUSED
+    else -> "Lost the connection to Hermes"
+}
 
 /** The foreground connection also gives due update checks an opportunity while Android defers jobs. */
 internal suspend fun keepConnectedUpdateChecks(check: suspend () -> Unit) {
@@ -575,6 +590,8 @@ class KeepConnectedService : Service() {
     @Volatile private var callbackNetwork: Network? = null
     @Volatile private var callbackHeard = false
     private var awakeJob: kotlinx.coroutines.Job? = null
+    // When the poll loop last started a try or ended a wait (elapsedRealtime); the CPU lease's tick restarts a loop that stopped.
+    @Volatile private var loopBeat = 0L
     private var updatesJob: kotlinx.coroutines.Job? = null
     // Signs that the path may be back while reconnecting (see KeepConnectedNudge): a network under the VPN, an unlock.
     private val nudge = KeepConnectedNudge({ SystemClock.elapsedRealtime() })
@@ -597,11 +614,13 @@ class KeepConnectedService : Service() {
             val wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:notifications")
                 .apply { setReferenceCounted(false) }
             try {
+                var tickedAt = SystemClock.elapsedRealtime()
                 while (currentCoroutineContext().isActive) {
                     wake.acquire(KEEP_CONNECTED_CPU_LEASE_MILLIS)
-                    if (preferences(this@KeepConnectedService).getString(KEY_STATUS, STATUS_OFF) == STATUS_CONNECTED && status(this@KeepConnectedService) != STATUS_CONNECTED) {
-                        setStatus(this@KeepConnectedService, STATUS_RECONNECTING, failureReason(this@KeepConnectedService))
-                    }
+                    val now = SystemClock.elapsedRealtime()
+                    val sinceTick = now - tickedAt
+                    tickedAt = now
+                    android.os.Handler(mainLooper).post { superviseLoop(sinceTick) }
                     delay(KEEP_CONNECTED_CPU_RENEW_MILLIS)
                 }
             } catch (error: CancellationException) { throw error }
@@ -612,14 +631,28 @@ class KeepConnectedService : Service() {
         }
     }
 
+    /** Main thread: a loop that is gone or stopped trying starts over on a fresh connection, and the notice says why. */
+    private fun superviseLoop(sinceTick: Long) {
+        if (activeInstance !== this || !isEnabled(this)) return
+        val origin = pollOrigin ?: return
+        val owner = pollOwner ?: return
+        val provider = pollProvider ?: return
+        if (preferences(this).getString(KEY_STATUS, STATUS_OFF) in setOf(STATUS_OFF, STATUS_SIGNED_OUT)) return
+        val reason = keepConnectedRestartReason(pollJob?.isActive == true, SystemClock.elapsedRealtime() - loopBeat, sinceTick) ?: return
+        setStatus(this, STATUS_RECONNECTING, reason)
+        restartPoll(origin, owner, provider)
+    }
+
     private fun restartPoll(origin: String, owner: String, nativeProvider: String) {
         val previous = pollJob
         previous?.cancel()
         pollOrigin = origin
         pollOwner = owner
         pollProvider = nativeProvider
+        loopBeat = SystemClock.elapsedRealtime()
         pollJob = serviceScope.launch {
-            previous?.join()
+            // A try stuck where cancelling cannot reach it (a blocked call) must not hold the new loop back.
+            withTimeoutOrNull(KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS) { previous?.join() }
             runLoop(origin, owner, nativeProvider)
         }
     }
@@ -647,7 +680,7 @@ class KeepConnectedService : Service() {
                         val owner = pollOwner
                         val provider = pollProvider
                         if (origin != null && owner != null && provider != null) {
-                            setStatus(this@KeepConnectedService, STATUS_RECONNECTING)
+                            setStatus(this@KeepConnectedService, STATUS_RECONNECTING, "Network changed")
                             restartPoll(origin, owner, provider)
                         }
                     }
@@ -709,7 +742,7 @@ class KeepConnectedService : Service() {
         activeGeneration = ensureStopToken(this)
         activeStartId = startId
         if (!promote()) {
-            setStatus(this, STATUS_RECONNECTING)
+            setStatus(this, STATUS_RECONNECTING, KEEP_CONNECTED_NOT_STARTED)
             stopSelfResult(startId)
             return START_NOT_STICKY
         }
@@ -863,6 +896,7 @@ class KeepConnectedService : Service() {
         retrySignal.tryReceive()
         try {
             while (currentCoroutineContext().isActive && isEnabledFor(this, Scope(origin, owner, "default", nativeProvider = nativeProvider))) {
+                loopBeat = SystemClock.elapsedRealtime()
                 val current = app.auth.read(origin)
                 val cached = current.cachedScopeFor(origin, replacingAccount = false)
                 if (cached == null || cached.owner != owner || cached.nativeProvider != nativeProvider) {
@@ -887,6 +921,7 @@ class KeepConnectedService : Service() {
                             client?.let(::keepConnectedDropConnections)
                             poller.retryNow()
                         }
+                        loopBeat = SystemClock.elapsedRealtime()
                     }
                     KeepConnectedCycle.SignedOut -> {
                         setStatus(this, STATUS_SIGNED_OUT, poller.lastFailureReason)
@@ -922,7 +957,10 @@ class KeepConnectedService : Service() {
 
     private fun connectionNotification(context: Context): android.app.Notification {
         val status = status(context)
-        val (title, body) = keepConnectedNotificationText(status, dev.hermes.android.data.currentAssistantName, failureReason(context), hasNetwork(context))
+        // The English line is translated with a {name} slot, then the assistant's name goes in.
+        val (englishTitle, englishBody) = keepConnectedNotificationText(status, "{name}", failureReason(context), hasNetwork(context))
+        val title = serviceText(context, englishTitle).replace("{name}", dev.hermes.android.data.currentAssistantName)
+        val body = serviceText(context, englishBody).replace("{name}", dev.hermes.android.data.currentAssistantName)
         val stop = Intent(context, KeepConnectedService::class.java)
             .setAction(ACTION_STOP)
             .setData(Uri.parse("beacon://keep-connected/stop/${stopToken(context)}"))
@@ -1095,7 +1133,8 @@ class KeepConnectedService : Service() {
                 ContextCompat.startForegroundService(context.applicationContext, Intent(context.applicationContext, KeepConnectedService::class.java).setAction(ACTION_START))
             } catch (_: Exception) {
                 startPending.set(false)
-                setStatus(context, STATUS_RECONNECTING)
+                // A running service keeps its own status; this one never started, and only opening Beacon can start it.
+                if (activeInstance == null) setStatus(context, STATUS_RECONNECTING, KEEP_CONNECTED_NOT_STARTED)
             }
         }
 
@@ -1214,10 +1253,13 @@ internal fun keepConnectedReasonText(reason: String): String {
     // A status ends the reason ("… (403)"); a profile name in the middle can't pass for one.
     val status = reason.substringAfterLast('(', "").removeSuffix(")").toIntOrNull()
     return when {
-        reason.isBlank() -> "Retrying…"
         reason == "Hermes sign-in expired" || status == 401 -> "Sign in again"
-        // 1.2.0 stored "did not answer in time" for every timeout; the first cycle after an update replaces it.
-        reason == "Lost the connection to Hermes" || reason == "Hermes did not answer in time" -> "Lost the connection to Hermes. Retrying…"
+        // 1.2.0 stored "did not answer in time" for every timeout; the first cycle after an update replaces it. No reason: a
+        // "Connected" that heard nothing for 90 s, which the CPU lease's next tick restarts.
+        reason.isBlank() || reason == "Lost the connection to Hermes" || reason == "Hermes did not answer in time" -> "Lost the connection to Hermes. Retrying…"
+        reason == "Network changed" -> "Network changed. Retrying…"
+        reason == KEEP_CONNECTED_PAUSED -> "Android paused Beacon. Retrying…"
+        reason == KEEP_CONNECTED_NOT_STARTED -> "Open Beacon to reconnect."
         // Also what a phone sees while Hermes' computer is asleep or off, so it does not blame the phone's connection.
         reason == "Could not reach Hermes" -> "Can't reach Hermes. Retrying…"
         status == 403 || status == 409 -> "Hermes refused the connection. Retrying…"

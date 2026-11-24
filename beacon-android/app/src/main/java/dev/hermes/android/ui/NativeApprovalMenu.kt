@@ -16,6 +16,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.AndroidUiDispatcher
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -57,6 +58,16 @@ internal fun shieldDescription(selection: String, approvals: String, mode: Strin
 /** While a read or save is in flight the shield keeps a known state on screen (the one just asked for, else the last read) instead of "Unknown". */
 internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: String?): String = if (inFlight) asked ?: settled else settled
 
+/** Pre-1.2.3 installs may have the last session snapshot and the profile setting but no separate shield entry. */
+internal fun approvalFromProjection(raw: JSONObject, setting: JSONObject?, chat: Scope?): JSONObject? {
+    if (chat == null || raw.string("session_id") != chat.session || raw.string("profile") != chat.profile) return null
+    val owner = chat.copy(session = "").key
+    val mode = raw.string("approval_mode").takeIf { it in nativeApprovalModes } ?: setting?.takeIf { it.string("scope_key") == owner }?.string("value")
+    if (mode !in nativeApprovalModes || raw.opt("yolo") !is Boolean) return null
+    return json("session_id" to chat.session, "scope_key" to owner, "profile_mode" to mode,
+        "session_status_known" to true, "session_bypass" to raw.getBoolean("yolo"), "_stale" to true)
+}
+
 /** Composer shield adapts Hermes Relay's session-info approval-bypass indicator. */
 @Composable internal fun NativeApprovalMenu(vm: BeaconViewModel, enabled: Boolean) {
     val data by vm.data.collectAsStateWithLifecycle()
@@ -72,7 +83,9 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     var saving by remember(capturedClient, capturedScope) { mutableStateOf(false) }
     val busy = saving || "${capturedScope?.key}|/api/approval/mode" in pending || "${capturedClient?.scope?.key}|/api/profile/approval-mode" in pending
     val key = "picker:approvals"
-    val record = data[key]?.takeIf { it.string("scope_key") == capturedClient?.scope?.key && it.string("session_id") == capturedScope?.session }
+    val displayOwner = capturedClient?.scope ?: vm.restoredScope()
+    val record = data[key]?.takeIf { it.string("scope_key") == displayOwner?.key && it.string("session_id") == capturedScope?.session }
+        ?: approvalFromProjection(chat.raw, data["profile:approvals"], capturedScope?.takeIf { it.copy(session = "") == displayOwner })
     val profileMode = record?.string("profile_mode").orEmpty()
     val loading = key in refreshing
     // A YOLO change in an unsent chat cannot be read back from Hermes before its first message, so the default is shown only until one is tried.
@@ -84,7 +97,7 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     // True while a YOLO change is being saved (the choice asked for), so the shield shows it at once.
     var askedYolo by remember(capturedClient, capturedScope) { mutableStateOf<Boolean?>(null) }
     val askedSelection = askedYolo?.let { if (it) "yolo" else profileMode.takeIf { mode -> mode in setOf("manual", "smart") } }
-    val selection = shownApprovalSelection(chatApprovalSelection(record, capturedClient?.scope?.key, capturedScope?.session, newChat, chosenYolo), loading || busy, askedSelection)
+    val selection = shownApprovalSelection(chatApprovalSelection(record, displayOwner?.key, capturedScope?.session, newChat, chosenYolo), loading || busy, askedSelection)
     val runtimeSession = chat.raw.string("runtime_session_id")
     val reloadNotice = uiText("Refresh Approvals in this chat before changing it.")
     val skippedNotice = uiText("Approvals skipped for this chat")
@@ -95,7 +108,7 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
     }
     fun applyYolo(turnOn: Boolean) {
         if (saving || "${capturedScope?.key}|/api/approval/mode" in vm.conversationPending.value) return
-        if (!enabled || loading || profileMode !in nativeApprovalModes || profileMode == "off" || capturedClient == null || capturedScope == null || vm.client !== capturedClient || vm.authenticatedScope() != capturedScope) {
+        if (!enabled || loading || record?.optBoolean("_stale") == true || profileMode !in nativeApprovalModes || profileMode == "off" || capturedClient == null || capturedScope == null || vm.client !== capturedClient || vm.authenticatedScope() != capturedScope) {
             vm.notice(reloadNotice); return
         }
         saving = true
@@ -106,15 +119,18 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
         scope.launch { try { job.join(); open = false } finally { saving = false; askedYolo = null } }
     }
     Box {
-        IconButton(onClick = { open = true; vm.loadChatApprovals() }, enabled = enabled && capturedClient != null && capturedScope != null && !busy, modifier = Modifier.testTag("composer-approvals")) {
-            ApprovalShield(selection, shieldDescription(selection, uiText("Approvals"), uiText(approvalChoiceLabel(selection))))
+        val description = shieldDescription(selection, uiText("Approvals"), uiText(approvalChoiceLabel(selection)))
+        IconButton(onClick = { open = true; vm.loadChatApprovals(passive = false, force = true) },
+            enabled = enabled && capturedClient != null && capturedScope != null && !busy,
+            modifier = Modifier.size(48.dp).testTag("composer-approvals").semantics { contentDescription = description }) {
+            ApprovalShield(selection)
         }
         DropdownMenu(open, { open = false }, modifier = Modifier.heightIn(max = 360.dp).testTag("approvals-menu")) {
             DropdownMenuItem({ Text(uiText("Approvals in this chat")) }, {}, enabled = false)
             if (loading || busy) DropdownMenuItem({ Text(uiText(if (busy) "Saving…" else "Checking…")) }, {}, enabled = false)
-            if (record == null && !loading) DropdownMenuItem({ Text(uiText("Couldn't load approvals")) }, { vm.loadChatApprovals() })
+            if ((record == null || record.optBoolean("_stale")) && !loading) DropdownMenuItem({ Text(uiText("Couldn't load approvals")) }, { vm.loadChatApprovals(passive = false, force = true) })
             if (profileMode == "off") DropdownMenuItem({ Text(uiText("Approvals are off")) }, {}, enabled = false)
-            val choicesEnabled = enabled && !loading && !busy && profileMode in nativeApprovalModes && profileMode != "off"
+            val choicesEnabled = enabled && !loading && !busy && record?.optBoolean("_stale") != true && profileMode in nativeApprovalModes && profileMode != "off"
             // Hermes keeps only YOLO per chat; Manual or Auto is the profile's mode and is changed in Profiles.
             if (profileMode != "off") listOf("ask", "yolo").forEach { choice ->
                 val isSelected = if (choice == "ask") selection in setOf("manual", "smart") else selection == "yolo"
@@ -122,7 +138,7 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
                     text = { Column {
                         Text(uiText(approvalChoiceLabel(if (choice == "ask") profileMode else "yolo")))
                     } },
-                    leadingIcon = { ApprovalShield(if (choice == "ask") profileMode else "yolo", null) },
+                    leadingIcon = { ApprovalShield(if (choice == "ask") profileMode else "yolo") },
                     trailingIcon = { if (isSelected) Icon(Icons.Rounded.Check, uiText("Selected")) },
                     enabled = choicesEnabled,
                     modifier = Modifier.testTag("approval-$choice").semantics { selected = isSelected },
@@ -190,8 +206,22 @@ internal fun shownApprovalSelection(settled: String, inFlight: Boolean, asked: S
                 try {
                     vm.authorizeSettingsProfile(active, active.scope.profile)
                     if (!vm.settingsProfileCurrent(active, version)) return@launch
+                    val fresh = c.get("/api/profile/approval-mode")
+                    if (!vm.settingsProfileCurrent(active, version)) return@launch
+                    if (fresh.string("scope_key") != active.scope.key || fresh.string("value") != value?.string("value")) {
+                        if (fresh.string("scope_key") == active.scope.key) vm.storeData(key, fresh)
+                        failed = true
+                        return@launch
+                    }
                     val result = c.post("/api/profile/approval-mode", json("mode" to mode, "scope_key" to active.scope.key))
-                    if (vm.settingsProfileCurrent(active, version)) { vm.storeData(key, result); vm.notice(updatedNotice) }
+                    if (vm.settingsProfileCurrent(active, version)) {
+                        vm.screens.invalidate(active.scope, "/api/profile/approval-mode")
+                        vm.screens.invalidate(active.scope, "/api/approval/mode")
+                        vm.screens.set(active.scope, key, result, "/api/profile/approval-mode")
+                        vm.storeData(key, result)
+                        if (vm.client?.scope == active.scope) vm.loadChatApprovals(force = true)
+                        vm.notice(updatedNotice)
+                    }
                 } catch (e: Exception) {
                     if (e is CancellationException) throw e
                     if (vm.settingsProfileCurrent(active, version)) { vm.profileSettingsFailure(e); if (vm.settingsProfileCurrent(active, version)) vm.notice(appErrorText(e)) }
@@ -236,8 +266,8 @@ internal val ProfileApprovalChoices = listOf("manual", "smart")
 internal fun profileApprovalsOff(mode: String): Boolean = mode == "off"
 
 internal fun approvalChoiceLabel(choice: String): String = when (choice) {
-    "manual" -> "Always ask"
-    "smart" -> "Ask for risky ones"
+    "manual" -> "Ask for risky ones"
+    "smart" -> "Hermes decides"
     "off", "yolo" -> "Don't ask"
     else -> "Unknown"
 }
@@ -245,7 +275,7 @@ internal fun approvalChoiceLabel(choice: String): String = when (choice) {
 /** Every label [approvalChoiceLabel] gives; the menu and shield show them through uiText. */
 internal val ApprovalStrings = listOf("manual", "smart", "off", "yolo", "").map(::approvalChoiceLabel)
 
-@Composable internal fun ApprovalShield(selection: String, description: String?) {
+@Composable internal fun ApprovalShield(selection: String) {
     val colors = MaterialTheme.colorScheme
     // A glyph per mode, so the state never rests on colour alone.
     val (glyph, tint) = when (selection) {
@@ -255,5 +285,5 @@ internal val ApprovalStrings = listOf("manual", "smart", "off", "yolo", "").map(
         "yolo" -> Icons.Rounded.Warning to colors.error
         else -> Icons.Rounded.Shield to colors.onSurfaceVariant
     }
-    Icon(glyph, description, tint = tint)
+    Icon(glyph, null, tint = tint)
 }

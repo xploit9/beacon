@@ -7,13 +7,13 @@ import android.content.pm.PackageManager
 import android.media.AudioManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import com.google.firebase.messaging.FirebaseMessaging
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 import dev.hermes.android.*
 import dev.hermes.android.core.*
 import dev.hermes.android.data.ApiFailure
-import dev.hermes.android.data.AppPreferences
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.data.NativePairing
 import dev.hermes.android.data.NativeDeviceRemoval
@@ -41,8 +41,8 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 private val opaquePattern=Regex("[A-Za-z0-9_.:-]+")
 fun validOpaque(value: String): Boolean = value.length in 1..200 && value != "." && value != ".." && value.matches(opaquePattern)
-// A reply that lands while Beacon is open is still listed, just without a sound.
-internal fun silentPushNotification(kind: String, uiVisible: Boolean) = kind == "working" || kind == "completion" && uiVisible
+// A reply or thread post that lands while Beacon is open is still listed, just without a sound (one of the chat on screen goes: ShownChat).
+internal fun silentPushNotification(kind: String, uiVisible: Boolean) = kind == "working" || kind in setOf("completion", "task_result") && uiVisible
 internal fun requiresLocalKeepConnectedReceipt(localActionToken: String?): Boolean = localActionToken != null
 internal fun canAuthorizeWithoutKeepConnectedReceipt(receiptRequired: Boolean, action: String): Boolean =
     !receiptRequired && (action == "answer" || action == "decline")
@@ -252,6 +252,7 @@ class PushManager(private val app: BeaconApplication) {
         targets.forEach { target -> client.nativeRequest("/api/plugins/beacon/mobile/notifications/targets/$target","DELETE") }
     } }
     fun binding(source: String): JSONObject? { if (!validOpaque(source)) return null; return synchronized(lock) { runCatching { read("source:${source.digest()}") }.getOrNull() } }
+    internal fun sourceScope(source: String): Scope? = binding(source)?.let(::bindingScope)
     private fun deviceAuthorized(binding: JSONObject): Boolean {
         val scope = bindingScope(binding)
         return pushDeviceAuthorized(privatePrefs.getBoolean(removedKey(scope), false), binding.string("device_id"), NativePairing.deviceId(app, scope))
@@ -358,7 +359,7 @@ class PushManager(private val app: BeaconApplication) {
     private fun storedInvitation(source: String, event: String): IncomingCall? = runCatching {
         read("incoming:${"$source\u0000$event".digest()}")?.let {
             IncomingCall(it.getString("source"), it.getString("event"), it.getLong("expires_at"), it.getString("action_token"),
-                it.optLong("arrived_at"), it.optLong("arrived_elapsed"), it.optInt("boot", -2), it.optString("state", "missed"), it.optString("conversation"))
+                it.optLong("arrived_at"), it.optLong("arrived_elapsed"), it.optInt("boot", -2), it.optString("state", "missed"), it.optString("conversation"), it.optString("caller_name"))
         }?.takeIf { it.source == source && it.event == event }
     }.getOrNull()
     private fun invitationRequiresKeepConnectedReceipt(source: String, event: String): Boolean = runCatching {
@@ -367,7 +368,7 @@ class PushManager(private val app: BeaconApplication) {
     }.getOrDefault(true)
     private fun persistInvitation(invite: IncomingCall, receiptRequired: Boolean = invitationRequiresKeepConnectedReceipt(invite.source, invite.event)) = save("incoming:${invite.key}", json("source" to invite.source, "event" to invite.event,
         "expires_at" to invite.expiresAt, "action_token" to invite.actionToken, "arrived_at" to invite.arrivedAt,
-        "arrived_elapsed" to invite.arrivedElapsed, "boot" to invite.boot, "state" to invite.state, "conversation" to invite.conversation,
+        "arrived_elapsed" to invite.arrivedElapsed, "boot" to invite.boot, "state" to invite.state, "conversation" to invite.conversation, "caller_name" to invite.callerName,
         "keep_connected_receipt_required" to receiptRequired))
     private fun deadlineIntent(invite: IncomingCall) = PendingIntent.getBroadcast(app, 0,
         Intent(app, IncomingCallReceiver::class.java).setAction(invite.deadlineAction).setData(android.net.Uri.parse("hermes://incoming/${invite.key}/deadline"))
@@ -445,6 +446,8 @@ class PushManager(private val app: BeaconApplication) {
         }
         persistInvitation(invite.copy(state = "missed"))
         clearIncomingPresentation(source, event)
+        // Once: only a ringing or retryable invitation gets here, and it is now missed.
+        CoroutineScope(SupervisorJob() + Dispatchers.IO).launch { dev.hermes.android.voice.reportMissedIncoming(app, source, event) }
         if (!permitsIncoming(source)) return
         val manager = app.getSystemService(NotificationManager::class.java)
         ensureActivityChannels(manager)
@@ -453,9 +456,9 @@ class PushManager(private val app: BeaconApplication) {
             .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val callback = PendingIntent.getActivity(app, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         try { manager.notify(invite.key, 2, NotificationCompat.Builder(app, alertingChannel(manager, "hermes-messages")).setSmallIcon(R.drawable.ic_beacon_notification)
-            .setContentTitle("Beacon · Missed call").setContentText("Tap to call back.")
+            .setContentTitle("${invite.callerName.ifBlank { dev.hermes.android.data.currentAssistantName }} · ${serviceText(app, "Missed call")}")
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setSilent(true).setAutoCancel(true).setContentIntent(callback)
-            .addAction(R.drawable.ic_beacon_logo, "Call back", callback).build()) } catch (_: SecurityException) { /* Notification permission was revoked. */ }
+            .addAction(R.drawable.ic_beacon_logo, serviceText(app, "Call back"), callback).build()) } catch (_: SecurityException) { /* Notification permission was revoked. */ }
     }
     fun discardInvitation(source: String, event: String): Boolean = synchronized(lock) {
         if (!validOpaque(source) || !validOpaque(event)) return false
@@ -708,11 +711,11 @@ internal fun quietAlertCount(active: Array<android.service.notification.StatusBa
     1 + active.count { it.id == 1 && it.tag != justPosted && it.notification.group == ALERT_GROUP && it.notification.extras.getBoolean(QUIET_ALERT_EXTRA) }
 
 /** Services have no Compose strings: the line comes from the same catalog, in the language of the phone. */
-internal fun serviceText(context: Context, english: String): String {
+internal fun serviceText(context: Context, english: String, key: String = english): String {
     val language = dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault())
     if (language == "en") return english
     val strings = runCatching { (context.applicationContext as BeaconApplication).readTranslations().optJSONObject(language) }.getOrNull() ?: return english
-    return strings.optString(dev.hermes.android.ui.normalized(english)).ifBlank { english }
+    return strings.optString(dev.hermes.android.ui.normalized(key)).ifBlank { english }
 }
 
 private fun postQuietSummary(context: Context, manager: NotificationManager, justPosted: String) {
@@ -773,6 +776,11 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
             conversation = data["conversation_ref"].orEmpty(),
         ) else null
         if (incoming && (invite == null || !invite.valid() || !validOpaque(data["conversation_ref"].orEmpty()) || !app.push.permitsIncoming(source))) return null
+        if (invite != null) {
+            val actor = app.push.sourceScope(source) ?: return null
+            val name = runBlocking { dev.hermes.android.voice.callerDisplayName(app, actor) }
+            invite = invite.copy(callerName = name)
+        }
         val now = System.currentTimeMillis()
         // An alert Android would drop is not marked seen, so Keep connected can still deliver it (quietly) once alerts can be shown.
         if (!incoming && !alertsPresentable(context)) { DeliveryLog.recordDropped(context, now); return null }
@@ -787,8 +795,8 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
         val routeKey = "$source\u0000$event".digest()
         val intent = Intent(context, BeaconActivity::class.java).setData(android.net.Uri.parse("hermes://activity/$routeKey")).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
         val pending = PendingIntent.getActivity(context, "$source:$event".hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-        val content = notificationFallback(data["kind"].orEmpty())
-        val public = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText("Open Beacon to view private activity.").build()
+        val content = notificationFallback(data["kind"].orEmpty()) { serviceText(context, it) }
+        val public = NotificationCompat.Builder(context, activityChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText(serviceText(context, "Open Beacon to view private activity.")).build()
         if (!incoming) {
             // The alert shows when it happened; an old one, or one of a burst, arrives quietly under a single summary.
             val alertMillis = alertTimeMillis(data["created_at"], now)
@@ -805,7 +813,7 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
         if (invite != null && ring) {
             DeliveryLog.recordArrival(context, nativeKind, event, now)
             val invite = invite!!
-            val assistantName = runBlocking { context.applicationContext.preferences.data.first().let(AppPreferences::read).assistantName }
+            val assistantName = invite.callerName.ifBlank { dev.hermes.android.data.currentAssistantName }
             val incomingChannel = incomingCallChannel(manager)
             val channel = manager.getNotificationChannel(incomingChannel)
             val audio = context.getSystemService(AudioManager::class.java)
@@ -821,19 +829,26 @@ internal fun receivePush(context: Context, data: Map<String, String>, localActio
                 ringVolume = audio.getStreamVolume(AudioManager.STREAM_RING),
             )
             val options = incomingCallCardOptions(invite.ringDurationMillis(), silent = !alert)
-            val answerIntent = Intent(context, BeaconActivity::class.java).setAction(invite.answerAction).setData(android.net.Uri.parse("hermes://incoming/$routeKey/answer")).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
+            val dialer = Intent(context, dev.hermes.android.voice.IncomingDialerActivity::class.java)
+                .setData("hermes://incoming/$routeKey/ring".toUri())
+                .putExtra("push_source", source).putExtra("push_event", event)
+            val ringing = PendingIntent.getActivity(context, 0, dialer, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            val answerIntent = Intent(dialer).setAction(invite.answerAction)
+                .setData("hermes://incoming/$routeKey/answer".toUri())
             val answer = PendingIntent.getActivity(context, 0, answerIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
             val declineIntent = Intent(context, IncomingCallReceiver::class.java).setAction(invite.declineAction).setData(android.net.Uri.parse("hermes://incoming/$routeKey/decline")).putExtra("push_source", source).putExtra("push_event", event)
             val decline = PendingIntent.getBroadcast(context, 0, declineIntent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
-            val person = androidx.core.app.Person.Builder().setName(assistantName).setImportant(true).build()
+            val person = dev.hermes.android.voice.callerPerson(context, assistantName)
             fun notification(callStyle: Boolean = options.callStyle): Notification {
                 val card = options
-                val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("$assistantName is calling").setContentText("Answer to start a private voice call").setContentIntent(pending).setDeleteIntent(decline).setCategory(card.category).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(card.timeoutAfterMillis).setOnlyAlertOnce(card.onlyAlertOnce).setOngoing(true)
-                if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText("Calling")
+                val builder = NotificationCompat.Builder(context, incomingChannel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(serviceText(context, "Beacon is calling").replace("Beacon", assistantName))
+                    .setShowWhen(false)
+                    .setContentIntent(ringing).setDeleteIntent(decline).setCategory(card.category).setPriority(NotificationCompat.PRIORITY_HIGH).setVisibility(NotificationCompat.VISIBILITY_PUBLIC).setTimeoutAfter(card.timeoutAfterMillis).setOnlyAlertOnce(card.onlyAlertOnce).setOngoing(true)
+                if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText(serviceText(context, "Calling"))
                 // The alerting CallStyle falls back to heads-up when FSI is denied; ringing never starts the microphone.
-                if (card.fullScreenIntent) builder.setFullScreenIntent(pending, true)
+                if (card.fullScreenIntent) builder.setFullScreenIntent(ringing, true)
                 if (callStyle) builder.setStyle(NotificationCompat.CallStyle.forIncomingCall(person, decline, answer))
-                else builder.addAction(R.drawable.ic_beacon_logo, "Decline", decline).addAction(R.drawable.ic_beacon_logo, "Answer", answer)
+                else builder.addAction(R.drawable.ic_beacon_logo, serviceText(context, "Decline"), decline).addAction(R.drawable.ic_beacon_logo, serviceText(context, "Answer"), answer)
                 // A non-silent CallStyle card lets Android's existing user-configured channel own the single ringtone.
                 return builder.setSilent(card.silent).build().apply { if (card.insistent) flags = flags or Notification.FLAG_INSISTENT }
             }

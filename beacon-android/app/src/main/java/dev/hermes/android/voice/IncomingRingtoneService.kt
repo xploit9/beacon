@@ -135,6 +135,21 @@ class IncomingRingtoneService : Service() {
 
         internal fun isSilenced(source: String, event: String): Boolean = suppressed(source, event)
 
+        /** The ring stops at once when the user taps Answer or Decline, so their tap haptic is not outranked by the ring vibration. */
+        fun silenceActive() { active?.let { silence(it.source, it.event) } }
+
+        /** The confirming tick of Answer or Decline. The ring vibration outranks it until Android has cancelled it, so it follows a moment later and does not depend on the screen still being there. */
+        fun tapHaptic(context: Context, delayMillis: Long = 120) {
+            val vibrator = context.applicationContext.getSystemService(Vibrator::class.java) ?: return
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                try {
+                    if (android.os.Build.VERSION.SDK_INT >= 33) vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK),
+                        android.os.VibrationAttributes.createForUsage(android.os.VibrationAttributes.USAGE_TOUCH))
+                    else vibrator.vibrate(VibrationEffect.createPredefined(VibrationEffect.EFFECT_HEAVY_CLICK))
+                } catch (_: RuntimeException) { /* No haptic motor, or the vibrator is busy. */ }
+            }, delayMillis)
+        }
+
         fun silence(source: String, event: String) {
             silenced["$source\u0000$event"] = android.os.SystemClock.elapsedRealtime() + INCOMING_RING_SECONDS * 1000
             // Push/storage callbacks can run off-main; serialize with Service lifecycle and a new invitation.

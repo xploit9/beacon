@@ -151,7 +151,7 @@ internal suspend fun receivedPreviewBytes(vm: BeaconViewModel, origin: Scope, re
                     if (progress != null) LinearProgressIndicator(progress = { progress }, modifier = Modifier.weight(1f).testTag("received-file-progress"))
                     else LinearProgressIndicator(Modifier.weight(1f).testTag("received-file-progress"))
                     TextButton(onClick = { pending = null; store.cancel(origin, reference.path) }, modifier = Modifier.testTag("received-file-cancel")) { Text(uiText("Cancel")) }
-                } else if (state.local != null || state.problem != ReceivedFileProblem.Gone && state.problem != ReceivedFileProblem.Refused) Row {
+                } else if (state.local != null || state.problem != ReceivedFileProblem.Gone && state.problem != ReceivedFileProblem.Refused) @OptIn(ExperimentalLayoutApi::class) FlowRow {
                     if (receivedFileOpens(name)) TextButton(onClick = { request(ReceivedFileAction.Open) }, modifier = Modifier.testTag("received-file-open")) {
                         Icon(Icons.AutoMirrored.Rounded.OpenInNew, null, Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text(uiText("Open"))
                     }

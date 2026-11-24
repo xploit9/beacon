@@ -1168,6 +1168,20 @@ class NativeExperienceUiTest {
         capture("audit-message-actions")
     }
 
+    @Test fun editAndBranchOnTheFirstMessageOpensANewChatWithItAsTheDraft() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        await { vm.chat.value.sessionId == "chat-a" && vm.chat.value.projectionReady && vm.chat.value.messages.isNotEmpty() }
+        val first = vm.chat.value.messages.first()
+        assertEquals("user", first.role)
+        compose.onNodeWithTag("message-bubble:${first.id}").performScrollTo().performTouchInput { longClick() }
+        compose.onNodeWithText("Edit and branch").performClick()
+        await { vm.chat.value.sessionId.startsWith("new-") && vm.composer.value.text == editAndBranchDraft(first.text) }
+        // Hermes cannot branch an empty chat, so no branch is asked for.
+        assertFalse(fixture.requests.any { it.string("method") == "session.branch" })
+        receipts += "Edit and branch on a chat's first message opens a new chat with that text as the draft."
+        capture("b2-edit-first-message")
+    }
+
     @Test fun systemSteeringNoteStaysInRawHistoryButIsNotRendered() = withFixture { vm, _ ->
         val before = vm.chat.value
         val note = json("id" to "system-steering", "role" to "user", "text" to "[System: The active model changed]")
@@ -1275,7 +1289,7 @@ class NativeExperienceUiTest {
                 compose.onNodeWithTag("files-menu").performClick()
                 compose.onNodeWithTag("files-new-file").performClick()
                 await { vm.form.value != null }
-                compose.runOnIdle { vm.formValue("path", "C:/synthetic-workspace/created-audit.txt"); vm.formValue("content", "Exact synthetic text") }
+                compose.runOnIdle { vm.formValue("name", "created-audit.txt"); vm.formValue("content", "Exact synthetic text") }
                 compose.onNodeWithText("Save").performClick()
                 await { fixture.workspaceFiles.containsKey("created-audit.txt") && vm.form.value == null }
                 compose.onNode(hasContentDescription("File actions") and hasAnyAncestor(hasText("created-audit.txt"))).performScrollTo().performClick()
@@ -2300,7 +2314,7 @@ class NativeExperienceUiTest {
         }
         await { vm.data.value["profile-defaults"]?.string("model") == "profile-default-model" }
         // The chip merges its labels into one Text list.
-        compose.onNodeWithTag("composer-model-effort").assert(hasText("Profile Default Model")).assert(hasText("high"))
+        compose.onNodeWithTag("composer-model-effort").assert(hasText("Profile Default Model")).assert(hasText("High"))
         receipts += "A chat with no messages shows the model and effort Hermes starts this profile's chats with, not placeholder labels."
     }
 
@@ -2308,7 +2322,7 @@ class NativeExperienceUiTest {
         // The defaults load on first composition, so the fixture's own profile effort is expected.
         assertTrue(vm.chat.value.messages.isNotEmpty() && vm.chat.value.raw.string("reasoning_effort").isBlank())
         await { vm.data.value["profile-defaults"]?.string("reasoning_effort") == fixture.reasoningEffort }
-        compose.onNodeWithTag("composer-model-effort").assert(hasText("Synthetic Model")).assert(hasText(fixture.reasoningEffort))
+        compose.onNodeWithTag("composer-model-effort").assert(hasText("Synthetic Model")).assert(hasText(dev.hermes.android.ui.reasoningLevelLabel(fixture.reasoningEffort)))
         receipts += "A chat whose effort Hermes reports blank (it follows the profile) shows the profile's effort."
     }
 
@@ -2631,6 +2645,66 @@ class NativeExperienceUiTest {
         }
     }
 
+    // R3-F7: a question alert tapped while a reconnect was on its way (a fresh start, a return with no connection, the network back) opened the last
+    // chat: both bump the sign-in generation only after their first suspension, so the open gave up without a word whenever the reconnect bumped later.
+    @Test fun aQuestionAlertOpensItsChatAtTheQuestionWhileAReconnectIsOnItsWay() = withFixture { vm, fixture ->
+        val scope = fixture.scope
+        val previousFactory = dev.hermes.android.push.KeepConnectedService.clientFactoryForTest
+        val pushClients = mutableListOf<dev.hermes.android.data.BeaconClient>()
+        val profileClients = mutableListOf<dev.hermes.android.data.BeaconClient>()
+        val event = java.util.UUID.randomUUID().toString().replace("-", "")
+        val source = "question-notice-${event.take(12)}"
+        try {
+            dev.hermes.android.push.KeepConnectedService.clientFactoryForTest = { current, store -> fixture.freshClientFor(current, store).also(pushClients::add) }
+            val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.BeaconClient = { auth ->
+                fixture.freshClientFor(auth, app.auth).also(profileClients::add)
+            }
+            field(vm, "profileSwitchClientFactoryForTest", profileSwitchClientFactory)
+            assertTrue(app.push.bindKeepConnectedSource(scope, source))
+            fixture.incomingNotification = json("seq" to 1, "event_id" to event, "owner_id" to scope.owner, "profile" to scope.profile, "kind" to "clarify",
+                "state" to "pending", "source_ref" to source, "session_id" to "chat-b", "reason" to "Question notice")
+            compose.runOnIdle { vm.handlePush(source, event); vm.connect(scope.origin) }
+            await { vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && !vm.ui.value.loading }
+            // The reconnect that yielded never takes the chat back afterwards.
+            repeat(15) { Thread.sleep(200); assertEquals("chat-b", vm.chat.value.sessionId) }
+            assertEquals("Chat", vm.ui.value.tab)
+            receipts += "A question alert opens its own chat also when a reconnect starts while it opens."
+        } finally {
+            dev.hermes.android.push.KeepConnectedService.clientFactoryForTest = previousFactory
+            vm.client?.closeNative()
+            profileClients.forEach { it.closeNative() }
+            pushClients.forEach { it.closeNative() }
+            app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit().remove("source:" + source.digest()).commit()
+        }
+    }
+
+    // R3-F7 guard: a reconnect that yielded to a notification open is not lost when the open fails with no connection: it runs after it.
+    @Test fun aReconnectThatYieldedToAFailedNotificationOpenRunsAfterIt() = withFixture { vm, fixture ->
+        val scope = fixture.scope
+        val previousFactory = dev.hermes.android.push.KeepConnectedService.clientFactoryForTest
+        val pushClients = mutableListOf<dev.hermes.android.data.BeaconClient>()
+        val profileClients = mutableListOf<dev.hermes.android.data.BeaconClient>()
+        val source = "gone-notice-" + java.util.UUID.randomUUID().toString().replace("-", "").take(12)
+        try {
+            dev.hermes.android.push.KeepConnectedService.clientFactoryForTest = { current, store -> fixture.freshClientFor(current, store).also(pushClients::add) }
+            val profileSwitchClientFactory: (dev.hermes.android.data.AuthContext) -> dev.hermes.android.data.BeaconClient = { auth ->
+                fixture.freshClientFor(auth, app.auth).also(profileClients::add)
+            }
+            field(vm, "profileSwitchClientFactoryForTest", profileSwitchClientFactory)
+            assertTrue(app.push.bindKeepConnectedSource(scope, source))
+            fixture.incomingNotification = null
+            compose.runOnIdle { field(vm, "client", null); vm.handlePush(source, "notice-gone"); vm.connect(scope.origin) }
+            await { vm.client != null && vm.ui.value.connected && !vm.ui.value.loading && !vm.ui.value.restoringSession }
+            receipts += "A reconnect that yielded to a notification open that failed still connects afterwards."
+        } finally {
+            dev.hermes.android.push.KeepConnectedService.clientFactoryForTest = previousFactory
+            vm.client?.closeNative()
+            profileClients.forEach { it.closeNative() }
+            pushClients.forEach { it.closeNative() }
+            app.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE).edit().remove("source:" + source.digest()).commit()
+        }
+    }
+
     @Test fun leavingTheAssistantTabNeverLeavesItsConversationInChat() = withFixture { vm, fixture ->
         compose.runOnIdle { vm.newChat() }
         await { vm.chat.value.sessionId.isBlank() || vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.newChatOpening }
@@ -2710,7 +2784,7 @@ class NativeExperienceUiTest {
         await { !vm.reasoningSaving.value && vm.chat.value.sessionReasoningEffort == "high" }
         compose.runOnIdle { vm.newChat() }
         await { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && vm.data.value["profile-defaults"]?.string("session_id") == vm.chat.value.sessionId }
-        compose.onNodeWithTag("composer-model-effort", useUnmergedTree = true).assert(hasAnyDescendant(hasText("Profile Model"))).assert(hasAnyDescendant(hasText("low")))
+        compose.onNodeWithTag("composer-model-effort", useUnmergedTree = true).assert(hasAnyDescendant(hasText("Profile Model"))).assert(hasAnyDescendant(hasText("Low")))
         assertEquals("profile-model", fixture.profileModel)
         assertEquals("low", fixture.reasoningEffort)
         receipts += "A new chat displays the profile defaults without inheriting the previous chat's model or reasoning override."
@@ -2827,6 +2901,284 @@ class NativeExperienceUiTest {
                 listOf("beacon-session", "beacon-opening", "selected-session", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
             }
         }
+    }
+
+    /**
+     * H1b P0-1 (UX pass, 1.2.3): Beacon's chat, with saved turns, was deleted on Hermes (History, the dashboard). Before, every Beacon open landed on its
+     * saved copy with "Chat unavailable" and "This item is no longer available": the tab was stuck. Now the phone forgets it quietly and opens Beacon the
+     * normal way, a fresh chat, with no notice. Related: Beacon's chat never becomes the Chat tab's remembered chat (it showed there as an untitled "New chat").
+     */
+    @Test fun aBeaconChatDeletedOnHermesIsReplacedQuietly_andNeverReopensOnTheChatTab() = withFixture { vm, fixture ->
+        var freshId = ""
+        try {
+            // Beacon's chat has saved turns and the app's own saved copy; the owner left words in it and a message Hermes never took.
+            runBlocking { app.cache.write(fixture.scope, "beacon-session", "chat-b", true) }
+            compose.runOnIdle { vm.tab("Beacon") }
+            await { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId == "chat-b" && vm.chat.value.projectionReady && vm.chat.value.messages.isNotEmpty() && !vm.ui.value.beaconOpening }
+            val box = QueuedMessage("Box words", state = "settled", outcome = "cancelled", id = "box-1", createdAt = 1)
+            val waiting = QueuedMessage("Waiting words", state = "queued", id = "wait-1", createdAt = 2)
+            compose.runOnIdle { vm.composer(TextFieldValue("Unsent words")); flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(queued = listOf(box, waiting)) }
+            compose.runOnIdle { vm.tab("Chat") }
+            await { vm.ui.value.tab == "Chat" && runBlocking { app.cache.read(fixture.scope.session("chat-b"), "draft") }.orEmpty().contains("Box words") }
+            // Deleted on Hermes (History, the dashboard).
+            fixture.deleteOnHermes("chat-b")
+            compose.runOnIdle { vm.clearMessage(); vm.tab("Beacon") }
+            await { vm.ui.value.tab == "Beacon" && vm.chat.value.sessionId.startsWith("new-") && !vm.ui.value.beaconOpening && vm.chat.value.projectionReady }
+            freshId = vm.chat.value.sessionId
+            assertEquals(freshId, runBlocking { app.cache.read(fixture.scope, "beacon-session") })
+            assertEquals("quietly: no notice", "", vm.ui.value.notice)
+            assertEquals("quietly: no error", "", vm.ui.value.error)
+            assertEquals("", vm.ui.value.beaconError)
+            assertFalse(vm.chat.value.status, vm.chat.value.status.contains("unavailable"))
+            assertNotEquals("Beacon's chat is not the Chat tab's chat", freshId, runBlocking { app.cache.read(fixture.scope, "selected-session") })
+            await { vm.composer.value.text == "Unsent words" && vm.chat.value.queued.map { it.id }.containsAll(listOf("box-1", "wait-1")) }
+            // Root msg_f2774c2f5936: both wait as Not sent because their chat was deleted, and nothing goes into the new chat without the owner's Retry.
+            assertTrue(vm.chat.value.queued.toString(), vm.chat.value.queued.filter { it.id in setOf("box-1", "wait-1") }.all { it.notSent() && it.outcome == CHAT_GONE_OUTCOME })
+            android.os.SystemClock.sleep(2_000); compose.waitForIdle()
+            assertTrue("Nothing was sent by itself", fixture.requests.none { it.string("method") == "prompt.submit" })
+            receipts += "A Beacon chat deleted on Hermes is forgotten quietly and Beacon opens a fresh chat with the unsent words and box message; the Chat tab never reopens Beacon's chat."
+        } finally {
+            runBlocking {
+                listOf("chat-b", freshId).filter(String::isNotBlank).forEach { id ->
+                    listOf("client-created-shell", "session", "draft", "pending").forEach { app.cache.delete(fixture.scope.session(id), it) }
+                }
+                listOf("beacon-session", "beacon-opening", "selected-session", "initial-draft").forEach { app.cache.delete(fixture.scope, it) }
+            }
+        }
+    }
+
+    @Test fun transientResumeKeepsTheLiveUnpersistedBeaconChat() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.isBeaconConversation() && vm.chat.value.projectionReady }
+        val id = vm.chat.value.sessionId
+        val creates = fixture.requests.count { it.string("method") == "session.create" }
+        fixture.assistantLookup = 200 to json("conversation_id" to id)
+        fixture.storageUnavailableOnResume = id
+        fixture.markUnpromptedShell(id)
+        runBlocking {
+            fixture.client.nativeSession("chat-a")
+            val live = fixture.client.nativeRpc("session.active_list").rows("sessions")
+            assertTrue(live.any { it.string("session_key") == id && it.string("id") == fixture.unseenRuntime(id) })
+            assertFalse(fixture.client.nativeGet("/api/sessions/$id/mutation-snapshot", mapOf("profile" to fixture.scope.profile)).getBoolean("exists"))
+        }
+        val beforeFailure = fixture.resumedSessionIds().count { it == id }
+        compose.runOnIdle { vm.composer(TextFieldValue("First prompt")); vm.tab("Beacon") }
+        await { fixture.resumedSessionIds().count { it == id } > beforeFailure }
+        runBlocking { vm.awaitSelection() }
+        await { !vm.ui.value.beaconOpening }
+        assertEquals("A live first-turn chat must keep its handle", id, runBlocking { app.cache.read(fixture.scope, "beacon-session") })
+        assertEquals(id, vm.chat.value.sessionId)
+        assertEquals("First prompt", vm.composer.value.text)
+        assertEquals(creates, fixture.requests.count { it.string("method") == "session.create" })
+        fixture.storageUnavailableOnResume = null
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { !fixture.isUnpromptedShell(id) && vm.isBeaconConversation() && vm.chat.value.projectionReady }
+        compose.runOnIdle { vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" } }
+        val sent = fixture.requests.single { it.string("method") == "prompt.submit" }.getJSONObject("params")
+        assertEquals("First prompt", sent.string("text"))
+        assertEquals(fixture.unseenRuntime(id), sent.string("session_id"))
+        assertEquals(id, vm.chat.value.sessionId)
+    }
+
+    @Test fun replacementRetryKeepsTheDeletedChatDraftFilesAndQueue() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.isBeaconConversation() && vm.chat.value.projectionReady }
+        val old = vm.chat.value.sessionId
+        val text = "Keep my draft"
+        val selection = androidx.compose.ui.text.TextRange(2, 6)
+        val file = json("id" to "synthetic-note", "name" to "note.txt", "mime" to "text/plain")
+        val row = QueuedMessage("Keep my reply", state = "settled", outcome = "cancelled", id = "retry-row", createdAt = 1)
+        compose.runOnIdle {
+            vm.composer(TextFieldValue(text, selection))
+            flow<List<JSONObject>>(vm, "_attachments").value = listOf(file)
+            flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(queued = listOf(row))
+        }
+        fixture.markUnpromptedShell(old)
+        fixture.forgetUnpromptedShell(old)
+        fixture.assistantLookup = 503 to json("detail" to "Synthetic lookup unavailable")
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { !vm.ui.value.beaconOpening && vm.ui.value.beaconError.isNotBlank() }
+        fixture.assistantLookup = 200 to json("conversation_id" to "chat-b")
+        compose.onNodeWithText(if (args.getString("native_ui_language") == "ar") "إعادة المحاولة" else "Retry").performClick()
+        await { vm.isBeaconConversation() && vm.chat.value.projectionReady && vm.chat.value.sessionId == "chat-b" }
+        assertEquals("Retry must restore the deleted chat's composer", text, vm.composer.value.text)
+        assertEquals(selection, vm.composer.value.selection)
+        assertEquals(listOf(file.toString()), vm.attachments.value.map(JSONObject::toString))
+        val restored = vm.chat.value.queued.single { it.id == row.id }
+        assertTrue(restored.notSent() && restored.outcome == CHAT_GONE_OUTCOME)
+        val saved = runBlocking { Draft.decode(requireNotNull(app.cache.read(fixture.scope.session("chat-b"), "draft"))) }
+        assertEquals(text, saved.text)
+        assertEquals(listOf(row.id), saved.queued.map { it.id })
+        assertEquals(listOf(file.toString()), saved.attachments.map(JSONObject::toString))
+        assertTrue(fixture.requests.none { it.string("method") == "prompt.submit" })
+    }
+
+    @Test fun reopeningAPendingTransferKeepsTheRegisteredChatsOwnDraft() = withFixture { vm, fixture ->
+        val owner = fixture.scope
+        val old = "deleted-synthetic-chat"
+        val target = owner.session("chat-b")
+        val token = "synthetic-handoff"
+        val incoming = Draft("Recovered words", attachments = listOf(json("id" to "note", "name" to "note.txt")))
+        val record = JSONObject(incoming.encode()).put("from", old).put("transfer_id", token).toString()
+        val other = owner.copy(profile = "coder")
+        try {
+            runBlocking {
+                // A new opening sees only the protected rows, including the old handle if the app stopped before clearing it.
+                app.cache.write(owner, "beacon-draft-transfer", record, true)
+                app.cache.write(other, "beacon-draft-transfer", "other profile's transfer", true)
+                app.cache.write(owner, "beacon-session", old, true)
+                app.cache.write(target, "draft", Draft("Already here").encode(), true)
+            }
+            fixture.assistantLookup = 200 to json("conversation_id" to target.session)
+            compose.runOnIdle { vm.tab("Beacon") }
+            await { vm.isBeaconConversation() && vm.chat.value.sessionId == target.session && vm.chat.value.projectionReady }
+            assertEquals("Already here", vm.composer.value.text)
+            val row = vm.chat.value.queued.single { it.id == token }
+            assertEquals("Recovered words", row.text)
+            assertEquals("note.txt", row.attachments.single().string("name"))
+            assertTrue(row.notSent() && row.outcome == CHAT_GONE_OUTCOME)
+            runBlocking {
+                assertNull(app.cache.read(owner, "beacon-draft-transfer"))
+                assertEquals("other profile's transfer", app.cache.read(other, "beacon-draft-transfer"))
+                // Replay the durable boundary after the target write and before the pending record was retired.
+                val disk = JSONObject(requireNotNull(app.cache.read(target, "draft"))).put("beacon_transfer_id", token)
+                app.cache.write(target, "draft", disk.toString(), true)
+                app.cache.write(owner, "beacon-draft-transfer", record, true)
+            }
+            val reopen = compose.runOnIdle { vm.openBeacon() }
+            runBlocking { reopen.join() }
+            assertEquals("Already here", vm.composer.value.text)
+            assertEquals(listOf(token), vm.chat.value.queued.map { it.id })
+            assertNull(runBlocking { app.cache.read(owner, "beacon-draft-transfer") })
+            assertTrue(fixture.requests.none { it.string("method") == "prompt.submit" })
+        } finally {
+            runBlocking {
+                app.cache.delete(owner, "beacon-draft-transfer")
+                app.cache.delete(other, "beacon-draft-transfer")
+            }
+        }
+    }
+
+    @Test fun turnlessBeaconChatRecoversFromStorageUnavailable() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val old = vm.chat.value.sessionId
+        assertTrue(vm.chat.value.messages.isEmpty())
+        compose.runOnIdle { vm.composer(TextFieldValue("Unsent draft")) }
+        fixture.markUnpromptedShell(old)
+        fixture.storageUnavailableOnResume = old
+        fixture.forgetUnpromptedShell(old)
+        compose.runOnIdle { vm.selectSession(old) }
+        await { vm.chat.value.sessionId != old && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.beaconOpening }
+        assertEquals("Unsent draft", vm.composer.value.text)
+        assertTrue(fixture.resumedSessionIds().contains(old))
+        assertEquals(vm.chat.value.sessionId, runBlocking { app.cache.read(fixture.scope, "beacon-session") })
+        capture("turnless-recovered")
+        compose.runOnIdle { vm.send() }
+        await { fixture.requests.any { it.string("method") == "prompt.submit" && it.getJSONObject("params").string("text") == "Unsent draft" } }
+    }
+
+    @Test fun inconclusiveOrDeniedReadsKeepThePinnedBeaconChat() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val id = vm.chat.value.sessionId
+        fixture.unsavedRows += id
+        fixture.storageUnavailableOnResume = id
+        runBlocking { fixture.client.nativeSession("chat-a") }
+        fun readAgain() {
+            compose.runOnIdle { vm.selectSession(id) }
+            runBlocking { vm.awaitSelection() }
+            assertEquals(id, vm.chat.value.sessionId)
+            assertEquals(id, runBlocking { app.cache.read(fixture.scope, "beacon-session") })
+        }
+        readAgain() // The chat is still listed.
+        fixture.sessions.getValue(id).getJSONObject("info").put("hidden", true)
+        readAgain() // The same stored id can be absent from the first page.
+        fixture.deleteOnHermes(id)
+        fixture.sessionListFailures = mapOf(fixture.scope.profile to (503 to "Storage unavailable"))
+        readAgain()
+        fixture.sessionListFailures = emptyMap()
+        fixture.nativeStatusFailure = true
+        readAgain() // The stored row is gone but the runtime inventory is unavailable.
+        fixture.nativeStatusFailure = false
+        fixture.deniedSessionIds = setOf(id)
+        val snapshots = fixture.requests.count { it.string("path").endsWith("/mutation-snapshot") }
+        readAgain()
+        assertEquals("A denied read must never try to replace the chat", snapshots, fixture.requests.count { it.string("path").endsWith("/mutation-snapshot") })
+    }
+
+    @Test fun retryInADeletedTurnlessBeaconChatExplainsWhyItWasNotSent() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val old = vm.chat.value.sessionId
+        val item = QueuedMessage("Keep my reply", state = "settled", outcome = "cancelled", id = "prior-reply", createdAt = 1)
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(queued = listOf(item)) }
+        fixture.markUnpromptedShell(old)
+        fixture.storageUnavailableOnResume = old
+        fixture.forgetUnpromptedShell(old)
+        compose.onNodeWithTag("queue-retry:${item.id}").performClick()
+        await { vm.chat.value.sessionId != old && vm.chat.value.queued.any { it.id == item.id && it.notSent() && it.outcome == CHAT_GONE_OUTCOME } }
+        assertTrue(fixture.requests.none { it.string("method") == "prompt.submit" })
+        assertFalse(noticeLog.toString(), noticeLog.any { it.contains("Reconnect before sending") })
+    }
+
+    @Test fun sendingToADeletedTurnlessBeaconChatKeepsTheMessageForExplicitRetry() = withFixture { vm, fixture ->
+        compose.runOnIdle { vm.tab("Beacon") }
+        await { vm.ui.value.tab == "Beacon" && !vm.ui.value.beaconOpening && vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady }
+        val old = vm.chat.value.sessionId
+        fixture.markUnpromptedShell(old)
+        fixture.storageUnavailableOnResume = old
+        fixture.forgetUnpromptedShell(old)
+        compose.runOnIdle { vm.composer(TextFieldValue("Keep this message")); vm.send() }
+        await { vm.chat.value.sessionId != old && vm.chat.value.queued.any { it.text == "Keep this message" && it.notSent() && it.outcome == CHAT_GONE_OUTCOME } }
+        await { vm.chat.value.projectionReady && !vm.ui.value.beaconOpening }
+        assertTrue(fixture.requests.none { it.string("method") == "prompt.submit" })
+        val item = vm.chat.value.queued.single { it.text == "Keep this message" }
+        val reason = if (args.getString("native_ui_language") == "ar") "لم تُرسل · حُذفت المحادثة" else "Not sent · Its chat was deleted"
+        compose.onNodeWithTag("queue-not-sent:${item.id}", useUnmergedTree = true).assertTextEquals(reason).assertIsDisplayed()
+        capture("turnless-not-sent")
+        compose.onNodeWithTag("queue-retry:${item.id}").performClick()
+        await { fixture.requests.count { it.string("method") == "prompt.submit" } == 1 }
+        assertFalse(noticeLog.toString(), noticeLog.any { it.contains("Reconnect before sending") })
+    }
+
+    @Test fun fullModelNameFitsBesideTheApprovalShieldOnAPhone() = withFixture { vm, fixture ->
+        val name = "Deepseek V4.1 Flash"
+        compose.runOnIdle {
+            val chat = vm.chat.value
+            flow<ChatState>(vm, "_chat").value = chat.copy(raw = chat.raw.copy().put("model", "deepseek-v4.1-flash"))
+            vm.storeData("picker:models", json("groups" to JSONArray().put(json("models" to JSONArray().put(json("id" to "deepseek-v4.1-flash", "label" to name))))))
+            vm.storeData("picker:approvals", json("scope_key" to fixture.scope.key, "session_id" to chat.sessionId, "profile_mode" to "smart", "session_status_known" to true, "session_bypass" to false))
+        }
+        val model = compose.onNode(hasAnyAncestor(hasTestTag("composer-model-effort")) and hasText(name), useUnmergedTree = true)
+        model.assertIsDisplayed()
+        val arabic = args.getString("native_ui_language") == "ar"
+        compose.onNodeWithTag("composer-approvals").assertWidthIsEqualTo(48.dp)
+            .assertContentDescriptionContains(if (arabic) "يقرّر Hermes" else "Hermes decides", substring = true)
+        if (!arabic) {
+            val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+            model.performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            assertFalse("The full model name must fit at standard phone width", layouts.single().isLineEllipsized(0))
+        }
+        capture("composer-shield")
+    }
+
+    /** H1b P1-2: a chat's notice stays with the chat; leaving for Settings or another tab clears it, so it never reads as that page's failure. */
+    @Test fun aChatNoticeDoesNotFollowTheOwnerIntoSettings() = withFixture { vm, _ ->
+        // Checked at the step itself: a wait would let the snackbar's own timeout clear it (the test clock runs ahead), which is not the navigation.
+        compose.runOnIdle {
+            vm.tab("Chat"); vm.notice("Open a chat first.")
+            assertEquals("Open a chat first.", vm.ui.value.notice)
+            vm.more("Appearance")
+            assertEquals("Settings opens without the chat's notice", "", vm.ui.value.notice)
+        }
+        compose.runOnIdle {
+            vm.tab("Beacon"); vm.notice("Hermes couldn't do that. Try again.")
+            vm.tab("Chat")
+            assertEquals("Chat opens without Beacon's notice", "", vm.ui.value.notice)
+        }
+        receipts += "A chat notice is cleared when the owner leaves the chat."
     }
 
     @Test fun referenceNavigationAndNativeBoardControls() = withFixture { vm, fixture ->
@@ -4460,10 +4812,10 @@ class NativeExperienceUiTest {
         compose.onNodeWithTag("message-input").performClick().performTextInput("Keep low reasoning for this conversation")
         compose.onNodeWithTag("message-send").performClick()
         await { fixture.requests.any { it.string("method") == "prompt.submit" && it.optJSONObject("params")?.string("text") == "Keep low reasoning for this conversation" } }
-        compose.onNodeWithTag("composer-model-effort").assertTextContains("low")
+        compose.onNodeWithTag("composer-model-effort").assertTextContains("Low")
         compose.runOnIdle { vm.selectSession("chat-a") }
         await { vm.chat.value.projectionReady && vm.chat.value.sessionReasoningEffort == "low" }
-        compose.onNodeWithTag("composer-model-effort").assertTextContains("low")
+        compose.onNodeWithTag("composer-model-effort").assertTextContains("Low")
         receipts += "Configured/custom models show fresh native readback; native confirmation cancel makes no change; confirmed selection preserves messages; low effort stays session-scoped after send and refresh."
         capture("audit-model-effort")
     }
@@ -5536,8 +5888,8 @@ class NativeExperienceUiTest {
         // R6M moved policy changes to profile Settings; this menu describes the chat's bypass.
         compose.onNodeWithText("Approvals in this chat").assertExists()
         await { vm.data.value["picker:approvals"]?.let { it.string("scope_key") == fixture.scope.key && it.string("session_id") == vm.chat.value.sessionId } == true && "picker:approvals" !in vm.refreshing.value }
-        compose.onNodeWithContentDescription("Approvals: Always ask").assertExists()
-        compose.onNodeWithTag("approval-ask").assertTextContains("Always ask").assertIsSelected()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertExists()
+        compose.onNodeWithTag("approval-ask").assertTextContains("Ask for risky ones").assertIsSelected()
     }
 
     @Test fun botOverviewKeepsUnsupportedMembershipAndConfirmedDeletionExplicit() = withFixture { vm, fixture ->
@@ -5639,10 +5991,14 @@ class NativeExperienceUiTest {
                 // A failing plugin must not downgrade the native route (BeaconClient: only an unknown route is "not installed"), so the send is refused in plain words.
                 await { vm.ui.value.notice == "Couldn't send the message. Review it and try again." }
                 assertEquals("A refused send never reaches Hermes", submitsBefore, fixture.requests.count { it.string("method") == "prompt.submit" })
-                assertEquals("The refused message stays in the composer", "Native send while the plugin is down", vm.composer.value.text)
+                // S1 (owner's queue rule): a send that never reached Hermes waits in the box as Not sent, never back in the draft.
+                await { vm.chat.value.queued.any { it.text == "Native send while the plugin is down" && it.notSent() } }
+                assertEquals("Never back in the composer", "", vm.composer.value.text)
                 assertTrue("A plugin outage does not sign the user out", vm.ui.value.authenticated && vm.ui.value.connected)
-                // The plugin answers again: the next send connects by itself, with no new sign-in.
+                // The plugin answers again: Edit brings the words back to the composer and Send connects by itself, with no new sign-in.
                 fixture.pluginStatus = null
+                compose.onNodeWithTag("queue-edit:${vm.chat.value.queued.single { it.text == "Native send while the plugin is down" }.id}").performClick()
+                await { vm.composer.value.text == "Native send while the plugin is down" && vm.chat.value.queued.isEmpty() }
                 compose.onNodeWithTag("message-send").performClick()
                 await { fixture.requests.count { it.string("method") == "prompt.submit" } == submitsBefore + 1 }
                 val resumed = fixture.requests.last { it.string("method") == "prompt.submit" }.getJSONObject("params")

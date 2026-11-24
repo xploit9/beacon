@@ -215,7 +215,8 @@ def store(monkeypatch):
         opened.append((params['profile'], writer))
         yield db if state.available else None
 
-    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=SimpleNamespace(_profile_db=profile_db)))
+    # Delivery also reads which home a profile has (native.profile_fingerprint), as Hermes' server says it.
+    monkeypatch.setitem(sys.modules, 'tui_gateway', SimpleNamespace(server=SimpleNamespace(_profile_db=profile_db, _profile_home=lambda profile: None)))
     monkeypatch.setitem(sys.modules, 'hermes_state_ids', SimpleNamespace(new_session_id=lambda: '20261025_081500_abcdef'))
     return rows, opened, state
 

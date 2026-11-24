@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import json
 import os
+import secrets
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -208,10 +209,13 @@ class PhoneLease:
         self._listeners.append(listener)
         return lambda: self._listeners.remove(listener) if listener in self._listeners else None
 
-    def acquire(self, viewer, reason=''):
-        """``viewer`` takes the phone. Last writer wins: another viewer is evicted (its view sees the epoch change)."""
+    def acquire(self, viewer, reason='', *, new_view=False):
+        """A newly opened control socket gets its own epoch, even on the same linked phone."""
         def mutate(lease, now):
-            if lease.holder == HUMAN and lease.viewer_id == viewer:
+            if new_view and (lease.epoch == 0 or lease.viewer_id == 'unreadable-lease'):
+                # A recreated lease file must not reissue the previous file's first control epoch.
+                lease.epoch = secrets.randbits(52)
+            if not new_view and lease.holder == HUMAN and lease.viewer_id == viewer:
                 if lease.away is not None or now - (lease.last_input or 0) >= INPUT_NOTE_SECONDS:
                     lease.away, lease.last_input = None, now
                     return 'quiet'  # the same viewer back: no new epoch, so its own actions stay valid
@@ -235,7 +239,7 @@ class PhoneLease:
             return 'released'
         return self._transition(mutate)
 
-    def note_input(self, viewer, last_note=None):
+    def note_input(self, viewer, last_note=None, *, epoch=None):
         """``viewer`` sent input. Returns (holds, written_at): whether it still holds, and when ``last_input`` was last written.
         Writes only when ``last_note`` is older than ``INPUT_NOTE_SECONDS`` (callers keep it), so a finger drag costs no I/O."""
         now = self.clock()
@@ -243,18 +247,18 @@ class PhoneLease:
             return True, last_note
 
         def mutate(lease, now):
-            if lease.holder == HUMAN and lease.viewer_id == viewer:
+            if lease.holder == HUMAN and lease.viewer_id == viewer and (epoch is None or lease.epoch == epoch):
                 lease.last_input, lease.away = now, None
                 return 'quiet'
             return None
         lease = self._transition(mutate)
-        holds = lease.holder == HUMAN and lease.viewer_id == viewer
+        holds = lease.holder == HUMAN and lease.viewer_id == viewer and (epoch is None or lease.epoch == epoch)
         return holds, (now if holds else None)
 
-    def went_away(self, viewer):
+    def went_away(self, viewer, epoch=None):
         """``viewer``'s view is gone (socket closed) or in the background: frames stop, the lease is kept ``away_seconds``."""
         def mutate(lease, now):
-            if lease.holder == HUMAN and lease.viewer_id == viewer and lease.away is None:
+            if lease.holder == HUMAN and lease.viewer_id == viewer and lease.away is None and (epoch is None or lease.epoch == epoch):
                 lease.away = now
                 return 'quiet'
             return None

@@ -477,7 +477,7 @@ def flush_held_posts(owner,provider,profile):
     _posts_until[key]=now+15
     for row in mobile.held_posts(owner,profile,limit=mobile.MAX_HELD_POSTS):
         try:
-            native.verify(owner,provider,profile,row['conversation'])
+            principal=native.verify_saved(owner,provider,profile,row['conversation'])
             native.post(owner,provider,profile,row['conversation'],row['key'],row['text'],row['name'])
         except ValueError:
             logging.getLogger(__name__).warning('Beacon dropped scheduled post %s: it can never land',row['key'])
@@ -489,7 +489,7 @@ def flush_held_posts(owner,provider,profile):
                 _posts_logged.add(row['key'])
                 logging.getLogger(__name__).info('Beacon scheduled post %s waits: %s',row['key'],type(exc).__name__)
             continue
-        mobile.enqueue_task_result(owner,profile,row['conversation'],row['key'],row['text'][:4000])
+        mobile.enqueue_task_result(owner,profile,row['conversation'],row['key'],row['text'][:4000],principal)
         mobile.drop_held_post(owner,profile,row['key'])
 @router.post('/mobile/calls')
 async def calls(request:Request):
@@ -707,10 +707,16 @@ def watch_pending(job_id,pending,uncertain):
         # The watch pass prunes notices once, not once per waiting job.
         conn.execute("UPDATE jobs SET status=?,error=CASE WHEN ?<>'' THEN ? WHEN error=? THEN '' ELSE error END,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',marker,marker,_PENDING_JOB_ERROR,time.time(),job_id))
 
+_activity_logged=set()
 def watch(owner,provider,profile):
     sys.modules['beacon_voice_continuation'].sync(mobile,native,owner,provider,profile)
     try: activity.sync(mobile,native,owner,provider,profile)
-    except (ImportError,AttributeError,RuntimeError): pass  # Native runtime or store unavailable: never invent or settle activity.
+    except (ImportError,AttributeError,RuntimeError) as exc:
+        # Native runtime or store unavailable: never invent or settle activity. Said once per kind, never with its text.
+        if type(exc).__name__ not in _activity_logged:
+            _activity_logged.add(type(exc).__name__)
+            logging.getLogger(__name__).warning('Beacon could not read live Hermes work for phone alerts: %s',type(exc).__name__)
+    sys.modules['beacon_observers'].settle_expired(mobile,owner,profile)
     epoch=native_replay_epoch()
     with mobile.connect() as conn: rows=[dict(r) for r in conn.execute("SELECT * FROM jobs WHERE owner=? AND profile=? AND (provider='' OR provider=?) AND ((epoch=? AND status IN ('watching','needs_input')) OR (status='completed' AND callback=1)) ORDER BY rowid LIMIT 512",(owner,profile,provider,epoch))]
     settled=[]
@@ -1124,7 +1130,7 @@ def notice_preview(kind,reason=''):
     if kind=='phone_request': return 'Phone request','Open Beacon to review the request.'
     if kind=='agent_phone_approval': return 'Approval needed','Open Beacon to review the request.'
     if kind=='agent_phone_done': return {'payment':'Payment done','send':'Sent'}.get(reason,"Done on the assistant's phone"),'Open Beacon to see it.'
-    if kind=='clarify': return 'Question for you','Answer here or open Beacon.'
+    if kind=='clarify': return 'Question for you','Open Beacon to answer.'
     if kind=='working': return 'Beacon working','Hermes is working on your chat.'
     if kind=='activity_end': return 'Activity ended','Open Beacon to review your session.'
     if kind=='task_result': return 'Task finished','A task finished.'
@@ -1226,13 +1232,14 @@ async def activity_answer(event_id:str,request:Request):
 @router.post('/mobile/callbacks/{invitation_id}/{action}')
 async def answer(invitation_id:str,action:str,request:Request):
     value=await body(request,1024);owner,provider,profile,cfg=await identity_async(request)
-    if action not in ('answer','decline'): raise HTTPException(404,'Unknown callback action')
+    if action not in ('answer','decline','missed'): raise HTTPException(404,'Unknown callback action')
     if action=='answer': _client_key_mode(value)
     def peek():
         with mobile.connect() as conn:
             row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
         if not row or row['kind']!='incoming_call': raise HTTPException(404,'Owned invitation unavailable')
-        if row['state']!='pending' or row['expires']<=time.time(): raise HTTPException(409,'Invitation consumed or expired')
+        # A ring that timed out on the phone is reported after the server window too, so only a settled notice is refused for it.
+        if row['state']!='pending' or (row['expires']<=time.time() and action!='missed'): raise HTTPException(409,'Invitation consumed or expired')
         return dict(row)
     initial=await asyncio.to_thread(peek)
     principal=voice_principal(request,owner,provider)
@@ -1251,8 +1258,14 @@ async def answer(invitation_id:str,action:str,request:Request):
         with mobile.LOCK,mobile.connect() as conn:
             row=conn.execute('SELECT * FROM notices WHERE id=? AND owner=? AND profile=?',(invitation_id,owner,profile)).fetchone()
             if not row or row['kind']!='incoming_call': raise HTTPException(404,'Owned invitation unavailable')
-            if (row['state']!='pending' or row['expires']<=time.time() or row['conversation']!=initial['conversation']
+            if (row['state']!='pending' or (row['expires']<=time.time() and action!='missed') or row['conversation']!=initial['conversation']
                     or (row['principal'] or '')!=bound): raise HTTPException(409,'Invitation consumed or expired')
+            if action=='missed':
+                # Another linked phone may still ring from a late push, an idle one most of all: only the window's end settles the call then.
+                if conn.execute('SELECT COUNT(*) FROM beacon_devices WHERE owner=? AND removed=0',(owner,)).fetchone()[0]>1:
+                    return {'missed':False,'state':'pending','callback_id':invitation_id,'kind':'incoming_call','profile':profile,**source}
+                conn.execute("UPDATE notices SET state='missed' WHERE id=?",(invitation_id,))
+                return {'missed':True,'state':'missed','callback_id':invitation_id,'kind':'incoming_call','profile':profile,**source}
             if action=='decline':
                 conn.execute("UPDATE notices SET state='declined' WHERE id=?",(invitation_id,))
                 return {'declined':True,'state':'declined','callback_id':invitation_id,'kind':'incoming_call','profile':profile,**source}
@@ -1476,7 +1489,7 @@ def check_hermes():
     try:
         from hermes_cli.web_server import PROJECT_ROOT
         compat=sys.modules['beacon_compat']
-        gone=compat.missing(compat.needs(),PROJECT_ROOT)
+        gone=compat.missing(compat.needs(),PROJECT_ROOT)+compat.missing_hooks(compat.hooks(),PROJECT_ROOT)
     except Exception as exc:
         logging.getLogger(__name__).info('Beacon could not compare itself with this Hermes: %s',type(exc).__name__)
         return

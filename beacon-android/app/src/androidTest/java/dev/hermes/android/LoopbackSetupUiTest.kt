@@ -53,6 +53,9 @@ class LoopbackSetupUiTest {
         assertTrue(runCatching { parseBeaconConnectLink("""{"type":"beacon-connect","url":"https://hermes.example","session":"$secret"}""") }.isFailure)
         assertEquals("https://hermes.example", setupAddressForDisplay(link))
         assertEquals("https://hermes.example", setupAddressForDisplay("https://hermes.example"))
+        // The field shows the decoded address of a pasted link, and leaves a typed address as it is.
+        assertEquals("https://hermes.example", dev.hermes.android.ui.pastedAddress(link))
+        assertEquals("hermes.example", dev.hermes.android.ui.pastedAddress("hermes.example"))
 
         val state = AppState(setupOrigin = parsed.origin, setupWizard = true, setupStep = "connect", restoringSession = false)
         var submitted: String? = null

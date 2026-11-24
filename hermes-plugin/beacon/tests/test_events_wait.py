@@ -51,8 +51,8 @@ def test_event_wait_returns_early_when_beacon_call_user_creates_invitation(harne
         invitation = json.loads(call_user({'reason': 'Please call me'}, session_id='native-stored'))
         response = pending.result(timeout=2)
 
-    assert response.status_code == 200
-    assert any(row['event_id'] == invitation['event_id'] for row in response.json()['events'])
+    assert response.status_code == 200 and invitation['status'] == 'ringing' and 'event_id' not in invitation
+    assert any(row['kind'] == 'incoming_call' for row in response.json()['events'])
     assert time.monotonic() - started < 3
 
 
@@ -62,12 +62,184 @@ def test_deferred_call_user_invitation_appears_after_active_call_closes(harness,
     active_call = reserve(client)
     invitation = json.loads(call_user({'reason': 'Call after this session'}, session_id='native-stored'))
     assert client.get(EVENTS).json()['events'] == []
+    # The model is told the truth: another call is open, so nothing rings yet.
+    assert invitation['status'] == 'waiting' and 'event_id' not in invitation and 'not rung' in invitation['message']
 
     assert client.delete(f'/api/plugins/beacon/mobile/calls/{active_call}').status_code == 200
     response = client.get(EVENTS)
 
-    assert any(row['event_id'] == invitation['event_id'] and row['kind'] == 'incoming_call'
-               for row in response.json()['events'])
+    assert any(row['kind'] == 'incoming_call' for row in response.json()['events'])
+
+
+def _fake_clock(monkeypatch):
+    clock = [time.time()]
+    monkeypatch.setattr(time, 'time', lambda: clock[0])
+    return clock
+
+
+def _device(api, at):
+    device = api.mobile.link_device('owner', 'basic', 'Pixel')['device_id']
+    touch_device(api, device, at)
+    return device
+
+
+def touch_device(api, device, at):
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE beacon_devices SET last_seen=? WHERE id=?', (at, device))
+
+
+def _call_row(api):
+    with api.mobile.connect() as conn:
+        return dict(conn.execute('SELECT closed,status FROM calls').fetchone())
+
+
+def test_relaunched_app_rings_at_once_over_its_old_call(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    device = _device(api, clock[0] - 5)
+    reserve(client)
+    clock[0] += 61
+    touch_device(api, device, clock[0])  # the app is back and talking to the plugin, the old call is not
+    result = json.loads(call_user({'reason': 'Gone'}, session_id='native-stored'))
+    assert result['status'] == 'ringing' and 'event_id' not in result
+    assert _call_row(api) == {'closed': 1, 'status': 'failed'}
+
+
+def test_a_silent_phone_keeps_its_call_open_and_its_tools(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    _device(api, clock[0] - 5)
+    reserve(client)
+    clock[0] += 90  # the link dropped: nothing reached the plugin, so nothing says the call ended
+    assert json.loads(call_user({'reason': 'Live'}, session_id='native-stored'))['status'] == 'waiting'
+    assert _call_row(api) == {'closed': 0, 'status': 'pending'}
+    clock[0] += 211  # past the 300 s window the call is closed as before
+    assert json.loads(call_user({'reason': 'Later'}, session_id='native-stored'))['status'] in ('waiting', 'ringing')
+    assert _call_row(api)['closed'] == 1
+
+
+def test_two_recently_active_phones_keep_a_quiet_call_until_300_seconds(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    _device(api, clock[0] - 5)
+    other = api.mobile.link_device('owner', 'basic', 'Tablet')['device_id']
+    reserve(client)
+    clock[0] += 90
+    touch_device(api, other, clock[0])  # the other phone is active; which one held the call is unknown
+    assert json.loads(call_user({'reason': 'Live'}, session_id='native-stored'))['status'] == 'waiting'
+    assert _call_row(api)['closed'] == 0
+
+
+def test_removed_or_long_unseen_phones_do_not_count_as_active(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    start = clock[0]
+    phone = _device(api, start - 5)
+    removed = api.mobile.link_device('owner', 'basic', 'Old')['device_id']
+    idle = api.mobile.link_device('owner', 'basic', 'Idle')['device_id']
+    touch_device(api, idle, start - 400)
+    reserve(client)
+    clock[0] += 90
+    touch_device(api, phone, clock[0])
+    touch_device(api, removed, clock[0])
+    api.mobile.remove_device('owner', removed)  # removed, though it was seen after the call
+    result = json.loads(call_user({'reason': 'Gone'}, session_id='native-stored'))
+    assert result['status'] == 'ringing' and _call_row(api)['closed'] == 1
+
+
+def test_another_owners_phone_does_not_close_the_call(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    reserve(client)
+    other = api.mobile.link_device('other-owner', 'basic', 'Other')['device_id']
+    clock[0] += 90
+    touch_device(api, other, clock[0])
+    assert json.loads(call_user({'reason': 'Live'}, session_id='native-stored'))['status'] == 'waiting'
+    assert _call_row(api)['closed'] == 0
+
+
+def test_a_missed_report_ends_the_notice_and_the_next_call_rings_again(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    first = json.loads(call_user({'reason': 'Ring'}, session_id='native-stored'))
+    assert first == {'status': 'ringing', 'message': 'The phone is ringing now.'}
+    with api.mobile.connect() as conn:
+        notice = conn.execute("SELECT id,expires-created AS window FROM notices WHERE kind='incoming_call'").fetchone()
+    assert notice['window'] == 120  # a late push on a phone with background limits still rings
+    clock[0] += 25
+    response = client.post(f"/api/plugins/beacon/mobile/callbacks/{notice['id']}/missed", json={})
+    assert response.status_code == 200 and response.json()['state'] == 'missed', response.text
+    with api.mobile.connect() as conn:
+        assert conn.execute('SELECT state FROM call_log WHERE id=?', (notice['id'],)).fetchone()[0] == 'missed'
+    assert [e['state'] for e in client.get(EVENTS).json()['events']] == ['missed']
+    assert client.post(f"/api/plugins/beacon/mobile/callbacks/{notice['id']}/missed", json={}).status_code == 409
+    again = json.loads(call_user({'reason': 'Ring again'}, session_id='native-stored'))
+    assert again['status'] == 'ringing'
+    with api.mobile.connect() as conn:
+        rows = conn.execute("SELECT id,state FROM notices WHERE kind='incoming_call' ORDER BY created,rowid").fetchall()
+    assert [r['state'] for r in rows] == ['missed', 'pending'] and rows[0]['id'] != rows[1]['id']
+
+
+def _ring(api, call_user):
+    json.loads(call_user({'reason': 'Ring'}, session_id='native-stored'))
+    with api.mobile.connect() as conn:
+        return conn.execute("SELECT id FROM notices WHERE kind='incoming_call'").fetchone()['id']
+
+
+def _notice_state(api, notice):
+    with api.mobile.connect() as conn:
+        return conn.execute('SELECT state FROM notices WHERE id=?', (notice,)).fetchone()[0]
+
+
+def test_a_missed_report_with_two_active_phones_leaves_the_other_ringing(harness, monkeypatch):
+    """R2 review: phone A's ring timed out, but phone B's push may come late (the 120 s window). A's report must not end B's ring."""
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    _device(api, clock[0] - 5)
+    other = api.mobile.link_device('owner', 'basic', 'Tablet')['device_id']
+    touch_device(api, other, clock[0] - 5)
+    notice = _ring(api, call_user)
+    clock[0] += 50
+    response = client.post(f'/api/plugins/beacon/mobile/callbacks/{notice}/missed', json={})
+    assert response.status_code == 200 and response.json()['missed'] is False, response.text
+    assert _notice_state(api, notice) == 'pending'
+    assert client.post(f'/api/plugins/beacon/mobile/callbacks/{notice}/decline', json={}).status_code == 200  # B can still act on it
+
+
+def test_a_missed_report_with_an_idle_second_phone_keeps_the_call_pending(harness, monkeypatch):
+    """R3 review: an idle phone (Keep connected off, or frozen by the system) is the one whose push comes late, so it still counts."""
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    _device(api, clock[0] - 5)
+    idle = api.mobile.link_device('owner', 'basic', 'Drawer')['device_id']
+    touch_device(api, idle, clock[0] - 600)
+    notice = _ring(api, call_user)
+    clock[0] += 50
+    response = client.post(f'/api/plugins/beacon/mobile/callbacks/{notice}/missed', json={})
+    assert response.status_code == 200 and response.json()['missed'] is False, response.text
+    assert _notice_state(api, notice) == 'pending'
+
+
+def test_a_missed_report_with_the_other_phone_removed_still_ends_the_ring(harness, monkeypatch):
+    api, client, cfg, tmp_path, _ = harness
+    call_user = call_user_tool(api, cfg, tmp_path, monkeypatch)
+    clock = _fake_clock(monkeypatch)
+    _device(api, clock[0] - 5)
+    old = api.mobile.link_device('owner', 'basic', 'Old')['device_id']
+    api.mobile.remove_device('owner', old)
+    notice = _ring(api, call_user)
+    clock[0] += 50
+    response = client.post(f'/api/plugins/beacon/mobile/callbacks/{notice}/missed', json={})
+    assert response.status_code == 200 and response.json()['missed'] is True, response.text
+    assert _notice_state(api, notice) == 'missed'
 
 
 REQUEST_ID = 'a' * 32

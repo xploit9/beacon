@@ -740,6 +740,7 @@ private fun Modifier.edgeFade(scroll: ScrollState, rtl: Boolean) = graphicsLayer
         OverlayLine.NotHeard -> uiText("Didn't catch that")
         OverlayLine.NoRecognizer -> uiText("Voice typing isn't available")
         OverlayLine.NotSent -> uiText("Couldn't send")
+        OverlayLine.Queued -> uiText("Couldn't send it now. It's in the queue.")
         // The short reason the call service gave (it names whose side failed) without its second instruction, which the action carries.
         OverlayLine.CallFailed -> when (callFailure) {
             CallReason.HermesNoAnswer -> uiText("Hermes didn't answer")

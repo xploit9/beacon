@@ -52,9 +52,10 @@ internal class DirectGatewayReceipts {
         if (owned.settled) return JSONObject(owned.receipt.toString())
         owned.receipt = JSONObject(value.toString())
         owned.settled = value.getString("status") in FINAL_RECEIPTS
-        // A request that is not read-only may change what a read returns: no earlier read answers again.
+        // A request that is not read-only may change what a read returns: no earlier read answers again. A live read (the plugin marks
+        // the agent phone's screen) changes by itself, so it never answers again either.
         if (!value.optBoolean("read_only")) forgetReads()
-        else if (value.optString("status") == "completed") { owned.completedAt = System.nanoTime() / 1_000_000; owned.reusable = true }
+        else if (value.optString("status") == "completed" && !value.optBoolean("live")) { owned.completedAt = System.nanoTime() / 1_000_000; owned.reusable = true }
         return JSONObject(owned.receipt.toString())
     }
     /** Something that is not a read happened in this call (a write, a hand-over, an approval decision): every read is asked of Hermes again. */

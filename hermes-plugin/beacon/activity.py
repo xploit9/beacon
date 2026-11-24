@@ -64,6 +64,8 @@ def snapshot(native, owner, provider, profile):
 
 
 def sync(mobile, native, owner, provider, profile):
+    import sys
+    observers = sys.modules['beacon_observers']  # the same request rules as the gateway's own hook (observers.human_input)
     live = snapshot(native, owner, provider, profile)
     now = time.time()
     with mobile.LOCK, mobile.connect() as conn:
@@ -80,7 +82,7 @@ def sync(mobile, native, owner, provider, profile):
                 remaining -= 1
                 kind = frame['method'] if frame else 'working'
                 conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,runtime,request_id,principal) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-                             (event, owner, profile, kind, work['stored'], now, now + (300 if frame else 14400), (work['key'] + '-' + frame['id']) if frame else work['key'], work['runtime'], frame['id'] if frame else '',work.get('principal') or ''))
+                             (event, owner, profile, kind, work['stored'], now, now + (observers.human_wait_seconds(kind) if frame else 14400), (work['key'] + '-' + frame['id']) if frame else work['key'], work['runtime'], frame['id'] if frame else '',work.get('principal') or ''))
         previous = conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND kind IN ('working','approval','clarify') AND activity_key!='' AND state='pending'", (owner, profile)).fetchall()
         for row in previous:
             if row['id'] not in active:
@@ -91,10 +93,8 @@ def sync(mobile, native, owner, provider, profile):
                     args=(owner,provider,profile,row['conversation'])+((None,True,row['principal']) if row['principal'] else ())
                     native.verify(*args)
                 except (LookupError,RuntimeError,ValueError,ImportError,AttributeError): continue
-                conn.execute("UPDATE notices SET state='settled' WHERE id=?", (row['id'],))
                 # A new outbox row makes cancellation observable to cursor polling as well as FCM.
-                conn.execute('INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,principal) VALUES(?,?,?,?,?,?,?,?,?)',
-                             ('settled-' + row['id'], owner, profile, 'activity_end', row['conversation'], now, now + 300, row['activity_key'],row['principal']))
+                observers.ended(mobile, conn, row, now)
 
 
 def pending(native, owner, provider, profile, row):

@@ -642,7 +642,8 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     val ui by vm.ui.collectAsStateWithLifecycle()
     val context = LocalContext.current.applicationContext
     val source = vm.client
-    val scopeKey = source?.scope?.key.orEmpty()
+    val owner = (source?.scope ?: vm.restoredScope())?.takeIf { it.origin == ui.origin && it.owner == ui.owner && it.profile == ui.profile }
+    val scopeKey = owner?.key.orEmpty()
     var devices by remember(scopeKey) { mutableStateOf(pairedDevicesOf(vm.data.value[PAIRED_DEVICES_KEY])) }
     var loading by remember(scopeKey) { mutableStateOf(false) }
     var busy by remember(scopeKey) { mutableStateOf(false) }
@@ -662,7 +663,7 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
 
     fun linkFailure(failure: Throwable) = if ((failure as? ApiFailure)?.status == 409) tooManyPhones else couldntAddPhone
 
-    LaunchedEffect(scopeKey, refresh, pluginAbsent) {
+    LaunchedEffect(source, scopeKey, refresh, pluginAbsent) {
         val client = vm.client ?: return@LaunchedEffect
         if (pluginAbsent || client.auth.owner.isBlank()) return@LaunchedEffect
         loading = true
@@ -721,7 +722,7 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
         }
     }
 
-    val thisDeviceId = source?.let { NativePairing.deviceId(context, it.scope) }
+    val thisDeviceId = owner?.let { NativePairing.deviceId(context, it) }
     val title = uiText("Phones")
     val refreshLabel = uiText("Refresh devices")
     // Refresh sits beside the heading; a spinner next to it says a read or a change is running.
@@ -732,6 +733,8 @@ internal fun DevicesSettingsSection(vm: BeaconViewModel, pluginAbsent: Boolean) 
     Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(SettingsKit.SectionGap)) {
         when {
             pluginAbsent -> SettingsSection(title, testTag = DEVICES_SECTION_TAG) { MissingBeaconPluginState(compact = true) }
+            source == null && owner != null && ui.authenticated && devices != null ->
+                DevicesList(devices.orEmpty(), thisDeviceId, enabled = false, onRemove = {})
             source == null || !ui.authenticated -> SettingsSection(title, testTag = DEVICES_SECTION_TAG) {
                 SettingsErrorRow(uiText("Reconnect to see devices"), { vm.connect(ui.origin) }, uiText("Reconnect"))
             }

@@ -37,7 +37,9 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.State
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -346,7 +348,9 @@ internal fun agentPhoneSetupDisplayText(text: String): String =
 @Composable internal fun AgentPhoneSetupScreen(state: AgentPhoneSetupState, actions: AgentPhoneSetupActions, modifier: Modifier = Modifier) {
     // The checks only read the computer, so the owner may leave while they run; an accept or an install button in flight waits.
     val working = state.accepting || state.installBusy
-    CompositionLocalProvider(LocalSetupClose provides SetupClose(enabled = !working, onClose = actions.close)) {
+    // Remembered: a new object on every reading would recompose the header each time.
+    val close = remember(working, actions.close) { SetupClose(enabled = !working, onClose = actions.close) }
+    CompositionLocalProvider(LocalSetupClose provides close) {
         val step = agentPhoneStepNumber(state.stage)
         val tag = Modifier.testTag("agent-phone-stage:${state.stage.name}")
         when (state.stage) {
@@ -550,55 +554,65 @@ private val TERMS_BODY = AgentPhoneLines.templates.getValue("install.licences")
 
 @Composable private fun DownloadPage(state: AgentPhoneSetupState, actions: AgentPhoneSetupActions, modifier: Modifier, step: Int) {
     val install = state.install
-    val failed = install.state == AgentPhoneInstallState.Failed
-    val title = when (install.state) {
+    val installState = install.state
+    val failed = installState == AgentPhoneInstallState.Failed
+    // The byte readings arrive every poll: only the progress bar reads them (through this State), so the shell, the phases and the buttons
+    // keep the same inputs between readings and are not measured again.
+    val latest = rememberUpdatedState(state)
+    val title = when (installState) {
         AgentPhoneInstallState.Paused -> uiText("Paused")
         AgentPhoneInstallState.Cancelled -> uiText("Cancelled")
         AgentPhoneInstallState.Failed -> uiText("The download stopped")
         else -> uiText("Getting the phone ready")
     }
-    val body = when (install.state) {
+    val body = when (installState) {
         AgentPhoneInstallState.Paused -> uiText("Resume any time. Nothing is lost.")
         AgentPhoneInstallState.Cancelled -> uiText("Nothing was kept on the computer.")
         AgentPhoneInstallState.Failed -> ""
         else -> uiText("It keeps going if you close this.")
     }
+    val phase = install.phase
+    val installLine = state.installLine
+    val serverLine = agentPhoneLine(install.line, code = install.lineCode, args = install.lineArgs)
+    val line = (installLine ?: serverLine?.takeIf { failed || installState == AgentPhoneInstallState.Running })
+        // Under "The download stopped", the line says only what to do (P3-7: not "Download stopped" twice).
+        ?.let { if (failed && it.template == AgentPhoneLines.templates["install.offline"]) it.copy(template = AgentPhoneLines.templates.getValue("check.network_fix")) else it }
+    val fix = if (failed) agentPhoneLine(install.fix, code = install.fixCode) else null
+    val failedAction = if (failed) agentPhoneFailedAction((installLine ?: serverLine)?.action, install.retry) else null
+    val installBusy = state.installBusy
     SetupShell(step, title, modifier, body,
         content = {
-            AgentPhoneDust(working = install.state == AgentPhoneInstallState.Running || install.state == AgentPhoneInstallState.Done)
-            if (install.state != AgentPhoneInstallState.Cancelled) {
-                AgentPhoneProgress(install, state.minutesLeft)
-                AgentPhonePhases(install)
+            AgentPhoneDust(working = installState == AgentPhoneInstallState.Running || installState == AgentPhoneInstallState.Done)
+            if (installState != AgentPhoneInstallState.Cancelled) {
+                AgentPhoneProgress(latest)
+                AgentPhonePhases(installState, phase)
             }
-            val line = (state.installLine ?: agentPhoneLine(install.line, code = install.lineCode, args = install.lineArgs)?.takeIf { failed || install.state == AgentPhoneInstallState.Running })
-                // Under "The download stopped", the line says only what to do (P3-7: not "Download stopped" twice).
-                ?.let { if (failed && it.template == AgentPhoneLines.templates["install.offline"]) it.copy(template = AgentPhoneLines.templates.getValue("check.network_fix")) else it }
             // The failed page's one action is its primary button, so the line stands alone; a running install's line ("A download was damaged…") is news, not an error.
             line?.let { SetupStatusLine(agentPhoneSetupDisplayText(agentPhoneText(it)), error = failed, modifier = Modifier.testTag("agent-phone-line")) }
-            if (failed) agentPhoneLine(install.fix, code = install.fixCode)?.let {
+            fix?.let {
                 Text(agentPhoneSetupDisplayText(agentPhoneText(it)), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         },
         actions = {
-            when (install.state) {
+            when (installState) {
                 AgentPhoneInstallState.Paused -> {
-                    SetupPrimaryButton(uiText("Resume"), actions.resume, Modifier.testTag("agent-phone-resume"), loading = state.installBusy)
-                    SetupTextAction(uiText("Cancel"), actions.cancel, Modifier.testTag("agent-phone-cancel"), enabled = !state.installBusy)
+                    SetupPrimaryButton(uiText("Resume"), actions.resume, Modifier.testTag("agent-phone-resume"), loading = installBusy)
+                    SetupTextAction(uiText("Cancel"), actions.cancel, Modifier.testTag("agent-phone-cancel"), enabled = !installBusy)
                 }
                 AgentPhoneInstallState.Failed -> {
-                    val line = state.installLine ?: agentPhoneLine(install.line, code = install.lineCode, args = install.lineArgs)
-                    when (val action = agentPhoneFailedAction(line?.action, install.retry)) {
-                        AgentPhoneAction.TryAgain -> SetupPrimaryButton(uiText("Try again"), actions.resume, Modifier.testTag("agent-phone-resume"), loading = state.installBusy)
+                    val shown = installLine ?: serverLine
+                    when (val action = failedAction ?: AgentPhoneAction.TryAgain) {
+                        AgentPhoneAction.TryAgain -> SetupPrimaryButton(uiText("Try again"), actions.resume, Modifier.testTag("agent-phone-resume"), loading = installBusy)
                         AgentPhoneAction.CheckAgain -> SetupPrimaryButton(uiText("Check now"), actions.check, Modifier.testTag("agent-phone-check-again"))
                         AgentPhoneAction.StartAgain -> SetupPrimaryButton(uiText("Start again"), actions.startAgain, Modifier.testTag("agent-phone-start-over"))
-                        else -> SetupPrimaryButton(uiText(agentPhoneActionWord(action)), { line?.let(actions.line) }, Modifier.testTag("agent-phone-line-action"))
+                        else -> SetupPrimaryButton(uiText(agentPhoneActionWord(action)), { shown?.let(actions.line) }, Modifier.testTag("agent-phone-line-action"))
                     }
-                    SetupTextAction(uiText("Cancel"), actions.cancel, Modifier.testTag("agent-phone-cancel"), enabled = !state.installBusy)
+                    SetupTextAction(uiText("Cancel"), actions.cancel, Modifier.testTag("agent-phone-cancel"), enabled = !installBusy)
                 }
                 AgentPhoneInstallState.Cancelled, AgentPhoneInstallState.Idle -> SetupPrimaryButton(uiText("Start again"), actions.startAgain, Modifier.testTag("agent-phone-start-over"))
                 else -> {
-                    OutlinedButton(actions.pause, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("agent-phone-pause"), enabled = !state.installBusy && install.state == AgentPhoneInstallState.Running) { Text(uiText("Pause")) }
-                    SetupTextAction(uiText("Cancel"), actions.cancel, Modifier.testTag("agent-phone-cancel"), enabled = !state.installBusy)
+                    OutlinedButton(actions.pause, Modifier.fillMaxWidth().heightIn(min = 52.dp).testTag("agent-phone-pause"), enabled = !installBusy && installState == AgentPhoneInstallState.Running) { Text(uiText("Pause")) }
+                    SetupTextAction(uiText("Cancel"), actions.cancel, Modifier.testTag("agent-phone-cancel"), enabled = !installBusy)
                 }
             }
         })
@@ -630,7 +644,9 @@ private val TERMS_BODY = AgentPhoneLines.templates.getValue("install.licences")
 }
 
 /** "1.2 of 2.4 GB · about 6 min left" over a bar that reads its own fraction to TalkBack. */
-@Composable private fun AgentPhoneProgress(install: AgentPhoneInstall, minutesLeft: Long?) {
+@Composable private fun AgentPhoneProgress(latest: State<AgentPhoneSetupState>) {
+    val install = latest.value.install
+    val minutesLeft = latest.value.minutesLeft
     val total = install.totalBytes
     val done = (install.doneBytes ?: 0L).coerceAtMost(total ?: Long.MAX_VALUE)
     val fraction = if (total != null && total > 0) (done.toFloat() / total).coerceIn(0f, 1f) else null
@@ -658,15 +674,16 @@ private val TERMS_BODY = AgentPhoneLines.templates.getValue("install.licences")
 
 /** Download → Check → Set up: the install's three phases, the current one marked. */
 @OptIn(ExperimentalLayoutApi::class)
-@Composable private fun AgentPhonePhases(install: AgentPhoneInstall) {
+// Takes the state and phase alone, so the byte readings that change every poll don't recompose it.
+@Composable private fun AgentPhonePhases(installState: AgentPhoneInstallState, installPhase: AgentPhoneInstallPhase?) {
     val order = listOf(AgentPhoneInstallPhase.Download, AgentPhoneInstallPhase.Check, AgentPhoneInstallPhase.SetUp).zip(AgentPhonePhaseWords)
     val current = when {
-        install.state == AgentPhoneInstallState.Done -> order.size
-        install.phase == null -> 0
-        else -> order.indexOfFirst { it.first == install.phase }
+        installState == AgentPhoneInstallState.Done -> order.size
+        installPhase == null -> 0
+        else -> order.indexOfFirst { it.first == installPhase }
     }
     val palette = rememberSettingsStatusPalette()
-    val running = install.state == AgentPhoneInstallState.Running
+    val running = installState == AgentPhoneInstallState.Running
     val words = order.mapIndexed { index, (_, word) -> uiText(word) to uiText(if (index < current) "Done" else if (index == current) "Now" else "Next") }
     // One spoken summary that changes only when the phase does ("Download, Done. Check, Now. Set up, Next."), announced politely.
     val summary = words.joinToString(". ") { (label, state) -> "$label, $state" }

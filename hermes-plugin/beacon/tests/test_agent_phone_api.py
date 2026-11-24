@@ -39,6 +39,10 @@ class FakeGrpc:
         self.blocked.set()
 
     def screenshots(self, fmt, width=0, height=0, mmap_path=None):
+        if mmap_path is None:
+            yield {'width': width, 'height': height, 'rotation': b'', 'image': bytes([40, 90, 200]) * (width * height)}
+            self.blocked.wait(20)
+            return
         self.host.frame_paths.append(Path(mmap_path))
         with open(mmap_path, 'r+b') as fh:
             fh.write(bytes([40, 90, 200]) * (width * height))
@@ -204,9 +208,10 @@ def phone_api(harness, monkeypatch):  # noqa: F811
                            lease_mod=lease_mod, stream=stream, tmp=tmp, cfg=cfg)
 
 
-def ticket(p, device=None, profile='default'):
+def ticket(p, device=None, profile='default', watch=False):
     headers = {'x-beacon-device-id': device} if device else {}
-    response = p.client.post(f'{PREFIX}/mobile/agent-phone/view-ticket?beacon_profile={profile}', json={}, headers=headers)
+    response = p.client.post(f'{PREFIX}/mobile/agent-phone/view-ticket?beacon_profile={profile}',
+                             json={'mode': 'watch'} if watch else {}, headers=headers)
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -266,6 +271,29 @@ def add_done_notice(api, reason, label):
                      (notice, 'owner', 'default', 'agent_phone_done', 'agent-phone-done-' + notice, time.time(), time.time() + 3600,
                       reason, f'agent_phone_activity:{seq}'))
     return notice
+
+
+def test_a_step_that_paid_nothing_says_done_and_never_payment_done(harness):  # noqa: F811
+    """Q2 R5-F2: a scroll and a terms ticked box on a page Beacon takes for a checkout posted "Payment done". The notice's
+    reason was the approval's risk class, so the plugin had no reason to give for a step that paid nothing and claimed a
+    payment instead. Such a step now posts its own line, and the phone reads "Done on the assistant's phone", not a payment."""
+    api, client, cfg, tmp, app = harness
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('beacon_agent_phone_approvals_x2d', Path(__file__).resolve().parents[1] / 'agent_phone_approvals.py')
+    approvals = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(approvals)
+    with api.mobile.connect() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS agent_phone_activity(seq INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, profile TEXT, '
+                     'at REAL, app TEXT, action TEXT, label TEXT, approved INTEGER, outcome TEXT)')
+    seq = approvals.add_activity('owner', 'default', 'Chrome', 'swipe', 'CATEGORIES', True, 'done')
+    ticked = approvals.add_activity('owner', 'default', 'Chrome', 'tap', 'I agree with the terms of service', True, 'done')
+    notices = [approvals.notify_done('owner', 'default', '', row) for row in (seq, ticked)]
+    paid = approvals.notify_done('owner', 'default', 'payment', ticked)
+    events = {e['event_id']: e for e in client.get('/api/plugins/beacon/mobile/notifications/events').json()['events']}
+    done_line = "Done on the assistant's phone"
+    assert [events[n]['title'] for n in notices] == [done_line, done_line] and events[paid]['title'] == 'Payment done'
+    assert client.get('/api/plugins/beacon/mobile/notifications/events/' + notices[1]).json()['preview'] == {
+        'title': done_line, 'body': 'I agree with the terms of service'}
 
 
 def test_the_done_notice_says_payment_done_or_sent_then_the_activity_label(harness, monkeypatch):  # noqa: F811
@@ -375,19 +403,59 @@ def test_stop_stops_the_phone_and_frees_the_lease(phone_api):
 def test_hand_back_frees_only_this_phones_lease(phone_api):
     mine = phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.device)
     theirs = phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.other_device)
-    phone_api.lease.acquire(theirs)
-    kept = phone_api.client.post(f'{PREFIX}/mobile/agent-phone/hand-back?beacon_profile=default', json={})
-    assert kept.json()['lease']['holder'] == 'human' and not kept.json()['lease']['you']
-    phone_api.lease.acquire(mine)
-    back = phone_api.client.post(f'{PREFIX}/mobile/agent-phone/hand-back?beacon_profile=default', json={})
+    url = f'{PREFIX}/mobile/agent-phone/hand-back?beacon_profile=default'
+    held = phone_api.lease.acquire(theirs)
+    kept = phone_api.client.post(url, json={'epoch': held.epoch})
+    assert kept.status_code == 409 and phone_api.lease.holds(theirs)
+    held = phone_api.lease.acquire(mine)
+    back = phone_api.client.post(url, json={'epoch': held.epoch})
     assert back.json()['lease'] == {'holder': 'agent', 'you': False, 'epoch': 3, 'away': False}
 
 
-def test_hand_back_repairs_a_damaged_lease(phone_api):
-    (phone_api.folder / 'run').mkdir(exist_ok=True)
+def test_damaged_lease_stays_held_until_a_fresh_view_sends_done(phone_api):
+    viewer = phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.device)
+    stale = phone_api.lease.acquire(viewer, new_view=True).epoch
     (phone_api.folder / 'run' / 'lease.json').write_text('{broken')
-    back = phone_api.client.post(f'{PREFIX}/mobile/agent-phone/hand-back?beacon_profile=default', json={})
-    assert back.json()['lease']['holder'] == 'agent'
+    url = f'{PREFIX}/mobile/agent-phone/hand-back?beacon_profile=default'
+    back = phone_api.client.post(url, json={})
+    assert back.status_code == 400 and phone_api.lease.get().holder == 'human'
+    issued = ticket(phone_api)
+    with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
+        assert ws.receive_json()['lease'] == 'you'
+        assert phone_api.client.post(url, json={'epoch': stale}).status_code == 409
+        assert phone_api.lease.holds(viewer)
+        ws.send_json({'t': 'done'})
+        read_until(ws, lambda m: isinstance(m, dict) and m.get('t') == 'bye')
+    assert phone_api.lease.get().holder == 'agent'
+
+
+@pytest.mark.parametrize('first_done', [True, False])
+def test_r5_a_delayed_hand_back_keeps_the_next_takeover_on_the_same_phone(phone_api, first_done):
+    url = f'{PREFIX}/mobile/agent-phone/hand-back?beacon_profile=default'
+    def control():
+        issued = ticket(phone_api)
+        return phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']])
+    with control() as old:
+        state = old.receive_json()
+        original = {k: state[k] for k in ('epoch',) if k in state}
+        if first_done:
+            old.send_json({'t': 'done'})
+            read_until(old, lambda m: isinstance(m, dict) and m.get('t') == 'bye')
+        with control() as new:
+            current = new.receive_json()
+            delayed = phone_api.client.post(url, json=original)
+            assert phone_api.lease.get().holder == 'human', 'the newer takeover must outlive the old HTTP retry'
+            assert delayed.status_code == 409
+            assert current['epoch'] > original['epoch']
+            if not first_done:
+                assert read_until(old, lambda m: isinstance(m, dict) and m.get('t') == 'bye')[-1]['reason'] == 'replaced'
+            assert phone_api.client.post(url, json={}).is_error
+            assert phone_api.lease.get().epoch == current['epoch']
+            released = phone_api.client.post(url, json={'epoch': current['epoch']})
+            assert released.status_code == 200 and released.json()['lease']['holder'] == 'agent'
+            assert read_until(new, lambda m: isinstance(m, dict) and m.get('t') == 'bye')[-1]['reason'] == 'ended'
+            assert new.receive()['type'] == 'websocket.close'
+        assert old.receive()['type'] == 'websocket.close'
 
 
 # -- the ticket ------------------------------------------------------------------------------------------------------------------
@@ -482,6 +550,43 @@ def test_hermes_ws_client_check_runs_on_the_socket(phone_api, monkeypatch):
 
 # -- the open view ---------------------------------------------------------------------------------------------------------------
 
+def test_watching_leaves_the_agent_in_control_and_rejects_input(phone_api):
+    issued = ticket(phone_api, watch=True)
+    epoch = phone_api.lease.get().epoch
+    with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
+        assert ws.receive_json()['lease'] == 'watch'
+        phone_api.lease.assert_agent_may_act()
+        frame = read_until(ws, lambda value: isinstance(value, bytes))[-1]
+        seq, *_ = phone_api.stream.read_frame_message(frame)
+        ws.send_json({'t': 'ack', 'seq': seq})
+        ws.send_json({'t': 'background'})
+        ws.send_json({'t': 'foreground'})
+        ws.send_json({'t': 'key', 'key': 'back'})
+        refused = read_until(ws, lambda value: isinstance(value, dict) and value.get('t') == 'refused')[-1]
+        assert refused == {'t': 'refused', 'what': 'key', 'reason': 'read_only'}
+        ws.send_json({'t': 'done'})
+        assert read_until(ws, lambda value: isinstance(value, dict) and value.get('t') == 'bye')[-1]['reason'] == 'done'
+    phone_api.lease.assert_agent_may_act()
+    assert phone_api.lease.get().epoch == epoch
+    assert not phone_api.host.inputs
+
+def test_watch_stops_at_takeover_and_cannot_hand_back_a_controllers_lease(phone_api):
+    issued = ticket(phone_api, watch=True)
+    viewer = phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.device)
+    with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
+        assert ws.receive_json()['lease'] == 'watch'
+        issued_control = ticket(phone_api)
+        with phone_api.client.websocket_connect(issued_control['path'], subprotocols=[SUB, 'beacon-ticket.' + issued_control['ticket']]) as control:
+            assert control.receive_json()['lease'] == 'you'
+            assert read_until(ws, lambda v: isinstance(v, dict) and v.get('t') == 'bye')[-1]['reason'] == 'replaced'
+            assert phone_api.lease.holds(viewer)
+            with pytest.raises(phone_api.lease_mod.OwnerHasPhone):
+                phone_api.lease.assert_agent_may_act()
+            control.send_json({'t': 'done'})
+            assert read_until(control, lambda v: isinstance(v, dict) and v.get('t') == 'bye')[-1]['reason'] == 'done'
+    phone_api.lease.assert_agent_may_act()
+
+
 def test_the_view_takes_the_lease_streams_and_hands_back(phone_api, monkeypatch):
     import io
     from PIL import Image
@@ -503,7 +608,8 @@ def test_the_view_takes_the_lease_streams_and_hands_back(phone_api, monkeypatch)
     viewer = phone_api.lease_mod.viewer_id('owner', 'basic', phone_api.device)
     with phone_api.client.websocket_connect(issued['path'], subprotocols=[SUB, 'beacon-ticket.' + issued['ticket']]) as ws:
         assert ws.accepted_subprotocol == SUB
-        assert ws.receive_json() == {'t': 'state', 'keyboard': False, 'rotation': 0, 'helper': 'starting', 'prompt': None, 'lease': 'you'}
+        assert ws.receive_json() == {'t': 'state', 'keyboard': False, 'rotation': 0, 'helper': 'starting', 'prompt': None,
+                                     'lease': 'you', 'epoch': phone_api.lease.get().epoch}
         assert phone_api.lease.holds(viewer)
         with pytest.raises(phone_api.lease_mod.OwnerHasPhone):
             phone_api.lease.assert_agent_may_act()

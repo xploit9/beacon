@@ -74,7 +74,9 @@ def call_user(args,session_id=None,**kwargs):
         # Only an in-chat call dedupes: cron fallbacks share one conversation but carry different reasons.
         event_id=mobile.invitation(owner,profile,stored,reason,deduplicate=stored==session_id,principal=principal or '')
         # The durable outbox is the authority. FCM is asynchronous wake-up only.
-        return json.dumps({'event_id':event_id,'status':'pending','expires_in_seconds':120,'conversation_id':stored})
+        with mobile.connect() as conn: waiting=conn.execute('SELECT 1 FROM deferred WHERE id=?',(event_id,)).fetchone() is not None
+        if waiting: return json.dumps({'status':'waiting','message':'Another call is still open, so this call has not rung yet. It rings as soon as that call ends. Do not say it is ringing.'})
+        return json.dumps({'status':'ringing','message':'The phone is ringing now.'})
     except Exception:
         return json.dumps({'error':'Owned native callback context unavailable'})
 
@@ -311,6 +313,24 @@ def native_completion(**kwargs):
         cfg=mobile.settings(profile)
         observers.completion(mobile,native,cfg,profile,**kwargs)
     except (LookupError,ValueError,RuntimeError): return
+
+_human_input_logged=set()
+def native_human_input(**kwargs):
+    # Hermes waits for the owner (tools/human_input_hooks.py): the phone hears of it even with Beacon in the background.
+    _human_input_step(observers.human_input,mobile,native,**kwargs)
+def native_human_input_resolved(**kwargs):
+    _human_input_step(observers.human_input_resolved,mobile,**kwargs)
+def _human_input_step(step,*args,**kwargs):
+    try:
+        profile=current_profile(mobile.settings())
+        step(*args,mobile.settings(profile),profile,**kwargs)
+    except LookupError: return  # not a chat this owner holds
+    except Exception as exc:
+        # Said once per kind, never with its text: the request may quote a private command or question.
+        if type(exc).__name__ not in _human_input_logged:
+            _human_input_logged.add(type(exc).__name__)
+            import logging
+            logging.getLogger(__name__).warning('Beacon could not alert the phone to a Hermes question or approval: %s',type(exc).__name__)
 
 def native_voice_context(session_id=None, conversation_history=None, **kwargs):
     """Supply same-chat voice context through Hermes' native per-turn context boundary."""
@@ -835,6 +855,8 @@ def register(ctx):
     ctx.register_hook('pre_llm_call',native_file_delivery_context)
     ctx.register_hook('pre_llm_call',native_watch_guard_context)
     ctx.register_hook('on_session_end',native_completion)
+    ctx.register_hook('on_human_input_request',native_human_input)
+    ctx.register_hook('on_human_input_resolved',native_human_input_resolved)
     ctx.register_hook('post_tool_call',native_mailbox_observation)
     ctx.register_hook('pre_tool_call',native_proactive_read_only_guard)
     if callable(getattr(ctx,'on_unload',None)): ctx.on_unload(pause_proactive_jobs)

@@ -700,11 +700,12 @@ class ViewSession:
     usb_debugging`` and every input but Back is dropped.
     """
 
-    def __init__(self, socket, lease, viewer, *, open_frames, open_control, open_channel=None, keyboard_probe=None,
+    def __init__(self, socket, lease, viewer, *, epoch, watching=False, open_frames, open_control, open_channel=None, keyboard_probe=None,
                  revalidate=None, note_activity=None, phone_running=None, update_in_progress=None, size=DEVICE_SIZE,
                  max_fps=MAX_FPS, clock=time.perf_counter, limits=None, revalidate_seconds=None, lease_check_seconds=None,
                  pace=KEY_PACE_SECONDS, debug_prompt=None, deny_prompt=None, phone_stopping=None):
         self.socket, self.lease, self.viewer = socket, lease, viewer
+        self.epoch, self.watching = epoch, watching
         self.open_frames, self.open_control, self.open_channel = open_frames, open_control, open_channel
         self.keyboard_probe, self.revalidate, self.note_activity = keyboard_probe, revalidate, note_activity
         self.debug_prompt, self.deny_prompt = debug_prompt, deny_prompt
@@ -746,7 +747,7 @@ class ViewSession:
 
     # -- lifecycle --
     async def run(self):
-        """Runs the view until it ends; returns the end reason. The lease must already be this viewer's (the API acquires it)."""
+        """Run a controlling view with its lease, or an observer bound to the original agent epoch."""
         self._loop = asyncio.get_running_loop()
         tasks = []
         code = CLOSE_DONE
@@ -799,10 +800,11 @@ class ViewSession:
             return False
 
     def _start_parts(self):
-        self.worker = InputWorker(self.open_control, helper=self._helper, refused=self._refused, size=self.size,
-                                  pace=self.pace).start()
-        self.probes = Probes(keyboard=self.keyboard_probe, on_keyboard=self._keyboard_seen, guard=self.debug_prompt,
-                             on_guard=self._guard_seen).start()
+        if not self.watching:
+            self.worker = InputWorker(self.open_control, helper=self._helper, refused=self._refused, size=self.size,
+                                      pace=self.pace).start()
+            self.probes = Probes(keyboard=self.keyboard_probe, on_keyboard=self._keyboard_seen, guard=self.debug_prompt,
+                                 on_guard=self._guard_seen).start()
         self.frames = self.open_frames(self._on_frame).start()
 
     def _stop_parts(self):
@@ -820,11 +822,13 @@ class ViewSession:
                 channel.close('done')
 
     def _settle_lease(self):
+        if self.watching:
+            return
         try:
             if self.reason in ('done', 'removed', 'stopped'):
-                self.lease.release(self.viewer)
+                self.lease.release(self.viewer, self.epoch)
             elif self.reason not in ('replaced', 'ended'):
-                self.lease.went_away(self.viewer)  # dropped, backgrounded or broken: kept 5 min (§4.3)
+                self.lease.went_away(self.viewer, self.epoch)  # dropped, backgrounded or broken: kept 5 min (§4.3)
         except OSError:
             log.info('agent phone stream: the lease could not be updated')
 
@@ -883,7 +887,9 @@ class ViewSession:
         state.setdefault('rotation', 0)
         state.setdefault('helper', 'off')
         state.setdefault('prompt', None)
-        state['lease'] = 'you'
+        state['lease'] = 'watch' if self.watching else 'you'
+        if not self.watching:
+            state['epoch'] = self.epoch
         if state != self._state:
             self._state = state
             await self._send_json({'t': 'state', **state})
@@ -921,6 +927,10 @@ class ViewSession:
                 continue
             if last_send is not None and self.min_interval:
                 await self._wait_until(last_send + self.min_interval)
+            if self.watching:
+                current = await asyncio.to_thread(self.lease.get)
+                if current.holder != 'agent' or current.epoch != self.epoch:
+                    return 'replaced'
             self._seq += 1
             self._in_flight = self._seq
             await self.socket.send_bytes(frame_message(self._seq, latest.width, latest.height, latest.rotation, jpeg))
@@ -988,17 +998,23 @@ class ViewSession:
             if not self._paused:
                 self._paused = True
                 await asyncio.to_thread(self._pause_frames)
-                await asyncio.to_thread(self.lease.went_away, self.viewer)
+                if not self.watching:
+                    await asyncio.to_thread(self.lease.went_away, self.viewer, self.epoch)
             return None
         if t == 'foreground':
             if not self._paused:
                 return None
-            if not await asyncio.to_thread(self._take_back):
-                return 'replaced'
+            if not self.watching:
+                holds, _ = await asyncio.to_thread(self.lease.note_input, self.viewer, epoch=self.epoch)
+                if not holds:
+                    return 'replaced'
             await asyncio.to_thread(self._resume_frames)
             self._paused = False
             self._refresh = True
             self._frame_ready.set()
+            return None
+        if self.watching:
+            await self._send_json({'t': 'refused', 'what': t, 'reason': 'read_only'})
             return None
         if self._paused:
             return None  # input from a backgrounded view is dropped
@@ -1059,19 +1075,12 @@ class ViewSession:
     def _resume_frames(self):
         self.frames = self.open_frames(self._on_frame).start()
 
-    def _take_back(self):
-        lease = self.lease.get()
-        if lease.holder == 'human' and lease.viewer_id != self.viewer:
-            return False
-        self.lease.acquire(self.viewer)
-        return True
-
     async def _noted_input(self):
         """Keeps the lease's input time (at most every 10 s) and the keeper's activity file (every 5 s); False when the lease is
         no longer this viewer's."""
         now = self.clock()
         if self._noted is None or now - self._noted >= 10.0:
-            holds, _ = await asyncio.to_thread(self.lease.note_input, self.viewer)
+            holds, _ = await asyncio.to_thread(self.lease.note_input, self.viewer, epoch=self.epoch)
             if not holds:
                 return False
             self._noted = now
@@ -1129,7 +1138,10 @@ class ViewSession:
             if self._stopping():
                 return 'stopped'
             lease = await asyncio.to_thread(self.lease.get)
-            if lease.holder != 'human' or lease.viewer_id != self.viewer:
+            if self.watching:
+                if lease.holder != 'agent' or lease.epoch != self.epoch:
+                    return 'replaced'
+            elif lease.holder != 'human' or lease.viewer_id != self.viewer or lease.epoch != self.epoch:
                 return 'replaced' if lease.holder == 'human' else 'ended'
             if self.clock() >= next_check:
                 next_check = self.clock() + self.revalidate_seconds

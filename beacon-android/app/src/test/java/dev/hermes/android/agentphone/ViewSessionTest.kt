@@ -35,14 +35,18 @@ class ViewSessionTest {
         var startError: Exception? = null
         var starts = 0
         val phones = ArrayDeque<Pair<String, String>>()
-        var handBacks = 0
+        val handBackEpochs = mutableListOf<Long>()
+        val handBacks get() = handBackEpochs.size
         /** The error the n-th hand-back (0-based) throws, if any. */
         var handBackError: (Int) -> Exception? = { null }
         override suspend fun ticket(): ViewTicket { ticketCalls++; return answer() }
         override fun open(ticket: ViewTicket, listener: ViewListener): ViewConnection = Connection(now).also { opened += it to listener }
         override suspend fun start(): StartAnswer { starts++; startError?.let { throw it }; return start }
         override suspend fun phone(): Pair<String, String> = phones.removeFirstOrNull() ?: ("on" to "")
-        override suspend fun handBack() { handBackError(handBacks++)?.let { throw it } }
+        override suspend fun handBack(epoch: Long) {
+            handBackEpochs += epoch
+            handBackError(handBacks - 1)?.let { throw it }
+        }
     }
 
     private class Sink : FrameSink {
@@ -73,6 +77,11 @@ class ViewSessionTest {
         fun advance(ms: Long) { scope.advanceTimeBy(ms); scope.runCurrent() }
         fun accept(helper: String = "ready") { listener.onOpen(); listener.onText(state(helper)); run() }
         fun live(helper: String = "ready"): Rig { session.open(); run(); accept(helper); return this }
+        fun disconnect() {
+            transport.answer = { throw IOException("down") }
+            listener.onFailure(null)
+            run()
+        }
         fun end(reason: String?, code: Int) { reason?.let { listener.onText(bye(it)) }; listener.onClosed(code); run() }
         fun messages(of: Connection = connection) = of.sent.map { JSONObject(it.second) }
         fun types(of: Connection = connection) = messages(of).map { it.getString("t") }
@@ -80,7 +89,7 @@ class ViewSessionTest {
 
     companion object {
         fun state(helper: String = "ready", keyboard: Boolean = false, prompt: String? = null): String =
-            JSONObject().put("t", "state").put("keyboard", keyboard).put("rotation", 0).put("helper", helper).put("lease", "you")
+            JSONObject().put("t", "state").put("keyboard", keyboard).put("rotation", 0).put("helper", helper).put("lease", "you").put("epoch", 17)
                 .apply { if (prompt != null) put("prompt", prompt) }.toString()
         fun bye(reason: String) = """{"t":"bye","reason":"$reason"}"""
         fun frame(seq: Long): ByteArray = byteArrayOf(1, (seq ushr 24).toByte(), (seq ushr 16).toByte(), (seq ushr 8).toByte(), seq.toByte(), 2, -48, 6, 64, 0, -1, -40, -1)
@@ -189,10 +198,8 @@ class ViewSessionTest {
     }
 
     @Test fun doneWithTheSocketGoneUsesTheHandBackRoute() {
-        val rig = Rig()
-        rig.transport.answer = { throw IOException("down") }
-        rig.session.open()
-        rig.run()
+        val rig = Rig().live()
+        rig.disconnect()
         assertEquals(ViewPhase.BackSoon, rig.ui.phase)
         rig.session.done()
         rig.run()
@@ -347,11 +354,34 @@ class ViewSessionTest {
         assertEquals(2, rig.transport.ticketCalls)
     }
 
-    @Test fun theHandBackFinishesEvenWhenTheViewGoesAwayAtOnce() {
+    @Test fun leavingControlWithAnUnacknowledgedDoneHandsBackEvenAfterDisposal() {
+        val rig = Rig().live()
+        rig.session.done()
+        rig.run()
+        assertEquals("done", rig.types().last())
+        rig.advance(2_001)
+        rig.session.dispose()
+        rig.run()
+        assertEquals(ViewPhase.Closed, rig.ui.phase)
+        assertEquals(1, rig.transport.handBacks)
+    }
+
+    @Test fun aLostDoneWithoutAnAcquisitionCannotReleaseAnotherView() {
         val rig = Rig()
-        rig.transport.answer = { throw IOException("down") }
         rig.session.open()
         rig.run()
+        rig.listener.onOpen()
+        rig.listener.onText("""{"t":"state","lease":"you"}""")
+        rig.run()
+        rig.session.done()
+        rig.end(null, 1000)
+        assertEquals(ViewPhase.Closed, rig.ui.phase)
+        assertEquals(0, rig.transport.handBacks)
+    }
+
+    @Test fun theHandBackFinishesEvenWhenTheViewGoesAwayAtOnce() {
+        val rig = Rig().live()
+        rig.disconnect()
         rig.session.done()
         // Closed finishes the activity, which cancels the view model's scope straight away.
         assertEquals(ViewPhase.Closed, rig.ui.phase)
@@ -361,11 +391,9 @@ class ViewSessionTest {
     }
 
     private fun closedWithoutASocket(error: (Int) -> Exception?): Rig {
-        val rig = Rig()
-        rig.transport.answer = { throw IOException("down") }
+        val rig = Rig().live()
+        rig.disconnect()
         rig.transport.handBackError = error
-        rig.session.open()
-        rig.run()
         rig.session.done()
         assertEquals(ViewPhase.Closed, rig.ui.phase)
         rig.scope.cancel()
@@ -378,7 +406,7 @@ class ViewSessionTest {
         rig.scope.testScheduler.advanceTimeBy(1_999); rig.scope.testScheduler.runCurrent()
         assertEquals(1, rig.transport.handBacks)
         rig.scope.testScheduler.advanceTimeBy(2_001); rig.scope.testScheduler.runCurrent()
-        assertEquals(3, rig.transport.handBacks)
+        assertEquals(listOf(17L, 17L, 17L), rig.transport.handBackEpochs)
         rig.scope.testScheduler.advanceTimeBy(120_000); rig.scope.testScheduler.runCurrent()
         assertEquals(3, rig.transport.handBacks)
     }
@@ -665,7 +693,7 @@ class ViewSessionTest {
         assertEquals("low", rig.messages().first { it.getString("t") == "quality" }.getString("level"))
     }
 
-    @Test fun closingHandsBackOnlyWhenThePhoneMayStillBeTheOwners() {
+    @Test fun closingAnErrorCardKeepsTheHoldAndDoneCannotReleaseAReplacement() {
         val failed = Rig().live()
         failed.end("error", 1011)
         failed.accept()
@@ -673,10 +701,10 @@ class ViewSessionTest {
         failed.session.close()
         failed.run()
         assertEquals(ViewPhase.Closed, failed.ui.phase)
-        assertEquals(1, failed.transport.handBacks)
+        assertEquals(0, failed.transport.handBacks)
         val replaced = Rig().live()
         replaced.end("replaced", 1000)
-        replaced.session.close()
+        replaced.session.done()
         replaced.run()
         assertEquals(ViewPhase.Closed, replaced.ui.phase)
         assertEquals(0, replaced.transport.handBacks)

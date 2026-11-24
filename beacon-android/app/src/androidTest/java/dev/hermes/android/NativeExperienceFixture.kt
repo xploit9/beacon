@@ -87,6 +87,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     val releaseMemoryRead = java.util.concurrent.CountDownLatch(1)
     val memoryReadReturned = java.util.concurrent.CountDownLatch(1)
     @Volatile var reasoningEffort = "medium"
+    var reasoningOptions = listOf("low", "medium", "high")
+    var persistReasoningInRow = true
+    var legacyInventory: JSONArray? = null
+    val holdNextReasoningRead = java.util.concurrent.atomic.AtomicBoolean()
+    val reasoningReadHeld = java.util.concurrent.CountDownLatch(1)
+    val holdReasoningOptions = java.util.concurrent.atomic.AtomicBoolean()
+    val reasoningOptionsHeld = java.util.concurrent.CountDownLatch(1)
+    val releaseReasoningOptions = java.util.concurrent.CountDownLatch(1)
     val sessionReasoning = ConcurrentHashMap<String, String>()
     @Volatile var updateApplied = false
     @Volatile var voiceProvider = "gemini"
@@ -157,6 +165,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     /** Hermes's lazy session.resume can omit info.yolo even after a session-scoped yolo write. */
     @Volatile var omitResumeYolo = false
     @Volatile var rejectPromptResponse = false
+    /** S1d: the next prompt.submit is refused with this RPC error (code, message); its socket stays open. */
+    @Volatile var failNextPrompt: Pair<Int, String>? = null
     @Volatile var onPromptResponse: (() -> Unit)? = null
     /** Runs once as an answer reaches the socket, before it is recorded or rejected: a case changes the chat's state while the answer is in flight. */
     @Volatile var beforePromptResponse: (() -> Unit)? = null
@@ -195,6 +205,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     /** The chats Hermes has no saved row for right now, and the stored ids the gateway was asked to resume (newest last): what a failure text says about the fixture's side. */
     fun unpromptedShellIds(): Set<String> = unpromptedShells.keys.toSet()
     fun resumedSessionIds(): List<String> = requests.toList().filter { it.optString("method") == "session.resume" }.map { it.optJSONObject("params")?.optString("session_id").orEmpty() }
+    @Volatile var storageUnavailableOnResume: String? = null
+    @Volatile var assistantLookup: Pair<Int, JSONObject>? = null
     fun forgetUnpromptedShell(id: String) {
         check(unpromptedShells.remove(id) != null) { "Synthetic unprompted shell missing" }
         // The phone's gateway keeps its last binding and a background read can reopen its socket, so a bound shell would resume without asking Hermes; bind another chat.
@@ -796,7 +808,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         kotlinx.coroutines.runBlocking {
             for (profile in listOf("default", "coder", "academic")) for (id in listOf("chat-a", "chat-b") + (1..24).map { "new-$it" }) {
                 val chat = scope.copy(profile = profile).session(id)
-                val kinds = listOf("live:runtime-$id", "live:$id", "running-turn", "pending", "draft", "session", "client-created-shell", "side-question")
+                val kinds = listOf("live:runtime-$id", "live:$id", "running-turn", "live-turn", "pending", "draft", "session", "client-created-shell", "side-question")
                 app.cache.readMany(chat, kinds).keys.forEach { app.cache.delete(chat, it) }
             }
         }
@@ -957,6 +969,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         }
     }
     private fun http(path: String, method: String, body: JSONObject, profile: String, directory: String, archived: Boolean = false, url: HttpUrl? = null): Pair<Int, JSONObject> {
+        if (path == "/api/plugins/beacon/mobile/assistant-conversation" && method == "GET") assistantLookup?.let { return it }
         if (path == "/api/plugins/beacon/mobile/bot-mode/space/fixture-room" && holdNextRoomRead.getAndSet(false)) { roomReadCaptured.countDown(); check(releaseRoomRead.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         if (path in setOf("/api/sessions", "/api/sessions/search") && holdNextSessionList.getAndSet(false)) { sessionListCaptured.countDown(); check(releaseSessionList.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
         return when {
@@ -1229,7 +1242,13 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
         path == "/auth/logout" -> 200 to json("ok" to true)
         // Like Hermes' own route: the profile's current model and provider beside the provider list. /api/profile/defaults reads the model from here (since b8dbad4c).
         path == "/api/model/options" -> 200 to json("model" to profileModel, "provider" to "fixture", "providers" to JSONArray().put(json("slug" to "fixture", "name" to "Configured provider", "models" to JSONArray(listOf("synthetic-model", "other-model", "confirm-model")))))
-        path == "/api/plugins/beacon/admin/model-capabilities" -> 200 to json("reasoning_known" to true, "reasoning_options" to JSONArray(listOf("low", "medium", "high")))
+        path == "/api/plugins/beacon/admin/model-capabilities" -> {
+            if (holdReasoningOptions.getAndSet(false)) {
+                reasoningOptionsHeld.countDown()
+                check(releaseReasoningOptions.await(30, java.util.concurrent.TimeUnit.SECONDS))
+            }
+            200 to json("reasoning_known" to true, "reasoning_options" to JSONArray(reasoningOptions))
+        }
         path == "/api/tools/toolsets" -> 200 to json("items" to JSONArray().put(json("name" to "web", "label" to "Web research", "description" to "Read public pages", "enabled" to toolEnabled, "configured" to true, "tools" to JSONArray().put("web_search"))))
         path == "/api/tools/toolsets/web" && method == "PUT" -> {
             if (holdNextToolOperation.compareAndSet(true, false)) { toolOperationCaptured.countDown(); check(releaseToolOperation.await(10, java.util.concurrent.TimeUnit.SECONDS)) }
@@ -1438,8 +1457,11 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                         return true
                     }
                     val deferred = synchronized(delayedCreates) {
+                        val holdEffort = method == "config.get" && params.string("key") == "reasoning" &&
+                            params.string("session_id").isNotBlank() && holdNextReasoningRead.getAndSet(false)
+                        if (holdEffort) reasoningReadHeld.countDown()
                         if (holdCreateAcknowledgement && method == "session.create" || holdPromptAcknowledgement && method == "prompt.submit" || method == "prompt.submit" && holdPromptOf != null && params.string("session_id") == holdPromptOf || holdSteerAcknowledgement && method == "session.steer" || holdReceiptAcknowledgement && method == "prompt.receipt" || holdActiveListAcknowledgement && method == "session.active_list" ||
-                            holdConfigAcknowledgement && method == "config.set" || holdBranchAcknowledgement && method == "session.branch" || holdHiddenAcknowledgement && method == "session.set_hidden" ||
+                            holdEffort || holdConfigAcknowledgement && method == "config.set" || holdBranchAcknowledgement && method == "session.branch" || holdHiddenAcknowledgement && method == "session.set_hidden" ||
                             holdVaultListAcknowledgement && method == "vault.list") { delayedCreates += { listener.onMessage(this, response) }; heldSockets += listener to this; true } else false
                     }
                     if (!deferred) listener.onMessage(this, response)
@@ -1472,6 +1494,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                         error.field?.let { put("data", json("reason" to error.message, "field" to it)) }
                     }).toString()
                     if (holdResumeRefusals && frame.optString("method") == "session.resume") heldRefusals += { listener.onMessage(this, refusal) }
+                    // S1d: a held prompt's refusal waits for the release like its answer would.
+                    else if (holdPromptAcknowledgement && frame.optString("method") == "prompt.submit") synchronized(delayedCreates) { delayedCreates += { listener.onMessage(this, refusal) }; heldSockets += listener to this }
                     else listener.onMessage(this, refusal)
                 } catch (error: IllegalArgumentException) {
                     val missing = error.message == "Synthetic session missing"
@@ -1528,6 +1552,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             "projects.tree" -> json("projects" to JSONArray().put(json("id" to "p_project_a", "label" to "Travel", "path" to "C:/synthetic-workspace", "sessionCount" to 2)), "scoped_session_ids" to JSONArray().put("chat-a").put("chat-b"))
             "projects.project_sessions" -> json("project" to json("id" to params.getString("project_id"), "label" to "Travel", "sessionIds" to JSONArray().put("chat-a").put("chat-b"), "previewSessions" to JSONArray().put(json("id" to "chat-a", "title" to "Travel planning", "profile" to scope.profile))))
             "session.resume" -> {
+                if (id == storageUnavailableOnResume) throw FixtureRpcFailure(503, "storage_unavailable")
                 require(!historyFailure) { "Synthetic history unavailable" }
                 if (failingResumes.getAndUpdate { (it - 1).coerceAtLeast(0) } > 0) throw FixtureRpcFailure(resumeFailureCode, if (resumeFailureCode == 403) "forbidden" else "Synthetic resume unavailable")
                 if (profileSessionIds[params.string("profile")]?.contains(id) == false) throw IllegalArgumentException("Synthetic session missing")
@@ -1600,7 +1625,9 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                     "open_requests" to JSONArray(openNativeServerRequests.values.filter { it.optJSONObject("params")?.string("session_id") == params.string("session_id") }))
                     .apply { if (evicted) put("truncated", true).put("snapshot_required", true).put("last_sequence", nativeEventSequence.get()).put("replay_epoch", "synthetic").put("count", 0) }
             }
-            "session.active_list" -> if (params.optString("current_session_id").isBlank() && unseenTurns.isNotEmpty()) {
+            "session.active_list" -> if (params.optString("current_session_id").isBlank() && legacyInventory != null) {
+                json("sessions" to legacyInventory)
+            } else if (params.optString("current_session_id").isBlank() && unseenTurns.isNotEmpty()) {
                 if (nativeStatusFailure) throw IllegalArgumentException("Synthetic active status unavailable")
                 // The inventory read (no current session), as Hermes lists every live session: each turn it holds unseen, with the one turn status.
                 json("sessions" to JSONArray(unseenTurns.filter(sessions::containsKey).map { stored -> json("id" to unseenRuntime(stored), "session_key" to stored, "status" to nativeTurnStatus) }))
@@ -1655,7 +1682,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 }
                 if (key == "reasoning") {
                     if (params.string("session_id").isBlank()) reasoningEffort = value else sessionReasoning[id] = value
-                    if (params.string("session_id").isNotBlank()) {
+                    if (persistReasoningInRow && params.string("session_id").isNotBlank()) {
                         sessions.getValue(id).getJSONObject("info").put("reasoning_effort", value)
                         sessions.getValue(id).put("model_config", JSONObject(sessions.getValue(id).optString("model_config").ifBlank { "{}" }).put("reasoning_config", json("enabled" to (value != "none"), "effort" to value)).toString())
                     }
@@ -1682,6 +1709,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
                 json("pairs" to JSONArray().apply { repeat(commandDistractors) { put(JSONArray().put("/candidate$it").put("The help text describes another command")) } }.put(JSONArray().put("/help").put("Show available commands")).put(JSONArray().put("/model").put("Choose a model")).apply { extraCommands.forEach { (name, description) -> put(JSONArray().put(name).put(description)) } })
             }
             "prompt.submit" -> {
+                failNextPrompt?.let { failNextPrompt = null; throw FixtureRpcFailure(it.first, it.second) }
                 if (canonicalAuthority) {
                     val submission = params.string("submission_id")
                     canonicalSubmits.computeIfAbsent(submission) { AtomicInteger() }.incrementAndGet()
@@ -1759,6 +1787,14 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             "image.attach_bytes" -> json("attached" to true, "path" to "/synthetic/staged/image-${sequence.incrementAndGet()}.png", "mime" to "image/png")
             "image.detach" -> json("detached" to true)
             else -> throw IllegalArgumentException("Synthetic fixture has no response for $method")
+        }.also { reply ->
+            // The legacy inventory includes idle in-memory drafts even though neither REST store read can see them.
+            if (method == "session.active_list" && params.string("current_session_id").isBlank() && unpromptedShells.isNotEmpty()) {
+                val liveDrafts = unpromptedShells.map { (stored, shell) ->
+                    json("id" to (currentRuntimeSessionIds[stored] ?: shell.string("session_id")), "session_key" to stored, "status" to "idle")
+                }
+                reply.put("sessions", JSONArray((reply.rows("sessions") + liveDrafts).distinctBy { it.string("id") }))
+            }
         }
     }
 }

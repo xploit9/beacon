@@ -447,6 +447,26 @@ class KeepConnectedStallTest {
         assertEquals("at most one early try per 30 s", 120, allowed)
     }
 
+    /**
+     * K2 (22 Nov 2026): the owner's phone stopped polling and sat on a reason-less "Retrying…". Every timeout inside a try runs on a clock
+     * that stops while Android pauses Beacon, so the CPU lease's tick, timed on the clock that keeps counting, restarts a loop that stopped.
+     */
+    @Test fun aLoopThatStoppedTryingIsRestartedAndTheNoticeSaysWhy() {
+        val tick = KEEP_CONNECTED_CPU_RENEW_MILLIS
+        assertEquals("a loop that tries is left alone", null, keepConnectedRestartReason(true, KEEP_CONNECTED_POLL_TIMEOUT_MILLIS, tick))
+        assertEquals(null, keepConnectedRestartReason(true, KEEP_CONNECTED_STALL_MILLIS, tick))
+        assertEquals("no try for 90 s", "Lost the connection to Hermes", keepConnectedRestartReason(true, KEEP_CONNECTED_STALL_MILLIS + 1, tick))
+        assertEquals("a loop that ended", "Lost the connection to Hermes", keepConnectedRestartReason(false, 0, tick))
+        // The tick itself came minutes late: Android froze Beacon or let the phone sleep, and the notice says so.
+        assertEquals(KEEP_CONNECTED_PAUSED, keepConnectedRestartReason(true, 600_000, 600_000))
+        assertEquals("a pause the loop already came back from", null, keepConnectedRestartReason(true, 1_000, 600_000))
+        assertEquals("Reconnecting…" to "Android paused Beacon. Retrying…",
+            keepConnectedNotificationText(KeepConnectedService.STATUS_RECONNECTING, "Beacon", KEEP_CONNECTED_PAUSED, online = true))
+        // A healthy loop starts a try or ends a wait well inside the bound: a long poll, a profile read and a probe, or the longest backoff.
+        assertTrue(KEEP_CONNECTED_POLL_TIMEOUT_MILLIS + 2 * KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS < KEEP_CONNECTED_STALL_MILLIS)
+        assertTrue(keepConnectedBackoffMs(Int.MAX_VALUE) + KEEP_CONNECTED_PROBE_TIMEOUT_MILLIS < KEEP_CONNECTED_STALL_MILLIS)
+    }
+
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     @Test fun aConnectedCycleClearsTheLostLinkSoTheProfileListIsReadAgain() = runTest {
         var now = 0L

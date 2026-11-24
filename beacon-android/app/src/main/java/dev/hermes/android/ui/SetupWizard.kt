@@ -179,6 +179,10 @@ internal fun parseBeaconConnectLink(value: String): BeaconConnectInput {
     return BeaconConnectInput(trustedOrigin(if (explicitScheme) address else "https://$address"))
 }
 
+/** What the address field shows for [value]: a readable beacon://connect link becomes its Hermes address, anything else stays as typed. */
+internal fun pastedAddress(value: String): String =
+    if (value.trim().startsWith("beacon:", ignoreCase = true)) setupAddressForDisplay(value).ifBlank { value } else value
+
 internal fun parseBeaconConnectInput(value: String): String = parseBeaconConnectLink(value).origin
 
 internal fun setupAddressForDisplay(value: String): String {
@@ -269,7 +273,8 @@ internal fun SetupWizardScreen(
     // Without an install to reach (previews, tests) the button opens the PC steps instead.
     val openPcSteps = { uriHandler.openUri(BEACON_PC_INSTALL_URL) }
 
-    fun updateAddress(value: String) { address = value.take(4096) }
+    // A pasted beacon://connect link shows as the address it holds, not its encoded form.
+    fun updateAddress(value: String) { address = pastedAddress(value.take(4096)) }
     fun pasteAddress() {
         val clip = context.getSystemService(ClipboardManager::class.java)?.primaryClip?.takeIf { it.itemCount > 0 }
         clip?.getItemAt(0)?.coerceToText(context)?.toString()?.let(::updateAddress)
@@ -343,6 +348,10 @@ internal fun SetupWizardScreen(
         }
     }
 
+    // Only the Connect step has a text field; the keyboard goes when the wizard moves on.
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    LaunchedEffect(shownStep) { if (shownStep != "connect") { focus.clearFocus(); keyboard?.hide() } }
     AnimatedContent(
         targetState = shownStep,
         transitionSpec = {
@@ -464,7 +473,7 @@ internal fun SetupWizardScreen(
                         SetupPrimaryButton(
                             when {
                                 allowed -> uiText("Continue")
-                                permission == "permission-full-screen" -> uiText("Open settings")
+                                permission == "permission-full-screen" -> uiText("Allow full-screen alerts")
                                 permanentDenial -> uiText("Open app settings")
                                 else -> uiText(if (permission == "permission-microphone") "Allow microphone" else "Allow notifications")
                             },

@@ -13,6 +13,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -32,6 +33,7 @@ import androidx.compose.ui.unit.height as boundsHeight
 import androidx.compose.ui.unit.width as boundsWidth
 import dev.hermes.android.BeaconTheme
 import dev.hermes.android.IncomingCallContent
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.ui.CallBubbleAsk
 import dev.hermes.android.ui.CallUiActions
 import dev.hermes.android.ui.KeepConnectedSetupGroup
@@ -64,7 +66,9 @@ class CallsSetupUiTest {
         }
         compose.onNodeWithTag("beacon-incoming-presence").assertIsDisplayed()
         compose.onNodeWithTag("beacon-incoming-ring").assertIsDisplayed()
-        compose.onNodeWithText("Beacon is calling").assertIsDisplayed()
+        compose.onNodeWithTag("beacon-incoming-name", useUnmergedTree = true).assertIsDisplayed()
+        compose.onNodeWithTag("beacon-incoming-status", useUnmergedTree = true).assertTextEquals("Incoming call")
+        compose.onAllNodesWithText("00:", substring = true).assertCountEquals(0)
         compose.onNodeWithTag("beacon-incoming-reason").assertIsDisplayed().assertTextContains("Your 3 pm is moved")
         val decline = compose.onNodeWithTag("beacon-incoming-decline").assertIsDisplayed().getUnclippedBoundsInRoot()
         val answer = compose.onNodeWithTag("beacon-incoming-answer").assertIsDisplayed().getUnclippedBoundsInRoot()
@@ -140,7 +144,22 @@ class CallsSetupUiTest {
 
     // ---- Call bubble question ----
 
-    @Test fun theBubbleIsAskedOnceAfterTheCallEndsAndNeverDuringIt() {
+    @Test fun hangingUpNeverPutsUpTheBubbleQuestion() {
+        // F06: minimized without the permission, the owner returns, then hangs up. The question may come on the return, never after the hang-up.
+        var call by mutableStateOf(CallState(active = true, state = "listening", callId = "bubble-hangup", overlayPermissionMissing = true, minimized = true))
+        var asked by mutableStateOf(true)
+        compose.setContent {
+            NativeLocalization("en") { BeaconTheme(dark = true) { CallBubbleAsk(call, asked, onAsked = { asked = true }, onAllow = {}) } }
+        }
+        compose.runOnIdle { asked = false }
+        compose.runOnIdle { call = call.copy(active = false, minimized = false, overlayPermissionMissing = false) }
+        compose.waitForIdle()
+        Thread.sleep(1_500)
+        compose.onAllNodesWithTag("beacon-allow-bubble-dialog").assertCountEquals(0)
+        compose.onAllNodesWithText("Allow call bubble").assertCountEquals(0)
+    }
+
+    @Test fun theBubbleIsAskedOnceOnComingBackToAMinimizedCallAndNeverAtTheEnd() {
         var call by mutableStateOf(CallState(active = true, state = "listening", callId = "bubble-1", overlayPermissionMissing = true))
         var asked by mutableStateOf(false)
         var allowed = 0
@@ -148,7 +167,10 @@ class CallsSetupUiTest {
             NativeLocalization("en") { BeaconTheme(dark = true) { CallBubbleAsk(call, asked, onAsked = { asked = true }, onAllow = { allowed++ }) } }
         }
         compose.onAllNodesWithTag("beacon-allow-bubble-dialog").assertCountEquals(0)
-        compose.runOnIdle { call = call.copy(active = false, overlayPermissionMissing = false) }
+        compose.runOnIdle { call = call.copy(minimized = true) }
+        compose.waitForIdle()
+        compose.onAllNodesWithTag("beacon-allow-bubble-dialog").assertCountEquals(0)
+        compose.runOnIdle { call = call.copy(minimized = false) }
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("beacon-allow-bubble-dialog").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithText("Show calls in a floating bubble.").assertIsDisplayed()
         compose.onNodeWithTag("beacon-allow-bubble").performClick()
@@ -156,9 +178,58 @@ class CallsSetupUiTest {
         assertEquals(1, allowed)
         assertTrue(asked)
         // Another call without the permission, once it was asked: no second question.
-        compose.runOnIdle { call = call.copy(active = true, callId = "bubble-2", overlayPermissionMissing = true) }
+        compose.runOnIdle { call = call.copy(active = true, callId = "bubble-2", overlayPermissionMissing = true, minimized = true) }
+        compose.runOnIdle { call = call.copy(minimized = false) }
         compose.runOnIdle { call = call.copy(active = false, overlayPermissionMissing = false) }
         compose.waitForIdle()
+        compose.onAllNodesWithTag("beacon-allow-bubble-dialog").assertCountEquals(0)
+    }
+
+    @Test fun theBubbleIsAskedOnReturnWhenTheStoppedScreenNeverSawTheMinimize() {
+        // F06 part 2: the activity was stopped while the call was minimized, so the screen jumps straight from "not minimized" to "back".
+        var call by mutableStateOf(CallState(active = true, state = "listening", callId = "bubble-stopped"))
+        var seen by mutableStateOf(false)
+        var asked by mutableStateOf(false)
+        compose.setContent {
+            NativeLocalization("en") { BeaconTheme(dark = true) { CallBubbleAsk(call, asked, onAsked = { asked = true }, onAllow = {}, minimizedSeen = seen, missingSeen = seen) } }
+        }
+        compose.runOnIdle { seen = true }
+        compose.waitUntil(5_000) { compose.onAllNodesWithTag("beacon-allow-bubble-dialog").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("beacon-allow-bubble-skip").performClick()
+        compose.waitUntil(5_000) { asked }
+    }
+
+    @Test fun theHostAsksOnReturnAfterTheActivityWasStoppedWhileMinimized() {
+        // F06 part 2, through the real host: the screen collects with the lifecycle (as BeaconActivity does), the host does not.
+        val prefs = compose.activity.getSharedPreferences("beacon_call_ui", android.content.Context.MODE_PRIVATE)
+        val before = prefs.getBoolean("bubble_asked", false)
+        prefs.edit().putBoolean("bubble_asked", false).commit()
+        try {
+            val states = kotlinx.coroutines.flow.MutableStateFlow(CallState(active = true, state = "listening", callId = "bubble-host", overlayPermissionMissing = true))
+            compose.setContent {
+                val call by states.collectAsStateWithLifecycle()
+                NativeLocalization("en") { BeaconTheme(dark = true) { dev.hermes.android.ui.CallBubbleAskHost(call, states) } }
+            }
+            compose.waitForIdle()
+            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.CREATED)
+            states.value = states.value.copy(minimized = true)
+            Thread.sleep(300)
+            states.value = states.value.copy(minimized = false)
+            Thread.sleep(300)
+            compose.activityRule.scenario.moveToState(androidx.lifecycle.Lifecycle.State.RESUMED)
+            compose.waitUntil(5_000) { compose.onAllNodesWithTag("beacon-allow-bubble-dialog").fetchSemanticsNodes().isNotEmpty() }
+            compose.onNodeWithTag("beacon-allow-bubble-skip").performClick()
+            states.value = states.value.copy(active = false)
+        } finally { prefs.edit().putBoolean("bubble_asked", before).commit() }
+    }
+
+    @Test fun theBubbleIsNeverAskedAfterHangUpEvenWhenTheMinimizeWasSeen() {
+        var call by mutableStateOf(CallState(active = false, state = "idle"))
+        compose.setContent {
+            NativeLocalization("en") { BeaconTheme(dark = true) { CallBubbleAsk(call, false, onAsked = {}, onAllow = {}, minimizedSeen = true, missingSeen = true) } }
+        }
+        compose.waitForIdle()
+        Thread.sleep(1_000)
         compose.onAllNodesWithTag("beacon-allow-bubble-dialog").assertCountEquals(0)
     }
 
@@ -169,7 +240,8 @@ class CallsSetupUiTest {
         compose.setContent {
             NativeLocalization("en") { BeaconTheme(dark = true) { CallBubbleAsk(call, asked, onAsked = { asked = true }, onAllow = { allowed++ }) } }
         }
-        compose.runOnIdle { call = call.copy(active = false) }
+        compose.runOnIdle { call = call.copy(minimized = true) }
+        compose.runOnIdle { call = call.copy(minimized = false) }
         compose.waitUntil(5_000) { compose.onAllNodesWithTag("beacon-allow-bubble-skip").fetchSemanticsNodes().isNotEmpty() }
         compose.onNodeWithTag("beacon-allow-bubble-skip").performClick()
         compose.waitUntil(5_000) { asked }

@@ -185,7 +185,7 @@ internal const val BOT_MODE_ROSTER_KEY = "bot-mode:roster"
         if (state.error.isNotBlank()) {
             Glass(Modifier.padding(horizontal = SettingsPagePadding, vertical = 4.dp)) { SettingsErrorRow(uiText(state.error), { controller.refresh() }, uiText("Retry"), retryTestTag = "bot-mode-retry") }
         }
-        if (shared) SharedSpaceChat(state, profileRows, controller::draft, controller::send, controller::action, { vm.more("Profiles") }) { text, eventId ->
+        if (shared) SharedSpaceChat(if (vm.client == null) state.copy(loading = true, actions = emptyList()) else state, profileRows, controller::draft, controller::send, controller::action, { vm.more("Profiles") }) { text, eventId ->
             Markdown(text, vm, origin = null, documentKey = "room:${state.selectedSpace}:$eventId")
         }
         else BotModeHome(vm, state, profileRows, data["crons"], owner.profile, owner.botModeSwitching, dialog, Modifier.weight(1f))

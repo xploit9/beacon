@@ -15,6 +15,11 @@ import java.time.ZonedDateTime
 
 /** "What {name} did on its phone": the rows the plugin writes (approvals-v1 §3, §6, §6b; L3's tool in emu-join) and how they read. */
 class AgentPhoneLogTest {
+    @Test fun anOwnersHoldNamesTheReasonInTheActivityLog() {
+        val held = dev.hermes.android.data.AgentPhoneActivity(1, "", "open_app", "", false, "phone_in_use")
+        assertEquals("You're using the phone", logLine(held).outcome)
+    }
+
     private val zone = ZoneId.of("Europe/London")
     private fun at(day: Int, hour: Int) = ZonedDateTime.of(2026, 11, day, hour, 5, 0, 0, zone).toEpochSecond()
     private fun row(seq: Int, at: Long, app: String, action: String, label: String, approved: Any, outcome: String) =
@@ -87,7 +92,35 @@ class AgentPhoneLogTest {
     }
 
     @Test fun everyActionThePluginWritesHasAVerb() {
-        for (action in listOf("tap", "long_press", "swipe", "type", "key", "fill", "save", "answer")) assertTrue(action, AgentPhoneLogVerbs[action].orEmpty().isNotBlank())
+        for (action in listOf("tap", "long_press", "swipe", "type", "key", "fill", "save", "answer", "open_link", "back", "home", "recents"))
+            assertTrue(action, AgentPhoneLogVerbs[action].orEmpty().isNotBlank())
         for (word in AgentPhoneLogVerbs.values) assertTrue(word in AgentPhoneLogWords)
+    }
+
+    @Test fun anOpenedAppALinkAndTheNavigationKeysReadAsWords() {
+        // D2b: the plugin's open_app row carries the app's name; a link's row never names its address; the navigation keys use the
+        // words of the phone view's own bar ("Home screen", not "Home", which is the Files page's home folder).
+        val read = { action: String, app: String -> logLine(parseAgentPhoneActivity(JSONObject().put("activity", JSONArray(listOf(
+            row(1, at(17, 9), app, action, "", false, "done"))))).single()) }
+        assertEquals(LogLine(PhoneLine("Opened {0}", listOf("Clock")), "", "", appInTitle = true), read("open_app", "Clock"))
+        assertEquals(LogLine(PhoneLine("Opened a link"), "", ""), read("open_link", ""))
+        assertEquals(LogLine(PhoneLine("Back"), "", ""), read("back", ""))
+        assertEquals(LogLine(PhoneLine("Home screen"), "", ""), read("home", ""))
+        assertEquals(LogLine(PhoneLine("Recent apps"), "", ""), read("recents", ""))
+        assertEquals(LogLine(PhoneLine("Used the phone"), "", ""), read("open_app", ""))
+        assertTrue("Opened {0}" in AgentPhoneLogWords)
+    }
+
+    // Q2 R3-F3: rows read "com.google.android.apps.nexuslauncher · swipe". The plugin names the launcher by its fixed word, which every
+    // row, card and notice shows in the owner's language; an app's own name is never translated.
+    @Test fun theHomeScreenIsNamedInTheOwnersLanguageAndAnAppByItsOwnName() {
+        val arabic = { text: String -> if (text == "Home screen") "الشاشة الرئيسية" else text }
+        assertEquals("الشاشة الرئيسية", appWords(HOME_SCREEN, arabic))
+        assertEquals("Clock", appWords("Clock", arabic))
+        assertTrue(HOME_SCREEN in AgentPhoneLogWords)  // the words test holds it to every language
+        val row = parseAgentPhoneActivity(JSONObject().put("activity", JSONArray(listOf(row(9, at(17, 10), HOME_SCREEN, "swipe", "workspace", false, "done"))))).single()
+        val shown = logLine(row.copy(app = appWords(row.app, arabic)))
+        assertEquals(listOf("workspace"), shown.title.args)
+        assertFalse("com.google" in shown.title.text())
     }
 }

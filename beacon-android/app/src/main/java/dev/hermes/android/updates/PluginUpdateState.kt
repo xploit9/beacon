@@ -74,6 +74,9 @@ internal data class PluginRow(val status: PluginStatus = PluginStatus.Hidden, va
 internal val PluginRowStrings = (PluginStatus.entries.map { PluginRow(it).text } + UpdateStepStrings + StepNote.all + StepStateText.all + HeroActionStrings)
     .filter(String::isNotBlank).distinct()
 
+/** The version route answered with no version at all: a 1.2.2 plugin on a Hermes without PyYAML. It is installed, but old. */
+internal class BlankPluginVersion : Exception("the plugin reports no version")
+
 /** What the phone learned about the plugin on Hermes. */
 internal sealed interface PluginProbe {
     /** No Hermes session, no plugin, or not the owner: nothing to update. */
@@ -251,7 +254,7 @@ internal suspend fun probePlugin(endpoint: PluginEndpoint): PluginProbe = try {
 catch (error: Exception) {
     when {
         error is ApiFailure && error.status == 403 -> PluginProbe.None
-        error is ApiFailure && error.status == 404 -> PluginProbe.Unreadable
+        error is ApiFailure && error.status == 404 || error is BlankPluginVersion -> PluginProbe.Unreadable
         else -> PluginProbe.Failed
     }
 }
@@ -266,6 +269,10 @@ internal suspend fun runPluginUpdate(
     memo: RestartMemo = RestartMemo(), remember: (RestartMemo) -> Unit = {}, steps: StepTracker = StepTracker(), pause: suspend (Long) -> Unit = { delay(it) },
 ): PluginRow {
     var before: PluginVersions? = null
+    // A plugin that cannot read its own version still installs; the new one is read after the dashboard restarts.
+    var blank = false
+    suspend fun read(): PluginVersions? = try { endpoint.version() } catch (error: CancellationException) { throw error }
+        catch (error: BlankPluginVersion) { blank = true; null } catch (_: Exception) { null }
     try {
         before = runCatching { endpoint.version() }.getOrNull()
         val current = before
@@ -293,15 +300,16 @@ internal suspend fun runPluginUpdate(
         val unchanged = response?.optBoolean("unchanged") == true
         if (unchanged) steps.skipAll(UpdateStep.PluginDownload, UpdateStep.PluginInstall)
         else { steps.done(UpdateStep.PluginDownload); steps.active(UpdateStep.PluginInstall) }
-        var latest = runCatching { endpoint.version() }.getOrNull()
+        var latest = read()
         if (!unchanged) {
             // Hermes reports the new version a moment after the update call returns; after a lost reply the install may still be running.
             for (attempt in 0 until if (response == null) LOST_REPLY_POLLS else 10) {
-                if (latest != null && latest != before) break
+                if (latest != null && latest != before || blank) break
                 pause(1000)
-                latest = runCatching { endpoint.version() }.getOrNull() ?: latest
+                latest = read() ?: latest
             }
         }
+        if (latest == null && blank && response?.optBoolean("ok") == true) { steps.done(UpdateStep.PluginInstall); steps.skip(UpdateStep.PluginGateway); return restartDashboardStep(endpoint, "", target, steps, pause) }
         val done = latest ?: run { steps.fail(UpdateStep.PluginInstall, StepNote.PluginFailed); return PluginRow(PluginStatus.Failed, before?.installed.orEmpty(), target) }
         if (!olderVersion(done.installed, target)) steps.done(UpdateStep.PluginInstall)
         if (response?.optBoolean("restart_required") == true || done.restartKind() == RestartKind.Gateway)

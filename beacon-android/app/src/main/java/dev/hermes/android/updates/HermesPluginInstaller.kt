@@ -78,6 +78,8 @@ internal interface RepairEndpoint : PluginInstallEndpoint {
     suspend fun hub(): HubPlugin?
     /** Beacon's own version route, or null when Beacon does not answer. */
     suspend fun versions(): PluginVersions?
+    /** When the dashboard process started (epoch seconds), or null when it cannot say: a changed value is how a repair knows the dashboard restarted. */
+    suspend fun dashboardStart(): Long? = null
 }
 
 internal class HermesPluginInstaller(
@@ -96,6 +98,9 @@ internal class HermesPluginInstaller(
     override suspend fun versions(): PluginVersions? = try { HermesPluginUpdater(client).version() }
         catch (error: CancellationException) { throw error }
         catch (error: ApiFailure) { if (error.status == 404 || error.status == 502 || error.status == 503) null else throw error }
+    override suspend fun dashboardStart(): Long? = try {
+        client.nativeRequest("/api/plugins/beacon/mobile/health", params = mapOf("fresh" to "1")).optJSONObject("dashboard")?.optLong("started_at", 0)?.takeIf { it > 0 }
+    } catch (error: CancellationException) { throw error } catch (_: Exception) { null }
     override suspend fun enable(): JSONObject = client.nativeRequest("/api/dashboard/agent-plugins/beacon/enable", "POST", JSONObject())
     // "unauthorized" is the plugin answering before this phone is linked, which signing in does next.
     override suspend fun present(): Boolean = client.probeOptionalFeatures().optString("plugin") in setOf("available", "unauthorized")

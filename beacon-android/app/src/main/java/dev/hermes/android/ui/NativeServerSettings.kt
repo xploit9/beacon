@@ -344,6 +344,7 @@ private fun LazyListScope.serverLogs(state: NativeServerState, onLogFile: (Strin
                         }
                     }
                 }
+                state.savedLogCount != null && state.savedLogCount > 0 && state.logSearch.isBlank() -> SettingsValueRow(uiText("Logs"), value = state.savedLogCount.toString())
                 state.loading && !serverHasCache("Logs", state) -> SettingsSkeletonRows(3)
                 else -> SettingsEmpty(uiText("No matching log entries."), Icons.Rounded.SearchOff)
             }

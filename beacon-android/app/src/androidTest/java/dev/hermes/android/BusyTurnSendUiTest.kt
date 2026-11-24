@@ -297,6 +297,129 @@ class BusyTurnSendUiTest {
         assertEquals("runtime-chat-a", sent.string("session_id")); assertEquals("Keep this in chat A", sent.string("text"))
     }
 
+    /**
+     * S1d (R3 review #7): the box's Send takes over a passive drain whose turn look never answers. Within its own bound (EXPLICIT_DRAIN_LOOK_MS) it
+     * says it could not reach Hermes, nothing is sent meanwhile, and once the held looks answer the message goes at most once.
+     */
+    @Test fun theBoxSendTakesOverAHungDrainSaysWhyWithinItsBoundAndSendsAtMostOnce() = withFixture { vm, fixture ->
+        openWatchedChat(vm)
+        fixture.holdActiveListAcknowledgement = true
+        val before = fixture.requests.count { it.string("method") == "session.active_list" }
+        enqueueThroughComposer("Wait for my tap")
+        compose.waitUntil(10_000) { vm.chat.value.queued.singleOrNull()?.state == "queued" && fixture.requests.count { it.string("method") == "session.active_list" } > before }
+        val item = vm.chat.value.queued.single()
+        compose.runOnIdle { vm.notice("") }
+        val tapped = android.os.SystemClock.elapsedRealtime()
+        compose.onNodeWithTag("queue-send:${item.id}").performClick()
+        compose.waitUntil(EXPLICIT_DRAIN_LOOK_MS + 5_000) { vm.ui.value.notice == "Reconnect before sending. Your draft is kept." }
+        val took = android.os.SystemClock.elapsedRealtime() - tapped
+        assertTrue("said within its bound: $took ms", took in (EXPLICIT_DRAIN_LOOK_MS - 1_000)..(EXPLICIT_DRAIN_LOOK_MS + 5_000))
+        assertEquals("nothing sent while the look hung", 0, submits(fixture))
+        assertEquals("queued", vm.chat.value.queued.single { it.id == item.id }.state)
+        // The held looks answer now: the cancelled drain sends nothing, and the message goes at most once.
+        fixture.holdActiveListAcknowledgement = false
+        fixture.releasePromptAcknowledgement()
+        Thread.sleep(3_000); compose.waitForIdle()
+        assertTrue("never twice: ${submits(fixture)}", submits(fixture) <= 1)
+    }
+
+    /** Whether [c] holds an open native socket (its gateway's current connection). */
+    private fun holdsSocket(c: dev.hermes.android.data.BeaconClient): Boolean {
+        val native = c.javaClass.getDeclaredField("native").apply { isAccessible = true }.get(c)
+        return native.javaClass.getDeclaredField("connection").apply { isAccessible = true }.get(native) != null
+    }
+
+    /** The chats a profile-switch test made, in both profiles, must not reopen in a later test (each switch lands on a new chat). */
+    private fun forgetSwitchChats(fixture: NativeExperienceFixture, chats: List<String>, coderChats: List<String>) = runBlocking {
+        val coder = fixture.scope.copy(profile = "coder")
+        for (owner in listOf(fixture.scope, coder)) {
+            for (kind in listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session", "conversation-index", OFFLINE_OUTBOX_KIND)) app.cache.delete(owner, kind)
+        }
+        for (id in chats) for (kind in listOf("client-created-shell", "session", "draft", "pending")) app.cache.delete(fixture.scope.session(id), kind)
+        for (id in coderChats) for (kind in listOf("client-created-shell", "session", "draft", "pending")) app.cache.delete(coder.session(id), kind)
+    }
+
+    /**
+     * S1d (R3 review #4): a profile switch closes the own client it replaces. A new chat's first send rides that client (the socket that created the
+     * chat). Closed under it, its answer was lost and the message stayed unknown even after the owner's Check (A/B on 5578). So a client a send waits
+     * on closes only once the answer is in: never lost, never admitted twice, the Check settles, and the next message is not refused.
+     */
+    @Test fun aNewChatsFirstSendInFlightAtAProfileSwitchIsAskedAgainNeverLostNeverTwice() = withFixture(canonical = true) { vm, fixture ->
+        val chats = mutableListOf<String>()
+        val coderChats = mutableListOf<String>()
+        try {
+            val words = "Synthetic first words of a new chat"
+            fixture.persistTerminalMessages = true; fixture.persistCanonicalUserRows = true
+            compose.waitUntil(15_000) { vm.preferences.value.busySendLoaded }
+            compose.runOnIdle { vm.newChat() }
+            compose.waitUntil(15_000) { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            val chat = vm.chat.value.sessionId
+            chats += chat
+            val owned = vm.client
+            fixture.holdPromptAcknowledgement = true
+            compose.runOnIdle { vm.composer(TextFieldValue(words)); vm.send() }
+            compose.waitUntil(15_000) { submitParams(fixture).size == 1 }
+            val submission = submitParams(fixture).single().getString("submission_id")
+            compose.waitUntil(5_000) { fixture.canonicalAdmissionsFor(submission) == 1 }
+            compose.runOnIdle { vm.switchProfile("coder") }
+            compose.waitUntil(30_000) { vm.client?.scope?.profile == "coder" && vm.client !== owned && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            coderChats += vm.chat.value.sessionId
+            // The switch kept the replaced client's socket for the send; its answer comes now, late, on it, and then that socket closes.
+            assertTrue("kept while the send waits for its answer", holdsSocket(requireNotNull(owned)))
+            fixture.releasePromptAcknowledgement()
+            compose.waitUntil(15_000) { !holdsSocket(owned) }
+            compose.runOnIdle { vm.switchProfile("default") }
+            compose.waitUntil(30_000) { vm.client?.scope?.profile == "default" && vm.chat.value.sessionId == chat && vm.chat.value.projectionReady }
+            // The reopened chat asks once more under the same submission; the words show once (settled, or unknown until the Check below).
+            compose.waitUntil(30_000) { submitParams(fixture).size >= 2 && vm.chat.value.messages.count { it.role == "user" && it.text == words } == 1 &&
+                (vm.chat.value.uncertain.isBlank() || vm.ui.value.notice == "Tap your message to check it.") }
+            Thread.sleep(2_000); compose.waitForIdle()
+            assertEquals("one admission", 1, fixture.canonicalAdmissionsFor(submission))
+            assertEquals("one row", 1, fixture.userRows(words))
+            assertTrue("asked again only under its own submission: ${submitParams(fixture).map { it.string("submission_id") }}",
+                submitParams(fixture).all { it.getString("submission_id") == submission })
+            assertTrue("not in the box", vm.chat.value.queued.none { it.text == words && it.inBox() })
+            assertEquals("not back in the draft", "", vm.composer.value.text)
+            // The owner's check settles it (Hermes holds it once), and the next message is not refused for it.
+            if (vm.chat.value.uncertain.isNotBlank()) {
+                compose.onNodeWithTag("unconfirmed-bubble").performClick()
+                compose.onNodeWithTag("send-check").performClick()
+                compose.waitUntil(15_000) { vm.chat.value.uncertain.isBlank() }
+            }
+            assertEquals("still one admission", 1, fixture.canonicalAdmissionsFor(submission))
+            val next = "Synthetic next words"
+            compose.runOnIdle { vm.notice(""); vm.composer(TextFieldValue(next)); vm.send() }
+            compose.waitUntil(15_000) { submitParams(fixture).any { it.string("text") == next } || vm.chat.value.queued.any { it.text == next } }
+            assertNotEquals("Check that your last message arrived first.", vm.ui.value.notice)
+        } finally { forgetSwitchChats(fixture, chats, coderChats) }
+    }
+
+    /**
+     * S1d (R3 review #4): a send refused on its own client keeps that client's socket (CHAT-121 follow-up 11: a first prompt sent again needs the
+     * socket that made the chat). Replaced while the send waited, nothing would use that socket again: it closes once the refusal is in.
+     */
+    @Test fun aRefusedFirstSendOnAReplacedClientLetsItsSocketGo() = withFixture(canonical = true) { vm, fixture ->
+        val chats = mutableListOf<String>()
+        val coderChats = mutableListOf<String>()
+        try {
+            compose.waitUntil(15_000) { vm.preferences.value.busySendLoaded }
+            compose.runOnIdle { vm.newChat() }
+            compose.waitUntil(15_000) { vm.chat.value.sessionId.startsWith("new-") && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            chats += vm.chat.value.sessionId
+            val owned = requireNotNull(vm.client)
+            fixture.failNextPrompt = 4002 to "Synthetic refusal"
+            fixture.holdPromptAcknowledgement = true
+            compose.runOnIdle { vm.composer(TextFieldValue("Synthetic words Hermes refuses")); vm.send() }
+            compose.waitUntil(15_000) { submitParams(fixture).size == 1 }
+            compose.runOnIdle { vm.switchProfile("coder") }
+            compose.waitUntil(30_000) { vm.client?.scope?.profile == "coder" && vm.client !== owned && vm.chat.value.projectionReady && !vm.ui.value.newChatOpening }
+            coderChats += vm.chat.value.sessionId
+            assertTrue("kept while the send waits for its answer", holdsSocket(owned))
+            fixture.releasePromptAcknowledgement()
+            compose.waitUntil(15_000) { !holdsSocket(owned) }
+        } finally { forgetSwitchChats(fixture, chats, coderChats) }
+    }
+
     @Test fun foreignAdmissionReceiptCannotReleaseThePhoneQueue() = withFixture(canonical = true) { vm, fixture ->
         openWatchedChat(vm)
         val (firstId, admission) = queueCanonicalHead(vm, fixture)
@@ -464,6 +587,31 @@ class BusyTurnSendUiTest {
         compose.onNodeWithTag("composer-queue").assertDoesNotExist()
         compose.waitUntil(15_000) { vm.composer.value.text.isBlank() }
         assertEquals("A phone queue does not submit during the running turn", 1, fixture.requests.count { it.string("method") == "prompt.submit" })
+    }
+
+    /**
+     * Owner, 22 Nov: "when writing during a turn there are two useless buttons named send now and stop, remove them". With words typed during a turn the
+     * trailing button is the only send control and nothing else offers Stop; it steers or queues as the owner's setting says.
+     */
+    @Test fun duringATurnWithWordsTypedTheTrailingButtonIsTheOnlySendControl() = withFixture { vm, fixture ->
+        fixture.steerStatus = "queued"
+        startTurn(vm, fixture)
+        fun controls(label: String) = compose.onAllNodes(hasClickAction() and (hasText(label) or hasContentDescription(label)))
+        compose.onNodeWithTag("message-input").performTextInput("Steered words")
+        controls("Send now").assertCountEquals(1)
+        controls("Stop").assertCountEquals(0)
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send now").performClick()
+        compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
+        compose.waitUntil(15_000) { vm.composer.value.text.isBlank() }
+        compose.runOnIdle { vm.setBusySendAction("queue") }
+        compose.waitUntil(15_000) { vm.preferences.value.busySendAction == "queue" }
+        compose.onNodeWithTag("message-input").performTextInput("Queued words")
+        controls("Queue").assertCountEquals(1)
+        controls("Send now").assertCountEquals(0)
+        controls("Stop").assertCountEquals(0)
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Queue").performClick()
+        compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == "Queued words" && it.kind == "queue" } }
+        assertEquals("the queued words wait; only the first went as a steer", 1, fixture.requests.count { it.string("method") == "session.steer" })
     }
 
     @Test fun defaultSteerShowsTheBubbleBeforeAckAndKeepsLiveOutput() = withFixture { vm, fixture ->
@@ -1037,6 +1185,44 @@ class BusyTurnSendUiTest {
     private fun payload(params: JSONObject) = params.copy().apply { remove("session_id") }.toString()
 
     /**
+     * Owner 17:07 (S1): Send with a photo while the chat's model believes the app is not in front, one of the conditions that stop send() before any
+     * request. It used to vanish while the composer, which still held it, showed it again with no word (the owner's video, frame by frame); now it waits
+     * in the box as Not sent with its words and photo, the composer is empty, nothing reached Hermes, and the chat says so. Back in front (onStart,
+     * which a relaunch used to skip: ForegroundAfterRelaunchDeviceTest), it goes by itself, once, with its photo.
+     */
+    @Test fun aPhotoSendStoppedBeforeHermesWaitsInTheBoxAsNotSentNeverBackInTheDraft() = withFixture(canonical = true) { vm, fixture ->
+        val words = "Synthetic long request with a photo"
+        compose.waitUntil(15_000) { vm.preferences.value.busySendLoaded }
+        compose.runOnIdle {
+            flow<List<JSONObject>>(vm, "_attachments").value = listOf(json("id" to "00000000-0000-4000-8000-000000000007", "name" to "Photo.png", "mime" to "image/png",
+                "scope_key" to fixture.scope.session("chat-a").key, "staged_base64" to "iVBORw0KGgo="))
+        }
+        compose.onNodeWithTag("message-input").performTextInput(words)
+        try {
+            compose.runOnIdle { vm.foreground(false) }
+            compose.onNodeWithTag("message-send").performClick()
+            compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == words } }
+            val row = vm.chat.value.queued.single { it.text == words }
+            assertTrue("Not sent", queueBoxSaysNotSent(row) && row.waitingForConnection())
+            assertEquals("its photo stays with it", "Photo.png", row.attachments.single().string("name"))
+            assertEquals("never back in the draft", "", vm.composer.value.text)
+            assertTrue(vm.attachments.value.isEmpty())
+            compose.waitUntil(15_000) { vm.chat.value.uncertain.isBlank() && vm.ui.value.notice.isNotBlank() }
+            assertEquals("Couldn't send it now. It's in the queue.", vm.ui.value.notice)
+            assertEquals("never back in the draft once the send let go", "", vm.composer.value.text)
+            assertEquals("nothing reached Hermes", 0, submitParams(fixture).size)
+            // In front again (the activity's onStart): the copy in the box goes by itself, once, with its photo, and no tap.
+            compose.runOnIdle { vm.foreground(true) }
+            compose.waitUntil(20_000) { submitParams(fixture).size == 1 }
+            compose.waitUntil(15_000) { vm.chat.value.queued.none { it.text == words && it.inBox() } }
+            assertEquals("its photo went with it", 1, fixture.requests.count { it.string("method") == "image.attach_bytes" })
+            Thread.sleep(2_000); compose.waitForIdle()
+            assertEquals("sent once", 1, submitParams(fixture).size)
+            assertEquals("", vm.composer.value.text)
+        } finally { runBlocking { app.cache.delete(fixture.scope, OFFLINE_OUTBOX_KIND) } }
+    }
+
+    /**
      * CHATQA-121 follow-up 5: Hermes took the send (its admission and the person's row), and the network dropped before its answer came back.
      * When Hermes answers again the send is asked once more under the same submission id with exactly the same payload, its staged image too
      * (never staged again); Hermes answers with the admission it holds, and the bubble follows it like any accepted send: the reply comes, and
@@ -1333,7 +1519,8 @@ class BusyTurnSendUiTest {
             compose.onNodeWithTag("message-send").assertIsEnabled().performClick()
             compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == "Running late, start without me" && it.waitingForConnection() } }
             assertEquals("", vm.composer.value.text)
-            compose.onNodeWithText("Not sent").assertExists()
+            // H1b P2-14: the row says why.
+            compose.onNodeWithText("Not sent · Offline").assertExists()
             assertTrue(submittedTexts(fixture).isEmpty())
             compose.runOnIdle { field(vm, "client", fixture.client); field(vm, "cachedOwnerScope", null); flow<AppState>(vm, "_ui").value = vm.ui.value.copy(connected = true) }
             compose.runOnIdle { vm.drainOfflineOutbox() }

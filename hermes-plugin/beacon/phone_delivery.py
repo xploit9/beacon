@@ -98,7 +98,7 @@ def _queue_standalone_result(message, native_job_id, name, chat_id):
     try:
         if thread:
             mobile.ident(thread)
-        native.verify(owner, provider, profile, conversation)
+        principal = native.verify_saved(owner, provider, profile, conversation)
     except (LookupError, ValueError):
         if thread:
             raise LookupError(THREAD_GONE) from None
@@ -118,7 +118,7 @@ def _queue_standalone_result(message, native_job_id, name, chat_id):
             # The thread's own turn is running: the post waits, and the watcher adds it and notifies once the turn ends.
             mobile.hold_post(owner, provider, profile, conversation, job_id, str(message), name[:120])
             return "held-" + job_id
-    return mobile.enqueue_task_result(owner, profile, conversation, job_id, str(message)[:4000])
+    return mobile.enqueue_task_result(owner, profile, conversation, job_id, str(message)[:4000], principal)
 
 
 def _strip_cron_header(message):

@@ -142,6 +142,8 @@ class NativeBotModeController(
     private val openChat: suspend (String, String) -> Unit,
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val screens: ScreenCache? = null,
+    private val projections: ProjectionCache? = null,
+    private val restoredScope: () -> Scope? = { null },
     private val client: () -> BeaconClient?,
 ) {
     private val mutable = MutableStateFlow(NativeBotModeState())
@@ -162,7 +164,7 @@ class NativeBotModeController(
     // The account the list shown before any client came was saved for.
     private var paint: Triple<String, String, String>? = null
     private val path = "/api/plugins/beacon/mobile/bot-mode"
-    private fun key(space: String) = "bot-mode:${requireNotNull(root) { "Load Bot Mode before editing a draft" }.key}:$space"
+    private fun key(space: String) = "bot-mode:${requireNotNull(root ?: restoredScope()) { "Load Bot Mode before editing a draft" }.key}:$space"
     private fun operationKey(purpose: String, identity: String, legacy: String): String {
         val fresh = "bot-mode-action:${requireNotNull(root).key}:$purpose:${identity.digest()}"
         fun eventId(value: String?) = value != null && runCatching { UUID.fromString(value).toString() == value }.getOrDefault(false)
@@ -184,7 +186,7 @@ class NativeBotModeController(
         client()?.let { it.scope.sameAccount(c.scope) } == true
     fun clear() { ++generation; job?.cancel(); job = null; source?.closeNative(); source = null; accountClient = null; root = null; rosterAt = 0L; hasRoster = false; backgroundRead = false; last.clear(); rosterRead = null; rosterSaved = ""; paint = null; mutable.value = NativeBotModeState() }
     fun draft(text: String) {
-        if (root == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open a shared space first."); return }
+        if ((root ?: restoredScope()) == null || mutable.value.selectedSpace.isBlank()) { mutable.value = mutable.value.copy(error = "Open a shared space first."); return }
         mutable.value = mutable.value.copy(draft = text); saved[key(mutable.value.selectedSpace)] = text
     }
     /** The bot you are using is always in a space you create: Hermes lets only a space's own bots open it. */
@@ -297,13 +299,20 @@ class NativeBotModeController(
     }
     private suspend fun readSpace(c: BeaconClient, token: Int, id: String) {
         require(id.matches(Regex("[A-Za-z0-9_.:-]{1,128}"))) { "Unsupported native shared-space identity" }
-        val data = c.nativeRequest("$path/space/$id")
+        val data = try { c.nativeRequest("$path/space/$id") } catch (e: ApiFailure) {
+            if (e.status in setOf(401, 403, 404) && current(c, token)) {
+                mutable.value = mutable.value.copy(events = emptyList(), actions = emptyList())
+                projections?.delete(c.scope, "space-history:$id")
+            }
+            throw e
+        }
         if (!current(c, token) || mutable.value.selectedSpace != id) return
         val driver = data.optJSONObject("driver_status")
         val failed = driver?.optJSONObject("counts")?.optInt("failed", 0) ?: 0
         val room = data.optJSONObject("room")
         val typing = botModeTyping(data)
         val events = botModeEvents(data)
+        val historyChanged = events != mutable.value.events || data.optBoolean("earlier_events_omitted") != mutable.value.earlierEventsOmitted
         botModePreview(events)?.let { if (last[id] != it) { last[id] = it; saveRoster(c) } }
         mutable.value = mutable.value.copy(
             roster = botModeRoster(room), typing = typing, working = typing.isNotEmpty() || driver?.optBoolean("working") == true,
@@ -314,11 +323,35 @@ class NativeBotModeController(
             events = events, earlierEventsOmitted = data.optBoolean("earlier_events_omitted"),
             actions = botModeActions(data),
             status = when { driver?.optBoolean("blocked") == true -> "Shared space needs you"; driver?.optBoolean("working") == true -> "Bots are discussing…"; failed > 0 -> "Shared space needs you"; driver?.optBoolean("running") == true -> "Shared space is ready"; else -> "Shared space is offline" } + if (failed > 0) " · $failed bot ${if (failed == 1) "reply" else "replies"} failed" else "")
+        if (projections == null || !historyChanged) return
+        val kept = events.takeLast(100).map { json("id" to it.id, "speaker" to it.speaker, "text" to it.text, "failed" to it.failed, "at" to it.at) }
+        val history = json("events" to org.json.JSONArray(kept), "earlier" to (events.size > kept.size || data.optBoolean("earlier_events_omitted")))
+        try { projections.write(c.scope, "space-history:$id", history.toString()) }
+        catch (e: CancellationException) { throw e } catch (_: Exception) { /* The live copy is already on screen. */ }
+    }
+    private suspend fun openSavedSpace(owner: Scope, id: String, current: () -> Boolean) {
+        val cached = if (mutable.value.spaces.any { it.id == id }) try {
+            projections?.read(owner, "space-history:$id")?.let(::JSONObject)
+        } catch (e: CancellationException) { throw e } catch (_: Exception) { null } else null
+        if (!current()) return
+        val events = cached?.rows("events").orEmpty().map { BotModeEvent(it.string("id"), it.string("speaker"), it.string("text"), it.optBoolean("failed"), it.optLong("at")) }
+        mutable.value = mutable.value.copy(selectedSpace = id, events = events, earlierEventsOmitted = cached?.optBoolean("earlier") == true,
+            roster = emptyList(), members = emptyList(), typing = emptyList(), working = false, draft = saved.get<String>("bot-mode:${owner.key}:$id").orEmpty(),
+            canRename = false, canDelete = false, error = "", status = "", actions = emptyList())
     }
     fun selectSpace(id: String) {
         back()
+        if (client() == null) {
+            val owner = restoredScope() ?: return
+            showCached(screens?.exact(owner, "bot-mode:roster")?.value, owner.origin, owner.owner, owner.profile)
+            if (paint != Triple(owner.origin, owner.owner, owner.profile) || mutable.value.spaces.none { it.id == id }) return
+            val token = generation
+            job = scope.launch { openSavedSpace(owner, id) { generation == token && (client()?.scope ?: restoredScope()) == owner } }
+            return
+        }
         launch { c, token ->
-            mutable.value = mutable.value.copy(selectedSpace = id, events = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = saved.get<String>(key(id)).orEmpty(), error = "", status = "", actions = emptyList())
+            openSavedSpace(c.scope, id) { current(c, token) }
+            if (!current(c, token)) return@launch
             readSpace(c, token, id)
         }
     }
@@ -391,6 +424,7 @@ class NativeBotModeController(
                 val now = mutable.value
                 val rest = now.copy(spaces = now.spaces.filterNot { it.id == id })
                 mutable.value = if (now.selectedSpace != id) rest else rest.copy(selectedSpace = "", events = emptyList(), actions = emptyList(), members = emptyList(), roster = emptyList(), typing = emptyList(), working = false, draft = "", status = "")
+                projections?.delete(c.scope, "space-history:$id")
             }
         }
     }

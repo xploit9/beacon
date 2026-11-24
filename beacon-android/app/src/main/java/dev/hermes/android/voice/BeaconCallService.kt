@@ -40,7 +40,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 data class AudioRoute(val id: String, val name: String)
 data class CallState(val active: Boolean = false, val state: String = "idle", val muted: Boolean = false, val transcript: String = "", val error: String = "", val routes: List<AudioRoute> = emptyList(), val route: String = "", val startedAt: Long = 0, val conversationScope: Scope? = null, val callId: String = "", val transcripts: List<CallTranscript> = emptyList(), val transcriptStatus: String = "", val cameraSharing: Boolean = false, val cameraRear: Boolean = false, val cameraBusy: Boolean = false, val cameraCanFlip: Boolean = false, val cameraStopPending: Boolean = false, val held: Boolean = false, val userSpeaking: Boolean = false, val remoteSpeaking: Boolean = false, val localAudioLevel: Float? = null, val remoteAudioLevel: Float? = null, val minimized: Boolean = false, val screenSharing: Boolean = false, val screenBusy: Boolean = false, val screenStopPending: Boolean = false, val overlayPermissionMissing: Boolean = false, val contextNotice: String = "", val audioStopPending: Boolean = false, val hostCleanupPending: Boolean = false, val toolApprovals: List<CallToolApproval> = emptyList(), val voiceProvider: String = "gemini", val visionAvailable: Boolean = true, val failureReason: String = "", val toolReceipts: List<CallToolReceipt> = emptyList(),
     /** The call's link to Hermes is lost (a function was told hermes_unreachable or lost_result) until Hermes answers again. */
-    val hermesUnreachable: Boolean = false)
+    val hermesUnreachable: Boolean = false, val endedAt: Long = 0,
+    /** The calling profile's name, kept from the start so the shade says the same name as the ringing card and the call screen. */
+    val callerName: String = "")
 internal fun CallState.failedCallConversation(expectedId: String): Scope? =
     conversationScope.takeIf { !active && callId == expectedId && failureReason.isNotBlank() }
 internal fun callEndNotSentText(count: Int): String =
@@ -134,8 +136,8 @@ internal const val CALL_OPEN_TO_ANSWER = "Open Beacon to finish answering {0}."
 internal const val CALL_ANDROID_REFUSED = "Android couldn't start the call. Open Beacon and try again."
 internal const val CALL_SIGN_IN_AND_MIC = "Sign in and allow the microphone before calling {0}."
 /** The owner's line for [template], in the phone's language, with the assistant's name. */
-internal fun callText(context: Context, template: String): String =
-    dev.hermes.android.push.serviceText(context, template).replace("{0}", dev.hermes.android.data.currentAssistantName)
+internal fun callText(context: Context, template: String, name: String = ""): String =
+    dev.hermes.android.push.serviceText(context, template).replace("{0}", name.ifBlank { dev.hermes.android.data.currentAssistantName })
 /** Every fixed line a call's start or failure can show, so the translation test checks each one. */
 internal val CallFailureStrings = listOf(CALL_START_FAILED, CALL_ALREADY_ON, CALL_STILL_CONNECTING, CALL_ALLOW_MIC, CALL_STILL_ENDING, CALL_MIC_STILL_ON,
     CALL_INVITATION_ENDED, CALL_SIGN_IN_TO_ANSWER, CALL_OPEN_TO_ANSWER, CALL_ANDROID_REFUSED, CALL_SIGN_IN_AND_MIC,
@@ -225,9 +227,14 @@ class CallController(private val app: BeaconApplication) {
      */
     fun approvalCardShown(requestId: String, shown: Boolean) { if (approvalCards.set(requestId, shown)) service?.refreshToolNotification() }
     internal fun approvalCardOnScreen(requestId: String) = approvalCards.shown(requestId)
+    internal fun approvalUiVisible(requestId: String, account: Scope): Boolean = uiVisible ||
+        (approvalCardOnScreen(requestId) && dev.hermes.android.agentphone.AgentPhoneActivity.showsAccount(account) &&
+            !app.getSystemService(KeyguardManager::class.java).isDeviceLocked)
     fun minimize(expectedId: String) { if(state.value.callId==expectedId) service?.minimize(expectedId) }
     fun resumeWindow() { service?.restoreWindow() }
     fun refreshOverlayPermission() { _state.update { it.withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) } }
+    /** The lock-screen dialer is on screen: a call answered there has a window, like one answered in the app. */
+    @Volatile var dialerVisible = false
     @Volatile var uiVisible = false
         set(value) {
             field = value
@@ -409,6 +416,8 @@ class CallController(private val app: BeaconApplication) {
             stageLog.clear(); toolLog.clear(); this.tappedAt = tappedAt
             // Saved-auth restoration must recognize an already admitted local owner during reservation.
             _state.value = CallState(true, "connecting", startedAt = System.currentTimeMillis(), conversationScope = conversationId?.let { frozen.scope.session(it) })
+            val callerName = incoming?.callerName?.takeIf { it.isNotBlank() } ?: callerDisplayName(app, frozen.scope)
+            _state.update { if (it.active) it.copy(callerName = callerName) else it }
             if (incoming != null && app.push.invitation(incoming.source, incoming.event) == null) refuse(CALL_INVITATION_ENDED)
             val ownerName = if (incoming == null) withContext(Dispatchers.IO) { readOwnerName() } else ""
             val target = conversationId?.takeIf { incoming == null && it.isNotBlank() }?.let { frozen.scope.session(it) }
@@ -466,7 +475,7 @@ class CallController(private val app: BeaconApplication) {
                 if (generation != epoch.get()) { release(CallSpec(frozen, grant)); return }
                 if (incoming != null) {
                     if (!app.push.permitsIncoming(incoming.source)) refuse(CALL_SIGN_IN_TO_ANSWER)
-                    if (!uiVisible) refuse(CALL_OPEN_TO_ANSWER)
+                    if (!uiVisible && !dialerVisible) refuse(CALL_OPEN_TO_ANSWER)
                 }
                 CompletableDeferred(grant)
             }
@@ -636,7 +645,7 @@ class BeaconCallService : Service() {
         try { foreground(camera = false) }
         catch (e: RuntimeException) { failure("Open Beacon and allow microphone access to continue the call"); return START_NOT_STICKY }
         // Home may precede service binding; reconcile once foreground admission succeeds.
-        if (backgroundNeedsBubble(app.calls.state.value,app.calls.uiVisible)) { refreshOverlay(); minimize(app.calls.state.value.callId) }
+        if (backgroundNeedsBubble(app.calls.state.value,app.calls.uiVisible||app.calls.dialerVisible)) { refreshOverlay(); minimize(app.calls.state.value.callId) }
         telecomJob = scope.launch {
             try {
                 admitCallTransport(mediaLock,closed,{app.calls.service===this@BeaconCallService}) {
@@ -829,7 +838,7 @@ class BeaconCallService : Service() {
     internal fun decideTool(requestId:String,proposalId:String,decision:String,fromNotification:Boolean=false) {
         val pending=spec ?: return
         val state=app.calls.state.value
-        fun visibleOrUnlockedNotification()=if(fromNotification) !getSystemService(KeyguardManager::class.java).isDeviceLocked else app.calls.uiVisible
+        fun visibleOrUnlockedNotification()=if(fromNotification) !getSystemService(KeyguardManager::class.java).isDeviceLocked else app.calls.approvalUiVisible(requestId,pending.client.scope)
         // Saying no to a phone request needs no screen: leaving the card is itself a no.
         val phoneNo=decision=="deny"&&state.toolApprovals.any { it.requestId==requestId&&it.proposalId==proposalId&&it.phone!=null }
         if(decision !in setOf("approve", "approve_call", "deny")||closed.get()||(!phoneNo&&!visibleOrUnlockedNotification())||app.calls.ownerScope?.let { it.sameAccount(pending.client.scope)&&it.profile==pending.client.scope.profile }!=true) return
@@ -1044,7 +1053,7 @@ class BeaconCallService : Service() {
                 ended.complete(Unit)
                 val stopped=captureReleased
                 app.calls.cameraTrack(this@BeaconCallService,null)
-                app.calls.updateFrom(this@BeaconCallService) { it.copy(active=false,state="ending",cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Beacon if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" "),failureReason=if(failedConnection) error.orEmpty() else it.failureReason).afterTerminalControls(fenceFailure) }
+                app.calls.updateFrom(this@BeaconCallService) { it.copy(active=false,state="ending",endedAt=System.currentTimeMillis(),cameraSharing=false,cameraBusy=false,screenSharing=false,screenBusy=false,cameraStopPending=!stopped,screenStopPending=!stopped,audioStopPending=!audioReleased,minimized=false,error=listOfNotNull(error?:it.error,if(!audioReleased) "The microphone may still be on. Close Beacon if it stays on." else null,if(endDisposition.notSent>0) callEndNotSentText(endDisposition.notSent) else null,if(endDisposition.submissionUnknown>0) callEndUnknownText(endDisposition.submissionUnknown) else null).filter(String::isNotBlank).joinToString(" "),failureReason=if(failedConnection) error.orEmpty() else it.failureReason).afterTerminalControls(fenceFailure) }
                 // An admission still running when the call ended is released once it lands; a refused one has nothing to release.
                 val admittedId=spec?.let { pending -> withTimeoutOrNull(20_000) { runCatching { pending.admission.await() }.getOrNull() }?.optString("call_id") }.orEmpty()
                 val transcriptClosed=admittedId.isNotBlank()&&finishTranscriptSyncForCleanup {
@@ -1101,24 +1110,24 @@ class BeaconCallService : Service() {
             return PendingIntent.getService(this, code, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
         }
         val builder = NotificationCompat.Builder(this, CHANNEL).setSmallIcon(R.drawable.ic_beacon_voice)
-            .setContentTitle(if (retainedCameraWarning) "The call may still be open" else "${dev.hermes.android.data.currentAssistantName} call")
-            .setContentText(if (starting) { if(app.calls.state.value.active) "Connecting to ${dev.hermes.android.data.currentAssistantName}" else "Call cancelled" } else if (retainedCameraWarning) "Stop Beacon in Android to close it."
+            .setContentTitle(callText(this, if (retainedCameraWarning) "The call may still be open" else "{0} call", state.callerName))
+            .setContentText(callText(this, if (starting) { if(app.calls.state.value.active) "Connecting to {0}" else "Call cancelled" } else if (retainedCameraWarning) "Stop Beacon in Android to close it."
                 else if (app.calls.state.value.toolApprovals.isNotEmpty()) "Action needs approval. Open Beacon to review."
                 else if (app.calls.state.value.screenStopPending) "Screen may still be shared. Tap to stop."
-                else if (app.calls.state.value.screenSharing) "Screen sharing with ${dev.hermes.android.data.currentAssistantName}"
+                else if (app.calls.state.value.screenSharing) "Screen sharing with {0}"
                 else if (app.calls.state.value.cameraStopPending) "Camera may still be on. Tap to stop."
-                else if (muted) "Microphone muted" else if (state.state == "connecting" || state.state == "reconnecting") "Connecting to ${dev.hermes.android.data.currentAssistantName}"
-                else if (state.remoteSpeaking || state.state == "speaking") "${dev.hermes.android.data.currentAssistantName} is speaking" else "Listening to you")
+                else if (muted) "Microphone muted" else if (state.state == "connecting" || state.state == "reconnecting") "Connecting to {0}"
+                else if (state.remoteSpeaking || state.state == "speaking") "{0} is speaking" else "Listening to you", state.callerName))
             .setContentIntent(open).setOngoing(true).setCategory(if (retainedCameraWarning) NotificationCompat.CATEGORY_ERROR else NotificationCompat.CATEGORY_CALL)
             .setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-            .setPublicVersion(NotificationCompat.Builder(this,CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("${dev.hermes.android.data.currentAssistantName} call").setContentText("Tap to return to your call").build())
+            .setPublicVersion(NotificationCompat.Builder(this,CHANNEL).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(callText(this, "{0} call", state.callerName)).setContentText(callText(this, "Tap to return to your call")).build())
         if (!retainedCameraWarning && !starting) {
-            builder.setStyle(NotificationCompat.CallStyle.forOngoingCall(androidx.core.app.Person.Builder().setName(dev.hermes.android.data.currentAssistantName).setImportant(true).build(),action(HANGUP,23)))
-                .addAction(0, if (muted) "Unmute" else "Mute", action(MUTE, 22))
+            builder.setStyle(NotificationCompat.CallStyle.forOngoingCall(callerPerson(this, state.callerName.ifBlank { dev.hermes.android.data.currentAssistantName }),action(HANGUP,23)))
+                .addAction(0, callText(this, if (muted) "Unmute" else "Mute"), action(MUTE, 22))
             builder.setShowWhen(false)
             if(android.os.Build.VERSION.SDK_INT>=36) builder.setRequestPromotedOngoing(true).setShortCriticalText(state.chipLabel())
         }
-        if (!retainedCameraWarning && !starting && (app.calls.state.value.screenSharing || app.calls.state.value.screenStopPending)) builder.addAction(0,"Stop sharing screen",action(STOP_SCREEN,24))
+        if (!retainedCameraWarning && !starting && (app.calls.state.value.screenSharing || app.calls.state.value.screenStopPending)) builder.addAction(0,callText(this, "Stop sharing screen"),action(STOP_SCREEN,24))
         return builder.build()
     }
     private fun openCallIntent(id:String):PendingIntent = PendingIntent.getActivity(this,21,

@@ -674,6 +674,26 @@ def test_the_owners_first_words_start_the_providers_recall_once_memory_is_on(mem
     assert queued == [('What is on my calendar tomorrow', 'chat')]
 
 
+def test_missing_provider_warms_builtin_and_preserves_builtin_writes(memory_env, monkeypatch, caplog):
+    _, _, voice, _, root = memory_env
+    cfg = {'memory': {'provider': 'offline-fixture'}}
+    monkeypatch.setattr(voice, 'config', lambda root: cfg)
+    monkeypatch.setattr(voice, 'memory_toolset_on', lambda: True)
+    monkeypatch.setitem(sys.modules, 'plugins.memory', SimpleNamespace(load_memory_provider=lambda *args, **kw: None))
+    monkeypatch.setitem(sys.modules, 'agent.memory_provider', SimpleNamespace(is_trivial_prompt=lambda words: False))
+    (root / 'memories').mkdir()
+    (root / 'memories/MEMORY.md').write_text('Synthetic tea preference', encoding='utf-8')
+
+    assert voice.warm_recall('owner', 'basic', 'default', 'chat', 'call-1', 'Which tea?') is False
+    assert voice.provider_tool_schemas(cfg) == []
+    answer = voice.memory_tool_call(root, 'owner', 'basic', 'default', 'chat', 'call-1',
+                                    {'action': 'add', 'target': 'memory', 'content': 'Likes jasmine tea'})
+    assert json.loads(answer)['success']
+    mirrored()
+    assert 'Likes jasmine tea' in (root / 'memories/MEMORY.md').read_text(encoding='utf-8')
+    assert len([r for r in caplog.records if 'using built-in memory' in r.getMessage()]) == 1
+
+
 def test_hermes_memory_reads_through_the_provider_the_call_already_holds(memory_env, monkeypatch):
     _, _, voice, _, _ = memory_env
     matching = SimpleNamespace(prefetch=lambda query, *, session_id: 'Warm recall')

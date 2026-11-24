@@ -252,6 +252,13 @@ try:
     import firebase_admin
 except ImportError:
     firebase_admin = None
+def read_yaml(path):
+    try:
+        from hermes_cli.config import read_config_doc
+    except ImportError:
+        import yaml
+        return yaml.safe_load(path)
+    return read_config_doc(path)
 """)
     assert (('tui_gateway', 'server', None, False),) in needs
     assert (('tui_gateway', 'server', '_sessions', False),) in needs
@@ -261,6 +268,7 @@ except ImportError:
     assert (('tui_gateway.session_history', '_history_to_messages', None, False),
             ('tui_gateway.server', '_history_to_messages', None, False)) in needs, 'either import serves'
     assert (('firebase_admin', None, None, True),) in needs, 'an ImportError-only guard marks an optional import'
+    assert (('yaml', None, 'safe_load', True),) in needs, 'an attribute of a fallback-only import is optional, as the import is'
 
 
 # Turning Beacon on for another profile reaches Hermes' own enable by these private spellings: Hermes has no profile-scoped enable route, its name
@@ -472,3 +480,46 @@ def test_hermes_vault_still_has_the_shapes_the_agent_phone_relies_on(hermes):
     unlock = _text(hermes, 'agent', 'vault_backends', 'unlock.py')
     assert 'SaveLoginPrompt = Callable[[str, str], Optional[dict[str, str]]]' in unlock and 'CodePrompt = Callable[[str, str], str]' in unlock
     assert 'def saved_origins(meta) -> list[str]:' in _text(hermes, 'tools', 'browser_vault_context.py')
+
+
+# Phone alerts for a Hermes question or approval come from Hermes' own waits on a person (tools/human_input_hooks.py); Hermes keeps a hook
+# name it does not know with only a warning, so a rename would leave the phone silent instead of failing.
+ALERT_HOOK_NAMES = {'on_human_input_request', 'on_human_input_resolved', 'on_session_end'}
+
+
+def test_every_hook_the_plugin_registers_is_one_hermes_fires(hermes):
+    compat = _compat()
+    found = compat.hooks()
+    assert ALERT_HOOK_NAMES <= {name for name, _ in found}
+    assert compat.missing_hooks(found, hermes) == []
+
+
+def test_a_hook_hermes_renamed_says_question_alerts_need_a_beacon_update(hermes, tmp_path):
+    compat = _compat()
+    plugins = hermes.joinpath('hermes_cli', 'plugins.py').read_text(encoding='utf-8-sig')
+    assert '"on_human_input_request"' in plugins
+    tmp_path.joinpath('hermes_cli').mkdir()
+    tmp_path.joinpath('hermes_cli', 'plugins.py').write_text(plugins.replace('"on_human_input_request"', '"on_human_wait_renamed"'), encoding='utf-8')
+    gone = compat.missing_hooks(compat.hooks(), tmp_path)
+    assert gone == ['hook on_human_input_request (__init__.py)']
+    assert compat.stopped(gone) == ['Question and approval alerts on the phone need a Beacon update for this Hermes']
+    assert compat.missing_hooks(compat.hooks(), tmp_path / 'no-hermes') == ['hermes_cli.plugins.VALID_HOOKS (hooks)']
+
+
+def test_hermes_still_announces_each_wait_on_the_owner_the_way_alerts_read_it(hermes):
+    # observers.human_input reads kind, request_id and session_id; human_input_resolved reads the same request_id.
+    hooks = hermes.joinpath('tools', 'human_input_hooks.py').read_text(encoding='utf-8-sig')
+    assert '_fire("on_human_input_request", payload)' in hooks and '_fire("on_human_input_resolved", {**payload' in hooks
+    assert '"kind": kind, "request_id": uuid.uuid4().hex, **_identity()' in hooks and '"session_id": session_id' in hooks
+    # A clarify question and a gateway approval each wait through it.
+    assert 'human_input_request("clarify"' in hermes.joinpath('tools', 'clarify_tool.py').read_text(encoding='utf-8-sig')
+    assert 'human_input_request("approval"' in hermes.joinpath('tools', 'approval_gateway_wait.py').read_text(encoding='utf-8-sig')
+
+
+def test_alerts_read_how_long_hermes_waits_from_its_own_settings(hermes):
+    # observers.human_wait_seconds: a renamed setting would quietly fall back to an hour, so the scan must see both names.
+    compat = _compat()
+    groups = [group for group in compat.needs() if any(entry[3] == 'observers.py' and entry[0] in ('tools.clarify_gateway', 'tools.approval_context') for entry in group)]
+    assert {(entry[0], entry[1]) for group in groups for entry in group} >= {('tools.clarify_gateway', 'get_clarify_timeout'), ('tools.approval_context', '_get_approval_timeout')}
+    assert compat.missing(groups, hermes) == []
+    assert 'deadline = time.monotonic() + max(_ctx._get_approval_timeout()' in hermes.joinpath('tools', 'approval_gateway_wait.py').read_text(encoding='utf-8-sig')

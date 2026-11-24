@@ -126,7 +126,7 @@ internal class CallOverlayWindow(private val context: Context, private val read:
                         }) { Icon(if(call.muted) Icons.Rounded.MicOff else Icons.Rounded.Mic,if(call.muted) uiText("Unmute") else uiText("Mute")) }
                         IconButton({if(eligible()) returnToCall()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-return")) { Icon(Icons.Rounded.OpenInFull,uiText("Return to call")) }
                         IconButton({dismissBubble()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-hide")) { Icon(Icons.Rounded.VisibilityOff,hideLabel) }
-                        IconButton({if(eligible()) end()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-end")) { Icon(Icons.Rounded.CallEnd,uiText("Hang up"),tint=MaterialTheme.colorScheme.error) }
+                        IconButton({if(eligible()) end()},modifier=Modifier.size(48.dp).testTag("beacon-bubble-end")) { Icon(Icons.Rounded.CallEnd,uiText("End call"),tint=MaterialTheme.colorScheme.error) }
                     }
                 }
                 Surface(shape=CircleShape,color=androidx.compose.ui.graphics.Color.Transparent,border=BorderStroke(1.dp,CallGold.copy(alpha=.52f)),

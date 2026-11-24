@@ -77,7 +77,8 @@ internal fun readFrameHeader(data: ByteArray): FrameHeader? {
 /** Server -> app text messages, read leniently: an unknown `t` or field is ignored, so the server can add to the protocol. */
 internal sealed interface ServerText {
     /** [keyboard]: the phone's keyboard is up; [password]: the field it serves is a password field (revision 5 §11.2). */
-    data class State(val keyboard: Boolean, val rotation: Int, val helper: String, val prompt: String?, val password: Boolean = false) : ServerText
+    data class State(val keyboard: Boolean, val rotation: Int, val helper: String, val prompt: String?, val password: Boolean = false,
+                     val controlEpoch: Long? = null) : ServerText
     data class Refused(val what: String, val reason: String) : ServerText
     /** [reason] and [args]: the line's code and the names in it (revision 5 §11.1); the screen words a known code itself. */
     data class Notice(val kind: String, val line: String, val reason: String? = null, val args: Map<String, String> = emptyMap()) : ServerText
@@ -95,6 +96,7 @@ internal fun parseServerText(raw: String): ServerText {
             helper = message.optString("helper").takeIf { it in setOf("starting", "ready", "off") } ?: "off",
             prompt = (message.opt("prompt") as? String)?.takeIf { it.isNotBlank() },
             password = message.opt("keyboard") == "password",
+            controlEpoch = message.optString("epoch").toLongOrNull()?.takeIf { it > 0 && message.optString("lease") == "you" },
         )
         "refused" -> ServerText.Refused(message.optString("what"), message.optString("reason"))
         "notice" -> message.optString("line").takeIf { it.isNotBlank() }
@@ -358,7 +360,7 @@ internal interface ViewTransport {
     suspend fun phone(): Pair<String, String>
     /** The phone's state, its error line and that line's code (revision 5 §11.1 `error_reason`). */
     suspend fun phoneNow(): PhoneNow = phone().let { PhoneNow(it.first, it.second, null) }
-    suspend fun handBack()
+    suspend fun handBack(epoch: Long)
 }
 
 /** Decodes frames off the main thread; [done] reports whether the frame is now shown, from any thread. */
@@ -393,6 +395,7 @@ internal class ViewSession(
     private var job: Job? = null
     private var bye: String? = null
     private var donePending = false
+    private var controlEpoch: Long? = null
     private var downSince = -1L
     private var lastError = -1L
     private var lastUpgradeRefusal = -1L
@@ -468,18 +471,15 @@ internal class ViewSession(
             donePending = true
             outbox.offer(Lane.Control, ClientMessage.done())
             job?.cancel()
-            job = scope.launch { delay(2_000); finish() }
-        } else close()
+            job = scope.launch { delay(2_000); handBackAndClose() }
+        } else handBackAndClose()
     }
 
-    /** Leaves the view from one of its end states; a lease that may still be this phone's goes back to the agent. */
-    fun close() {
-        if (phaseNow == ViewPhase.Closed) return
+    /** Only the owner's Done or Return to call can start a hand-back after the socket goes away. */
+    private fun handBackAndClose() {
         val mayHold = phaseNow in setOf(ViewPhase.Connecting, ViewPhase.Reconnecting, ViewPhase.BackSoon, ViewPhase.Failed, ViewPhase.HermesDown, ViewPhase.Live, ViewPhase.Starting)
-        job?.cancel()
-        dropSocket(ViewProtocol.CLOSE_DONE)
-        if (mayHold) lasting.launch { handBack() }
-        phase(ViewPhase.Closed)
+        if (mayHold) controlEpoch?.let { epoch -> lasting.launch { handBack(epoch) } }
+        close()
     }
 
     /**
@@ -487,10 +487,10 @@ internal class ViewSession(
      * connection, so a hand-back that cannot reach Hermes is tried again every 2 s for a minute (otherwise the phone stays the owner's
      * for the server's 5 minutes); any answer from Hermes, yes or no, ends it.
      */
-    private suspend fun handBack() {
+    private suspend fun handBack(epoch: Long) {
         withTimeoutOrNull(ViewProtocol.HAND_BACK_MS) {
             while (true) {
-                val answered = try { withTimeoutOrNull(10_000) { transport.handBack() } != null }
+                val answered = try { withTimeoutOrNull(10_000) { transport.handBack(epoch) } != null }
                     catch (e: CancellationException) { throw e } catch (e: TicketRefused) { true } catch (e: Exception) { false }
                 if (answered) return@withTimeoutOrNull
                 delay(2_000)
@@ -566,6 +566,7 @@ internal class ViewSession(
     private fun serverText(message: ServerText) {
         when (message) {
             is ServerText.State -> {
+                controlEpoch = message.controlEpoch
                 becameLive()
                 val was = state.value
                 set { it.copy(keyboard = message.keyboard, keyboardPassword = message.keyboard && message.password, helper = message.helper,
@@ -605,7 +606,9 @@ internal class ViewSession(
         val wasDone = donePending
         dropSocket()
         when {
-            wasDone || reason == "done" -> finish()
+            reason == "done" -> close()
+            wasDone && reason == null -> handBackAndClose()
+            wasDone -> close()
             reason == "replaced" -> phase(ViewPhase.Replaced)
             reason == "ended" -> phase(ViewPhase.Ended)
             reason == "stopped" -> phase(ViewPhase.Stopped)
@@ -623,7 +626,7 @@ internal class ViewSession(
     }
 
     private fun failed(httpStatus: Int?) {
-        if (donePending) { finish(); return }
+        if (donePending) { handBackAndClose(); return }
         dropSocket()
         when {
             httpStatus == null -> dropped()
@@ -652,7 +655,7 @@ internal class ViewSession(
         connect(again())
     }
 
-    private fun finish() {
+    fun close() {
         job?.cancel()
         dropSocket()
         phase(ViewPhase.Closed)
@@ -724,7 +727,7 @@ internal class ViewSession(
 // -- the app's transport ------------------------------------------------------------------------------------------------------------------
 
 /** The plugin's routes through Beacon's signed-in client (Hermes sign-in, the linked device id, `beacon_profile`), and its socket. */
-internal class BeaconViewTransport(private val client: BeaconClient) : ViewTransport {
+internal class BeaconViewTransport(private val client: BeaconClient, private val watching: Boolean = false) : ViewTransport {
     private val sockets: OkHttpClient = client.http.newBuilder().readTimeout(0, TimeUnit.MILLISECONDS).pingInterval(10, TimeUnit.SECONDS).build()
 
     /** Beacon's own sign-in ended or this phone was removed: those are answers, not Hermes being away. */
@@ -734,7 +737,7 @@ internal class BeaconViewTransport(private val client: BeaconClient) : ViewTrans
         catch (e: DeviceRemovedFailure) { throw TicketRefused(403, "Device removed") }
 
     override suspend fun ticket(): ViewTicket {
-        val answer = answered { client.nativeRequest(ViewProtocol.TICKET_PATH, "POST", JSONObject()) }
+        val answer = answered { client.nativeRequest(ViewProtocol.TICKET_PATH, "POST", JSONObject().apply { if (watching) put("mode", "watch") }) }
         if (answer.optString("path") != ViewProtocol.SOCKET_PATH || answer.optString("subprotocol") != ViewProtocol.SUBPROTOCOL) throw TicketRefused(502, "unexpected ticket")
         return ViewTicket(runCatching { nativeConnectionTicket(answer.optString("ticket")) }.getOrElse { throw TicketRefused(502, "unexpected ticket") })
     }
@@ -779,5 +782,7 @@ internal class BeaconViewTransport(private val client: BeaconClient) : ViewTrans
         return PhoneNow(answer.optString("phone"), (answer.opt("error") as? String).orEmpty(), answer.code("error_reason"))
     }
 
-    override suspend fun handBack() { answered { client.nativeRequest(ViewProtocol.HAND_BACK_PATH, "POST", JSONObject()) } }
+    override suspend fun handBack(epoch: Long) {
+        if (!watching) answered { client.nativeRequest(ViewProtocol.HAND_BACK_PATH, "POST", JSONObject().put("epoch", epoch)) }
+    }
 }

@@ -6,6 +6,11 @@ import org.junit.Test
 
 /** A streamed reply Beacon keeps because it could not prove its turn belongs to that turn alone (review N1). Synthetic ids only. */
 class KeptReplyTurnTest {
+    @Test fun noKeptRepliesLeavesTheTranscriptUntouched() {
+        val shown = listOf(user(10, "First"), assistant(11, "Reply"))
+        assertSame(shown, placeKeptReplies(shown, emptyList()))
+    }
+
     @Test fun aKeptReplyRemembersThePromptRowItAnswers() {
         val chat = ChatState(sessionId = "chat", streamId = "runtime-1", liveText = "Streamed answer",
             messages = listOf(Message("10", "user", "First"), Message("11", "assistant", "Old"), Message("20", "user", "Second"), Message("21", "user", "Change course", displayKind = "steer")))

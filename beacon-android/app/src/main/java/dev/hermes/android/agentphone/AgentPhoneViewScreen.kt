@@ -199,11 +199,14 @@ internal fun AgentPhoneViewScreen(
     checklistOpen: Boolean = false,
     /** Whether opening the text row also brings up the owner's keyboard (off only in the capture test). */
     rowKeyboard: Boolean = true,
+    onTakeControl: (() -> Unit)? = null,
+    /** The surface around the picture; the call screen passes its own warm black, so the call and the phone are one surface. */
+    stageColor: Color? = null,
 ) = CompositionLocalProvider(LocalAssistantName provides name) {
     val scheme = MaterialTheme.colorScheme
     val dark = scheme.background.luminance() < .5f
     // One quiet surface around the picture, so the phone's own screen is the brightest thing in view.
-    val stage = if (dark) scheme.surfaceContainerLowest else scheme.surfaceContainer
+    val stage = stageColor ?: if (dark) scheme.surfaceContainerLowest else scheme.surfaceContainer
     val live = ui.phase == ViewPhase.Live
     var flash by remember { mutableStateOf<Pair<String, Long>?>(null) }
     var flashes by remember { mutableStateOf(0L) }
@@ -270,7 +273,7 @@ internal fun AgentPhoneViewScreen(
                 // Edge to edge: the picture takes all the width its ratio allows (AGENTUX-121 idea 4).
                 modifier = Modifier.fillMaxSize().then(if (ended) Modifier.blur(18.dp) else Modifier).testTag("agent-phone-frame"),
                 dim = if (ended) .72f else if (!live || ui.background) .55f else 0f,
-                enabled = live && !ui.prompt,
+                enabled = live && !ui.prompt && onTakeControl == null,
                 description = uiText("{name}'s phone screen").named(),
                 edge = if (dark) Color.White.copy(alpha = .10f) else Color.Black.copy(alpha = .10f),
                 onFingerDown = { if (row.value.text.isNotEmpty()) { sync(flush = true); row.clear() } },
@@ -292,7 +295,12 @@ internal fun AgentPhoneViewScreen(
         }
     }
     val bottom: @Composable (Modifier) -> Unit = { area ->
-        if (row.open) TextRow(row, ui, live, actions, area, rowKeyboard, onSync = ::sync, onClose = { closeRow(); if (ui.keyboard) row.closedByOwner = true })
+        if (onTakeControl != null) Box(area, contentAlignment = Alignment.Center) {
+            Button(onClick = onTakeControl, enabled = live || ui.phase in setOf(ViewPhase.Replaced, ViewPhase.Failed),
+                modifier = Modifier.padding(8.dp).testTag("agent-phone-take-control")) {
+                Text(uiText("Take control"))
+            }
+        } else if (row.open) TextRow(row, ui, live, actions, area, rowKeyboard, onSync = ::sync, onClose = { closeRow(); if (ui.keyboard) row.closedByOwner = true })
         else BottomBar(live, ui, area, actions, ::say,
             onKeyboard = { row.open = true; row.auto = false; row.closedByOwner = false },
             onPaste = {
@@ -309,7 +317,7 @@ internal fun AgentPhoneViewScreen(
         // The unfolded phone (AGENTUX-121 idea 7): the picture fills the height on one side, the page's setup steps sit beside it.
         // Only where the side pane costs the picture nothing: a window about as wide as it is tall (the unfolded phone, a tablet on its
         // side). A tall window (a tablet upright) keeps one pane, and a phone turned on its side keeps the whole width for its picture.
-        val wide = maxWidth >= WIDE_VIEW && maxHeight >= 480.dp && maxWidth >= maxHeight * .75f
+        val wide = checklist != null && maxWidth >= WIDE_VIEW && maxHeight >= 480.dp && maxWidth >= maxHeight * .75f
         if (wide) Row(Modifier.fillMaxSize()) {
             Column(Modifier.weight(1f).fillMaxHeight()) {
                 picture(Modifier.weight(1f).fillMaxWidth().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Start)).padding(top = 12.dp))

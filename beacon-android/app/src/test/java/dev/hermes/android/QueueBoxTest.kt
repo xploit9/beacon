@@ -314,4 +314,25 @@ class QueueBoxTest {
         assertFalse(item("unknown").inBox())
         assertFalse(item("settled", "failed", rowId = "1").inBox())
     }
+
+    // H1b P2-14: a Not sent row says why, in a word the owner knows; a waiting row says nothing.
+    @Test fun aNotSentRowSaysWhy() {
+        assertEquals("Offline", notSentReason(item("queued", OFFLINE_OUTCOME)))
+        assertEquals("Upload failed", notSentReason(item("queued", FILE_NOT_SENT_OUTCOME)))
+        assertEquals("Didn’t arrive", notSentReason(item("settled", "cancelled")))
+        assertEquals("Its chat was deleted", notSentReason(item("settled", CHAT_GONE_OUTCOME)))
+        assertTrue("it waits in the box with Retry", item("settled", CHAT_GONE_OUTCOME).inBox() && queueBoxAction(item("settled", CHAT_GONE_OUTCOME), false) == QueueBoxAction.Retry)
+        assertEquals("a held row's sentence stays the line above the box", "Offline", notSentReason(item("queued", OFFLINE_OUTCOME).copy(held = "Synthetic hold reason")))
+        assertEquals("", notSentReason(item("queued")))
+        assertEquals("", notSentReason(item("settled", "cancelled", rowId = "1")))
+    }
+
+    // H1b P1-3: back in a chat while its reply runs, the owner's message shows once: the row Hermes stamped with the copy's submission id IS that copy.
+    @Test fun aCopyNeverShowsBesideTheRowHermesStampedWithItsSubmission() {
+        val copy = item("accepted").copy(submissionId = "sub-1")
+        val stamped = Message.from(json("row_id" to 3L, "role" to "user", "content" to "Hello again", "display_metadata" to json("submission_id" to "sub-1")), 2, "chat")
+        assertEquals("sub-1", stamped.submission)
+        assertEquals(listOf("1", "2", "3"), inChat(listOf(copy), history + stamped))
+        assertEquals("another send's row hides nothing", listOf("1", "2", bubble(copy)), inChat(listOf(copy), history))
+    }
 }

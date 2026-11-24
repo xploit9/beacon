@@ -52,8 +52,10 @@ internal data class AgentApproval(
     /** The plugin's word that the tapped control itself pays (its words are a pay word or carry an amount); false when absent. */
     val pay: Boolean = false,
 ) {
-    /** A question about money: the amount is the first thing the owner reads, and a no stands for a minute (approvals-v1 §1). */
-    val payment: Boolean get() = kind == ApprovalKind.Action && (risk == ApprovalRisk.Payment || risk == ApprovalRisk.Unlabeled)
+    /** A question about money: the amount is the first thing the owner reads, and a no stands for a minute (approvals-v1 §1). A tap
+     *  Beacon can't read is one only on a checkout, where the plugin sends the screen's amount with it (D2c). */
+    val payment: Boolean get() = kind == ApprovalKind.Action &&
+        (risk == ApprovalRisk.Payment || risk == ApprovalRisk.Unlabeled && amount.isNotBlank())
 }
 
 internal val APPROVAL_ID = Regex("[0-9a-f]{32}")
@@ -220,7 +222,9 @@ private fun where(app: String, label: String): PhoneLine? = when {
 
 private fun riskTitle(risk: ApprovalRisk?, pay: Boolean): String = when (risk) {
     ApprovalRisk.Payment -> if (pay) "{name} wants to pay" else "{name} wants to tap on a payment screen"
-    ApprovalRisk.Unlabeled -> "{name} wants to tap on a payment screen"
+    // D2c: not a payment claim. The plugin asks this wherever it can't read the control; only a checkout adds its amount. Verb first,
+    // as the others (UX P1-8): the title says what Allow lets it do, not only what it can't.
+    ApprovalRisk.Unlabeled -> "{name} wants to tap an unreadable button"
     ApprovalRisk.Send -> "{name} wants to send"
     ApprovalRisk.Delete -> "{name} wants to delete"
     ApprovalRisk.Install -> "{name} wants to install an app"
@@ -229,7 +233,8 @@ private fun riskTitle(risk: ApprovalRisk?, pay: Boolean): String = when (risk) {
 }
 
 private fun riskGlyph(risk: ApprovalRisk?, action: String): ApprovalGlyph = when (risk) {
-    ApprovalRisk.Payment, ApprovalRisk.Unlabeled -> ApprovalGlyph.Payment
+    ApprovalRisk.Payment -> ApprovalGlyph.Payment
+    ApprovalRisk.Unlabeled -> ApprovalGlyph.Tap
     ApprovalRisk.Send -> ApprovalGlyph.Send
     ApprovalRisk.Delete -> ApprovalGlyph.Delete
     ApprovalRisk.Install -> ApprovalGlyph.Install
@@ -247,7 +252,7 @@ internal fun approvalFace(record: AgentApproval): ApprovalFace = when (record.ki
         val pin = record.pin.takeIf(String::isNotBlank)?.let(::serverLine)
         ApprovalFace(
             title = if (pin != null && fill) "{name} wants to use a saved login" else riskTitle(record.risk, record.pay),
-            glyph = if (pin != null && fill) ApprovalGlyph.Login else riskGlyph(record.risk, record.action),
+            glyph = if (pin != null && fill) ApprovalGlyph.Login else if (record.payment) ApprovalGlyph.Payment else riskGlyph(record.risk, record.action),
             // Pay only when the control itself pays (REVIEW-FIX-UI-121): a checkout's Sign in, Continue or unlabeled tap is Allow / Deny.
             buttons = when {
                 pin != null && fill || !record.payment || !record.pay -> ApprovalButtons.AllowDeny

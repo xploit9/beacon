@@ -1,14 +1,28 @@
 package dev.hermes.android
 
+import android.view.View
+import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import androidx.compose.ui.platform.ViewRootForTest
+import androidx.compose.ui.semantics.SemanticsNode
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.semantics.getOrNull
+
 import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsDisplayed
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.lifecycle.SavedStateHandle
@@ -21,6 +35,8 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.hermes.android.core.*
 import dev.hermes.android.data.AuthContext
 import dev.hermes.android.data.NativeBearerRecord
+import dev.hermes.android.data.ScreenCache
+import dev.hermes.android.data.screenRequest
 import dev.hermes.android.ui.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,6 +62,43 @@ import java.io.File
 class ColdStaleChatDeviceTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     private val app get() = ApplicationProvider.getApplicationContext<BeaconApplication>()
+    private val openSection = mutableStateOf("")
+
+    /** Sample the first draw containing the destination, including its reconnect alternative. A later refresh cannot satisfy it. */
+    private fun firstDraw(label: String, destination: (Set<String>) -> Boolean, content: (Set<String>) -> Boolean, navigate: () -> Unit) {
+        val view = compose.activity.window.decorView
+        val observed = java.util.concurrent.atomic.AtomicReference<Boolean?>(null)
+        val markers = java.util.concurrent.atomic.AtomicReference("")
+        val listener = ViewTreeObserver.OnDrawListener {
+            if (observed.get() == null) {
+                val values = mutableSetOf<String>()
+                fun node(n: SemanticsNode) {
+                    if (!n.layoutInfo.isPlaced) return
+                    n.config.getOrNull(SemanticsProperties.TestTag)?.let(values::add)
+                    n.config.getOrNull(SemanticsProperties.Text)?.forEach { values += it.text }
+                    n.config.getOrNull(SemanticsProperties.ContentDescription)?.let(values::addAll)
+                    n.children.forEach(::node)
+                }
+                fun walk(v: View) {
+                    if (v is ViewRootForTest) node(v.semanticsOwner.unmergedRootSemanticsNode)
+                    if (v is ViewGroup) for (i in 0 until v.childCount) walk(v.getChildAt(i))
+                }
+                android.view.inspector.WindowInspector.getGlobalWindowViews().forEach(::walk)
+                if (destination(values)) {
+                    markers.set(listOf("settings-skeleton", "settings-reconnect", "skill-hero", "Instructions", "skill-edit",
+                        "Saved skill directions", "composer-approvals", "composer-model-effort", "reasoning-skeleton", "reasoning-level:high")
+                        .filter(values::contains).joinToString())
+                    observed.set(content(values))
+                }
+                if (observed.get() == null) view.postInvalidateOnAnimation()
+            }
+        }
+        try {
+            compose.runOnIdle { view.viewTreeObserver.addOnDrawListener(listener); navigate() }
+            compose.waitUntil(20_000) { observed.get() != null }
+            assertEquals("First draw of $label [${markers.get()}]", true, observed.get())
+        } finally { compose.runOnUiThread { view.viewTreeObserver.removeOnDrawListener(listener) } }
+    }
 
     private companion object {
         const val GONE = "cold-gone-chat"
@@ -89,7 +142,7 @@ class ColdStaleChatDeviceTest {
         val prior = runBlocking { app.preferences.data.first() }
         val owners = listOf(scope, scope.copy(profile = "coder"))
         val ownerKinds = listOf("new-chat-shell", "new-chat-attempt", "initial-draft", "selected-session", "conversation-index", "beacon-session", "beacon-opening", "read-invalidated-at")
-        val chatKinds = listOf("pending", "draft", "session", "running-turn", "side-question", "alerts", "client-created-shell", "live:runtime-chat-a", "live:chat-a")
+        val chatKinds = listOf("pending", "draft", "session", "running-turn", "live-turn", "side-question", "alerts", "client-created-shell", "live:runtime-chat-a", "live:chat-a")
         fun clean() = runBlocking {
             owners.forEach { owner ->
                 ownerKinds.forEach { app.cache.delete(owner, it) }
@@ -131,7 +184,13 @@ class ColdStaleChatDeviceTest {
                 val settings by vm.data.collectAsState()
                 val prefs by vm.preferences.collectAsState()
                 CompositionLocalProvider(LocalBeaconSettings provides (settings["profile-settings"] ?: JSONObject()), LocalAssistantName provides prefs.assistantName) {
-                    NativeLocalization("en") { BeaconTheme(dark = true) { NativeWindowLayout(compose.activity) { Box(Modifier.fillMaxSize()) { BeaconRoot(vm) } } } }
+                    NativeLocalization("en") { BeaconTheme(dark = true) { NativeWindowLayout(compose.activity) { Box(Modifier.fillMaxSize()) {
+                        when (openSection.value) {
+                            "Phones" -> DevicesSettingsSection(vm, pluginAbsent = false)
+                            "Call history" -> CallHistorySheet(vm, { _, _ -> }, { openSection.value = "" })
+                            else -> BeaconRoot(vm)
+                        }
+                    } } } }
                 }
             }
             block(vm, fixture)
@@ -148,6 +207,86 @@ class ColdStaleChatDeviceTest {
         compose.runOnIdle { vm.connect(fixture.scope.origin) }
         compose.waitUntil(30_000) { vm.ui.value.authenticated && vm.ui.value.connected && !vm.ui.value.loading }
         if (wizard) compose.runOnIdle { vm.finishSetupWizard(keepConnected = false) }
+    }
+
+    @Test(timeout = 120_000) fun aFreshViewModelShowsSavedComposerAndSettingsBeforeAnyServerAnswer() = withColdPhone(setupDone = true) { vm, fixture ->
+        val owner = fixture.scope
+        val account = owner.copy(profile = "", session = "")
+        val prior = runBlocking { app.cache.read(account, "screens") }
+        try {
+            runBlocking {
+                val seed = ScreenCache({ null }, { scope, text -> app.cache.write(scope, "screens", text) }, {}, this, quietMs = 0)
+                seed.open(owner)
+                seed.set(owner, "picker:approvals", json("scope_key" to owner.key, "session_id" to GONE, "profile_mode" to "smart",
+                    "session_status_known" to true, "session_bypass" to true), screenRequest("/api/approval/mode", mapOf("session_id" to GONE)))
+                seed.set(owner, "profile-defaults", json("scope_key" to owner.key, "profile" to owner.profile, "model" to "Fixture Atlas",
+                    "reasoning_effort" to "high"), "/api/profile/defaults")
+                seed.set(owner, "native-mcp", json("servers" to JSONArray().put(json("name" to "Offline fixture MCP", "transport" to "stdio",
+                    "enabled" to true))), "/api/mcp/servers")
+                seed.set(owner, "settings:health", json("status" to json("overall" to "ok", "version" to "9.8.7", "gateway_state" to "running")))
+                seed.set(owner, "settings:update-check", json("update_available" to false, "current_version" to "9.8.7"))
+                seed.set(owner, "settings:logs:errors", json("count" to 7))
+                seed.set(owner, "settings:memory", json("status" to json("active" to "builtin"), "notes" to json("documents" to JSONArray().put(
+                    json("target" to "memory", "content" to "Persisted fixture note", "revision" to "a".repeat(64), "enabled" to true, "limit" to 2000)))))
+                seed.set(owner, "settings:backups", json("checkpoints" to JSONArray(), "total_bytes" to 0))
+                seed.set(owner, "native-usage:${owner.profile}:$GONE", json("input_tokens" to 37, "output_tokens" to 14),
+                    screenRequest("/api/session/usage", mapOf("session_id" to GONE)))
+                val assistant = vm.preferences.value.assistantProfile
+                seed.set(owner, agentPhoneCacheKey(assistant), json("installed" to true, "yours" to true, "profile" to assistant,
+                    "phone" to "on", "install" to json("state" to "idle")).put(PAGE_POLICY, json("enabled" to true, "ask" to "every_action")))
+                seed.set(owner, "paired-devices", json("devices" to JSONArray().put(json("id" to "second", "name" to "Previously linked fixture phone"))))
+                seed.set(owner, CALL_HISTORY_KEY, json("calls" to JSONArray().put(json("id" to "first-call", "conversation_id" to GONE,
+                    "direction" to "outgoing", "state" to "completed", "started_at" to 1_800_000_000, "duration_s" to 60, "reason" to "Saved fixture call"))))
+                seed.set(owner, "settings:skills", json("items" to JSONArray().put(json("name" to "trip-planning", "description" to "Offline planning",
+                    "enabled" to true, "requirements" to JSONArray(), "category" to "travel", "essential" to false, "provenance" to "fixture"))))
+                seed.set(owner, "skill-content:trip-planning", json("name" to "trip-planning", "content" to "Saved skill directions", "revision" to "a".repeat(64)))
+                seed.set(owner, "picker:reasoning", json("value" to "high", "known" to true, "options" to JSONArray(listOf("low", "high"))),
+                    screenRequest("/api/reasoning", mapOf("session_id" to GONE, "model" to "", "provider" to "")))
+                seed.flush(owner)
+                val raw = staleSnapshot(fixture).apply {
+                    listOf("model", "model_provider", "reasoning", "reasoning_effort", "info", "model_config").forEach(::remove)
+                }
+                app.cache.write(owner.session(GONE), "session", raw.toString())
+            }
+            fixture.refuseConnection = true
+            firstDraw("restored composer", {
+                vm.ui.value.authenticated && vm.authenticatedScope() == owner.session(GONE) &&
+                    "composer-approvals" in it && "composer-model-effort" in it
+            }, { words ->
+                "Approvals: Don't ask" in words && words.any { it.equals("Fixture Atlas", true) } && words.any { it.equals("high", true) }
+            }) { vm.connect(owner.origin) }
+            compose.waitUntil(20_000) { vm.ui.value.authenticated && vm.chat.value.sessionId == GONE && vm.chat.value.projectionReady }
+            compose.onNodeWithContentDescription("Approvals: Don't ask").assertIsDisplayed()
+            compose.onNodeWithText("Fixture Atlas", ignoreCase = true, useUnmergedTree = true).assertIsDisplayed()
+            compose.onNodeWithText("high", ignoreCase = true, useUnmergedTree = true).assertIsDisplayed()
+            firstDraw("MCP servers", { "tools-search" in it || "settings-reconnect" in it }, { "Offline fixture MCP" in it }) { vm.more("MCP servers") }
+            compose.onNodeWithText("Offline fixture MCP", useUnmergedTree = true).assertIsDisplayed()
+            firstDraw("Health", { "server-health-hero" in it || "settings-reconnect" in it }, { "Hermes 9.8.7" in it }) { vm.more("Health") }
+            firstDraw("Logs", { "server-log-lines" in it || "settings-reconnect" in it }, { "7" in it }) { vm.more("Logs") }
+            firstDraw("Memory", { "memory-page" in it || "settings-reconnect" in it }, { "Persisted fixture note" in it }) { vm.more("Memory") }
+            firstDraw("Server updates", { "server-update-hero" in it || "settings-reconnect" in it }, { it.any { line -> "9.8.7" in line } }) { vm.more("Server updates") }
+            firstDraw("File backups", { "File backups" in it && ("No backups yet." in it || "settings-skeleton" in it || "settings-reconnect" in it) },
+                { "No backups yet." in it }) { vm.more("Session checkpoints") }
+            firstDraw("Session usage", { "usage-page" in it || "settings-reconnect" in it }, { "37" in it && "14" in it }) { vm.more("Session usage") }
+            firstDraw("Agent phone", { "agent-phone-page" in it || "settings-reconnect" in it }, { "agent-phone-use" in it || "agent-phone-hero-line" in it }) { vm.more(AGENT_PHONE_ROUTE) }
+            firstDraw("Skills", { "skills-page" in it || "settings-reconnect" in it }, { "Offline planning" in it }) { vm.more("Skills") }
+            val openSkill = compose.onNodeWithTag("skill-row-trip-planning").assertIsEnabled().fetchSemanticsNode()
+                .config[androidx.compose.ui.semantics.SemanticsActions.OnClick].action!!
+            firstDraw("Skill instructions", { "skill-hero" in it }, { "Saved skill directions" in it }) {
+                check(openSkill())
+            }
+            firstDraw("Linked phones", { "Other phones" in it || "Reconnect to see devices" in it }, { "Previously linked fixture phone" in it }) { openSection.value = "Phones" }
+            firstDraw("Call history", { "call-history-close" in it }, { "Saved fixture call" in it }) { openSection.value = "Call history" }
+            compose.runOnIdle { openSection.value = ""; vm.tab("Chat") }
+            firstDraw("Reasoning", { "reasoning-skeleton" in it || "reasoning-level:high" in it }, { "reasoning-level:high" in it && "reasoning-skeleton" !in it }) {
+                vm.openCatalog("Reasoning")
+            }
+            assertFalse(vm.ui.value.connected)
+        } finally {
+            runBlocking {
+                if (prior == null) app.cache.delete(account, "screens") else app.cache.write(account, "screens", prior)
+            }
+        }
     }
 
     /**
@@ -359,5 +498,33 @@ class ColdStaleChatDeviceTest {
             assertFalse("chat-a's raw projection carries another chat's id: $state", state.substringAfterLast('|') == GONE)
         }
         assertEquals("chat-a opens under its own title. States: ${seenRows.distinct()}", "Travel planning", vm.chat.value.title)
+    }
+
+    /**
+     * H1b P0-1, related (UX pass): Beacon's own chat was the saved selection (opening Beacon used to save it), so a start on the Chat tab reopened it
+     * there, untitled, as "New chat". Beacon's chat opens on Beacon's tab only.
+     */
+    @Test(timeout = 150_000) fun beaconsChatNeverReopensOnTheChatTabAfterARestart() = withColdPhone(setupDone = true) { _, fixture ->
+        fun saveBeaconAsSelection() = runBlocking {
+            app.cache.write(fixture.scope, "beacon-session", "chat-b", protected = true)
+            app.cache.write(fixture.scope, "selected-session", "chat-b", protected = true)
+        }
+        saveBeaconAsSelection()
+        // The first view model's own start-up settles before the saved state is written for the last time.
+        android.os.SystemClock.sleep(1_500); compose.waitForIdle(); saveBeaconAsSelection()
+        val restarted = ViewModelStore()
+        try {
+            lateinit var next: BeaconViewModel
+            compose.runOnUiThread { next = ViewModelProvider(restarted, viewModelFactory { initializer { BeaconViewModel(app, SavedStateHandle()) } })[BeaconViewModel::class.java] }
+            compose.waitUntil(10_000) { !next.ui.value.restoringSession }
+            compose.runOnIdle {
+                next.profileSwitchClientFactoryForTest = { auth -> fixture.freshClientFor(auth, app.auth) }
+                flow<AppState>(next, "_ui").value = next.ui.value.copy(setupWizard = false, setupComplete = true, tab = "Chat")
+                next.connect(fixture.scope.origin)
+            }
+            compose.waitUntil(30_000) { next.ui.value.authenticated && next.ui.value.connected && !next.ui.value.loading }
+            android.os.SystemClock.sleep(1_500); compose.waitForIdle()
+            assertNotEquals("Beacon's chat opened on the Chat tab: ${describe(next, fixture)}", "chat-b", next.chat.value.sessionId)
+        } finally { compose.runOnUiThread { restarted.clear() } }
     }
 }

@@ -56,6 +56,20 @@ private val canonicalModelGuards = linkedMapOf<String, CanonicalModelGuard>()
 internal val nativeApprovalModes = listOf("manual", "smart", "off")
 /** Session detail keeps SQLite 0/1 flags; session lists expose booleans. */
 internal fun nativeSessionFlag(row: JSONObject, key: String): Boolean = row.optBoolean(key) || (row.opt(key) as? Number)?.toDouble() == 1.0
+/** True when Hermes' live counters hold no tokens (a runtime that was recycled), so its zeros say nothing about the chat. */
+internal fun liveUsageIsEmpty(live: JSONObject): Boolean =
+    listOf("input", "input_tokens", "output", "output_tokens").all { (live.opt(it) as? Number)?.toLong().let { n -> n == null || n == 0L } }
+
+/** The live usage with the stored row's token totals (Hermes' `input_tokens`, `output_tokens`, cache and reasoning columns) when the row has any. */
+internal fun usageWithStoredTotals(live: JSONObject, row: JSONObject): JSONObject {
+    fun stored(key: String) = (row.opt(key) as? Number)?.toLong() ?: 0L
+    if (stored("input_tokens") + stored("output_tokens") <= 0L) return live
+    return live.copy().apply {
+        for (zero in listOf("prompt", "completion", "input", "output", "reasoning")) remove(zero)
+        for (key in listOf("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")) if (row.has(key)) put(key, stored(key))
+    }
+}
+
 internal fun nativeHistoryStamp(row: JSONObject): List<String>? =
     if (row.opt("message_count") !is Number || row.opt("last_active") !is Number) null else
         listOf("message_count", "last_active", "title", "model", "provider", "model_config", "cwd", "hidden", "archived", "ended_at")
@@ -209,6 +223,8 @@ internal fun chatKeepsApprovalOrSpeed(session: JSONObject): Boolean {
     return config.optBoolean("yolo_mode") || config.string("service_tier").trim().lowercase() !in setOf("", "normal", "default", "standard", "off", "none")
 }
 private val storedSessionId = Regex("[A-Za-z0-9_.:-]{1,256}")
+/** The session sources Hermes runs as classic-CLI turns (gateway/session_policy.SURFACES to "cli", and kanban). */
+private val CLI_SURFACES = setOf("cli", "tool", "oneshot", "kanban")
 // Stock dashboard bounds: /api/sessions pages reject limit > 100; Beacon keeps its 200-row drawer window.
 private const val SESSION_PAGE_LIMIT = 100
 private const val SESSION_INDEX_WINDOW = 200
@@ -971,7 +987,11 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/session/usage" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
-                return c.nativeTurnRpc(lease, if (lease.authority) "session.stats" else "session.usage", json("session_id" to b.runtimeSessionId))
+                val live = c.nativeTurnRpc(lease, if (lease.authority) "session.stats" else "session.usage", json("session_id" to b.runtimeSessionId))
+                // A recycled runtime counts from zero; Hermes keeps the chat's real totals on its stored row.
+                if (!liveUsageIsEmpty(live)) return live
+                val row = try { c.nativeGet("/api/sessions/${b.storedSessionId}", mapOf("profile" to c.auth.profile)) } catch (e: CancellationException) { throw e } catch (_: Exception) { return live }
+                return usageWithStoredTotals(live, row)
             }
             "/api/session/update" -> {
                 val b = binding()
@@ -1111,8 +1131,9 @@ internal class NativeOperations(private val c: BeaconClient) {
             if (!info.has("profile_id") || info.isNull("profile_id")) return null
             return (info.opt("profile_id") as? String)?.takeIf(String::isNotBlank) ?: error("The admission belongs to another conversation")
         }
-        val profile = profileId(snapshot.optJSONObject("info"))
-            ?: profileId(c.nativeTurnRpc(lease, "session.info", json("session_id" to b.runtimeSessionId)))
+        var info = snapshot.optJSONObject("info")
+        val profile = profileId(info)
+            ?: profileId(c.nativeTurnRpc(lease, "session.info", json("session_id" to b.runtimeSessionId)).also { info = it })
             ?: return json("status" to "unknown")
         var admission = knownAdmission
         if (admission.isBlank()) {
@@ -1141,6 +1162,16 @@ internal class NativeOperations(private val c: BeaconClient) {
         // The committed settlement rows outlive the runtime event ring; use them first, then fall
         // back to the retained message.complete event for older native versions without a stored result.
         val settled = if (completedProof) nativeSettledTurn(receipt, input) else null
+        // R3-F5: a steer that came after the turn's last tool step is left over when the turn ends. On a classic-CLI surface (every chat Beacon
+        // creates: a canonical create without a source is "cli") Hermes hands it back here for the client to send as its own next turn
+        // (gateway/session_cli_turn.take_cli_result_fields); on any other surface Hermes runs it itself as the turn's follow-up.
+        receipt.optJSONObject("result")?.takeIf { completedProof }?.let { result ->
+            when (info?.string("source").orEmpty()) {
+                "" -> Unit
+                in CLI_SURFACES -> receipt.put("pending_steer", result.opt("pending_steer") as? String ?: "")
+                else -> receipt.put("steer_followup", true)
+            }
+        }
         receipt.remove("result")
         receipt.remove("usage")
         if (settled != null) {
@@ -1179,9 +1210,13 @@ internal class NativeOperations(private val c: BeaconClient) {
     private suspend fun saveTextFile(fields: JSONObject): JSONObject {
         require(fields.opt("content") is String && fields.opt("expected_content") is String) { "Reopen this file before saving; its disk revision is required." }
         val text = fields.string("content")
-        require(text.toByteArray(Charsets.UTF_8).size.toLong() + text.count { it == '\n' } <= 512 * 1024 && '\u0000' !in text) { "This file can't be edited on the phone. Your draft is kept." }
+        // The plugin keeps the disk's newlines and checks the exact bytes itself; the client checks only the normalized length.
+        val normalized = text.replace("\r\n", "\n")
+        require(normalized.toByteArray(Charsets.UTF_8).size <= 512 * 1024 && '\u0000' !in text) { "This file can't be edited on the phone. Your draft is kept." }
         try { return c.nativeRequest("/api/plugins/beacon/mobile/files/text", "POST", fields) }
         catch (error: ApiFailure) { if (error.status != 404 && !(error.plugin && error.status == 401)) throw error }
+        // Stock Hermes writes platform newlines the client cannot see: assume each newline may become two bytes.
+        require(normalized.toByteArray(Charsets.UTF_8).size.toLong() + normalized.count { it == '\n' } <= 512 * 1024) { "This file can't be edited on the phone. Your draft is kept." }
         val path = fields.getString("path")
         val latest = nativeTextFile(path)
         require('\uFFFD' !in latest.string("text") && '\uFFFD' !in fields.getString("expected_content")) { "This file can't be edited here." }
@@ -1302,7 +1337,7 @@ internal class NativeOperations(private val c: BeaconClient) {
         // Words inside the messages find a chat too: Hermes' own search answers for the chats a title cannot.
         val found = listed.map { it.first }.toSet()
         val shown = listed + (if (query.isBlank() || archived) emptyList() else sessionContentHits(query, threads, hiddenSources, found))
-        return json("sessions" to JSONArray(shown.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden")) }),
+        return json("sessions" to JSONArray(shown.map { (id, row) -> row.copy().put("session_id", id).put("profile", c.auth.profile).put("archived", nativeSessionFlag(row, "archived") || nativeSessionFlag(row, "hidden")).put("pinned", nativeSessionFlag(row, "pinned")) }),
             "search_scope" to "Conversation titles and message text", "limit" to SESSION_INDEX_WINDOW)
     }
 
@@ -1524,6 +1559,7 @@ internal class NativeOperations(private val c: BeaconClient) {
                 "tool.start" -> "tool"
                 "tool.complete" -> "tool_complete"
                 "session.title" -> "title"
+                "session.info" -> "session_info"
                 "approval" -> "approval"
                 "clarify" -> "clarify"
                 "request.cancel" -> "request_cancel"

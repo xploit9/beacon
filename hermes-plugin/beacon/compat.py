@@ -24,6 +24,7 @@ def _scan(body, aliases, path, found, optional=False):
     """Adds requirement groups to found: tuples of (module, name, attribute, file, optional); a group holds when any entry does."""
     scope = dict(aliases)
     nested = []
+    fallback = [False]  # inside an except handler that imports: the module bound there is the guarded alternative
 
     def need(entries):
         found.append(tuple(entries))
@@ -37,8 +38,12 @@ def _scan(body, aliases, path, found, optional=False):
             alternatives = any(isinstance(n, (ast.Import, ast.ImportFrom)) for h in node.handlers for n in ast.walk(h))
             guarded = bool(node.handlers) and all(_caught(h) and _caught(h) <= _IMPORT_ERRORS for h in node.handlers)
             local = [] if alternatives else group
-            for child in node.body + [c for h in node.handlers for c in h.body]:
+            for child in node.body:
                 visit(child, local, optional or (guarded and not alternatives))
+            for child in [c for h in node.handlers for c in h.body]:
+                fallback[0] = alternatives
+                visit(child, local, optional or (guarded and not alternatives))
+                fallback[0] = False
             for child in node.orelse + node.finalbody:
                 visit(child, group, optional)
             if alternatives and local:
@@ -53,14 +58,14 @@ def _scan(body, aliases, path, found, optional=False):
                 bound = [((a.name, None), a.asname) for a in node.names]
                 for a in node.names:
                     if not a.asname:
-                        scope[a.name.split('.')[0]] = (a.name.split('.')[0], None, optional)
+                        scope[a.name.split('.')[0]] = (a.name.split('.')[0], None, optional or fallback[0])
             for (module, name), alias in bound:
                 if module.startswith('beacon_'):
                     continue  # siblings loaded under a beacon_ key
                 entry = (module, name, None, path, optional)
                 group.append(entry) if group is not None else need([entry])
                 if alias:
-                    scope[alias] = (module, name, optional)
+                    scope[alias] = (module, name, optional or fallback[0])
             return
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ('getattr', 'hasattr') \
                 and len(node.args) >= 2 and isinstance(node.args[0], ast.Name) and isinstance(node.args[1], ast.Constant):
@@ -211,6 +216,9 @@ CARD_STOPS = 'Using a saved card on any site needs a Beacon update for this Herm
 # saved logins, cards and codes on the assistant's phone, and the phone itself keeps working.
 PHONE_VAULT_FILE = 'agent_phone_vault.py'
 PHONE_VAULT_STOPS = "Saved logins on the assistant's phone need a Beacon update for this Hermes"
+# Hermes' waits on a person (tools/human_input_hooks.py) are how the phone hears of a question or approval in the background.
+ALERT_HOOKS = 'hook on_human_input_'
+ALERT_STOPS = 'Question and approval alerts on the phone need a Beacon update for this Hermes'
 
 
 def stopped(gone):
@@ -222,7 +230,37 @@ def stopped(gone):
         sentences.append(CARD_STOPS)
     if any(f'({PHONE_VAULT_FILE})' in line for line in gone):
         sentences.append(PHONE_VAULT_STOPS)
+    if any(line.startswith(ALERT_HOOKS) for line in gone):
+        sentences.append(ALERT_STOPS)
     return sentences
+
+
+def hooks(root=ROOT):
+    """Each Hermes lifecycle hook the plugin registers by name, as (name, file)."""
+    found = set()
+    for source in sorted(root.rglob('*.py')):
+        if 'tests' in source.relative_to(root).parts:
+            continue
+        for node in ast.walk(ast.parse(source.read_text(encoding='utf-8-sig'))):
+            if (isinstance(node, ast.Call) and getattr(node.func, 'attr', getattr(node.func, 'id', None)) == 'register_hook'
+                    and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str)):
+                found.add((node.args[0].value, source.relative_to(root).as_posix()))
+    return sorted(found)
+
+
+def missing_hooks(found, hermes_root):
+    """Each hook this Hermes never fires, as 'hook name (file)'. Hermes keeps a hook it does not know with only a warning, so a
+    renamed one would leave its feature silent."""
+    path = Path(hermes_root) / 'hermes_cli' / 'plugins.py'
+    valid = None
+    if path.is_file():
+        for node in ast.walk(ast.parse(path.read_text(encoding='utf-8-sig'))):
+            target = node.target if isinstance(node, ast.AnnAssign) else node.targets[0] if isinstance(node, ast.Assign) else None
+            if isinstance(target, ast.Name) and target.id == 'VALID_HOOKS' and node.value is not None:
+                valid = {n.value for n in ast.walk(node.value) if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+    if valid is None:
+        return ['hermes_cli.plugins.VALID_HOOKS (hooks)']
+    return sorted(f'hook {name} ({file})' for name, file in found if name not in valid)
 
 
 def missing(groups, hermes_root):

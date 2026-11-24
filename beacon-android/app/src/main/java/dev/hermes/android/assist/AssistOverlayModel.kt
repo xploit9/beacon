@@ -1,7 +1,9 @@
 package dev.hermes.android.assist
 
 import dev.hermes.android.ChatState
+import dev.hermes.android.fileNotSent
 import dev.hermes.android.data.APP_CONNECTION_ERROR
+import dev.hermes.android.core.QueuedMessage
 import dev.hermes.android.core.rows
 import dev.hermes.android.ui.BeaconDustMood
 import dev.hermes.android.ui.presenceState
@@ -35,7 +37,7 @@ internal enum class OverlayPhase { Summoning, Open, Dismissing, Hidden }
  * One short line the overlay shows instead of failing quietly. Each has one action, if any. [Unlock] is the locked phone's: the
  * conversation turned something private away (see [unlockAsked]), and the unlock lets it go on.
  */
-internal enum class OverlayLine { Microphone, VoiceKey, SignIn, NotHeard, NoRecognizer, NotSent, CallFailed, Waiting, Unlock }
+internal enum class OverlayLine { Microphone, VoiceKey, SignIn, NotHeard, NoRecognizer, NotSent, Queued, CallFailed, Waiting, Unlock }
 
 /**
  * Why a call didn't start or dropped, for the reasons the call words itself ([full] is its constant in DirectVoice.kt, or the app's
@@ -141,7 +143,7 @@ internal fun reduce(state: AssistOverlayState, event: OverlayEvent): AssistOverl
             // Then the late reply takes the line's place and the card comes back: it was sent.
             else -> state.copy(ask = ask.copy(answer = event.answer, streaming = event.streaming, failed = false),
                 surface = if (ask.failed && state.surface == OverlaySurface.Pill) OverlaySurface.Answer else state.surface,
-                line = if (ask.failed && state.line == OverlayLine.NotSent) null else state.line)
+                line = if (ask.failed && (state.line == OverlayLine.NotSent || state.line == OverlayLine.Queued)) null else state.line)
         }
     } ?: state
     // The question goes back in the field and the line offers Try again; no empty card repeats it.
@@ -347,7 +349,7 @@ internal enum class LineAction { Allow, Open, SignIn, TryAgain, CallAgain, OpenW
 /** An expired sign-in can't be fixed by calling again: its action opens Beacon (unlocked first) to sign in. */
 internal fun lineAction(line: OverlayLine, reason: CallReason? = null): LineAction? = when (line) {
     OverlayLine.Microphone -> LineAction.Allow
-    OverlayLine.VoiceKey, OverlayLine.SignIn -> LineAction.Open
+    OverlayLine.VoiceKey, OverlayLine.SignIn, OverlayLine.Queued -> LineAction.Open
     OverlayLine.NotSent -> LineAction.TryAgain
     OverlayLine.CallFailed -> if (reason == CallReason.SignInExpired) LineAction.SignIn else LineAction.CallAgain
     OverlayLine.Waiting -> LineAction.OpenWaiting
@@ -355,6 +357,10 @@ internal fun lineAction(line: OverlayLine, reason: CallReason? = null): LineActi
     OverlayLine.Unlock -> LineAction.Unlock
     OverlayLine.NotHeard, OverlayLine.NoRecognizer -> null
 }
+
+/** S1d (R3 #5, R4 #1): the assistant chat's box holds this question and sends it by itself (offline, not a refused file), so the overlay must not hand it back too. A settled Not sent copy goes only on the owner's Send, so it falls back to Try again. */
+internal fun queuedInBox(queued: List<QueuedMessage>, question: String): Boolean =
+    queued.any { it.text == question && it.state == "queued" && !it.fileNotSent() }
 
 /** After a send failed the question goes back in the field, unless the owner already typed something new there. */
 internal fun draftAfterNotSent(draft: String, question: String): String = draft.ifBlank { question }

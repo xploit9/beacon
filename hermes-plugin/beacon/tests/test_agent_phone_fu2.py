@@ -286,7 +286,7 @@ def test_a_password_field_reaches_the_app_as_keyboard_password_with_the_hosts_ex
         await task
         return raw
     raw = streamtest.run(main())
-    assert '{"t":"state","helper":"ready","keyboard":"password","rotation":0,"prompt":null,"lease":"you"}' in raw
+    assert '{"t":"state","helper":"ready","keyboard":"password","rotation":0,"prompt":null,"lease":"you","epoch":1}' in raw
 
 
 def test_the_probe_reads_androids_own_field_type_measured_on_a_fresh_phone():
@@ -390,4 +390,4 @@ def test_the_debugging_prompts_state_line_is_the_exact_one_the_app_parses(tmp_pa
         await task
         return raw
     raw = streamtest.run(main())
-    assert '{"t":"state","helper":"ready","keyboard":false,"rotation":0,"prompt":"usb_debugging","lease":"you"}' in raw
+    assert '{"t":"state","helper":"ready","keyboard":false,"rotation":0,"prompt":"usb_debugging","lease":"you","epoch":1}' in raw

@@ -27,6 +27,7 @@ internal class HermesPluginUpdater(
         // "gateway" is the version the Hermes gateway loaded; a plugin that predates it sends nothing, and "" means Hermes does not know.
         val gateway = (response.opt("gateway") as? String).orEmpty().trim().takeIf { PLUGIN_VERSION_PATTERN.matches(it) }.orEmpty()
         val versions = PluginVersions(response.getString("running"), response.getString("installed"), gateway)
+        if (versions.running.isBlank() && versions.installed.isBlank()) throw BlankPluginVersion()
         require(versions.running.isNotBlank() && versions.installed.isNotBlank())
         return versions
     }

@@ -102,6 +102,13 @@ def producer_running(value):
 
 NATIVE_READ_ONLY = frozenset({'read_file','search_files','web_search','skills_list','skill_view','session_search'})
 NATIVE_READ_ONLY_ACTIONS = {'cronjob_manage': frozenset({'list'}), 'process_manage': frozenset({'list'})}
+# Beacon's own agent_phone tool (agent_phone_tools NAME and TOOLSET): these actions only look at its phone, so Auto runs them like
+# reads, and so does wait, which changes nothing. Opening apps, inputs, a task (no action) and vault_list (it shows which saved
+# logins exist) stay changes. Only Beacon's tools are classified here, never Hermes' own.
+BEACON_READ_ONLY_ACTIONS = {('agent_phone', 'beacon-agent-phone'): frozenset({'status', 'capture', 'list_apps', 'wait'})}
+# Reads of live state that changes by itself (the phone's screen), and a wait, whose point is the time it takes: the receipt says
+# `live`, so the app asks again instead of handing back an earlier answer to the same request.
+BEACON_LIVE_READS = {('agent_phone', 'beacon-agent-phone'): frozenset({'capture', 'wait'})}
 # Hermes runs these in its agent loop, where their state lives; voice_context gives a call the same state.
 INLINE_TOOLS = frozenset({'memory','session_search'})
 CALL_EXCLUDED_TOOLS = frozenset({'manage_connections','manage_catalog','setup_mcp',
@@ -586,8 +593,21 @@ def inline_tool(tool, arguments, scope, session_id):
 def tool_read_only(tool, arguments):
     if tool.get('read_only'): return reads_by_method(arguments,{'parameters':tool.get('parameters')}) and not writes_by_action(arguments)
     if tool.get('_kind')!='hermes': return False
-    name=tool.get('_raw')
-    return arguments.get('action') in NATIVE_READ_ONLY_ACTIONS.get(name,())
+    name,action=tool.get('_raw'),arguments.get('action')
+    return action in NATIVE_READ_ONLY_ACTIONS.get(name,()) or action in BEACON_READ_ONLY_ACTIONS.get((name,tool.get('_toolset')),())
+
+
+def agent_phone_app(tool, arguments):
+    """The app Beacon's own phone step opens, by the name the phone showed for it, so the call's card says "Open Clock" (R3-F10).
+    Only names read before: no phone lookup in the request. '' when unknown (the card then says the package)."""
+    if (tool.get('_raw'),tool.get('_toolset')) not in BEACON_READ_ONLY_ACTIONS or arguments.get('action')!='open_app': return ''
+    phone=sys.modules.get('beacon_agent_phone_tools')
+    try: return plain_line(phone.known_label(arguments.get('package')) or '',80) if phone else ''
+    except Exception: return ''  # a name is a nicety; the card still names the package
+
+
+def tool_live(tool, arguments):
+    return tool.get('_kind')=='hermes' and arguments.get('action') in BEACON_LIVE_READS.get((tool.get('_raw'),tool.get('_toolset')),())
 
 
 def tool_words(tool):
@@ -1360,7 +1380,7 @@ def receipt_v3(value):
     shown='running' if status=='ready' else status
     out={'request_id':value['request_id'],'tool_id':value.get('tool_id'),'tool':value.get('_tool') or value.get('tool_name'),
          'tool_name':value.get('tool_name'),'status':shown,'read_only':bool(value.get('_read_only')),
-         'approved_by':value.get('approved_by'),
+         **({'live':True} if value.get('_live') else {}),'approved_by':value.get('approved_by'),
          'ran_on_hermes':shown in ('running','completed') or shown=='uncertain' or bool(value.get('_dispatched')) and shown=='failed',
          'server_ms':dict(value.get('_timings_ms') or {})}
     if shown=='completed':
@@ -1775,7 +1795,7 @@ class Gateway:
         shown_name=plain_line(tool['name'],MAX_TOOL_NAME)
         result={'request_id':request,'tool_id':tool['tool_id'],'tool_name':shown_name,
                 'status':'needs_approval' if needs_approval else 'ready','approved_by':approved_by,
-                '_arguments':arguments,'_read_only':read_only,'_session_id':session_id,'_principal':principal,
+                '_arguments':arguments,'_read_only':read_only,'_live':tool_live(tool,arguments),'_session_id':session_id,'_principal':principal,
                 '_expires':time.time()+120,'_tool':declared}
         if '_timeout' in tool:
             result['_deadline_seconds']=max(DEADLINE,float(tool['_timeout'])+float(tool.get('_connect_timeout') or 0)+30)
@@ -1789,7 +1809,8 @@ class Gateway:
                 if v3: return refused_v3(request,declared,'invalid_arguments','These arguments cannot be shown accurately for approval; remove sensitive values.',tool,shown_name)
                 raise HTTPException(400,'These arguments cannot be shown accurately for approval; remove sensitive values') from None
             result['proposal']={'id':secrets.token_urlsafe(32),'tool_name':shown_name,'arguments':displayed,
-                                **({'allow_call':False} if tool.get('_kind')=='hermes' else {})}
+                                **({'allow_call':False} if tool.get('_kind')=='hermes' else {}),
+                                **({'app_label':label} if (label:=agent_phone_app(tool,arguments)) else {})}
         with self.db() as conn:
             previous=self._row(conn,scope,request)
             if previous:
@@ -1985,7 +2006,11 @@ class Gateway:
             oversized=len(encoded(result).encode())>MAX_RESULT
             if oversized: result={'text':text.encode()[:MAX_RESULT//8].decode('utf-8',errors='ignore'),'truncated':True}
             update={'status':state,'result':result,'truncated':len(raw)>MAX_RESULT or oversized}
-            if state!='completed': update['_error_code']='tool_error' if state=='failed' else 'outcome_unknown'
+            if (current.get('_kind')=='hermes' and (current.get('_raw'),current.get('_toolset')) in BEACON_READ_ONLY_ACTIONS
+                    and isinstance(result,dict) and result.get('error')=='busy' and type(result.get('not_started')) is bool):
+                # A takeover during a write may follow an input. Keep its uncertainty and tell the call why the phone stopped.
+                update.update(status='failed' if result['not_started'] else state,_error_code='phone_in_use',reason="You're using the phone")
+            elif state!='completed': update['_error_code']='tool_error' if state=='failed' else 'outcome_unknown'
         except HTTPException as error:
             changed=not dispatched and error.detail in ('Tool configuration changed','Tool access classification changed')
             update={'status':'uncertain' if dispatched and not tool['read_only'] else 'failed',

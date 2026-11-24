@@ -154,7 +154,7 @@ internal fun showReplyState(context: Context, source: String, event: String, sta
         NotificationCompat.Builder(context, alertingChannel(manager, "hermes-messages")).setSmallIcon(R.drawable.ic_beacon_notification)
             .setContentTitle(currentAssistantName).setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setAutoCancel(true).setContentIntent(open)
             .setPublicVersion(NotificationCompat.Builder(context, alertingChannel(manager, "hermes-messages")).setSmallIcon(R.drawable.ic_beacon_notification)
-                .setContentTitle(currentAssistantName).setContentText("Open Beacon to view private activity.").build())
+                .setContentTitle(currentAssistantName).setContentText(replyText(context, "Open Beacon to view private activity.")).build())
     }
     builder.setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true).setSilent(true)
         .setProgress(0, 0, state == ReplyState.Sending)

@@ -1205,6 +1205,104 @@ def test_native_mixed_tools_are_read_only_only_for_explicit_read_actions():
     assert read_only(process,{'action':'list'}) and not read_only(process,{'action':'write'})
 
 
+def test_agent_phone_looks_are_reads_in_a_call_and_its_changes_still_ask(tmp_path,monkeypatch):
+    """Q2 call 5 (22 Nov): with Auto every agent_phone primitive asked "Allow this action?", list_apps too. Auto asks for changes
+    only, Manual for everything, Full access never (owner, 4 Nov). Beacon classifies its own tool, by name and toolset, only."""
+    spec=importlib.util.spec_from_file_location('beacon_agent_phone_tools_schema',ROOT/'agent_phone_tools.py')
+    phone=importlib.util.module_from_spec(spec);spec.loader.exec_module(phone)
+    assert {(phone.NAME,phone.TOOLSET)}==set(g.BEACON_READ_ONLY_ACTIONS)
+    assert g.BEACON_READ_ONLY_ACTIONS[(phone.NAME,phone.TOOLSET)]<=set(phone.ACTIONS)
+    handled=[]
+    def handle_function_call(name,args,**kwargs):
+        handled.append((name,args));return json.dumps({'success':True})
+    monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(handle_function_call=handle_function_call))
+    monkeypatch.setitem(sys.modules,'gateway',SimpleNamespace(session_context=SimpleNamespace(
+        set_session_vars=lambda **kwargs:kwargs,clear_session_vars=lambda _:None)))
+    row={'name':'agent_phone','description':'Your own Android phone','parameters':phone.SCHEMA['parameters'],
+         'read_only':False,'_kind':'hermes','_raw':'agent_phone'}
+    native=g.NativeMcp()
+    native.cache_key=lambda:None
+    native.catalog=lambda discover=True:[dict(row,tool_id='e'*64,_toolset=phone.TOOLSET),
+                                         dict(row,tool_id='f'*64,_toolset='another-plugin')]
+    mobile=Mobile(tmp_path/'native.sqlite')
+    mobile.owned=lambda conn,call,owner,profile,writable:{'conversation':'native-stored','principal':'','native_home':''}
+    api=g.Gateway(mobile,lambda profile,fn:fn(tmp_path),native,lambda value,limit:str(value)[:limit])
+    def ask(request,arguments,choice='changes',tool='e'*64):
+        return api.invoke(SCOPE,{'request_id':request,'tool_id':tool,'arguments':arguments,'approval':choice},session_id='native-stored')
+
+    for action,arguments in (('list_apps',{}),('capture',{}),('status',{}),('wait',{'seconds':1})):
+        receipt=ask('look-'+action,{'action':action,**arguments})
+        assert receipt['status']!='needs_approval' and receipt['approved_by'] is None, receipt
+        assert settled(api,'look-'+action)['status']=='completed' and handled[-1]==('agent_phone',{'action':action,**arguments})
+        # The screen changes by itself and a wait is the time it takes: those two are live, which the app asks again, never reuses.
+        shown=api.status_v3(SCOPE,'look-'+action)
+        assert shown['read_only'] is True and shown.get('live') is (True if action in ('capture','wait') else None), shown
+    ran=len(handled)
+    for request,arguments in [('open',{'action':'open_app','package':'com.google.android.deskclock'}),
+                              ('tap',{'action':'tap','element':3,'purpose':'Open Clock'}),
+                              ('type',{'action':'type','text':'alarm','purpose':'Search'}),
+                              ('task',{'task':'Open the Clock app'}),
+                              ('vault',{'action':'vault_list'})]:
+        assert ask(request,arguments)['status']=='needs_approval',request
+    assert ask('manual-look',{'action':'list_apps'},'ask')['status']=='needs_approval'
+    assert ask('other-toolset',{'action':'list_apps'},tool='f'*64)['status']=='needs_approval'
+    assert len(handled)==ran
+    full=ask('full-open',{'action':'open_app','package':'com.google.android.deskclock'},'owner')
+    assert full['status']!='needs_approval' and full['approved_by']=='owner'
+    assert settled(api,'full-open')['status']=='completed' and handled[-1][1]['action']=='open_app'
+
+
+
+@pytest.mark.parametrize('action,read_only', [('open_app', False), ('list_apps', True)])
+def test_r4_owner_busy_reaches_the_call_with_the_certain_reason(gateway, action, read_only):
+    api, backend, _ = gateway
+    original = backend.catalog()[0]
+    row = dict(original, name='agent_phone', _raw='agent_phone', _kind='hermes', _toolset='beacon-agent-phone',
+               parameters={'type':'object','properties':{'action':{'type':'string'}}}, read_only=read_only)
+    backend.catalog = lambda discover=True: [row]
+    backend.result = {'error':'busy', 'message':"You're using the phone", 'not_started':True}
+    request = {'request_id':'held', 'tool_id':row['tool_id'], 'arguments':{'action':action}, 'approval':'owner'}
+    api.invoke(SCOPE, request)
+    assert settled(api, 'held')['status'] == 'failed'
+    visible = api.status_v3(SCOPE, 'held')
+    assert (visible['error_code'], visible['reason']) == ('phone_in_use', "You're using the phone")
+    if not read_only:
+        backend.result['not_started'] = False
+        api.invoke(SCOPE, dict(request, request_id='partial'))
+        assert settled(api, 'partial')['status'] == 'uncertain'
+        assert api.status_v3(SCOPE, 'partial')['reason'] == "You're using the phone"
+        backend.result.pop('not_started')
+        api.invoke(SCOPE, dict(request, request_id='other-busy'))
+        assert settled(api, 'other-busy')['status'] == 'uncertain'
+        assert api.status_v3(SCOPE, 'other-busy')['error_code'] == 'outcome_unknown'
+
+
+def test_r3_f10_an_agent_phone_card_names_the_app_it_opens_by_the_name_read_on_the_phone(tmp_path,monkeypatch):
+    """Q2 R3-F10: the call's card read "Allow this action? · Agent Phone" for open_app. The proposal carries the app's name as Beacon last
+    read it on its phone (any Hermes process, no lookup in the request), so the card says "Open Clock"; unknown, it carries none.
+    Manual still asks for every step (the owner's 4 Nov rule)."""
+    spec=importlib.util.spec_from_file_location('beacon_agent_phone_tools',ROOT/'agent_phone_tools.py')
+    phone=importlib.util.module_from_spec(spec);spec.loader.exec_module(phone)
+    monkeypatch.setitem(sys.modules,'beacon_agent_phone_tools',phone)
+    folder=tmp_path/'phone'
+    monkeypatch.setattr(phone,'pointer',lambda:{'folder':str(folder),'profile':'default'})
+    phone._keep_label(folder,'com.google.android.deskclock','Clock')  # written by the process that opened Clock before
+    row={'name':'agent_phone','description':'Your own Android phone','parameters':phone.SCHEMA['parameters'],
+         'read_only':False,'_kind':'hermes','_raw':'agent_phone','_toolset':phone.TOOLSET,'tool_id':'e'*64}
+    native=g.NativeMcp();native.cache_key=lambda:None;native.catalog=lambda discover=True:[row]
+    mobile=Mobile(tmp_path/'native.sqlite')
+    mobile.owned=lambda conn,call,owner,profile,writable:{'conversation':'native-stored','principal':'','native_home':''}
+    api=g.Gateway(mobile,lambda profile,fn:fn(tmp_path),native,lambda value,limit:str(value)[:limit])
+    def ask(request,arguments,choice='ask'):
+        return api.invoke(SCOPE,{'request_id':request,'tool_id':'e'*64,'arguments':arguments,'approval':choice},session_id='native-stored')
+    known=ask('open-clock',{'action':'open_app','package':'com.google.android.deskclock'})
+    assert known['status']=='needs_approval' and known['proposal']['app_label']=='Clock'
+    unknown=ask('open-other',{'action':'open_app','package':'com.example.unknown'})
+    assert 'app_label' not in unknown['proposal']
+    looked=ask('manual-list',{'action':'list_apps'})
+    assert looked['status']=='needs_approval' and 'app_label' not in looked['proposal']
+
+
 @pytest.mark.parametrize('kind',['hermes','mcp'])
 def test_read_only_gateway_tools_are_stopped_by_hermes_pre_tool_hook(tmp_path,monkeypatch,kind):
     monkeypatch.syspath_prepend(str(_hermes_agent_source()))

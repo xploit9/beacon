@@ -79,7 +79,10 @@ class RepairTest {
         var installOf: () -> JSONObject = { JSONObject().put("ok", true) },
         var enableOf: () -> JSONObject = { JSONObject().put("ok", true) },
         var presence: Boolean = true,
+        startScript: List<Long?> = emptyList(),
     ) : RepairEndpoint {
+        private val starts = startScript.toMutableList()
+        override suspend fun dashboardStart(): Long? { calls += "start"; return if (starts.size > 1) starts.removeAt(0) else starts.firstOrNull() }
         val calls = mutableListOf<String>()
         private val script = versionScript.toMutableList()
         override suspend fun published(): PublishedCommit { calls += "published"; return publishedOf() }
@@ -109,6 +112,21 @@ class RepairTest {
         assertEquals(1, hermes.count("install")); assertEquals(0, hermes.count("enable"))
         assertEquals("The release is read before anything changes", "published", hermes.calls.first())
         assertNothingRestarted(hermes)
+    }
+
+    @Test fun repairIsDoneOnlyAfterTheDashboardHasRestarted() {
+        // The same version text before and after: only the dashboard's start time says the restart happened.
+        val hermes = Hermes(versionScript = listOf(current), startScript = listOf(100L, 100L, 100L, 100L, 250L))
+        assertEquals(RepairUi(RepairStage.Done, finding = RepairFinding.Healthy), repair(hermes))
+        assertEquals("one read before the install, then one per look until it changed", 5, hermes.count("start"))
+        // A dashboard that never restarts (same files, nothing to load) is not held for ever, and says nothing false.
+        val still = Hermes(versionScript = listOf(current), startScript = listOf(100L))
+        assertEquals(RepairUi(RepairStage.Done, finding = RepairFinding.Healthy), repair(still))
+        // Files that did not change need no restart; a start time it cannot read changes nothing.
+        val same = Hermes(versionScript = listOf(current), installOf = { JSONObject().put("ok", true).put("unchanged", true) }, startScript = listOf(100L))
+        assertEquals(RepairUi(RepairStage.Done, finding = RepairFinding.Healthy), repair(same)); assertEquals(1, same.count("start"))
+        val unknown = Hermes(versionScript = listOf(current))
+        assertEquals(RepairUi(RepairStage.Done, finding = RepairFinding.Healthy), repair(unknown))
     }
 
     @Test fun aBeaconThatIsOffIsTurnedOnNotReinstalled() {

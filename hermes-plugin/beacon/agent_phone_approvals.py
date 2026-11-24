@@ -38,7 +38,7 @@ ACTIVITY_KEEP = 500
 ACTIVITY_DAYS = 30
 NOTICE_KIND = 'agent_phone_approval'
 DONE_KIND = 'agent_phone_done'  # §5.5: the line after an approved payment or send; no content in the push
-DONE_REASONS = ('payment', 'send')
+DONE_REASONS = ('payment', 'send', '')  # '': an approved step that paid nothing (Q2 R5-F2)
 DONE_SECONDS = 3600
 ASK_LEVELS = ('payments_and_sends', 'every_action')
 ID = re.compile(r'[0-9a-f]{32}')
@@ -348,6 +348,7 @@ def _wait_long(owner, record_id, seconds, sleep=time.sleep):
 # -- declines that stand -------------------------------------------------------------------------------------------------
 
 _declined = {}  # task id -> monotonic time the decline stops standing
+_decline_reasons = {}  # task id -> 'denied' (the owner said no) or 'expired' (no answer in time): both end the request (R2-F13)
 
 
 def declined_for(task):
@@ -357,12 +358,20 @@ def declined_for(task):
     return max(0, left)
 
 
-def note_decline(task):
+def decline_reason(task):
+    """Why the standing no stands: 'denied' or 'expired'."""
+    with _lock:
+        return _decline_reasons.get(task or 'default', 'denied')
+
+
+def note_decline(task, reason='denied'):
     now = _mono()
     with _lock:
         for key in [k for k, until in _declined.items() if until <= now]:
             _declined.pop(key, None)
+            _decline_reasons.pop(key, None)
         _declined[task or 'default'] = now + DECLINE_SECONDS
+        _decline_reasons[task or 'default'] = reason
 
 
 # -- amounts and the bound purchase grant ----------------------------------------------------------------------------------
@@ -579,9 +588,10 @@ def add_activity(owner, profile, app, action, label, approved, outcome):
 
 
 def notify_done(owner, profile, reason, seq):
-    """The push after an approved payment or send (§5.5): notice kind agent_phone_done, `reason` 'payment' | 'send',
-    `activity_key` 'agent_phone_activity:<seq>' naming the activity row the app shows. Nothing else, so the push carries no
-    content. Returns the notice id."""
+    """The push after an approved payment or send (§5.5): notice kind agent_phone_done, `reason` 'payment' | 'send' | '' (an
+    approved step that paid nothing: the notice says only that it ran, never "Payment done"), `activity_key`
+    'agent_phone_activity:<seq>' naming the activity row the app shows. Nothing else, so the push carries no content.
+    Returns the notice id."""
     if reason not in DONE_REASONS or not isinstance(seq, int):
         raise ValueError('invalid')
     notice_id, now = uuid.uuid4().hex, _now()

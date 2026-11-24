@@ -111,9 +111,13 @@ fun historyRowContent(row: JSONObject): Any? = when {
     else -> row.opt("content")
 }
 
-/** The rows of the turn the owner started: a steering note continues that turn instead of beginning another, so the messages before it still belong to it. */
+/**
+ * The rows of the turn the owner started: a steering note continues that turn instead of beginning another, so the messages before it still belong to it.
+ * H1b P1-3: the owner's own steer row (display_kind "steer") continues it too, as [dev.hermes.android.ui.runningTurnMessageIds] reads it; otherwise the
+ * tool rounds saved before the steer are not the turn's, and their replayed steps are drawn a second time in the live reply.
+ */
 fun runningTurnMessages(messages: List<JSONObject>): List<JSONObject> = messages.drop(messages.indexOfLast { row ->
-    row.string("role") == "user" && !isSteeringText(messageContentText("user", historyRowContent(row)))
+    row.string("role") == "user" && row.string("display_kind") != "steer" && !isSteeringText(messageContentText("user", historyRowContent(row)))
 }.coerceAtLeast(0))
 
 /** The most sealed segments a turn keeps on screen and in its live frame. */

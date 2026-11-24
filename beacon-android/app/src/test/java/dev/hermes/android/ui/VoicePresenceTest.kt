@@ -32,8 +32,8 @@ class VoicePresenceTest {
             Triple(call.copy(state = "connecting"), SphereState.Idle, "Connecting"),
             Triple(call.copy(state = "reconnecting"), SphereState.Idle, "Connecting"),
             Triple(call.copy(held = true), SphereState.Idle, "Call on hold"),
-            Triple(call.copy(muted = true), SphereState.Idle, "Muted"),
-            Triple(call.copy(userSpeaking = true, muted = true), SphereState.Idle, "Muted"),
+            Triple(call.copy(muted = true), SphereState.Idle, "You're muted"),
+            Triple(call.copy(userSpeaking = true, muted = true), SphereState.Idle, "You're muted"),
             Triple(call.copy(state = "idle"), SphereState.Idle, "Idle"),
         ).forEach { (state, expected, label) ->
             assertEquals(state.toString(), expected, presenceState(state))

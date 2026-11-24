@@ -244,7 +244,7 @@ def test_native_tool_context_uses_execution_owner_and_restores_login_binding(bou
             b.native.current_principal('owner','basic','default','owned')))
         assert b.api.phone_tools.authorize('owned')==('owner','default')
         assert sys.modules['beacon_email_drafts'].authorize('owned')==('owner','default')
-        assert json.loads(callback.call_user({'reason':'Synthetic requested callback'},session_id='owned'))['status']=='pending'
+        assert json.loads(callback.call_user({'reason':'Synthetic requested callback'},session_id='owned'))['status']=='ringing'
         return '{}'
     b.monkeypatch.setitem(sys.modules,'model_tools',SimpleNamespace(handle_function_call=handler))
     tool={'_kind':'hermes','_raw':'read_file','read_only':True}

@@ -209,7 +209,8 @@ object AgentApprovals {
     private fun doneBody(context: Context, row: AgentPhoneLogRow): String {
         val line = logLine(row)
         val title = PhoneLine(serviceText(context, line.title.template), line.title.args).shown()
-        return boundedNotificationText(if (row.app.isNotBlank() && row.action != "save") "${PhoneLine("{0}", listOf(row.app)).shown()}: $title" else title, 240)
+        val app = appWords(row.app) { serviceText(context, it) }
+        return boundedNotificationText(if (app.isNotBlank() && row.action != "save") "${PhoneLine("{0}", listOf(app)).shown()}: $title" else title, 240)
     }
 
     private const val NOTIFICATION_ID = 7

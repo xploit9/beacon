@@ -109,7 +109,9 @@ class UnconfirmedSendTest {
     }
 
     @Test fun theAddressErrorAsksForTheDashboardLink() {
-        assertEquals("Paste the https:// link from your Hermes dashboard, with nothing after the address.", runCatching { trustedOrigin("http://hermes.example") }.exceptionOrNull()?.message)
+        assertEquals("Enter an HTTPS site address.", runCatching { trustedOrigin("http://example.com") }.exceptionOrNull()?.message)
+        // The owner reads that sentence, not the generic failure (journey F03).
+        assertEquals("Enter an HTTPS site address.", dev.hermes.android.data.appErrorText(runCatching { trustedOrigin("http://example.com") }.exceptionOrNull()!!))
         assertEquals("https://hermes.example", trustedOrigin("https://hermes.example/"))
     }
 }

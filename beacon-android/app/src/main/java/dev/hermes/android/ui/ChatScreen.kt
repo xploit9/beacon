@@ -259,6 +259,20 @@ internal fun isPlainChatText(text: String): Boolean =
     text.length <= 240 && '\n' !in text && text.none { it in "*_`[]#>|$\\<!~=&" } && !text.contains("://") && !text.contains("MEDIA:", ignoreCase = true) &&
         !listItemStart.containsMatchIn(text)
 
+/** The text a saved message's bubble renders, as [MessageRow] derives it. */
+internal fun bubbleDisplayText(role: String, text: String, displayKind: String): String {
+    val history = safeHistoryMessagePresentation(role, if (role == "user") splitAttachedMedia(text).text else text).text
+    return channelPost(displayKind, role, history)?.body ?: history
+}
+
+/**
+ * R2C: a cold start parses the newest bubbles' Markdown before the chat's first frame (the parse is otherwise started by the bubble itself), so they
+ * draw at full height on that frame instead of growing a moment later and moving the list. Call it off the main thread.
+ */
+internal fun prepareBubbles(texts: List<String>) {
+    for (text in texts) if (text.isNotBlank() && !isPlainChatText(text) && MediaCache.markdown.get(text) == null) MediaCache.markdown.put(text, parseNativeMarkdown(text))
+}
+
 /** Hermes stores each tool round of one reply as its own assistant message; show a run of tool-only rounds as one
  *  activity, so its steps fold together instead of stacking card after card above the answer. */
 internal fun mergeToolOnlyRuns(messages: List<IndexedValue<Message>>): List<IndexedValue<Message>> {
@@ -362,7 +376,7 @@ internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: Stri
     var archived by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
     var allProfiles by rememberSaveable(ui.origin, ui.owner) { mutableStateOf(false) }
     var view by rememberSaveable(ui.origin, ui.owner, ui.profile) { mutableStateOf(HistoryView.All) }
-    var naming by rememberSaveable { mutableStateOf(false) }
+    val naming = NewThreadDraft.from == "history"
     var filtersOpen by remember { mutableStateOf(false) }
     // Long-press menu and the dialogs it opens, for one history row at a time.
     var menuFor by remember { mutableStateOf<String?>(null) }
@@ -384,14 +398,17 @@ internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: Stri
                 (view == HistoryView.Threads || it.string("source") !in hidden)
         }
     }
-    val scopeKey = vm.client?.scope?.key
+    val owner = vm.client?.scope ?: vm.restoredScope()
+    val scopeKey = owner?.key
     val searchData = data["history:search"]
     val matches = remember(searchData, search, scopeKey, archived, view, allProfiles, hidden, order) {
         searchData?.takeIf {
             it.string("query") == search && it.string("scope_key") == scopeKey && it.optBoolean("archived") == archived &&
                 it.optBoolean("threads") == (view == HistoryView.Threads) && it.optBoolean("all_profiles") == allProfiles &&
                 it.string("hidden_sources") == hidden.sorted().joinToString(",") && it.string("order") == order.key
-        }?.rows("sessions")
+        }?.rows("sessions") ?: owner?.takeIf { !allProfiles }?.let {
+            vm.screens.exact(it, "history-filter", dev.hermes.android.data.historyFilterRequest(search, archived, view == HistoryView.Threads, hidden.sorted().joinToString(","), order.key))?.value?.rows("sessions")
+        }
     }
     val rows = remember(loaded, search, matches, view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId) {
         historyRows(historySearchRows(loaded, search, matches, ui.profile), view, order, ui.profile, preferences.assistantProfile, ui.assistantSessionId)
@@ -523,7 +540,7 @@ internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: Stri
             }
             else if (ui.historyLoading) Box(Modifier.testTag("history-loading")) { SettingsSkeletonRows(4) }
             else when (view) {
-                HistoryView.Threads -> EmptyState(uiText("No threads yet"), "", action = uiText("New thread"), onAction = { naming = true })
+                HistoryView.Threads -> EmptyState(uiText("No threads yet"), "", action = uiText("New thread"), onAction = { NewThreadDraft.from = "history" })
                 HistoryView.Pinned -> EmptyState(uiText("No pinned chats"), "")
                 HistoryView.All -> EmptyState(uiText("No chats here"), "", action = uiText("New chat"), onAction = { vm.toggleSessions(false); vm.newChat() })
             }
@@ -565,13 +582,21 @@ internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: Stri
     renaming?.let { row -> RenameConversationDialog(vm, sessionRowId(row), row.string("profile", ui.profile), row.string("title"), onDismiss = { renaming = null }) }
     deleting?.let { row -> DeleteConversationDialog(vm, sessionRowId(row), row.string("profile", ui.profile), row.string("title"), onDismiss = { deleting = null }) }
     projectFor?.let { id -> ChatProjectPicker(vm, id, onDismiss = { projectFor = null }) }
-    if (naming) NewThreadDialog(vm, onDismiss = { naming = false }, onStarted = { view = HistoryView.Threads })
+    if (naming) NewThreadDialog(vm, onDismiss = NewThreadDraft::close, onStarted = { view = HistoryView.Threads })
 }
 
 /** The New thread dialog (a name and an optional emoji), shared by History and the drawer's New thread button. Starting calls `vm.tab("Chat")` then `vm.newThread(title)`. */
+/** The New thread dialog's state lives outside any one sidebar: a rotation swaps the drawer for the permanent sidebar, and the dialog and its text must stay open. [from] names the host that shows it. */
+internal object NewThreadDraft {
+    var from by mutableStateOf("")
+    var name by mutableStateOf("")
+    var emoji by mutableStateOf("")
+    fun close() { from = ""; name = ""; emoji = "" }
+}
+
 @Composable internal fun NewThreadDialog(vm: BeaconViewModel, onDismiss: () -> Unit, onStarted: () -> Unit = {}) {
-    var name by rememberSaveable { mutableStateOf("") }
-    var emoji by rememberSaveable { mutableStateOf("") }
+    var name by NewThreadDraft::name
+    var emoji by NewThreadDraft::emoji
     AlertDialog(onDismissRequest = onDismiss, title = { Text(uiText("New thread")) },
         text = { Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -587,7 +612,7 @@ internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: Stri
                 }
             }
         } },
-        confirmButton = { TextButton(onClick = { onDismiss(); onStarted(); vm.tab("Chat"); vm.newThread(threadTitle(emoji, name)) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
+        confirmButton = { TextButton(onClick = { val title = threadTitle(emoji, name); onDismiss(); onStarted(); vm.tab("Chat"); vm.newThread(title) }, enabled = name.isNotBlank(), modifier = Modifier.testTag("new-thread-start")) { Text(uiText("Start thread")) } },
         dismissButton = { TextButton(onClick = onDismiss) { Text(uiText("Cancel")) } })
 }
 
@@ -624,7 +649,25 @@ internal val ChatStrings get() = ToolOutcome.entries.map(::toolOutcomeLabel) + f
     "Thinking", "Responding", "Finishing", "Working", dev.hermes.android.TURN_STOPPED, dev.hermes.android.TURN_RESTARTED,
     "Send now", "Queue", "Run command", "Not sent", "Not confirmed yet", "Delivered", "Answered", "Change the reply…", "Queue a message…",
     // What Send in the queue box says when it cannot start (they reach the snackbar through a variable).
-    "Tap your message to check it.", "Wait for the current reply first.", "Finish the call or answer the request first.", "Turn on", "Retry")
+    "Tap your message to check it.", "Wait for the current reply first.", "Finish the call or answer the request first.", "Turn on", "Retry",
+    // Why a box row was not sent (P2-14) and the live row while Hermes waits for the owner (P2-9).
+    "Offline", "Upload failed", "Didn’t arrive", "Its chat was deleted", "Waiting for your answer")
+
+private val WORKING_LINES = setOf("Working", "Thinking", "Responding", "Finishing")
+/**
+ * P2-9: the line under a running reply. While Hermes waits for the owner it says so instead of Working: a question (its card, or the
+ * clarify step that asks it, before the card arrives) or an approval. One line for both, so it never repeats the card's own title just below.
+ * Any other line (Hermes' own wait line, a lost reply) shows as it is.
+ */
+internal fun liveStatusLine(chat: dev.hermes.android.ChatState): String {
+    val working = chat.status.isBlank() || chat.status in WORKING_LINES || chat.status.startsWith("Using ")
+    return when {
+        !working -> chat.status
+        chat.clarification != null || chat.approval != null ||
+            chat.liveTools.any { it.rawToolName() == "clarify" && toolOutcomeOf(it, streaming = true) in setOf(ToolOutcome.Running, ToolOutcome.Preparing) } -> "Waiting for your answer"
+        else -> chat.status.ifBlank { "Working" }
+    }
+}
 
 /**
  * What the menu of a bubble the phone still tracks offers. Hermes already holds a message it accepted, so only a message of unknown outcome
@@ -674,6 +717,7 @@ internal fun savedRepliesOnce(retained: List<Message>, saved: List<Message>): Li
  * failed mid-answer, or one a restart cut): Hermes saved no reply for them, so this copy is the only one of what the owner read. They sit above that row, where they were said.
  */
 internal fun placeKeptReplies(shown: List<Message>, kept: List<Pair<Message, String>>): List<Message> {
+    if (kept.isEmpty()) return shown
     fun isPrompt(message: Message) = message.role == "user" && message.displayKind != "steer"
     val unbound = mutableListOf<Message>()
     val before = mutableMapOf<Int, MutableList<Message>>()
@@ -1355,7 +1399,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                             Row(Modifier.heightIn(min = 32.dp).testTag("live-status"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                                 BeaconSignal(BeaconMotionMode.Pulse, size = 18.dp)
                                 // Hermes' own wait line shows as Hermes wrote it; the app's own lines are translated.
-                                Text(turnLineText(chat.status.ifBlank { "Working" }), Modifier.testTag("message-activity-status").semantics { liveRegion = LiveRegionMode.Polite }, style = if (lostReplyLine(chat.status)) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(turnLineText(liveStatusLine(chat)), Modifier.testTag("message-activity-status").semantics { liveRegion = LiveRegionMode.Polite }, style = if (lostReplyLine(chat.status)) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                             Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity(chat.liveReasoning.takeIf { settings.optBoolean("show_thinking", true) }.orEmpty(), chat.liveTools, "", streaming = true, onToolExpanded = { expanded -> follow = followAfterToolToggle(follow, expanded) }, vm = vm, scope = vm.authenticatedScope()?.session(chat.sessionId)) }
                         }
@@ -1678,17 +1722,23 @@ internal fun acceptsInitialConversationEdit(
     val inputFocus = remember { FocusRequester() }
     var inputFocused by remember { mutableStateOf(false) }
     LaunchedEffect(ui.origin, ui.owner, ui.profile) { vm.loadSlashCatalog() }
-    // Hermes reports a blank model/effort when the chat follows its profile (tui_gateway _session_info, _cfg_get_reasoning),
-    // so the profile's own values are the chat's effective ones.
+    // A provider-only row can still have a runtime pin. A confirmed empty read permits the profile fallback.
     val effort = chat.raw.string("reasoning_effort", chat.raw.string("reasoning"))
-    val sessionEffort = chat.sessionReasoningEffort
+    val reasoning = if (chat.sessionReasoningEffort.isBlank() && effort.isBlank() && chat.sessionId.isNotBlank())
+        vm.savedReasoning(data["picker:reasoning"], includeLevelOnly = true) else null
+    val sessionEffort = chat.sessionReasoningEffort.ifBlank { reasoning?.string("value").orEmpty() }
+    LaunchedEffect(vm, vm.client, vm.reasoningSelection, ui.connected, chat.sessionId, chat.projectionReady, chat.raw.string("model"), chat.raw.string("model_provider")) {
+        if (ui.connected && chat.sessionId.isNotBlank() && chat.projectionReady) vm.refreshChatEffort()
+    }
     val followsProfile = chat.raw.string("model").isBlank() || effort.isBlank() && sessionEffort.isBlank()
-    val defaults = data["profile-defaults"]?.takeIf { !opening && followsProfile && it.string("profile") == ui.profile && it.string("scope_key") == vm.client?.scope?.key && it.string("session_id") == chat.sessionId && recordError(it).isBlank() }
+    val defaultScope = vm.client?.scope ?: vm.restoredScope()
+    val defaults = data["profile-defaults"]?.takeIf { followsProfile && it.string("profile") == ui.profile && it.string("scope_key") == defaultScope?.key && recordError(it).isBlank() }
     LaunchedEffect(ui.origin, ui.owner, ui.profile, chat.sessionId, chat.projectionReady, ui.connected, followsProfile) {
         if (followsProfile && ui.connected && (chat.sessionId.isBlank() || chat.projectionReady)) vm.load("profile-defaults", "/api/profile/defaults", if (chat.sessionId.isBlank()) emptyMap() else mapOf("session_id" to chat.sessionId))
     }
     BoxWithConstraints(Modifier.widthIn(max = 840.dp).fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Reserve the action row before the editor grows. The editor scrolls its own long draft.
+        val compactModel = maxWidth < 360.dp
         val commandHeight = if (draft.text.startsWith("/")) (maxHeight - 160.dp).coerceIn(48.dp, 224.dp) else 0.dp
         val editorHeight = (maxHeight - 112.dp - commandHeight - (if (commandHeight > 0.dp) 8.dp else 0.dp) - if(chat.streamId.isNotBlank()) 48.dp else 0.dp).coerceAtMost(160.dp).coerceAtLeast(48.dp)
         Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1779,10 +1829,6 @@ internal fun acceptsInitialConversationEdit(
                         }, minLines = 1, maxLines = 6, enabled = editable && !callActive && !readOnly, shape = RoundedCornerShape(18.dp), colors = OutlinedTextFieldDefaults.colors(unfocusedBorderColor = Color.Transparent, focusedBorderColor = Color.Transparent))
                     }
                     }
-                    if (streaming && !voiceAction) Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                        TextButton(onClick = { vm.steer() }, enabled = canonical && preparing.isEmpty() && !readOnly && !callActive && draft.text.isNotBlank() && !draft.text.startsWith("/") && chat.uncertain.isBlank() && files.isEmpty(), modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Send now")) }
-                        TextButton(onClick = { vm.cancel() }, modifier = Modifier.heightIn(min = 48.dp)) { Text(uiText("Stop")) }
-                    }
                     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically) {
                         Box {
                             IconButton(onClick = {
@@ -1803,7 +1849,8 @@ internal fun acceptsInitialConversationEdit(
                         NativeApprovalMenu(vm, enabled = canonical && !callActive && !readOnly)
                         Box(Modifier.weight(1f, fill = false).widthIn(max = 168.dp)) {
                             val modelLabel = chatModelTitle(chatModelLabel(chat.raw.string("model"), defaults?.string("model").orEmpty()), data["picker:models"]?.rows("groups").orEmpty())
-                            val effortLabel = chatReasoningLabel(sessionEffort, effort, defaults?.string("reasoning_effort").orEmpty())
+                            val profileEffort = defaults?.takeIf { chat.sessionId.isBlank() || reasoning?.opt("value") == "" }?.string("reasoning_effort").orEmpty()
+                            val effortLabel = chatReasoningLabel(sessionEffort, effort, profileEffort)
                             val modelOptionsDescription = uiText("Choose model and reasoning options")
                             val reasoningLabel = uiText("Reasoning effort")
                             val chipEnabled = canonical && !callActive && !readOnly
@@ -1816,18 +1863,18 @@ internal fun acceptsInitialConversationEdit(
                                     if (modelLabel.isBlank() && effortLabel.isBlank()) contentDescription = modelOptionsDescription
                                     customActions = listOf(CustomAccessibilityAction(reasoningLabel) { if (chipEnabled) vm.openCatalog("Reasoning"); chipEnabled })
                                 }
-                                .alpha(if (chipEnabled) 1f else .38f)
-                                .padding(horizontal = 8.dp).testTag("composer-model-effort"), verticalAlignment = Alignment.CenterVertically) {
+                                .alpha(if (chipEnabled || modelLabel.isNotBlank() || effortLabel.isNotBlank()) 1f else .38f)
+                                .padding(horizontal = if (compactModel) 2.dp else 8.dp).testTag("composer-model-effort"), verticalAlignment = Alignment.CenterVertically) {
                                 Column(Modifier.weight(1f, fill = false), horizontalAlignment = Alignment.Start) {
                                     if (modelLabel.isNotBlank()) Text(modelLabel, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
                                     if (pickerNote.isNotBlank()) Text(uiText(pickerNote), Modifier.testTag("composer-model-note"), maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     // The effort as a small gauge and its level, so "low" reads as reasoning, not as a bare word.
                                     if (effortLabel.isNotBlank()) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                         Icon(Icons.Rounded.Speed, null, Modifier.size(12.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        Text(effortLabel, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                        Text(uiText(reasoningLevelLabel(effortLabel)), maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                     }
                                 }
-                                Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
+                                if (!compactModel) Icon(Icons.Rounded.ExpandMore, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.primary)
                             }
                         }
                         } }
@@ -2111,7 +2158,8 @@ private fun localActionTag(action: LocalAction): String = when (action) {
             if (item.attachments.size > 1) Text("${item.attachments.size}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Column(Modifier.weight(1f).padding(vertical = 6.dp)) {
-            if (failed) Text(uiText("Not sent"), Modifier.testTag("queue-not-sent:${item.id}"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
+            if (failed) Text(uiText("Not sent") + dev.hermes.android.notSentReason(item).takeIf { it.isNotBlank() }?.let { " · " + uiText(it) }.orEmpty(),
+                Modifier.testTag("queue-not-sent:${item.id}"), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.error)
             Text(words, Modifier.testTag("queue-text:${item.id}"), style = MaterialTheme.typography.bodyMedium.contentDirection(), maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
         }
         when (queueBoxAction(item, replying)) {
@@ -2129,6 +2177,8 @@ private fun localActionTag(action: LocalAction): String = when (action) {
 internal fun branchRowIds(rows: List<JSONObject>): org.json.JSONArray = org.json.JSONArray(rows.map {
     it.string("row_id", it.string("_row_id")).toLongOrNull()?.takeIf { id -> id > 0 } ?: JSONObject.NULL
 })
+/** No earlier active row: Hermes has nothing to branch from, so Edit and branch opens a new chat instead. */
+internal fun editStartsNewChat(index: Int, rows: List<JSONObject>): Boolean = rows.isNotEmpty() && rows.take(index).none { it.opt("archived") != true }
 internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONObject>, before: Boolean): JSONObject {
     val result = json("keep_count" to if (before) index else index + 1)
     val row = rows.getOrNull(index)
@@ -2162,6 +2212,7 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
     var selecting by remember(message.id) { mutableStateOf(false) }
     val own = isOwnMessage(message)
     val hasContent = displayText.isNotBlank() || history.attachments.isNotEmpty() || parts.media.isNotEmpty()
+    val editScope = rememberCoroutineScope()
     val openMessageActions = { haptic.performHapticFeedback(HapticFeedbackType.LongPress); actions = true }
     val copySource: (String) -> Unit = { text -> runCatching { ensureClipboardFits(text); (context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText(assistantMessageLabel, text)) }.onSuccess { vm.notice("Message copied") }.onFailure { vm.notice("Couldn't copy all of it. Select part of the text and copy that.") }; Unit }
     // Outside the bubble a reply names its files, never a MEDIA: tag or a path on the computer; the owner's own words stay as typed.
@@ -2189,7 +2240,10 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
             HorizontalDivider()
             DropdownMenuItem({ Text(uiText("Copy as plain text")) }, { actions = false; copySource(outsideText) }, leadingIcon = { Icon(Icons.Rounded.Code, null, Modifier.testTag("copy-source-icon")) }, modifier = Modifier.testTag("copy-source-action"))
             DropdownMenuItem({ Text(uiText("Branch from here")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = false)) { o -> branchSessionId(o).takeIf(String::isNotBlank)?.let { id -> vm.selectSession(id, titleHint = branchTitle(o)); vm.refreshSessions(); vm.notice("Branched into a new chat") } } }, leadingIcon = { Icon(Icons.AutoMirrored.Rounded.CallSplit, null) })
-            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; val state = vm.chat.value; vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList(), before = true)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, editAndBranchDraft(message.text), titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
+            if (own) DropdownMenuItem({ Text(uiText("Edit and branch")) }, { actions = false; val state = vm.chat.value; val rows = if (state.sessionId == message.sessionId) state.raw.rows("messages") else emptyList()
+                // Hermes cannot branch an empty chat: editing the first message starts a new chat with it as the draft.
+                if (editStartsNewChat(index, rows)) { val draft = editAndBranchDraft(message.text); val from = state.sessionId; editScope.launch { vm.newChat().join(); vm.chat.first { it.projectionReady && it.sessionId.isNotBlank() && it.sessionId != from }; vm.composer(TextFieldValue(draft, TextRange(draft.length))) } }
+                else vm.sessionAction("/api/session/branch", branchMessageRequest(message, index, rows, before = true)) { o -> (o.optJSONObject("session") ?: o).string("session_id").takeIf(String::isNotBlank)?.let { vm.selectSession(it, editAndBranchDraft(message.text), titleHint = branchTitle(o)); vm.refreshSessions() } } }, leadingIcon = { Icon(Icons.Rounded.Edit, null) })
             if (confirmedLocalId != null) DropdownMenuItem({ Text(uiText("Remove this copy")) }, { actions = false; vm.removeConfirmedLocalCopy(confirmedLocalId) })
         }
     }
@@ -2241,29 +2295,34 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
     }
 }
 
+internal fun <T : Any> attachedPreview(loaded: PreparedContent<out T?>?, ownerKey: String, vararg identity: Any?): T? = loaded?.forContext(ownerKey, identity.toList())
+
 /** A photo the user sent, as a thumbnail; a file, or a photo that cannot be read, as its name. Never the path on the computer. */
-@Composable private fun AttachedMediaView(vm: BeaconViewModel, origin: Scope?, media: AttachedMedia, name: String, thumb: String = "") {
+@Composable internal fun AttachedMediaView(vm: BeaconViewModel, origin: Scope?, media: AttachedMedia, name: String, thumb: String = "") {
     // Only a photo Hermes itself saved as this owner's upload is ever fetched; any other path in a message is just a file name.
     val reference = remember(media.path, origin?.key, origin?.session) {
         origin?.takeIf { it.session.isNotBlank() && media.image && isOwnUpload(media.path) }?.let { NativeReference.LocalMedia(media.path, it.session, null, "/api/file/raw") }
     }
-    val bitmap by produceState<Bitmap?>(null, reference, thumb, origin?.key) {
+    val ownerKey = origin?.key.orEmpty()
+    // A picture counts only for the account/session, reference and thumbnail it was made for, so a replaced attachment never shows the old one.
+    val loaded by produceState<PreparedContent<Bitmap?>?>(null, reference, thumb, origin?.key) {
+        value = null
         // The picked photo, kept small with the message on this phone, needs no download.
-        if (thumb.isNotBlank()) value = withContext(Dispatchers.Default) { decodeBase64Bitmap(thumb, 720) }
-        if (value != null) return@produceState
+        if (thumb.isNotBlank()) value = PreparedContent(ownerKey, listOf(reference, thumb), withContext(Dispatchers.Default) { decodeBase64Bitmap(thumb, 720) })
+        if (value?.value != null) return@produceState
         val ref = reference ?: return@produceState
         val owner = origin ?: return@produceState
         val key = MediaKey(owner.key, ref)
-        value = try {
+        value = PreparedContent(ownerKey, listOf(reference, thumb), try {
             val cached = MediaCache.payloads.get(key)
             val payload = cached ?: run {
                 val client = vm.client?.takeIf { it.scope == owner.copy(session = "") }?.detached() ?: return@produceState
                 try { NativeMediaBytes(client.bytes(ref.endpoint, ref.query(), limit = PHOTO_THUMBNAIL_BYTES)) } finally { client.closeNative() }
             }
             withContext(Dispatchers.Default) { decodeBoundedBitmap(payload.bytes, 720) }?.also { if (cached == null) MediaCache.payloads.put(key, payload, payload.bytes.size.toLong()) }
-        } catch (e: Throwable) { if (e is CancellationException) throw e; null }
+        } catch (e: Throwable) { if (e is CancellationException) throw e; null })
     }
-    val shown = bitmap
+    val shown = attachedPreview(loaded, ownerKey, reference, thumb)
     if (shown != null) Image(shown.asImageBitmap(), name, Modifier.fillMaxWidth().heightIn(max = 260.dp).padding(vertical = 2.dp).clip(RoundedCornerShape(12.dp)).testTag("attached-image"), contentScale = ContentScale.Fit)
     else Surface(shape = RoundedCornerShape(999.dp), color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.testTag("attached-file")) {
         Row(Modifier.padding(horizontal = 9.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2277,8 +2336,8 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
 @Composable private fun LocalAttachment(attachment: JSONObject) {
     val encoded = attachment.string("staged_base64").ifBlank { attachment.string("thumb_base64") }
     val image = imageMimeType(attachment.string("mime"))
-    val bitmap by produceState<Bitmap?>(null, encoded, image) { value = if (image && encoded.isNotBlank()) withContext(Dispatchers.Default) { decodeBase64Bitmap(encoded, 720) } else null }
-    val shown = bitmap
+    val loaded by produceState<PreparedContent<Bitmap?>?>(null, encoded, image) { value = null; value = PreparedContent("", listOf<Any?>(encoded, image), if (image && encoded.isNotBlank()) withContext(Dispatchers.Default) { decodeBase64Bitmap(encoded, 720) } else null) }
+    val shown = attachedPreview(loaded, "", encoded, image)
     if (shown != null) Image(shown.asImageBitmap(), attachment.string("name"), Modifier.fillMaxWidth().heightIn(max = 260.dp).padding(vertical = 2.dp).clip(RoundedCornerShape(12.dp)).testTag("local-attachment-image"), contentScale = ContentScale.Fit)
     else Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Icon(Icons.Rounded.AttachFile, null, Modifier.size(16.dp))
@@ -2286,8 +2345,8 @@ internal fun branchMessageRequest(message: Message, index: Int, rows: List<JSONO
     }
 }
 
-private fun decodeBase64Bitmap(encoded: String, maxEdge: Int): Bitmap? {
-    if (encoded.isBlank() || encoded.length > 24 * 1024 * 1024) return null
+private fun decodeBase64Bitmap(encoded: String, maxEdge: Int, maxChars: Int = 24 * 1024 * 1024): Bitmap? {
+    if (encoded.isBlank() || encoded.length > maxChars) return null
     val bytes = runCatching { android.util.Base64.decode(encoded, android.util.Base64.DEFAULT) }.getOrNull() ?: return null
     return decodeBoundedBitmap(bytes, maxEdge)
 }
@@ -2315,23 +2374,12 @@ private fun decodeBoundedBitmap(bytes: ByteArray, maxEdge: Int): Bitmap? {
     }
 }
 
-private fun decodePendingAttachmentThumbnail(encoded: String): Bitmap? {
-    if (encoded.isBlank() || encoded.length > 16 * 1024 * 1024) return null
-    val bytes = runCatching { android.util.Base64.decode(encoded, android.util.Base64.DEFAULT) }.getOrNull() ?: return null
-    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-    var sample = 1
-    while (bounds.outWidth / sample > 96 || bounds.outHeight / sample > 96) sample *= 2
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, BitmapFactory.Options().apply { inSampleSize = sample })
-}
-
 @Composable private fun PendingAttachmentChip(file: JSONObject, onClick: () -> Unit, onRemove: () -> Unit) {
     val name = file.string("name", file.string("filename", uiText("Attachment")))
     val image = imageMimeType(file.string("mime"))
     val encoded = file.string("staged_base64")
     val thumbnail by produceState<Bitmap?>(null, file.string("id"), encoded, image) {
-        value = if (image) withContext(Dispatchers.Default) { decodePendingAttachmentThumbnail(encoded) } else null
+        value = if (image) withContext(Dispatchers.Default) { decodeBase64Bitmap(encoded, 96, maxChars = 16 * 1024 * 1024) } else null
     }
     Surface(
         Modifier.widthIn(max = 240.dp).heightIn(min = 48.dp).clickable(onClick = onClick).testTag("pending-attachment-chip"),

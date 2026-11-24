@@ -17,9 +17,37 @@ class NativePresentationTest {
         for (path in listOf("/api/crons", "/api/cron/jobs", "/api/tools/toolsets")) {
             assertTrue(runCatching { client.get(path, mapOf("profile" to "other")) }.exceptionOrNull() is IllegalArgumentException)
         }
-        for (text in listOf("x".repeat(512 * 1024 + 1), "\n".repeat(256 * 1024 + 1), "binary\u0000")) {
+        for (text in listOf("x".repeat(512 * 1024 + 1), "\n".repeat(512 * 1024 + 1), "\r\n".repeat(512 * 1024 + 1), "binary\u0000")) {
             assertTrue(runCatching { client.post("/api/file/save", json("session_id" to "stored", "path" to "C:/work/notes.txt", "content" to text, "expected_content" to "old")) }.exceptionOrNull() is IllegalArgumentException)
         }
+    }
+    private fun saveClient(requests: MutableList<String>, pluginStatus: Int) = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", backend = "hermes-dashboard"), null) { builder ->
+        builder.addInterceptor { chain ->
+            val req = chain.request(); requests.add(req.url.encodedPath)
+            val plugin = req.url.encodedPath == "/api/plugins/beacon/mobile/files/text"
+            val code = if (plugin) pluginStatus else 200
+            val body = if (plugin && pluginStatus == 200) """{"ok":true,"path":"C:/work/notes.txt","byteSize":1}""" else """{"detail":"Not Found","text":"old"}"""
+            Response.Builder().request(req).protocol(Protocol.HTTP_1_1).code(code).message("OK").body(body.toResponseBody("application/json".toMediaType())).build()
+        }
+    }
+    private fun save(c: BeaconClient, text: String) = runBlocking { c.post("/api/file/save", json("session_id" to "stored", "path" to "C:/work/notes.txt", "content" to text, "expected_content" to "old")) }
+
+    @Test fun anLfTextFileOf480KiBReachesThePluginSave() {
+        val requests = mutableListOf<String>()
+        val text = "line\n".repeat(480 * 1024 / 5)
+        assertTrue(text.toByteArray().size <= 512 * 1024 && text.toByteArray().size + text.count { it == '\n' } > 512 * 1024)
+        save(saveClient(requests, 200), text)
+        assertEquals(listOf("/api/plugins/beacon/mobile/files/text"), requests)
+    }
+    @Test fun anOversizedCrlfFileIsRefusedBeforeAnyNetworkWrite() {
+        val requests = mutableListOf<String>()
+        assertTrue(runCatching { save(saveClient(requests, 200), "line\r\n".repeat(512 * 1024 / 5 + 100)) }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(emptyList<String>(), requests)
+    }
+    @Test fun theStockFallbackKeepsTheWorstCaseNewlineGuardWithNoDiskWrite() {
+        val requests = mutableListOf<String>()
+        assertTrue(runCatching { save(saveClient(requests, 404), "line\n".repeat(480 * 1024 / 5)) }.exceptionOrNull() is IllegalArgumentException)
+        assertTrue(requests.none { it.endsWith("/write-text") })
     }
     @Test fun retiredServerDictationCannotReachAnOldService() = runBlocking<Unit> {
         val client = BeaconClient(AuthContext("https://native.example", emptyList(), "owner", backend = "hermes-dashboard"), null) { builder ->

@@ -4,7 +4,7 @@ import org.json.JSONObject
 
 /**
  * The saved answers a page can show by itself while Hermes is not reached (a cold start offline). A page with none keeps the full
- * "Reconnect to Hermes" page; MCP servers, Health, Logs, Server updates and Session checkpoints keep nothing, so they always do.
+ * "Reconnect to Hermes" page. Log text is only held in process.
  */
 private fun savedKeys(page: String): List<(String) -> Boolean> = when (page) {
     "Skills" -> listOf { it == "settings:skills" }
@@ -14,6 +14,11 @@ private fun savedKeys(page: String): List<(String) -> Boolean> = when (page) {
     "Bots" -> listOf({ it == "bot-mode:roster" }, { it == "settings:bots" })
     "Providers & models" -> listOf { it == "picker:models" }
     "Tools & commands" -> listOf { it == "native-tools" }
+    "MCP servers" -> listOf { it == "native-mcp" }
+    "Health" -> listOf { it == "settings:health" }
+    "Logs" -> listOf { it == "settings:logs:errors" }
+    "Server updates" -> listOf { it == "settings:update-check" }
+    "Session checkpoints" -> listOf { it == "settings:backups" }
     "Commands" -> listOf { it == "slash:catalog" }
     "Notifications" -> listOf { it.startsWith("history-retention") }
     "Tasks" -> listOf { it == "crons" }

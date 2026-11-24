@@ -48,8 +48,18 @@ class PluginHealthTest {
     @Test fun theVersionShownIsTheInstalledOneAndAnUnreadableVersionHidesTheSection() {
         assertEquals("1.1.24", pluginHealthOf(answer(installed = "1.1.24"), false)!!.version)
         assertEquals("1.1.23", pluginHealthOf(answer(installed = "", running = "1.1.23"), false)!!.version)
-        assertNull(pluginHealthOf(answer(installed = "", running = ""), false))
         assertNull(pluginHealthOf(answer(installed = "not a version", running = "x"), false))
+    }
+
+    @Test fun aPluginThatAnswersWithNoVersionIsOldAndStillShowsItsRows() {
+        val health = pluginHealthOf(answer(installed = "", running = ""), keepConnected = false, voiceKeySaved = true)!!
+        assertEquals("", health.version)
+        assertEquals(SettingsStatus.Attention, health.overall)
+        assertEquals("Ready", health.calls.text)
+        // No answer at all is still no section data, so a missing plugin is not shown as an old one.
+        assertNull(pluginHealthOf(null, false))
+        assertNull(pluginHealthOf(JSONObject().put("plugin", JSONObject().put("installed", "").put("running", "")), false))
+        assertTrue("Unknown" in PluginHealthStrings)
     }
 
     @Test fun aDashboardOrGatewayRunningOldCodeNeedsARestart() {

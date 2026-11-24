@@ -33,6 +33,7 @@ data class NativeServerState(
     val asked: Boolean = false,
     /** The pages Hermes has answered at least once, even with nothing in the answer (no log lines, no backups): an empty answer is still the answer, so it never draws a skeleton again. */
     val answered: Set<String> = emptySet(),
+    val savedLogCount: Int? = null,
 ) {
     val canApply get() = updateStatusFresh && !hostBusy && error.isBlank() && update?.optBoolean("can_apply") == true && update.optBoolean("update_available") && !loading && !applying && (requestedAt.isBlank() || outcome in terminalUpdateOutcomes)
     val outcome: String get() {

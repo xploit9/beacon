@@ -10,10 +10,15 @@ def create_file(path, content):
     from hermes_cli.web_routers.files import _fs_path
     if not isinstance(path, str) or not isinstance(content, str):
         raise HTTPException(400, 'File path and text are required')
-    data = content.encode('utf-8')
+    try:
+        data = content.encode('utf-8')
+    except UnicodeEncodeError:
+        raise HTTPException(400, 'Choose valid UTF-8 text before saving.') from None
     if len(data) > 1024 * 1024:
         raise HTTPException(413, 'File exceeds the 1 MiB editor limit')
     target = _fs_path(path)
+    if target.is_dir():
+        raise HTTPException(400, 'Add a file name.')
     if not target.parent.is_dir():
         raise HTTPException(400, 'Choose an existing folder')
     staged = None
@@ -119,7 +124,7 @@ def build_router(identity, read_body, native):
         if not isinstance(content, str) or not isinstance(expected, str) or '\x00' in content:
             raise HTTPException(400, 'Reopen the file before saving text of up to 512 KiB')
         try:
-            size = len(content.encode('utf-8')) + content.count('\n')
+            size = len(content.replace('\r\n', '\n').encode('utf-8'))
         except UnicodeEncodeError:
             raise HTTPException(400, 'Choose valid UTF-8 text before saving.') from None
         if size > 512 * 1024:

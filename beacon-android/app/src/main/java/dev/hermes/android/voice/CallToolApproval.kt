@@ -1,5 +1,6 @@
 package dev.hermes.android.voice
 
+import dev.hermes.android.phone.PhoneLine
 import dev.hermes.android.phone.PhoneTools
 import org.json.JSONObject
 import org.json.JSONArray
@@ -9,7 +10,8 @@ data class PhoneApprovalText(val action: String, val target: String = "", val de
     /** Seconds the card counts down before it places the call by itself; 0 means the owner must tap. Only a call can have one. */ val countdown: Int = 0,
     /** When the card was made on the phone's elapsed clock; a card never stamped, or one that waited too long to be drawn, does not count down. */ val askedAt: Long = 0)
 
-data class CallToolApproval(val requestId: String, val proposalId: String, val toolName: String, val arguments: String, val busy: Boolean = false, val error: String = "", val allowCall: Boolean = true, val phone: PhoneApprovalText? = null) {
+data class CallToolApproval(val requestId: String, val proposalId: String, val toolName: String, val arguments: String, val busy: Boolean = false, val error: String = "", val allowCall: Boolean = true, val phone: PhoneApprovalText? = null,
+    /** Beacon's own phone step: the name its phone shows for the app it opens (the plugin's, never the model's); "" when unknown. */ val appLabel: String = "") {
     companion object {
         fun from(value: JSONObject): CallToolApproval {
             val request = value.getString("request_id")
@@ -25,7 +27,8 @@ data class CallToolApproval(val requestId: String, val proposalId: String, val t
                 PhoneApprovalText(clipped(it.optString("action"), 300), clipped(it.optString("target"), 100), it.optString("details").take(1200), it.optString("preview").take(1000),
                     if (name == "phone_call") it.optInt("countdown").coerceIn(0, 5) else 0, it.optLong("asked_at"))
             }?.takeIf { it.action.isNotBlank() } else null
-            return CallToolApproval(request, proposal, name, arguments, allowCall = !value.has("allow_call") || value.opt("allow_call") == true, phone = card)
+            val app = if (name == AGENT_PHONE_TOOL) (value.opt("app_label") as? String).orEmpty().filterNot(Char::isISOControl).trim().let { clipped(it, 80) } else ""
+            return CallToolApproval(request, proposal, name, arguments, allowCall = !value.has("allow_call") || value.opt("allow_call") == true, phone = card, appLabel = app)
         }
 
         /** [text] within [limit] characters; a cut one ends in an ellipsis, so the card never hides that there is more. */
@@ -108,12 +111,36 @@ internal data class CallApprovalSummary(
     val preview: String = "",
     val service: String = "",
     val fields: String = "",
+    /** The headline as a line the card translates (Beacon's own phone step); shown instead of [action] when set. */
+    val headline: PhoneLine? = null,
+    /** The agent's own reason for the step, shown as "For: …". */
+    val purpose: String = "",
+)
+
+/** Beacon's own phone tool, as a call's request names it. */
+internal const val AGENT_PHONE_TOOL = "agent_phone"
+
+/** What a call's step on Beacon's own phone will do, by its action (R3-F10): the card's headline instead of "Agent Phone". {0} is the app. */
+internal val AgentPhoneStepWords: Map<String, String> = linkedMapOf(
+    "task" to "Do a phone task", "status" to "Check the phone", "capture" to "Look at the screen", "tap" to "Tap", "long_press" to "Press and hold",
+    "type" to "Type text", "key" to "Press a key", "swipe" to "Swipe", "open_app" to "Open {0}", "list_apps" to "List apps", "open_link" to "Open a link",
+    "wait" to "Wait", "vault_list" to "Check the vault", "fill" to "Fill from the vault", "save_login" to "Save a login", "new_login" to "Make a login",
+    "code" to "Enter a code",
 )
 
 internal fun callToolApprovalSummary(approval: CallToolApproval): CallApprovalSummary {
     // A phone request shows exactly what will run: the headline, who or where, the details and the notes or message.
     approval.phone?.let { return CallApprovalSummary(it.action, it.target, it.preview, "", it.details) }
     val arguments = runCatching { JSONObject(approval.arguments) }.getOrDefault(JSONObject())
+    if (approval.toolName == AGENT_PHONE_TOOL) {
+        val action = arguments.optString("action").ifBlank { if (arguments.has("task")) "task" else "" }
+        AgentPhoneStepWords[action]?.let { words ->
+            val app = approval.appLabel.ifBlank { arguments.optString("package") }
+            return CallApprovalSummary(words.replace("{0}", app), preview = arguments.optString("task").trim().clipWithEllipsis(APPROVAL_PREVIEW_MAX),
+                fields = arguments.optString("url").clipWithEllipsis(APPROVAL_FIELD_MAX), headline = PhoneLine(words, if (action == "open_app") listOf(app) else emptyList()),
+                purpose = arguments.optString("purpose").trim().clipWithEllipsis(APPROVAL_FIELD_MAX))
+        }
+    }
     val name = approval.toolName.substringAfterLast("__").lowercase()
     val words = name.replace('_', ' ').split(' ').filter(String::isNotBlank)
     val action = when (name) {
@@ -184,6 +211,7 @@ internal fun callToolApprovalEvent(requestId: String, toolName: String, proposal
     JSONObject().put("type", "tool_approval").put("request_id", requestId).put("proposal_id", proposal.getString("id"))
         .put("tool_name", toolName).put("arguments", JSONObject(proposal.getJSONObject("arguments").toString()))
         .apply { if (proposal.has("allow_call")) put("allow_call", proposal.get("allow_call")) }
+        .apply { if (proposal.has("app_label")) put("app_label", proposal.get("app_label")) }
 
 data class CallToolReceipt(
     val requestId: String,
@@ -191,6 +219,7 @@ data class CallToolReceipt(
     val status: String,
     val approvedBy: String? = null,
     val hasResult: Boolean = false,
+    val phoneInUse: Boolean = false,
 ) {
     companion object {
         private val decisions = setOf("chat_yolo", "profile_off", "smart", "memory", "call_allowance", "owner")
@@ -209,7 +238,8 @@ data class CallToolReceipt(
             // Fixed reads omit private contents; gateway receipts still require their actual result.
             val fixedReadResult = status == "completed" && !value.has("tool_id") && value.opt("result_present") == true &&
                 toolName in setOf("discover_tools", "hermes_search", "hermes_memory", "hermes_skills", "hermes_context")
-            return CallToolReceipt(requestId, toolName, status, approvedBy, (value.has("result") && !value.isNull("result")) || fixedReadResult)
+            return CallToolReceipt(requestId, toolName, status, approvedBy, (value.has("result") && !value.isNull("result")) || fixedReadResult,
+                status in setOf("failed", "uncertain") && value.optString("error_code") == "phone_in_use")
         }
     }
 }
@@ -246,14 +276,22 @@ internal fun CallToolReceipt.statusLabel(): String? = statusTemplate()?.replace(
 /** The receipt texts that reach uiText whole or as templates; the tool chip's "<tool> complete" forms are built from the tool's own name. */
 internal val CallToolStrings = listOf(
     "Using {0}…", "Writing a file…", "Updating a file…", "Reading files…",
-    "Needs approval", "Not confirmed", "Action denied", "Approval expired", "Action cancelled", HERMES_UNREACHABLE_LINE,
-)
+    "Needs approval", "Not confirmed", "Action denied", "Approval expired", "Action cancelled", "You're using the phone", HERMES_UNREACHABLE_LINE,
+) + AgentPhoneStepWords.values
+
+/**
+ * The approval a card shows for the account [origin]/[owner]/[profile]: the call's first, only while the call runs in that account. Every
+ * host of the card (the app, the watched phone, Take control) asks this one question (R3-F9).
+ */
+internal fun CallState.pendingApprovalFor(origin: String, owner: String, profile: String): CallToolApproval? =
+    toolApprovals.firstOrNull()?.takeIf { active && conversationScope?.let { it.origin == origin && it.owner == owner && it.profile == profile } == true }
 
 /** The tool chip's line: while Hermes can't be reached, a tool still waiting says so instead of spinning. */
 internal fun CallToolReceipt.chipText(unreachable: Boolean): String? =
     if (unreachable && status in setOf("ready", "running", "needs_approval")) HERMES_UNREACHABLE_LINE else chipLabel()
 
 internal fun CallToolReceipt.chipLabel(): String? {
+    if (phoneInUse) return "You're using the phone"
     activityLabel()?.let { return it }
     val tool = toolName.substringAfterLast("__").lowercase()
     val service = toolName.takeIf { it.startsWith("mcp__") }?.removePrefix("mcp__")?.substringBefore("__")

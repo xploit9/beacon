@@ -75,9 +75,34 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
                      and isinstance(node.args[0], ast.Constant) and node.args[0].value == 'on_session_end')
     emitted_hook = compile(ast.Expression(body=hook_call), str(finalizer_path), 'eval')
     seen = []
+    # Hermes' own wait on a person (tools/human_input_hooks.py), reaching whatever hooks the plugin registers, as Hermes' dispatch would.
+    import hermes_cli.lifecycle
+    from tools import approval_context
+    from tools.human_input_hooks import human_input_request
+    registered = {}
+    entry.register(SimpleNamespace(register_tool=lambda **kwargs: None,
+                                   register_hook=lambda name, callback: registered.setdefault(name, []).append(callback)))
+    fired = []
+    def invoke_hook(name, **kwargs):
+        fired.append(name)
+        return [callback(**kwargs) for callback in registered.get(name, [])]
+    monkeypatch.setattr(hermes_cli.lifecycle, 'invoke_hook', invoke_hook)
+    waits = []
+
+    def ask(kind, claimed):
+        """A tool in this turn waits for the owner, the way clarify or a gateway approval does; the notices are read during the wait."""
+        tokens = approval_context.set_current_observability_context(turn_id=claimed['admission_id'], tool_call_id='synthetic-call', session_id='same-chat')
+        try:
+            with human_input_request(kind, prompt='Synthetic question?', **({'session_key': 'synthetic-key'} if kind == 'approval' else {})) as human:
+                waits.append(notice_rows(api))
+                api.activity.sync(api.mobile, api.native, 'owner', 'basic', 'default')  # the dashboard watcher's pass meanwhile
+                waits.append(notice_rows(api))
+                human.outcome = 'answered'
+        finally:
+            approval_context.reset_current_observability_context(tokens)
 
     async def drive(*, proven=True, foreign_binding=False, foreign_actor=False, failed=False,
-                    interrupted=False, execute=True, live_call=False, stale_generation=False):
+                    interrupted=False, execute=True, live_call=False, stale_generation=False, asks=None):
         ref = SessionRef(str(tmp_path), 'same-chat')
         submitting=connection
         if foreign_actor:
@@ -132,14 +157,19 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
                 eval(emitted_hook, values)
             async def handle(event):
                 assert event.source.user_id in (subject(),api.native.execution_subject('owner','basic',subject())) and event.text == 'Synthetic text task'
-                emit()
-                emit()  # A duplicate hook for this native turn must not duplicate the outbox row.
+                if asks:
+                    ask(asks, claimed)
+                else:
+                    emit()
+                    emit()  # A duplicate hook for this native turn must not duplicate the outbox row.
                 execution_result.get()['terminal_result'] = {'completed': not failed, 'failed': failed,
                                                             'final_response': 'Synthetic task result'}
                 return 'Synthetic task result'
             runner._handle_message = handle
             if execute:
                 await execute_admission(authority, ref, claimed)
+            elif asks:
+                ask(asks, claimed)  # A real receipt and a viewer alone do not create executing-turn proof.
             else:
                 emit()  # A real receipt and a viewer alone do not create executing-turn proof.
             result = authority.pending_results.get(claimed['admission_id'], {'result': {'completed': True}})
@@ -150,10 +180,46 @@ def native_notice(canonical_call, monkeypatch, tmp_path):
             relay.cancel()
             await asyncio.gather(relay, return_exceptions=True)
             authority.executing.pop('same-chat', None)
+    drive.waits = waits
     try:
         yield api, client, sessions, make_session, seen, drive
     finally:
         db.close()
+
+
+def notice_rows(api):
+    with api.mobile.connect() as conn:
+        return [(row['id'], row['kind'], row['state'], row['principal'], row['conversation'], row['activity_key'])
+                for row in conn.execute('SELECT * FROM notices ORDER BY seq')]
+
+
+@pytest.mark.parametrize('live_call', [False, True])  # the call screen cannot show it, so a question in the call's chat alerts too
+@pytest.mark.parametrize('kind', ['clarify', 'approval'])
+def test_a_question_or_approval_in_an_app_chat_alerts_the_phone_once_until_it_is_answered(native_notice, kind, live_call):
+    api, client, sessions, make_session, seen, drive = native_notice
+    asyncio.run(drive(asks=kind, live_call=live_call))
+    waits = drive.waits
+    # While Hermes waits: exactly one pending notice of that kind, bound to the chat's login. The dashboard's own pass keeps it.
+    assert len(waits) == 2 and waits[0] == waits[1]
+    (event, wait_kind, state, principal, conversation, ref), = waits[0]
+    assert (wait_kind, state, principal, conversation) == (kind, 'pending', subject(), 'same-chat') and ref == event
+    # Answered: the notice is settled and its activity ended, so the phone takes the alert down.
+    rows = notice_rows(api)
+    assert [(r[1], r[2], r[3], r[5]) for r in rows] == [(kind, 'settled', subject(), event), ('activity_end', 'pending', subject(), event)]
+    # Only the chat's own login sees it; no request text is stored or served.
+    detail = client.get('/api/plugins/beacon/mobile/notifications/events/' + event)
+    assert detail.status_code == 200 and detail.json()['kind'] == kind and 'Synthetic question' not in detail.text
+    assert {e['event_id'] for e in client.get('/api/plugins/beacon/mobile/notifications/events').json()['events']} == {r[0] for r in rows}
+    sessions[0] = make_session('https://other.example')
+    assert client.get('/api/plugins/beacon/mobile/notifications/events/' + event).status_code == 404
+    assert client.get('/api/plugins/beacon/mobile/notifications/events').json()['events'] == []
+
+
+@pytest.mark.parametrize('options', [{'foreign_binding': True}, {'execute': False}, {'proven': False}])
+def test_a_wait_outside_a_proven_owner_turn_makes_no_notice(native_notice, options):
+    api, _, _, _, _, drive = native_notice
+    asyncio.run(drive(asks='clarify', **options))
+    assert notice_rows(api) == [] and drive.waits == [[], []]
 
 
 @pytest.mark.parametrize('failed,kind', [(False, 'completion'), (True, 'failure')])

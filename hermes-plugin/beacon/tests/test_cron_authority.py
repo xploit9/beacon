@@ -74,12 +74,13 @@ def test_call_user_rejects_foreign_owned_cron_and_allows_unowned_cron(harness, m
         assert conn.execute("SELECT COUNT(*) FROM notices WHERE kind='incoming_call'").fetchone()[0] == 0
 
     allowed = json.loads(plugin.call_user({'reason': 'ring the owner'}, session_id='cron-unowned'))
-    assert allowed['status'] == 'pending' and allowed['conversation_id'] == 'owned-chat'
+    assert allowed['status'] == 'ringing' and 'event_id' not in allowed
 
     allowed_principal = json.loads(plugin.call_user({'reason': 'ring the owner'}, session_id='cron-owner'))
-    assert allowed_principal['status'] == 'pending' and allowed_principal['conversation_id'] == 'owned-chat'
+    assert allowed_principal['status'] == 'ringing'
     # Two cron jobs share the fallback chat but carry their own reasons, so neither swallows the other.
-    assert allowed_principal['event_id'] != allowed['event_id']
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(DISTINCT id) FROM notices WHERE kind='incoming_call' AND conversation='owned-chat'").fetchone()[0] == 2
 
 
 def test_canonical_call_user_requires_current_verified_principal(harness,monkeypatch):
@@ -96,9 +97,9 @@ def test_canonical_call_user_requires_current_verified_principal(harness,monkeyp
         return {'user_id':principal}
     monkeypatch.setattr(api.native,'verify',verify)
     accepted=json.loads(plugin.call_user({'reason':'synthetic'},session_id='canonical'))
-    assert accepted['status']=='pending'
+    assert accepted['status']=='ringing'
     with api.mobile.connect() as conn:
-        assert conn.execute('SELECT principal FROM notices WHERE id=?',(accepted['event_id'],)).fetchone()[0]==principal
+        assert conn.execute("SELECT principal FROM notices WHERE kind='incoming_call'").fetchone()[0]==principal
     for value in (None,other):
         active[0]=value
         assert 'error' in json.loads(plugin.call_user({'reason':'synthetic'},session_id='canonical'))

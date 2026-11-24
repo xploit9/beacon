@@ -5,6 +5,16 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class CallToolApprovalTest {
+    @Test fun anOwnerBusyPhoneReceiptNamesTheHold() {
+        val receipt = JSONObject().put("request_id", "held").put("tool_name", "agent_phone")
+            .put("status", "failed").put("error_code", "phone_in_use")
+        assertEquals("You're using the phone", CallToolReceipt.from(receipt)?.chipLabel())
+        assertEquals("phone_in_use", timelineToolReceipt(receipt)?.optString("error_code"))
+        assertEquals("You're using the phone", CallToolReceipt.from(receipt.put("status", "uncertain"))?.chipLabel())
+        receipt.put("status", "failed")
+        assertEquals("Agent phone failed", CallToolReceipt.from(receipt.put("error_code", "tool_error"))?.chipLabel())
+    }
+
     // Device round 2, item 2: "Lost Hermes. Check the chat." stayed on the call screen after the link was back and the result was said.
     @Test fun theLostHermesLineGoesWhenHermesIsBack() {
         val lost = CallState(active = true, callId = "call-synthetic", error = CALL_LOST_HERMES)
@@ -237,5 +247,47 @@ class CallToolApprovalTest {
         val short = CallToolApproval.from(JSONObject(value.toString()).put("phone_card", JSONObject(card.toString()).put("action", "Add 'Dentist' to Personal").put("target", "Personal"))).phone!!
         assertEquals("Add 'Dentist' to Personal", short.action)
         assertEquals("Personal", short.target)
+    }
+
+    private fun agentPhone(arguments: JSONObject, label: Any? = null, tool: String = AGENT_PHONE_TOOL) = CallToolApproval.from(
+        callToolApprovalEvent("req-synthetic-0100", tool, JSONObject().put("id", "p".repeat(40)).put("arguments", arguments).put("allow_call", false)
+            .apply { if (label != null) put("app_label", label) }))
+
+    // Q2 R3-F10: every agent_phone step's card read "Allow this action? · Agent Phone"; it says what Beacon will do, in the owner's language.
+    @Test fun anAgentPhoneStepCardSaysWhatBeaconWillDo() {
+        val open = callToolApprovalSummary(agentPhone(JSONObject().put("action", "open_app").put("package", "com.google.android.deskclock"), "Clock"))
+        assertEquals("Open {0}", open.headline!!.template);assertEquals(listOf("Clock"), open.headline!!.args);assertEquals("Open Clock", open.action)
+        val unknown = callToolApprovalSummary(agentPhone(JSONObject().put("action", "open_app").put("package", "com.example.notes")))
+        assertEquals(listOf("com.example.notes"), unknown.headline!!.args)
+        val list = callToolApprovalSummary(agentPhone(JSONObject().put("action", "list_apps")))
+        assertEquals("List apps", list.headline!!.template);assertEquals("", list.purpose)
+        val tap = callToolApprovalSummary(agentPhone(JSONObject().put("action", "tap").put("element", 4).put("purpose", "Focus the store search box")))
+        assertEquals("Tap", tap.headline!!.template);assertEquals("Focus the store search box", tap.purpose)
+        val task = callToolApprovalSummary(agentPhone(JSONObject().put("task", "Open the Clock app")))
+        assertEquals("Do a phone task", task.headline!!.template);assertEquals("Open the Clock app", task.preview)
+        assertTrue(AgentPhoneStepWords.values.all { it in CallToolStrings })
+        // The plugin's agent_phone ACTIONS (agent_phone_tools.py), each with its words.
+        assertEquals(setOf("task", "status", "capture", "tap", "long_press", "type", "key", "swipe", "open_app", "list_apps", "open_link", "wait",
+            "vault_list", "fill", "save_login", "new_login", "code"), AgentPhoneStepWords.keys)
+    }
+
+    // The name is the plugin's own (read on Beacon's phone), carried only for Beacon's own phone tool; another tool never shows one.
+    @Test fun onlyBeaconsOwnPhoneToolCarriesAnAppName() {
+        assertEquals("Clock", agentPhone(JSONObject().put("action", "open_app").put("package", "com.google.android.deskclock"), "Clock\u0007").appLabel)
+        assertEquals("", agentPhone(JSONObject().put("action", "open_app").put("package", "x.y"), "Clock", tool = "mcp__other__open_app").appLabel)
+        assertEquals("", agentPhone(JSONObject().put("action", "open_app").put("package", "x.y"), 7).appLabel)
+        val other = callToolApprovalSummary(agentPhone(JSONObject().put("action", "open_app"), "Clock", tool = "write_file"))
+        assertNull(other.headline)
+    }
+
+    // R3-F9: the app, the watched phone and Take control show a call's card under one account check.
+    @Test fun aCallsCardShowsOnlyForTheAccountTheCallRunsIn() {
+        val approval = agentPhone(JSONObject().put("action", "list_apps"))
+        val call = CallState(active = true, callId = "call-synthetic", toolApprovals = listOf(approval),
+            conversationScope = dev.hermes.android.core.Scope("https://hermes.example.com", "owner-1", "default"))
+        assertEquals(approval, call.pendingApprovalFor("https://hermes.example.com", "owner-1", "default"))
+        assertNull(call.pendingApprovalFor("https://hermes.example.com", "owner-1", "work"))
+        assertNull(call.pendingApprovalFor("https://other.example.com", "owner-1", "default"))
+        assertNull(call.copy(active = false).pendingApprovalFor("https://hermes.example.com", "owner-1", "default"))
     }
 }

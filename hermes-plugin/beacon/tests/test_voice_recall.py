@@ -56,6 +56,52 @@ class FakeProvider:
         self.closed = True
 
 
+@pytest.mark.parametrize('available', [None, False])
+def test_unloadable_user_bridge_falls_back_to_scoped_builtin_on_call(harness, monkeypatch, caplog, available):
+    from plugins.memory import find_provider_dir, load_memory_provider
+    from hermes_constants import get_hermes_home
+
+    api, client, _, root, _ = harness
+    voice = api.voice_context
+    name = 'mempalace-bridge'
+    home = root / 'work'
+    plugin = home / 'plugins' / name
+    plugin.mkdir(parents=True)
+    (plugin / '__init__.py').write_text('from hermes_provider import register\n', encoding='utf-8')
+    (plugin / 'plugin.yaml').write_text(f'name: {name}\nkind: standalone\n', encoding='utf-8')
+    (home / 'config.yaml').write_text(f'memory:\n  provider: {name}\n', encoding='utf-8')
+    (home / 'memories').mkdir()
+    (home / 'memories' / 'MEMORY.md').write_text('Favorite fruit is mango.', encoding='utf-8')
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    assert get_hermes_home() == home
+    assert find_provider_dir(name) is None and load_memory_provider(name, register_skills=False) is None
+    if available is False:
+        provider = FakeProvider()
+        provider.is_available = lambda: False
+        provider.shutdown = lambda: pytest.fail('This provider has not been initialized')
+        monkeypatch.setitem(sys.modules, 'plugins.memory', SimpleNamespace(load_memory_provider=lambda *a, **k: provider))
+    server = sys.modules['tui_gateway'].server
+    server._profile_home = lambda profile: home
+    server._session_auth_user_id = lambda row: row.get('user_id')
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kw: fn(home))
+    call = reserve(client)
+    url = f'/api/plugins/beacon/mobile/calls/{call}'
+    for _ in range(2):
+        result = client.post(url + '/memory', json={'query': 'favorite fruit'}).json()
+        assert result['status'] == 'completed' and 'mango' in result['summary']
+        assert result['sources'][0]['ref'] == 'native-memory:builtin'
+    capability = client.get(url + '/context').json()['capability_details']['memory_recall']
+    assert capability['provider'] == 'builtin' and capability['available'] is True
+    warnings = [r for r in caplog.records if r.levelname == 'WARNING' and 'using built-in memory' in r.getMessage()]
+    assert len(warnings) == 1
+    assert 'mango' not in warnings[0].getMessage()
+    (home / 'config.yaml').write_text(
+        f'memory:\n  provider: {name}\n  memory_enabled: false\n  user_profile_enabled: false\n', encoding='utf-8')
+    disabled = client.post(url + '/memory', json={'query': 'favorite fruit'}).json()
+    assert disabled['status'] == 'unavailable' and not disabled['sources']
+    assert client.get(url + '/context').json()['capabilities']['memory_recall'] is False
+
+
 def configured_provider(monkeypatch, voice, provider):
     monkeypatch.setattr(voice, 'config', lambda root: {'memory': {'provider': provider.name}})
     loads = []
@@ -228,7 +274,7 @@ def test_provider_exception_does_not_disclose_private_error_or_fake_builtin_succ
 
 
 @pytest.mark.parametrize('query', ['What do you remember about me?', 'What do you know about me?', 'unmatched question'])
-def test_general_or_unmatched_query_returns_full_bounded_curated_memory(recall_env, monkeypatch, query):
+def test_any_query_returns_full_bounded_curated_memory(recall_env, monkeypatch, query):
     voice, _, _, _, _ = recall_env
     memory = 'Name: Maya\nPrefers jasmine tea\n' + 'Curated detail\n' * 750
     monkeypatch.setattr(voice, 'builtin_memory', lambda *args: memory)
@@ -238,11 +284,21 @@ def test_general_or_unmatched_query_returns_full_bounded_curated_memory(recall_e
     assert result['sources'][0]['ref'] == 'native-memory:builtin'
 
 
-def test_specific_query_uses_meaningful_matching_lines(recall_env, monkeypatch):
+def test_builtin_snapshot_is_returned_whole_even_when_the_query_shares_no_words(recall_env, monkeypatch):
     voice, _, _, _, _ = recall_env
-    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: 'The owner works in robotics\nName: Maya\nFavorite tea: jasmine\nLikes tea with honey')
+    memory = 'The owner works in robotics' + chr(10) + 'Name: Maya' + chr(10) + 'Favorite tea: jasmine'
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: memory)
+    for query in ('What is the favorite tea?', 'zebra quantum'):
+        result = voice.recall('owner', 'basic', 'default', 'chat', query)
+        assert result['status'] == 'completed' and result['summary'] == memory
+
+
+def test_a_query_matching_only_some_lines_still_returns_the_whole_snapshot(recall_env, monkeypatch):
+    voice, _, _, _, _ = recall_env
+    memory = chr(10).join(['The owner works in robotics', 'Name: Maya', 'Favorite tea: jasmine', 'Likes tea with honey'])
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: memory)
     result = voice.recall('owner', 'basic', 'default', 'chat', 'What is the favorite tea?')
-    assert result['summary'] == 'Favorite tea: jasmine\nLikes tea with honey'
+    assert result['summary'] == memory  # base 1a7c13ce filtered this to the two tea lines
 
 
 def test_empty_builtin_is_explicitly_empty(recall_env, monkeypatch):

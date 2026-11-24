@@ -70,7 +70,7 @@ class CallPresentationTest {
         // Where the tool has a line of its own, the status is the state alone.
         assertEquals("Listening", callStatusLabel(call.copy(toolReceipts = listOf(receipt)), withTool = false))
         assertEquals("Thinking", callStatusLabel(call.copy(state = "thinking", toolReceipts = listOf(receipt)), withTool = false))
-        assertEquals("Muted", callStatusLabel(call.copy(muted = true)))
+        assertEquals("You're muted", callStatusLabel(call.copy(muted = true)))
     }
 
     @Test fun fileToolReceiptHasAReadableActivityLabel() {

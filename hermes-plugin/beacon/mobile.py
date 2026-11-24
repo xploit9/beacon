@@ -409,11 +409,19 @@ def connect(thread_safe=False):
     with LOCK: return _connect(thread_safe)
 
 
+def read_yaml(path):
+    """A YAML file parsed by Hermes' own reader; Hermes' default install has no PyYAML."""
+    try: from hermes_cli.config import read_config_doc
+    except ImportError:  # a Hermes from before this reader, which still carried PyYAML
+        import yaml
+        return yaml.safe_load(Path(path).read_text(encoding='utf-8-sig'))
+    return read_config_doc(Path(path))
+
+
 def read_plugin_version(path):
     """The version a plugin.yaml names, or '' when it is missing or unreadable."""
     try:
-        import yaml
-        value=yaml.safe_load(Path(path).read_text(encoding='utf-8-sig'))
+        value=read_yaml(path)
         version=value.get('version') if isinstance(value,dict) else None
         return version.strip() if isinstance(version,str) else ''
     except Exception: return ''
@@ -683,7 +691,8 @@ def named_files(text,clean=lambda words:words,mark=None,after=''):
     if mark is not None and not any(w.strip(_FILES_ONLY) for w in words): return mark+', '.join(names)
     return ''.join(w+(names[i]+after if i<len(names) else '') for i,w in enumerate(words))
 
-def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
+def enqueue_task_result(owner,profile,conversation,job_id,reason='',principal=None):
+    """[principal] is the login the chat is bound to (native.verify_saved): only that login's phones see the notice."""
     if (not isinstance(owner,str) or not owner or len(owner)>256 or any(ord(c)<32 for c in owner)
             or not isinstance(profile,str) or not profile or len(profile)>80
             or not isinstance(job_id,str) or not ID.fullmatch(job_id)
@@ -699,8 +708,8 @@ def enqueue_task_result(owner,profile,conversation,job_id,reason=''):
             raise RuntimeError('Notification outbox capacity reached')
         event=uuid.uuid4().hex
         now=time.time()
-        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason) VALUES(?,?,?,?,?,?,?,?,?)',
-                     (event,owner,profile,'task_result',conversation,now,now+86400,job_id,reason))
+        conn.execute('INSERT INTO notices(id,owner,profile,kind,conversation,created,expires,job_id,reason,principal) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                     (event,owner,profile,'task_result',conversation,now,now+86400,job_id,reason,principal or ''))
     return event
 
 def _history_key(owner):
@@ -802,6 +811,9 @@ def call_lock(call_id):
         return lock
 
 STALE_CALL_SECONDS=300
+# A silent phone keeps its call for the full window (its link to Hermes can drop mid-call). A call is closed sooner only when the owner's
+# phone has reached the plugin after the call's last touch and the call has been quiet this long: the app is alive but no longer in it.
+ABANDONED_CALL_SECONDS=60
 # A call's update events (CALLS-CONTRACT.md section 3) stay this long after the call closed; the watch pass removes them.
 CALL_UPDATES_KEEP_SECONDS=900
 _call_updates_pruned=[0.0]
@@ -816,6 +828,11 @@ def call_open_on(conn,owner,profile,conversation):
 
 def prune_notices(conn):
     now=time.time()
+    conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,seen,created),status='failed' WHERE closed=0 AND COALESCE(seen,created)<? "
+                 # Calls record no device, so only a lone recently active phone is known to be the one that held the call.
+                 "AND (SELECT COUNT(*) FROM beacon_devices d WHERE d.owner=calls.owner AND d.removed=0 AND d.last_seen>=?)=1 "
+                 "AND EXISTS(SELECT 1 FROM beacon_devices d WHERE d.owner=calls.owner AND d.removed=0 AND d.last_seen>=? AND d.last_seen>COALESCE(calls.seen,calls.created))",
+                 (now-ABANDONED_CALL_SECONDS,now-STALE_CALL_SECONDS,now-STALE_CALL_SECONDS))
     conn.execute("UPDATE calls SET closed=1,ended=COALESCE(ended,seen,created),status='failed' WHERE closed=0 AND COALESCE(seen,created)<?",(now-STALE_CALL_SECONDS,))
     conn.execute('''DELETE FROM call_tool_allowances WHERE NOT EXISTS
         (SELECT 1 FROM calls c WHERE c.id=call_id AND c.owner=call_tool_allowances.owner
@@ -1044,7 +1061,7 @@ def events(call_id,owner,body):
         if 'stage' in row and row['stage'] not in DIAGNOSTIC_STAGES: raise ValueError('Invalid stage')
         if 'error_code' in row:
             codes=DIAGNOSTIC_CODES
-            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating|tool_unknown|tool_changed|invalid_arguments|tool_error|capacity|not_started|outcome_unknown|deadline'
+            if row['type']=='tool_receipt': codes+='|tool_http_failure|admission_rejected|memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating|tool_unknown|tool_changed|invalid_arguments|tool_error|capacity|not_started|outcome_unknown|deadline|phone_in_use'
             if row['type'] not in ('tool_receipt','media_diagnostic') or not isinstance(row['error_code'],str) or not re.fullmatch(codes,row['error_code']): raise ValueError('Invalid diagnostic code')
         if 'elapsed_ms' in row: finite(row['elapsed_ms'])
         for field,limit in (('count',1000000),('total_corrected_ms',9007199254740991)):

@@ -2,6 +2,10 @@ package dev.hermes.android
 
 import dev.hermes.android.data.*
 import dev.hermes.android.ui.NativeSkillsState
+import dev.hermes.android.ui.MediaCache
+import dev.hermes.android.ui.parseNativeMarkdown
+import dev.hermes.android.ui.skillInstructionBody
+import dev.hermes.android.ui.memoryEntries
 import dev.hermes.android.ui.withSkillEnabled
 import dev.hermes.android.core.*
 import androidx.lifecycle.SavedStateHandle
@@ -163,6 +167,23 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     private fun savedMemory(scope: Scope?): NativeMemoryState? = scope?.let { screens?.exact(it, "settings:memory")?.value }
         ?.let { runCatching { val cached = it.copy(); NativeMemoryState.parse(scope.key, cached.getJSONObject("status"), cached.getJSONObject("notes")) }.getOrNull() }
 
+    private suspend fun prepareMarkdown(texts: List<String>, current: () -> Boolean) {
+        val missing = texts.distinct().filter { MediaCache.markdown.get(it) == null }
+        if (missing.isEmpty()) return
+        val parsed = withContext(Dispatchers.Default) {
+            missing.mapNotNull { text ->
+                try { text to parseNativeMarkdown(text) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+            }
+        }
+        if (current()) parsed.forEach { (text, node) -> MediaCache.markdown.put(text, node) }
+    }
+
+    internal suspend fun prepareSavedMemory(scope: Scope, current: () -> Boolean) {
+        if (screens?.exact(scope, "settings:memory") == null) return
+        val entries = withContext(Dispatchers.Default) { savedMemory(scope)?.documents.orEmpty().flatMap { memoryEntries(it.content) } }
+        if (current()) prepareMarkdown(entries, current)
+    }
+
     /**
      * Points the editors at the client's profile (or, before any client exists, at the account the phone restored). [keepLists] and a plain rebind to the same
      * profile keep what the pages already show, the saved copy is the first thing a new profile shows, and only drafts and selections are dropped.
@@ -203,7 +224,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         val base = NativeServerState(requestedActionId = saved["server-update:$host:id"] ?: "", requestedAt = saved["server-update:$host:at"] ?: "")
         _server.value = when {
             sameHost -> base.copy(version = prior.version, overall = prior.overall, gatewayState = prior.gatewayState, activeAgents = prior.activeAgents, components = prior.components,
-                recentError = prior.recentError, update = prior.update, checkpoints = prior.checkpoints, checkpointBytes = prior.checkpointBytes, logs = prior.logs, logFile = prior.logFile, logSearch = prior.logSearch, asked = prior.asked, answered = prior.answered)
+                recentError = prior.recentError, update = prior.update, checkpoints = prior.checkpoints, checkpointBytes = prior.checkpointBytes, logs = prior.logs, logFile = prior.logFile, logSearch = prior.logSearch, asked = prior.asked, answered = prior.answered, savedLogCount = prior.savedLogCount)
             force -> base
             else -> savedServer(hostScope, base).also { updateCheckedAt = 0L }
         }
@@ -229,6 +250,9 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         runCatching { screens?.exact(scope, SERVER_HEALTH_KEY)?.value?.copy()?.let { state = parseServerStatus(it.getJSONObject("status"), state).copy(asked = true, answered = state.answered + "Health") } }
         runCatching { screens?.exact(scope, SERVER_UPDATE_KEY)?.value?.copy()?.let { state = state.copy(update = it, asked = true, answered = state.answered + "Server updates") } }
         runCatching { screens?.exact(scope, SERVER_BACKUPS_KEY)?.value?.copy()?.let { state = parseCheckpoints(it, state).copy(asked = true, answered = state.answered + "Session checkpoints") } }
+        screens?.exact(scope, "settings:logs:${state.logFile}")?.value?.let {
+            state = state.copy(savedLogCount = it.optInt("count"), answered = state.answered + "Logs")
+        }
         return state
     }
     private fun keepServer(scope: Scope, key: String, value: JSONObject) { jobs.launch(Dispatchers.Default) { cacheAttempt { screens?.open(scope); screens?.set(scope, key, value) } } }
@@ -250,7 +274,12 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 authorizeProfile(active, c.scope.profile)
                 if (!current(active, revision)) return@launch
                 val result = block(NativeSkills(c))
-                if (current(active, revision)) { _skills.value = result.copy(loading = false, saving = false, toggling = null); draftChanged() }
+                if (current(active, revision)) {
+                    result.content?.takeIf { it.name == result.selected?.name && !result.editing }?.let {
+                        screens?.set(active.scope, "skill-content:${it.name}", json("name" to it.name, "content" to it.content, "revision" to it.revision))
+                    }
+                    _skills.value = result.copy(loading = false, saving = false, toggling = null); draftChanged()
+                }
             } catch (e: CancellationException) { throw e }
             catch (e: Exception) { if (current(active, revision)) { _skills.update { (undo?.invoke(it) ?: it).copy(loading = false, saving = false, toggling = null, error = appErrorText(e)) }; profileFailure(e) } }
             finally { c.closeNative() }
@@ -276,10 +305,34 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
             old.copy(skills = list, selected = list.firstOrNull { it.name == old.selected?.name }, notice = api.warnings.takeIf { it.isNotEmpty() }?.joinToString("\n"))
         }
     }
+    private fun cachedSkill(name: String): JSONObject? {
+        val scope = client()?.scope ?: cachedScope()
+        return scope?.takeIf { it.key == scopeKey }?.let { screens?.exact(it, "skill-content:$name")?.value }
+            ?.takeIf { it.string("name") == name && it.has("content") && it.has("revision") }
+    }
+    internal fun hasSavedSkill(skill: NativeSkill) = cachedSkill(skill.name) != null
     fun openSkill(skill: NativeSkill) {
-        if (_skills.value.saving) return
-        _skills.update { it.copy(selected = skill, content = null, editing = false, draft = "") }
-        skillsRequest { api -> _skills.value.copy(content = api.read(skill.name)) }
+        if (_skills.value.saving || _skills.value.toggling != null) return
+        val scope = client()?.scope ?: cachedScope()
+        val cached = cachedSkill(skill.name)?.let { NativeSkillContent(skill.name, it.getString("content"), it.getString("revision")) }
+        fun show() {
+            _skills.update { it.copy(selected = skill, content = cached, editing = false, draft = "") }
+            skillsRequest { api -> _skills.value.copy(content = api.read(skill.name)) }
+        }
+        val body = cached?.let { skillInstructionBody(it.content) }
+        if (body == null || MediaCache.markdown.get(body) != null) { show(); return }
+        val revision = bindingRevision
+        skillJob?.cancel()
+        val prepare = jobs.launch(start = CoroutineStart.LAZY) {
+            // Prepare the existing renderer's cache off the main thread before exposing this document.
+            fun current() = revision == bindingRevision && (client()?.scope ?: cachedScope()) == scope
+            prepareMarkdown(listOf(body), ::current)
+            if (!current()) return@launch
+            skillJob = null
+            show()
+        }
+        skillJob = prepare
+        prepare.start()
     }
     fun skillSearch(value: String) { _skills.update { it.copy(search = value) } }
     fun skillDraft(value: String) { _skills.update { it.copy(draft = value) }; draftChanged() }
@@ -330,6 +383,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val status = c.nativeGet("/api/memory", profile)
                 val notes = c.nativeGet("/api/plugins/beacon/memory/documents", profile)
                 val result = NativeMemoryState.parse(c.scope.key, status, notes)
+                prepareMarkdown(result.documents.flatMap { memoryEntries(it.content) }) { current(active, revision) }
                 if (current(active, revision)) {
                     if (_memory.value.editing.isBlank()) { _memory.value = result; memoryAt = System.currentTimeMillis() }
                     else memoryAt = 0L
@@ -375,6 +429,38 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
     }
 
+    /** Warm non-mutating server summaries without replacing or cancelling the page the owner is reading. */
+    internal suspend fun warmServer(active: BeaconClient, page: String) {
+        val cache = screens ?: return
+        if (global() !== active) return
+        val key = when (page) {
+            "Health" -> SERVER_HEALTH_KEY
+            "Server updates" -> SERVER_UPDATE_KEY
+            "Session checkpoints" -> SERVER_BACKUPS_KEY
+            "Logs" -> "settings:logs:errors"
+            else -> return
+        }
+        if (cache.exact(active.scope, key)?.let { startupReadFresh(it.at, System.currentTimeMillis()) } == true) return
+        val c = active.detached()
+        try {
+            val q = mapOf("profile" to c.scope.profile)
+            val data = when (page) {
+                "Health" -> {
+                    val status = c.nativeGet("/api/status", q)
+                    val verdict = parseServerStatus(status, NativeServerState(), recentHermesError(c, q)).overall
+                    json("status" to status.copy().put("overall", verdict))
+                }
+                "Server updates" -> c.nativeGet("/api/hermes/update/check", q + ("force" to "false"))
+                "Session checkpoints" -> c.nativeGet("/api/ops/checkpoints", q)
+                else -> json("count" to c.nativeGet("/api/logs", q + mapOf("file" to "errors", "lines" to "100")).getJSONArray("lines").length())
+            }
+            if (global() === active) {
+                cache.set(active.scope, key, data)
+                if (!_server.value.loading && page !in _server.value.answered) _server.update { savedServer(active.scope, it) }
+            }
+        } finally { c.closeNative() }
+    }
+
     fun loadServer(page: String, force: Boolean = false) {
         // No client yet (the sign-in is still reconnecting): the page is waiting for its answer, not reporting an empty one.
         val active = global() ?: run { _server.update { it.copy(loading = true, error = "") }; return }
@@ -401,7 +487,12 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                         // The saved copy keeps the verdict (Needs attention when the log said so), never the log's sentence: log lines are not saved.
                         parseServerStatus(status, _server.value, recent).also { if (global() === active) keepServer(c.scope, SERVER_HEALTH_KEY, json("status" to status.copy().put("overall", it.overall))) }
                     }
-                    "Logs" -> _server.value.copy(logs = c.nativeGet("/api/logs", q + mapOf("file" to _server.value.logFile, "search" to _server.value.logSearch, "lines" to "100")).optJSONArray("lines")?.strings().orEmpty())
+                    "Logs" -> {
+                        val source = _server.value
+                        val lines = c.nativeGet("/api/logs", q + mapOf("file" to source.logFile, "search" to source.logSearch, "lines" to "100")).getJSONArray("lines").strings()
+                        if (global() === active && source.logSearch.isBlank()) keepServer(c.scope, "settings:logs:${source.logFile}", json("count" to lines.size))
+                        source.copy(logs = lines, savedLogCount = null)
+                    }
                     "Session checkpoints" -> {
                         val backups = c.nativeGet("/api/ops/checkpoints", q)
                         parseCheckpoints(backups, _server.value).also { if (global() === active) keepServer(c.scope, SERVER_BACKUPS_KEY, backups) }
@@ -418,7 +509,12 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     private suspend fun recentHermesError(c: BeaconClient, q: Map<String, String>): String = try {
         readRecentServerError { query -> c.nativeGet("/api/logs", q + query).optJSONArray("lines")?.strings().orEmpty() }
     } catch (e: CancellationException) { throw e } catch (e: Exception) { "" }
-    fun logFile(value: String) { _server.update { it.copy(logFile = value) }; loadServer("Logs") }
+    fun logFile(value: String) {
+        val scope = global()?.scope ?: cachedScope()
+        val count = scope?.let { screens?.exact(it, "settings:logs:$value")?.value?.optInt("count") }
+        _server.update { it.copy(logFile = value, logs = emptyList(), savedLogCount = count, answered = if (count == null) it.answered - "Logs" else it.answered + "Logs") }
+        loadServer("Logs")
+    }
     fun logSearch(value: String) { _server.update { it.copy(logSearch = value) } }
     fun clearReviewedUpdate() {
         val c = global() ?: return

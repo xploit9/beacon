@@ -85,6 +85,36 @@ class ScreenCacheTest {
         assertNotNull(cache.exact(default, "profiles", "/api/profiles"))
     }
 
+    @Test fun perChatReadsKeepOnlyTheNewestTwentyEachAndNeverEvictAnotherProfilesScreens() = runBlocking<Unit> {
+        val cache = newCache().apply { open(default) }
+        cache.put(other, "profiles", "/api/profiles", at(0), json("n" to 0))
+        val paths = listOf(CHAT_APPROVAL_PATH, "/api/model/current", "/api/reasoning", "/api/mobile/beacon/reasoning", "/api/projects/detail")
+        repeat(60) { chat ->
+            for (path in paths) {
+                val query = if (path == "/api/projects/detail") mapOf("id" to "c$chat") else mapOf("session_id" to "c$chat")
+                cache.put(default, "$path:c$chat", screenRequest(path, query), at(chat + 1L), json("n" to chat))
+            }
+        }
+        for (path in paths) assertEquals(path, ScreenCache.CHAT_PROJECT_ENTRIES, cache.latest(default).count { it.key.startsWith("$path:") })
+        assertNotNull(cache.exact(other, "profiles", "/api/profiles"))
+    }
+
+    @Test fun anIdenticalAnswerSchedulesNoWriteButAChangedOneDoes() = runBlocking<Unit> {
+        var writes = 0
+        val cache = ScreenCache(read = { null }, write = { scope, value -> writes++; rows[scope.key] = value }, drop = { rows.remove(it.key) }, jobs = jobs, quietMs = 20)
+        cache.open(default)
+        cache.put(default, "profiles", "/api/profiles", at(1), json("n" to 1))
+        kotlinx.coroutines.delay(300)
+        assertEquals(1, writes)
+        cache.put(default, "profiles", "/api/profiles", at(2), json("n" to 1))
+        kotlinx.coroutines.delay(300)
+        assertEquals("an unchanged answer must not rewrite the row", 1, writes)
+        assertEquals(at(2), cache.exact(default, "profiles", "/api/profiles")?.at)
+        cache.put(default, "profiles", "/api/profiles", at(3), json("n" to 2))
+        kotlinx.coroutines.delay(300)
+        assertEquals(2, writes)
+    }
+
     @Test fun oversizedAndCredentialShapedAnswersAreNeverKeptAndReplaceTheOlderCopy() = runBlocking<Unit> {
         val cache = newCache().apply { open(default) }
         cache.put(default, "models", "", at(1), json("groups" to 1))
@@ -212,7 +242,7 @@ class ScreenCacheTest {
         assertTrue(screenReadCacheable("/api/pc/files", mapOf("path" to "/home"), "p"))
         assertTrue(screenReadCacheable("/api/crons/history", mapOf("job_id" to "j"), "p"))
         assertFalse("chat-scoped reads stay live", screenReadCacheable("/api/crons/history", mapOf("session_id" to "s"), "p"))
-        assertFalse(screenReadCacheable("/api/session/usage", mapOf("session_id" to "s"), "p"))
+        assertTrue(screenReadCacheable("/api/session/usage", mapOf("session_id" to "s"), "p"))
         assertTrue("MCP server configs can hold secrets, so only their redacted rows are kept (redactMcpServers)", screenReadCacheable("/api/mcp/servers", emptyMap(), "p"))
         assertFalse("the plain allowlist still names no MCP path", "/api/mcp/servers" in screenReadPaths)
         // The one chat-keyed read is a chat's project (no messages); every other chat-scoped read stays live.

@@ -35,6 +35,7 @@ import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
@@ -231,6 +232,13 @@ private const val HELPER_WAIT_MS = 180_000L
  * Holds what the phone page and the journey show, and talks to the plugin. Every change goes through [state]. The phone keeps only the
  * owner's confirmation and hand ticks; where the journey stands is read from the server each time.
  */
+internal fun savedAgentPhone(cached: JSONObject?): AgentPhoneUi = AgentPhoneUi(
+    status = cached?.takeIf { !it.has("_error") }?.let(::parseAgentPhoneStatus),
+    policy = cached?.optJSONObject(PAGE_POLICY)?.let { runCatching { parseAgentPhonePolicy(it) }.getOrNull() },
+    activity = cached?.optJSONObject(PAGE_ACTIVITY)?.let { runCatching { parseAgentPhoneActivity(it) }.getOrNull() },
+    needsYou = cached?.optJSONObject(PAGE_NEEDS_YOU)?.let { runCatching { parseAgentPhoneNeedsYou(it) }.getOrNull() }.orEmpty(),
+)
+
 internal class AgentPhoneController(
     private val api: AgentPhoneApi,
     private val scope: CoroutineScope,
@@ -239,13 +247,7 @@ internal class AgentPhoneController(
     private val onStatus: (JSONObject) -> Unit = {},
     private val now: () -> Long = System::currentTimeMillis,
 ) {
-    private val _state = MutableStateFlow(AgentPhoneUi(
-        status = cached?.takeIf { !it.has("_error") }?.let(::parseAgentPhoneStatus),
-        policy = cached?.optJSONObject(PAGE_POLICY)?.let { runCatching { parseAgentPhonePolicy(it) }.getOrNull() },
-        activity = cached?.optJSONObject(PAGE_ACTIVITY)?.let { runCatching { parseAgentPhoneActivity(it) }.getOrNull() },
-        needsYou = cached?.optJSONObject(PAGE_NEEDS_YOU)?.let { runCatching { parseAgentPhoneNeedsYou(it) }.getOrNull() }.orEmpty(),
-        setup = AgentPhoneSetupState(ticks = ticks?.read().orEmpty()),
-    ))
+    private val _state = MutableStateFlow(savedAgentPhone(cached).copy(setup = AgentPhoneSetupState(ticks = ticks?.read().orEmpty())))
     /** The page's copy as last kept: the status answer and the other three (cache review, fu2). */
     private var kept: JSONObject? = cached?.takeIf { !it.has("_error") }
     val state: StateFlow<AgentPhoneUi> = _state
@@ -679,6 +681,7 @@ internal fun agentPhoneVaultName(profileId: String, profiles: List<org.json.JSON
     val profileRows = data["navigation-profiles"]?.optJSONArray("profiles")?.let { rows -> (0 until rows.length()).mapNotNull { rows.optJSONObject(it) } }.orEmpty()
     // One client for the assistant's profile while the page is open; closed when it goes.
     val client = remember(source, profile) { source?.let { runCatching { it.forAuthorizedProfile(profile) }.getOrNull() } }
+    val saved = remember(key, data[key], vm.restoredScope()) { savedAgentPhone(data[key].takeIf { vm.restoredScope() != null }) }
     DisposableEffect(client) { onDispose { client?.closeNative() } }
     val scope = rememberCoroutineScope()
     val controller = remember(client) {
@@ -731,6 +734,20 @@ internal fun agentPhoneVaultName(profileId: String, profiles: List<org.json.JSON
     BackHandler { vm.backFromSettings() }
     Column(Modifier.fillMaxSize()) {
         Header(uiText("{name}'s phone").named(), back = { vm.backFromSettings() }, menu = LocalOpenNavigationMenu.current)
+        if (client == null && saved.status != null) {
+            val status = saved.status
+            val hero = agentPhoneHero(status, saved.needsYou.size)
+            SettingsList(Modifier.weight(1f), testTag = "agent-phone-page") {
+                item { PhoneHero(hero, status, heroLine(hero, status, saved, profile, ::readableProfileId),
+                    saved.activity?.maxByOrNull { it.atMillis }, emptyList()) }
+                if (saved.policy != null) item { PhonePolicySection(saved, null) }
+                saved.activity?.let { rows -> item { SettingsSection(uiText("Recent activity")) {
+                    if (rows.isEmpty()) SettingsEmpty(uiText("Nothing yet"), Icons.Rounded.History)
+                    rows.take(8).forEach { ActivityRow(it) }
+                } } }
+            }
+            return@Column
+        }
         key(controller) {
             AgentPhonePage(
                 state, profileName = profile,
@@ -879,6 +896,23 @@ internal fun agentPhoneSize(context: Context, bytes: Long): String = isolateBidi
     else -> ""
 }
 
+@Composable private fun PhonePolicySection(state: AgentPhoneUi, actions: AgentPhonePageActions?) {
+    val busy = state.busy
+    val policy = state.policy
+    // Under "Ask before": the two honest lines the owner decided on (design Q3 and Q11).
+    val honestLines = uiText("Payment questions cover {name}'s phone tool.").named() + "\n" + uiText("Scheduled orders can't use cards from your vault.")
+    SettingsSection(uiText("Using the phone"), footer = honestLines, testTag = "agent-phone-use") {
+        SettingsSwitchRow(uiText("Let {name} use its phone").named(), policy?.enabled ?: true, { actions?.setEnabled?.invoke(it) }, icon = Icons.Rounded.Smartphone,
+            enabled = actions != null && policy != null, busy = busy == AgentPhoneBusy.Policy, testTag = "agent-phone-enabled")
+        SettingsDivider()
+        val asks = AgentPhoneAsk.entries.map { it.wire }
+        SettingsChoiceRow(uiText("Ask before"), (policy?.ask ?: AgentPhoneAsk.PaymentsAndSends).wire, asks, { wire -> AgentPhoneAsk.entries.firstOrNull { it.wire == wire }?.let { actions?.setAsk?.invoke(it) } },
+            icon = Icons.Rounded.VerifiedUser, optionLabels = mapOf("payments_and_sends" to "Payments and sends", "every_action" to "Every action"),
+            optionTestTags = asks.associateWith { "agent-phone-ask:$it" }, enabled = actions != null && policy != null && policy.enabled && busy != AgentPhoneBusy.Policy,
+            style = ChoiceStyle.Auto, fitSegments = true)
+    }
+}
+
 private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(
     state: AgentPhoneUi, status: AgentPhoneStatus, profileName: String, actions: AgentPhonePageActions, enterTask: () -> Unit,
 ) {
@@ -931,21 +965,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(
         }
     }
     if (!status.yours) return
-    item(key = "use") {
-        val policy = state.policy
-        // Under "Ask before": the two honest lines the owner decided on (design Q3 and Q11).
-        val honestLines = uiText("Payment questions cover {name}'s phone tool.").named() + "\n" + uiText("Scheduled orders can't use cards from your vault.")
-        SettingsSection(uiText("Using the phone"), footer = honestLines, testTag = "agent-phone-use") {
-            SettingsSwitchRow(uiText("Let {name} use its phone").named(), policy?.enabled ?: true, actions.setEnabled, icon = Icons.Rounded.Smartphone,
-                enabled = policy != null, busy = busy == AgentPhoneBusy.Policy, testTag = "agent-phone-enabled")
-            SettingsDivider()
-            val asks = AgentPhoneAsk.entries.map { it.wire }
-            SettingsChoiceRow(uiText("Ask before"), (policy?.ask ?: AgentPhoneAsk.PaymentsAndSends).wire, asks, { wire -> AgentPhoneAsk.entries.firstOrNull { it.wire == wire }?.let(actions.setAsk) },
-                icon = Icons.Rounded.VerifiedUser, optionLabels = mapOf("payments_and_sends" to "Payments and sends", "every_action" to "Every action"),
-                optionTestTags = asks.associateWith { "agent-phone-ask:$it" }, enabled = policy != null && policy.enabled && busy != AgentPhoneBusy.Policy,
-                style = ChoiceStyle.Auto, fitSegments = true)
-        }
-    }
+    item(key = "use") { PhonePolicySection(state, actions) }
     item(key = "phone") {
         SettingsSection(uiText("Phone"), testTag = "agent-phone-settings") {
             SettingsNavRow(uiText("Saved logins"), actions.openVault, icon = Icons.Rounded.Key,
@@ -1108,7 +1128,7 @@ private fun androidx.compose.foundation.lazy.LazyListScope.phonePage(
                 // The app's first letter on a tile, where its icon would be: Beacon has the app's name, not its picture.
                 Box(Modifier.size(52.dp).clip(RoundedCornerShape(16.dp)).background(scheme.primary.copy(alpha = .16f)), contentAlignment = Alignment.Center) {
                     Text(String(Character.toChars(app.codePointAt(0))).uppercase(locale), style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.SemiBold),
-                        color = scheme.primary)
+                        color = scheme.primary, modifier = Modifier.clearAndSetSemantics {}) // decorative: the app's name follows, a lone "C" node only confuses readers
                 }
                 Text(isolateBidi(app), Modifier.testTag("agent-phone-hero-app"), style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
             } else HeroGlyph(state, 44.dp, if (on) ink else ink.copy(alpha = .7f))

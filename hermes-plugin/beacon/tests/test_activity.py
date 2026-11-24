@@ -249,3 +249,168 @@ def test_capacity_does_not_settle_existing_requests_after_a_new_request(activity
     with api.mobile.connect() as conn:
         assert conn.execute("SELECT state FROM notices WHERE id='native-srq-fixture'").fetchone()[0] == 'pending'
         assert conn.execute("SELECT COUNT(*) FROM notices WHERE id='native-new-request'").fetchone()[0] == 0
+
+
+def test_a_failed_activity_pass_is_logged_once_by_kind_never_with_its_text(harness, monkeypatch, caplog):
+    import logging
+    api, *_ = harness
+    def fail(*args): raise AttributeError('echo private-fixture-command')
+    monkeypatch.setattr(api.activity, 'sync', fail)
+    monkeypatch.setattr(api, '_activity_logged', set(), raising=False)
+    with caplog.at_level(logging.WARNING):
+        api.watch('owner', 'basic', 'default')
+        api.watch('owner', 'basic', 'default')
+    said = [r.getMessage() for r in caplog.records if 'live Hermes work' in r.getMessage()]
+    assert said == ['Beacon could not read live Hermes work for phone alerts: AttributeError']
+    assert 'private-fixture-command' not in caplog.text
+
+
+def test_a_failed_question_alert_is_logged_once_by_kind_and_a_foreign_chat_is_not_a_failure(harness, monkeypatch, caplog):
+    import logging
+    from test_mobile import load_private
+    plugin = load_private('__init__')
+    monkeypatch.setattr(plugin, 'current_profile', lambda cfg: 'default')
+    def foreign(*args, **kwargs): raise LookupError('not this owner')
+    def broken(*args, **kwargs): raise RuntimeError('private-fixture-question')
+    with caplog.at_level(logging.WARNING):
+        monkeypatch.setattr(plugin.observers, 'human_input', foreign)
+        plugin.native_human_input(kind='clarify', request_id='a' * 32, session_id='chat', prompt='private-fixture-question')
+        monkeypatch.setattr(plugin.observers, 'human_input', broken)
+        for _ in range(2):
+            plugin.native_human_input(kind='clarify', request_id='a' * 32, session_id='chat', prompt='private-fixture-question')
+    said = [r.getMessage() for r in caplog.records if 'question or approval' in r.getMessage()]
+    assert said == ['Beacon could not alert the phone to a Hermes question or approval: RuntimeError']
+    assert 'private-fixture-question' not in caplog.text
+
+
+@pytest.mark.parametrize('kind,expected', [('canonical', 1), ('legacy', 0)])
+def test_a_question_alert_is_made_once_and_never_for_a_runtime_the_dashboard_alerts_for(harness, monkeypatch, kind, expected):
+    api, *_ = harness
+    observers = sys.modules['beacon_observers']
+    principal = 'auth:v1:["basic","https://issuer.example","owner"]'
+    monkeypatch.setattr(api.native, 'current_principal', lambda *args, **kwargs: principal)
+    monkeypatch.setattr(api.native, 'profile_fingerprint', lambda profile: 'f' * 64)
+    monkeypatch.setattr(api.mobile, 'native_conversation', lambda *args, **kwargs: {'kind': kind, 'principal': principal})
+    cfg = {'owner_id': 'owner', 'owner_provider': 'basic', 'profiles': ['default']}
+    for _ in range(2):  # Hermes fires once per wait; a repeat still makes one notice
+        observers.human_input(api.mobile, api.native, cfg, 'default', kind='clarify', request_id='b' * 32, session_id='chat')
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='sudo', request_id='c' * 32, session_id='chat')
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == expected
+
+
+def test_a_wait_inside_a_calls_own_tool_run_makes_no_notice(harness, monkeypatch):
+    # gateway_tools answers Hermes' gate there itself, from the owner's yes on the call screen: nobody waits on the phone.
+    api, *_ = harness
+    observers = sys.modules['beacon_observers']
+    principal = 'auth:v1:["basic","https://issuer.example","owner"]'
+    monkeypatch.setattr(api.native, 'current_principal', lambda *args, **kwargs: principal)
+    monkeypatch.setattr(api.native, 'profile_fingerprint', lambda profile: 'f' * 64)
+    monkeypatch.setattr(api.mobile, 'native_conversation', lambda *args, **kwargs: {'kind': 'canonical', 'principal': principal})
+    cfg = {'owner_id': 'owner', 'owner_provider': 'basic', 'profiles': ['default']}
+    token = api.native.call_principal.set(('owner', 'basic', 'default', 'chat', 'f' * 64, principal))
+    try:
+        observers.human_input(api.mobile, api.native, cfg, 'default', kind='approval', request_id='d' * 32, session_id='chat')
+    finally:
+        api.native.call_principal.reset(token)
+    with api.mobile.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] == 0
+
+
+PRINCIPAL = 'auth:v1:["basic","https://issuer.example","owner"]'
+
+
+def bound_chat(api, monkeypatch, waits=None):
+    """A canonical chat the owner holds, and Hermes' own wait settings (clarify, approval) when given."""
+    monkeypatch.setattr(api.native, 'current_principal', lambda *args, **kwargs: PRINCIPAL)
+    monkeypatch.setattr(api.native, 'profile_fingerprint', lambda profile: 'f' * 64)
+    monkeypatch.setattr(api.mobile, 'native_conversation', lambda *args, **kwargs: {'kind': 'canonical', 'principal': PRINCIPAL})
+    if waits:
+        monkeypatch.setitem(sys.modules, 'tools.clarify_gateway', SimpleNamespace(get_clarify_timeout=lambda: waits[0]))
+        monkeypatch.setitem(sys.modules, 'tools.approval_context', SimpleNamespace(_get_approval_timeout=lambda: waits[1]))
+    return {'owner_id': 'owner', 'owner_provider': 'basic', 'profiles': ['default']}
+
+
+def notice(api, event):
+    with api.mobile.connect() as conn:
+        found = conn.execute('SELECT * FROM notices WHERE id=?', (event,)).fetchone()
+    return dict(found) if found else None
+
+
+@pytest.mark.parametrize('waits,clarify,approval', [((7200, 600), 7200, 600), ((0, 0), 14400, 14400), ((3600, 300), 3600, 300)])
+def test_a_question_or_approval_alert_lasts_as_long_as_hermes_waits(harness, monkeypatch, waits, clarify, approval):
+    api, *_ = harness
+    observers = sys.modules['beacon_observers']
+    cfg = bound_chat(api, monkeypatch, waits)
+    now = time.time()
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='clarify', request_id='1' * 32, session_id='chat')
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='approval', request_id='2' * 32, session_id='chat')
+    assert abs(notice(api, 'human-' + '1' * 32)['expires'] - now - clarify) < 5
+    assert abs(notice(api, 'human-' + '2' * 32)['expires'] - now - approval) < 5
+    # Answered: the phone's "it ended" lives as long as the alert it ends, so a phone offline for a while still takes it down.
+    observers.human_input_resolved(api.mobile, cfg, 'default', request_id='1' * 32)
+    assert notice(api, 'settled-human-' + '1' * 32)['expires'] == notice(api, 'human-' + '1' * 32)['expires']
+
+
+def test_an_unreadable_hermes_wait_keeps_the_default_hour(harness, monkeypatch):
+    api, *_ = harness
+    observers = sys.modules['beacon_observers']
+    cfg = bound_chat(api, monkeypatch)
+    def broken(): raise RuntimeError('config unreadable')
+    monkeypatch.setitem(sys.modules, 'tools.clarify_gateway', SimpleNamespace(get_clarify_timeout=broken))
+    now = time.time()
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='clarify', request_id='3' * 32, session_id='chat')
+    assert abs(notice(api, 'human-' + '3' * 32)['expires'] - now - 3600) < 5
+
+
+def test_a_wait_whose_end_never_came_is_settled_once_it_expires(harness, monkeypatch):
+    # Hermes stopped mid-wait (no resolved hook): the row is not kept pending for ever.
+    api, *_ = harness
+    observers = sys.modules['beacon_observers']
+    cfg = bound_chat(api, monkeypatch, (3600, 300))
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='clarify', request_id='4' * 32, session_id='chat')
+    with api.mobile.connect() as conn:
+        conn.execute('UPDATE notices SET expires=? WHERE id=?', (time.time() - 1, 'human-' + '4' * 32))
+    api.watch('owner', 'basic', 'default')
+    # Settled (then pruned like any settled, expired notice) and the phone is told it ended.
+    assert (notice(api, 'human-' + '4' * 32) or {'state': 'settled'})['state'] == 'settled'
+    assert notice(api, 'settled-human-' + '4' * 32)['kind'] == 'activity_end'
+
+
+def test_a_legacy_request_alert_follows_hermes_wait_even_in_the_chat_of_an_open_call(harness, monkeypatch):
+    api, *_ = harness
+    bound_chat(api, monkeypatch, (7200, 600))
+    frames = [{'id': 'srq-a', 'method': 'approval', 'params': {}}, {'id': 'srq-c', 'method': 'clarify', 'params': {}}]
+    work = [{'key': 'k1', 'stored': 'chat', 'runtime': 'runtime', 'requests': frames[:1]},
+            {'key': 'k2', 'stored': 'call-chat', 'runtime': 'runtime-2', 'requests': frames[1:]}]
+    monkeypatch.setattr(api.activity, 'snapshot', lambda *args: work)
+    api.mobile.reserve('owner', 'default', 'call-chat')
+    now = time.time()
+    api.activity.sync(api.mobile, api.native, 'owner', 'basic', 'default')
+    assert abs(notice(api, 'native-srq-a')['expires'] - now - 600) < 5 and notice(api, 'native-srq-a')['push'] == 'pending'
+    assert abs(notice(api, 'native-srq-c')['expires'] - now - 7200) < 5 and notice(api, 'native-srq-c')['push'] == 'pending'
+
+
+def test_a_question_in_the_chat_of_an_open_call_pushes_once_like_any_other(harness, monkeypatch):
+    # The call screen has no card for a Hermes question, so the phone is told at once; it posts it quietly during the call.
+    from test_mobile import phone
+    api, client, cfg_api, tmp, app = harness
+    observers = sys.modules['beacon_observers']
+    cfg = bound_chat(api, monkeypatch, (3600, 300))
+    cfg_api['firebase_credentials'] = str(tmp / 'synthetic-service-account.json')
+    route = '/api/plugins/beacon/mobile/notifications/targets'
+    assert client.post(route, json={'id': 'p', 'token': 'synthetic-token-' + 'x' * 20}, headers=phone(client)).status_code == 200
+    with api.mobile.connect() as conn:
+        conn.execute("UPDATE targets SET payload=json_set(payload,'$.principal',?)", (PRINCIPAL,))
+    sent = []
+    messaging = SimpleNamespace(Message=lambda **kwargs: kwargs, AndroidConfig=lambda **kwargs: kwargs, send=lambda message, app=None: sent.append(message))
+    monkeypatch.setitem(sys.modules, 'firebase_admin', SimpleNamespace(get_app=lambda name: object(), credentials=SimpleNamespace(), messaging=messaging))
+    api.mobile.reserve('owner', 'default', 'call-chat', principal=PRINCIPAL)
+    in_call, elsewhere = 'human-' + 'a' * 32, 'human-' + 'b' * 32
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='clarify', request_id='a' * 32, session_id='call-chat')
+    observers.human_input(api.mobile, api.native, cfg, 'default', kind='approval', request_id='b' * 32, session_id='other-chat')
+    for _ in range(2):  # two dashboard passes while the call stays open
+        api.watch('owner', 'basic', 'default')
+        api.push('owner', 'default')
+    assert [m['data']['event_id'] for m in sent] == [in_call, elsewhere]
+    assert [row['id'] for row in api._notices_after('owner', 'basic', 'default', 0, PRINCIPAL)[0]] == [in_call, elsewhere]

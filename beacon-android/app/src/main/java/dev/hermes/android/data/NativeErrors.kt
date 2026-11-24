@@ -234,6 +234,8 @@ private val publicErrorText = setOf(
     "This chat changed. Refresh and try again.",
     "This chat is busy with a reply. Try again when it finishes.",
     "Hermes didn't allow that.",
+    "Add a file name.",
+    "A file already exists here. Choose another name or open it to edit.",
     "This phone was removed on Hermes. Sign in again in Settings › Connection.",
     "That chat belongs to another profile.",
     "Hermes is restarting. Try again in a moment.",

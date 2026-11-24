@@ -1,6 +1,8 @@
 package dev.hermes.android
 
 import androidx.activity.ComponentActivity
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -44,7 +46,7 @@ class QueueBoxUiTest {
         BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
     }
 
-    private fun withFixture(canonical: Boolean = false, light: Boolean = false, skin: String = "default", block: (BeaconViewModel, NativeExperienceFixture) -> Unit) {
+    private fun withFixture(canonical: Boolean = false, light: Boolean = false, skin: String = "default", language: String = "en", fontScale: Float = 1f, paintBackground: Boolean = false, block: (BeaconViewModel, NativeExperienceFixture) -> Unit) {
         check(!app.calls.state.value.active && app.calls.service == null) { "Never replace an active real call" }
         val prior = runBlocking { app.preferences.data.first() }
         val fixture = NativeExperienceFixture().apply { canonicalAuthority = canonical }
@@ -76,7 +78,19 @@ class QueueBoxUiTest {
                 vm.storeData("profile-settings", json("send_key" to "enter"))
             }
             rendered.value = vm
-            compose.setContent { NativeLocalization("en") { BeaconTheme(dark = !light, skin = skin) { rendered.value?.let { current -> ChatScreen(current) } } } }
+            compose.setContent {
+                val density = androidx.compose.ui.platform.LocalDensity.current
+                androidx.compose.runtime.CompositionLocalProvider(androidx.compose.ui.platform.LocalDensity provides androidx.compose.ui.unit.Density(density.density, fontScale),
+                    // Arabic is drawn right to left, as the app does under an Arabic locale.
+                    androidx.compose.ui.platform.LocalLayoutDirection provides if (language == "ar") androidx.compose.ui.unit.LayoutDirection.Rtl else androidx.compose.ui.unit.LayoutDirection.Ltr) {
+                    NativeLocalization(language) { BeaconTheme(dark = !light, skin = skin) {
+                        // The capture tests paint the theme's background the app's root gives the chat (the bare harness leaves the window's light base).
+                        androidx.compose.foundation.layout.Box(if (paintBackground) androidx.compose.ui.Modifier.fillMaxSize().background(androidx.compose.material3.MaterialTheme.colorScheme.background) else androidx.compose.ui.Modifier) {
+                            rendered.value?.let { current -> ChatScreen(current) }
+                        }
+                    } }
+                }
+            }
             block(vm, fixture)
         } finally {
             fixture.releasePromptAcknowledgement()
@@ -646,5 +660,83 @@ class QueueBoxUiTest {
         compose.onAllNodesWithTag("queue-not-sent:${item.id}").assertCountEquals(0)
         compose.onAllNodesWithTag("queue-box").assertCountEquals(0)
         assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
+    }
+
+    /** H1b captures (synthetic text): the three Not sent reasons (P2-14) and the live line while Hermes waits for the owner's answer (P2-9). */
+    private fun captureNotSentReasonsAndTheWaitingLine(vm: BeaconViewModel, prefix: String, english: Boolean) {
+        val now = System.currentTimeMillis()
+        val rows = listOf(
+            Message("1", "user", "Which flights go to Lisbon on Friday?", sessionId = "chat-a", recordedAt = now - 300_000),
+            Message("2", "assistant", "Three options: 07:10, 11:45 and 18:20.", sessionId = "chat-a", recordedAt = now - 290_000))
+        val offline = QueuedMessage("Running late, start without me", state = "queued", outcome = OFFLINE_OUTCOME, createdAt = now - 30_000)
+        val file = QueuedMessage("Synthetic report attached", listOf(json("name" to "Synthetic report.pdf", "mime" to "application/pdf")), state = "queued", outcome = FILE_NOT_SENT_OUTCOME, createdAt = now - 20_000)
+        val notTaken = QueuedMessage("Only direct flights, please", state = "settled", outcome = "cancelled", createdAt = now - 10_000)
+        val chatGone = QueuedMessage("Book the morning flight", state = "settled", outcome = CHAT_GONE_OUTCOME, createdAt = now - 5_000)
+        // At 2x the box holds about two rows on a phone, so Arabic shows the reasons in three shots.
+        val shots = if (english) listOf(listOf(offline, file, notTaken), listOf(chatGone)) else listOf(listOf(offline, notTaken), listOf(file), listOf(chatGone))
+        shots.forEachIndexed { index, shown ->
+            showChat(vm, rows, shown)
+            shown.forEach { compose.onNodeWithTag("queue-not-sent:${it.id}", useUnmergedTree = true).assertExists() }
+            if (english) shown.map(::notSentReason).forEach { compose.onNodeWithText("Not sent · $it", useUnmergedTree = true).assertExists() }
+            captureShot("$prefix-1${'a' + index}-not-sent-reasons")
+        }
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(queued = emptyList(), streamId = "runtime-chat-a", status = "Working",
+            liveTools = listOf(json("tool_call_id" to "q-1", "name" to "clarify", "status" to "running"))) }
+        compose.waitForIdle()
+        compose.onNodeWithTag("message-activity-status", useUnmergedTree = true).assertIsDisplayed()
+        if (english) compose.onNodeWithTag("message-activity-status", useUnmergedTree = true).assertTextEquals("Waiting for your answer")
+        captureShot("$prefix-2-waiting-for-the-answer")
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", status = "", liveTools = emptyList()) }
+    }
+
+    @Test fun screenshotsOfTheNotSentReasonsAndTheWaitingLine() = withFixture(paintBackground = true) { vm, _ ->
+        captureNotSentReasonsAndTheWaitingLine(vm, "h1b-dark", english = true)
+    }
+
+    @Test fun screenshotsOfTheNotSentReasonsAndTheWaitingLineInArabicAt2x() = withFixture(language = "ar", fontScale = 2f, paintBackground = true) { vm, _ ->
+        captureNotSentReasonsAndTheWaitingLine(vm, "h1b-ar-2x", english = false)
+    }
+
+    /**
+     * H1b P1-3 (UX pass): back in a chat mid-reply, the history that brings the owner's saved steer row must not draw the steer twice. Before, the
+     * render drew the row while the phone's copy still waited for its pairing (a separate update), so both showed for a moment.
+     */
+    @Test fun aSteerWhoseSavedRowArrivesIsNeverDrawnTwice() = withFixture { vm, fixture ->
+        val steer = QueuedMessage("Make it rhyme", state = "accepted", kind = "steer", createdAt = System.currentTimeMillis())
+        fixture.sessions.getValue("chat-a").getJSONArray("messages").put(json("role" to "user", "text" to "Make it rhyme", "display_kind" to "steer", "row_id" to 900))
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(queued = listOf(steer)) }
+        val twice = CopyOnWriteArrayList<String>()
+        val watch = CoroutineScope(Dispatchers.Main.immediate).launch {
+            vm.chat.collect { c -> if (c.messages.any { it.id == "900" } && "queued:${steer.id}" in chatTimelineMessages(c.messages, c.queued).map { it.id }) twice += c.queued.toString() }
+        }
+        try {
+            compose.runOnIdle { vm.selectSession("chat-a") }
+            compose.waitUntil(15_000) { vm.chat.value.messages.any { it.id == "900" } && vm.chat.value.queued.singleOrNull()?.rowId == "900" }
+        } finally { watch.cancel() }
+        assertTrue("The steer showed beside its saved row: $twice", twice.isEmpty())
+    }
+
+    /** H1b P2-9: while Hermes waits for the owner's answer (its clarify step runs, before the card arrives) the live line says so, not Working. */
+    @Test fun theLiveLineSaysWaitingForYourAnswerWhileHermesAsks() = withFixture { vm, _ ->
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "runtime-chat-a", status = "Working",
+            liveTools = listOf(json("tool_call_id" to "q-1", "name" to "clarify", "status" to "running"))) }
+        compose.waitForIdle()
+        compose.onNodeWithTag("message-activity-status", useUnmergedTree = true).assertTextEquals("Waiting for your answer")
+        compose.runOnIdle { flow<ChatState>(vm, "_chat").value = vm.chat.value.copy(streamId = "", status = "", liveTools = emptyList()) }
+    }
+
+    /** H1b P1-2: "Open a chat first." is said for a moment (a short snackbar, 4 s), not held for the long one (10 s). */
+    @Test fun openAChatFirstIsAShortSnackbar() {
+        val snackbar = androidx.compose.material3.SnackbarHostState()
+        val cleared = java.util.concurrent.atomic.AtomicBoolean(false)
+        compose.mainClock.autoAdvance = false
+        compose.setContent { NativeLocalization("en") { BeaconTheme(dark = true) {
+            androidx.compose.material3.SnackbarHost(snackbar)
+            NativeFeedbackEffect("", "Open a chat first.", false, snackbar, short = "Open a chat first." in SHORT_NOTICES) { cleared.set(true) }
+        } } }
+        compose.mainClock.advanceTimeBy(1_000)
+        compose.onNodeWithText("Open a chat first.").assertExists()
+        compose.mainClock.advanceTimeBy(6_000)
+        compose.onAllNodesWithText("Open a chat first.").assertCountEquals(0)
     }
 }

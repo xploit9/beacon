@@ -72,7 +72,12 @@ class AgentApprovalModelTest {
         assertEquals("{name} wants to pay", face("payment", "pay" to true).title)
         // A checkout tap whose control doesn't pay (a Sign in, Continue) says where it taps.
         assertEquals("{name} wants to tap on a payment screen", face("payment").title)
-        assertEquals("{name} wants to tap on a payment screen", face("unlabeled").title)
+        // D2c: a tap Beacon can't read says so; it is no payment claim. UX P1-8: verb first, saying what Allow lets it do.
+        assertEquals("{name} wants to tap an unreadable button", face("unlabeled").title)
+        assertFalse(face("unlabeled").money)  // no amount: no payment card
+        val checkout = face("unlabeled", "amount" to "€8.90")
+        assertEquals("{name} wants to tap an unreadable button", checkout.title)
+        assertEquals("€8.90", checkout.amount)  // the amount line stays on a checkout
         assertEquals("{name} wants to send", face("send").title)
         assertEquals("{name} wants to delete", face("delete").title)
         assertEquals("{name} wants to install an app", face("install").title)
@@ -89,11 +94,18 @@ class AgentApprovalModelTest {
         assertEquals("Pay {0}" to "Deny", pay.buttons.yes to pay.buttons.no)
         assertEquals(ApprovalGlyph.Payment, pay.glyph)
 
-        // An unlabeled tap names only the app; the amount when the screen showed one.
+        // An unlabeled tap names only the app; the amount when the screen showed one, which the plugin sends only on a checkout.
         val unlabeled = face("unlabeled", "app" to "Kanto Foods", "label" to "ignored", "amount" to "€8")
         assertEquals(PhoneLine("{0}", listOf("Kanto Foods")), unlabeled.subject)
         assertEquals("€8", unlabeled.amount)
         assertTrue(unlabeled.money)
+        assertEquals(ApprovalGlyph.Payment, unlabeled.glyph)
+        // Off a checkout (no amount): a plain tap question, nothing about money (D2c, the owner's product-page tap).
+        val product = face("unlabeled", "app" to "Kanto Foods", "purpose" to "Open the Golden Eggs product page")
+        assertFalse(product.money)
+        assertEquals(ApprovalGlyph.Tap, product.glyph)
+        assertEquals(ApprovalButtons.AllowDeny, product.buttons)
+        assertEquals("Nothing was done.", answeredLine(parse(record("agent_phone_action", 1, 100, "risk" to "unlabeled")).single(), false))
 
         val send = face("send", "app" to "Messages", "label" to "Send")
         assertFalse(send.money)
@@ -116,13 +128,17 @@ class AgentApprovalModelTest {
         val signIn = face("risk" to "payment", "app" to "Kanto Foods", "label" to "Sign in", "amount" to "£12.40", "pay" to false)
         assertEquals(PhoneLine("{0}: {1}", listOf("Kanto Foods", "Sign in")), signIn.subject)
         for (tap in listOf(signIn, face("risk" to "payment", "app" to "Kanto Foods", "label" to "Sign in", "amount" to "£12.40"),
-                face("risk" to "unlabeled", "app" to "Kanto Foods", "amount" to "€8.90"),
                 face("risk" to "payment", "app" to "Kanto Foods", "label" to "Place order", "amount" to "£12.40", "pay" to "true"))) {
             assertEquals(ApprovalButtons.AllowDeny, tap.buttons)
             assertEquals("{name} wants to tap on a payment screen", tap.title)
             assertTrue(tap.money)
             assertTrue(tap.amount.isNotBlank())
         }
+        // A tap Beacon can't read on a checkout: Allow / Deny with the amount, and a title that says what Allow lets it do (D2c, UX P1-8).
+        val unread = face("risk" to "unlabeled", "app" to "Kanto Foods", "amount" to "€8.90")
+        assertEquals(ApprovalButtons.AllowDeny, unread.buttons)
+        assertEquals("{name} wants to tap an unreadable button", unread.title)
+        assertTrue(unread.money && unread.amount.isNotBlank())
         // A saved login used on a payment screen is about the login: Allow / Deny.
         assertEquals(ApprovalButtons.AllowDeny, face("risk" to "payment", "action" to "fill", "pin" to "Use the Kanto Foods login in Kanto Foods?").buttons)
     }

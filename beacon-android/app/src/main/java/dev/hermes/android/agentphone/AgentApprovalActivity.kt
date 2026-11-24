@@ -241,6 +241,13 @@ internal class ApprovalDialogModel(application: Application) : AndroidViewModel(
                 fresh != null -> { shown = fresh; current = fresh }
             }
         }
+        // A question that is over (ended, or answered elsewhere) steps aside at once for the next one waiting (R3-F11): it never holds
+        // the queue until Close. With none waiting it stays, with Close, to say why. A record still open (sign-in lost) keeps its place.
+        val over = shown?.takeIf { (phase as? CardPhase.Problem)?.retry == false && queue.none { q -> q.id == it.id } }
+        if (over != null && queue.isNotEmpty()) {
+            link?.let { account -> viewModelScope.launch { AgentApprovals.ended(app, account, over) } }
+            shown = null; current = null
+        }
         if (shown == null) {
             val next = queue.firstOrNull()
             if (next == null) {
@@ -292,9 +299,9 @@ internal class ApprovalDialogModel(application: Application) : AndroidViewModel(
         }
     }
 
-    /** "Open the phone" (a Needs-you notice): L5's setup view, opened by class name as the phone page opens it. */
+    /** "Open the phone" (a Needs-you notice): L5's setup view, opened by class name, in control: the owner is asked to act on the phone (Settings opens it to watch). */
     private fun openPhone() {
-        val intent = Intent().setClassName(app, AGENT_PHONE_VIEW).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val intent = Intent().setClassName(app, AGENT_PHONE_VIEW).putExtra(AgentPhoneActivity.EXTRA_CONTROL, true).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (intent.resolveActivity(app.packageManager) != null) runCatching { app.startActivity(intent) }
         closing = true
         _ui.value = _ui.value.copy(finished = true)

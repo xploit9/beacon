@@ -15,7 +15,7 @@ private const val INCOMING_INVITATION_SECONDS = 120L
 private const val INCOMING_CLOCK_SKEW_SECONDS = 30L
 
 data class IncomingCall(val source: String, val event: String, val expiresAt: Long, val actionToken: String = java.util.UUID.randomUUID().toString(),
-    val arrivedAt: Long = 0, val arrivedElapsed: Long = 0, val boot: Int = -1, val state: String = "ringing", val conversation: String = "") {
+    val arrivedAt: Long = 0, val arrivedElapsed: Long = 0, val boot: Int = -1, val state: String = "ringing", val conversation: String = "", val callerName: String = "") {
     val key get() = "$source\u0000$event".digest()
     val answerAction get() = "hermes.call.ANSWER.$actionToken"
     val declineAction get() = "hermes.call.DECLINE.$actionToken"
@@ -117,6 +117,22 @@ suspend fun declineIncoming(app: BeaconApplication, source: String, event: Strin
             throw e
         }
     } finally { app.push.retryInvitation(source, event) }
+}
+
+/** A ring that timed out tells Hermes once, best effort, the way Decline does; 409 (already settled) and any failure end quietly. */
+suspend fun reportMissedIncoming(app: BeaconApplication, source: String, event: String) {
+    try {
+        withTimeout(8000) {
+            val binding = app.push.binding(source) ?: return@withTimeout
+            if (!app.push.permitsIncoming(source)) return@withTimeout
+            val client = app.push.clientFor(binding)
+            try {
+                client.bootstrap()
+                client.nativeRequest("/api/plugins/beacon/mobile/callbacks/$event/missed", "POST", org.json.JSONObject())
+            } finally { client.closeNative() }
+        }
+    } catch (cancelled: CancellationException) { throw cancelled }
+    catch (_: Exception) { /* Best effort: the server also settles an unanswered ring by itself. */ }
 }
 
 class IncomingCallReceiver : BroadcastReceiver() {

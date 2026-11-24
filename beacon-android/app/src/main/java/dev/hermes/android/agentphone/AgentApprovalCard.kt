@@ -155,7 +155,8 @@ private fun glyphIcon(glyph: ApprovalGlyph): ImageVector = when (glyph) {
     onClose: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val face = remember(ui.record) { approvalFace(ui.record) }
+    val home = uiText(HOME_SCREEN)
+    val face = remember(ui.record, home) { approvalFace(ui.record.copy(app = appWords(ui.record.app) { home })) }
     val palette = rememberSettingsStatusPalette()
     val scheme = MaterialTheme.colorScheme
     val ink = if (face.money) palette.attention else scheme.primary

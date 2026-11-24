@@ -6,6 +6,7 @@ capture, validation, input executor, completion checks, privacy and retry behavi
 import contextvars
 import hashlib
 import json
+import logging
 import queue
 import re
 import sqlite3
@@ -28,22 +29,31 @@ Return exactly one <tool_call>{"name":"mobile_use","arguments":{...}}</tool_call
 Allowed arguments, with no other keys:
 click: action and coordinate [x,y] at the center of the intended control
 swipe: action, coordinate [x,y] and coordinate2 [x2,y2]
+key: action and key ("home" or "back"). To open another app, use Home and find it on the launcher. Use Back to return to the previous screen.
 type: action and text for the focused ordinary field (no secrets or codes)
 wait: action and time in seconds (0 to 10)
 terminate: action and status ("success" or "failure")
 Examples of complete responses:
-<tool_call>{"name":"mobile_use","arguments":{"action":"click","coordinate":[500,400]}}</tool_call>
+<tool_call>{"name":"mobile_use","arguments":{"action":"click","coordinate":[212,948]}}</tool_call>
+<tool_call>{"name":"mobile_use","arguments":{"action":"key","key":"home"}}</tool_call>
 <tool_call>{"name":"mobile_use","arguments":{"action":"terminate","status":"success"}}</tool_call>
-Both axes run from 0 to 999 inclusive, from top left to bottom right of this exact image.
+Coordinates are whole pixels of this exact image, counted from its top left corner. Its size is the image field (width x height).
 Never interact with a masked field. When a vault operation is needed stop with failure.
+Start scroll gestures inside the app, below the status bar.
 Only report success when the requested end state is visible. Do not repeat a submission."""
-FIELDS = {'click': {'coordinate'}, 'swipe': {'coordinate', 'coordinate2'}, 'type': {'text'},
+FIELDS = {'click': {'coordinate'}, 'swipe': {'coordinate', 'coordinate2'}, 'key': {'key'}, 'type': {'text'},
           'wait': {'time'}, 'terminate': {'status'}}
 
 
 class Failure(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
+
+
+class BlockedSwipe(Failure):
+    def __init__(self, reason, message):
+        super().__init__('blocked', message)
+        self.reason = reason
 
 
 def _unique(pairs):
@@ -53,29 +63,35 @@ def _unique(pairs):
     return result
 
 
-def parse(text):
-    """Decode one upstream mobile_use call. No model text becomes an executor command or error message."""
+def parse(text, shown):
+    """Decode one upstream mobile_use call. No model text becomes an executor command or error message.
+    `shown` is the (width, height) of the image the model was sent: a coordinate is a pixel inside it, never rescaled or guessed."""
+    reason = 'empty or oversized response'
     try:
-        if not isinstance(text, str) or len(text) > 8192:
+        if not isinstance(text, str) or len(text) > 8192 or not text.strip():
             raise ValueError
+        reason = 'response format'
         # Older upstream-style models prepend two prose lines. Discard them without logging or returning them.
         match = re.fullmatch(r'\s*(?:Thought:[^<>\r\n]*\r?\nAction:[^<>\r\n]*\r?\n)?'
                              r'<tool_call>\s*(\{.*\})\s*</tool_call>\s*', text, re.DOTALL)
-        if not match:
-            raise ValueError
-        call = json.loads(match[1], object_pairs_hook=_unique)
+        # Some chat completions return the single JSON call without the XML wrapper.
+        call = json.loads(match[1] if match else text, object_pairs_hook=_unique)
+        reason = 'tool name or arguments'
         if set(call) != {'name', 'arguments'} or call['name'] != 'mobile_use':
             raise ValueError
         args = call['arguments']
         kind = args['action']
         if set(args) != FIELDS[kind] | {'action'}:
             raise ValueError
+        reason = 'invalid action value'
         for key in ('coordinate', 'coordinate2'):
             if key in args:
                 xy = args[key]
-                if not isinstance(xy, list) or len(xy) != 2 or any(type(n) is not int or not 0 <= n <= 999 for n in xy):
+                if not isinstance(xy, list) or len(xy) != 2 or any(type(n) is not int or not 0 <= n < axis for n, axis in zip(xy, shown)):
                     raise ValueError
         if kind == 'swipe' and args['coordinate'] == args['coordinate2']:
+            raise ValueError
+        if kind == 'key' and args['key'] not in ('home', 'back'):
             raise ValueError
         if kind == 'type' and (not isinstance(args['text'], str) or not 1 <= len(args['text']) <= 500
                                or any(not c.isprintable() for c in args['text'])):
@@ -86,7 +102,8 @@ def parse(text):
             raise ValueError
         return args
     except (ValueError, KeyError, TypeError, RecursionError):
-        raise Failure('invalid_plan', 'The vision model returned an invalid PhoneDriver action.') from None
+        logging.getLogger(__name__).info('PhoneDriver rejected a model reply (%s)', reason)
+        raise Failure('invalid_plan', 'The vision model could not choose a phone action.') from None
 
 
 def infer(profile, messages, timeout, route=None):
@@ -137,6 +154,7 @@ class Task:
         self.tools = sys.modules[step.__class__.__module__]
         self.deadline = time.monotonic() + TASK_SECONDS
         self.frame = self.expected = self.point = self.end = None
+        self.status_bar = None
         self.history = []
         self.route = []
         self.calls = self.captures = 0
@@ -185,28 +203,32 @@ class Task:
                     and screen.hit((box[0]+box[2])//2, (box[1]+box[3])//2) == i):
                 semantic.add(number)
         self.frame = dict(view, shown=shown.size, size=size, protected=protected, focus_box=focus_box, semantic=semantic,
-                          signature=(size, shown.size, screen.package, screen.window, digest.digest(), tuple(protected)))
+                          signature=(size, shown.size, screen.package, screen.window, digest.digest(), tuple(protected), self.status_bar))
 
-    def capture(self):
+    def capture(self, encode=True):
         self.access()
         self.step.note_activity()
         self.step._guard(before=True)
         self.captures += 1
-        result = self.step.do_capture()
+        result = self.step.do_capture(encode)
         self.access()
         if result.get('_multimodal') is not True:
             raise Failure(result.get('error', 'masked'), 'A safe picture of the virtual phone is unavailable.')
         return result['content']
 
     def before_effect(self):
-        self.capture()
+        self.capture(encode=False)
         if self.frame['signature'] != self.expected:
             raise Failure('changed', 'The phone screen changed during planning or approval. The planned input was stopped.')
 
-    def plan(self, goal, verify=False):
+    def plan(self, goal, verify=False, retry=False, feedback=None):
         content = self.capture()
         mode = ('Verify the visible end state independently. Return only terminate with success or failure.' if verify
                 else 'Choose the next action.')
+        if feedback:
+            mode += ' ' + feedback
+        if retry:
+            mode += ' Your last reply was invalid. Return one mobile_use call in the exact format shown.'
         messages = [{'role': 'system', 'content': PROMPT},
                     {'role': 'user', 'content': [{'type': 'text', 'text': json.dumps(
                         {'owner_goal': goal, 'previous_actions': self.history[-5:], 'instruction': mode})}, *content]}]
@@ -238,12 +260,18 @@ class Task:
         self.access()
         if not ok:
             raise Failure('vision_unavailable', UNAVAILABLE)
-        return parse(answer)
+        try:
+            return parse(answer, self.frame['shown'])
+        except Failure:
+            if retry: raise
+            # No input was dispatched. Re-check access and plan once from a fresh masked frame.
+            self.check()
+            return self.plan(goal, verify, retry=True, feedback=feedback)
 
     def position(self, xy):
-        # First choose a pixel on the actual model image, then its corresponding device pixel.
+        # The model's pixel on the image it was sent (parse() bounded it to that image), then its corresponding device pixel.
         shown, size = self.frame['shown'], self.frame['size']
-        pixel = tuple(round(n * (axis-1) / 999) for n, axis in zip(xy, shown))
+        pixel = tuple(xy)
         device = tuple(round(p * (axis-1) / max(1, display-1)) for p, axis, display in zip(pixel, size, shown))
         return list(pixel), device
 
@@ -252,6 +280,15 @@ class Task:
             raise Failure('masked', 'The planned input touches a protected area. Use the existing vault tools for private fields.')
 
     def check_swipe(self, screen, start, end):
+        bar = self.status_bar
+        reason = 'swipe_status_bar'
+        if bar is None or bar[2] <= bar[0] or bar[3] <= bar[1]:
+            width, height = self.frame['size']
+            # The short edge gives the same device-pixel inset in either orientation.
+            bar = (0, 0, width, max(1, min(width, height) // 16))
+            reason = 'swipe_status_bar_fallback'
+        if bar[0] <= start[0] < bar[2] and bar[1] <= start[1] < bar[3]:
+            raise BlockedSwipe(reason, 'Swipes may not start in the status bar. Use Home or Back to leave the app.')
         area = (min(start[0], end[0]), min(start[1], end[1]), max(start[0], end[0]), max(start[1], end[1]))
         self.protect(area)
         for i, node in enumerate(screen.nodes):
@@ -259,11 +296,13 @@ class Task:
             if box and self.tools._interactive(node) and _overlap(area, box):
                 risk, _ = self.tools.assess(screen, 'swipe', i, direction=self.step.args['direction'])
                 if self.tools.hard_block(screen, 'swipe', i) or risk:
-                    raise Failure('blocked', 'The swipe crosses a sensitive control. Select the control explicitly.')
+                    raise BlockedSwipe('swipe_sensitive_control', 'The swipe crosses a sensitive control. Select the control explicitly.')
 
     def primitive(self, action):
         kind = action['action']
         args = {'purpose': 'Perform the requested phone task'}
+        if kind == 'key':
+            return dict(args, action='key', key=action['key'])
         if kind == 'type':
             self.protect(self.frame['focus_box'])
             return dict(args, action='type', text=action['text'])
@@ -306,8 +345,9 @@ class Task:
 
     def loop(self, goal):
         seen = set()
+        feedback = None
         for _ in range(MAX_CYCLES):
-            action = self.plan(goal, self.verification_only)
+            action = self.plan(goal, self.verification_only, feedback=feedback)
             kind = action['action']
             if kind == 'terminate' and action['status'] == 'success':
                 if self.plan(goal, verify=True) == {'action': 'terminate', 'status': 'success'}:
@@ -329,11 +369,24 @@ class Task:
                     self.reserve()
                     self.dispatched = True
                 self.step.risk = None
-                result = getattr(self.step, 'do_' + self.step.args['action'])()
+                try:
+                    result = getattr(self.step, 'do_' + self.step.args['action'])()
+                except (Failure, self.tools.Refusal) as exc:
+                    # Only retry an unsent input, once per step and never past a question to the owner.
+                    if (exc.code != 'changed' and not isinstance(exc, BlockedSwipe)) or feedback or self.step.risk is not None:
+                        raise
+                    self.tools.log.info('PhoneDriver re-planned (%s)', getattr(exc, 'reason', exc.code))
+                    seen.discard(mark)  # never sent: the same input on the same screen again is no repeat
+                    feedback = exc.message if isinstance(exc, BlockedSwipe) else 'The screen changed. Choose again from the new view.'
+                    continue
                 if not result.get('success'):
                     raise Failure(result.get('error', 'incomplete'), 'The phone could not complete the planned input.')
+                # Even the last input in the budget can leave the shade over the next task.
+                if self.step.phone.focus()[0] == 'NotificationShade':
+                    self.capture(encode=False)
                 # Once a sensitive effect was authorized, only verify it; an ambiguous result cannot authorize another attempt.
                 self.verification_only = bool(self.step.risk in ('payment', 'unlabeled', 'send', 'delete', 'install', 'account'))
+            feedback = None
             self.history.append(kind)
             if self.progress:
                 self.progress(len(self.history))
@@ -351,7 +404,8 @@ def run(step, *, authorize=None, cancelled=None, progress=None):
                 raise Failure('busy', 'Another phone task is running or its lock is unavailable.') from None
             result = step.run()
     except (Failure, task.tools.Refusal) as exc:
-        result = {'success': False, 'error': exc.code, 'message': exc.message}
+        task.tools.log.info('PhoneDriver stopped (%s)', getattr(exc, 'reason', exc.code))  # a message can name the screen
+        result = {'success': False, 'error': exc.code, 'message': exc.message, **getattr(exc, 'extra', {})}
     except Exception as exc:  # error details may contain the goal, a credential, or screen content
         task.tools.log.info('PhoneDriver stopped (%s)', type(exc).__name__)
         result = {'success': False, 'error': 'unavailable',

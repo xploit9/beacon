@@ -7,7 +7,8 @@ import uuid
 from types import SimpleNamespace
 
 import pytest
-from test_agent_phone_tools import FakeHost, harness, load, node, phone, screen_xml  # noqa: F401
+from test_agent_phone_tools import (CHROME, CLOCK, LAUNCHER, SHOP_HOME, FakeAdb, FakeHost, _shop_page, fixture, harness,
+                                   load, node, phone, screen_xml)  # noqa: F401
 from test_agent_phone_api import PREFIX, phone_api  # noqa: F401
 
 
@@ -37,7 +38,8 @@ def reply(**args):
     return '<tool_call>' + json.dumps({'name': 'mobile_use', 'arguments': args}) + '</tool_call>'
 
 
-CLICK = reply(action='click', coordinate=[490, 399])
+SHOWN = (720, 1600)  # the image the model is sent: the fake phone's 1080x2400 screen at CAPTURE_WIDTH
+CLICK = reply(action='click', coordinate=[353, 638])  # a pixel of that image, on the Notes button
 OK = reply(action='terminate', status='success')
 
 
@@ -88,21 +90,206 @@ def test_checked_action_and_independent_verification(driver):
     assert invoke(tools)['error'] == 'already_attempted' and len(world.inputs) == 1
 
 
+@pytest.mark.parametrize('when', ['at_start', 'after_tap'])
+def test_r4_shade_is_collapsed_and_the_task_continues(driver, monkeypatch, when):
+    from test_agent_phone_tools import Done, FakeAdb
+    tools, _, world, _, answers, prompts, _ = driver
+    normal = world.xml
+    shade = screen_xml(node(text='Synthetic notification', package='com.android.systemui'), package='com.android.systemui')
+    def open_shade():
+        world.xml, world.focus_override = shade, 'NotificationShade'
+        world.dumpsys_windows = ('  Window #0 Window{ab u0 NotificationShade}:\n    package=com.android.systemui\n'
+                                 '    mAttrs={ty=NOTIFICATION_SHADE\n      fl=NOT_FOCUSABLE HARDWARE_ACCELERATED\n    }\n')
+    if when == 'at_start':
+        open_shade()
+    else:
+        monkeypatch.setattr(world, 'on_input', open_shade)
+    shell, collapsed = FakeAdb.shell, []
+    def phone_shell(adb, args, **options):
+        if args == ['cmd', 'statusbar', 'collapse']:
+            collapsed.append(True)
+            world.xml, world.focus_override = normal, None
+            world.dumpsys_windows = None
+            return Done('')
+        return shell(adb, args, **options)
+    monkeypatch.setattr(FakeAdb, 'shell', phone_shell)
+    answers.extend([CLICK, OK, OK])
+    result = invoke(tools)
+    assert result.get('verified') and collapsed == [True] and len(world.inputs) == 1
+    assert 'Synthetic notification' not in str(prompts)
+
+
+def test_r4_real_secure_window_stops_without_collapsing_or_showing_it(driver):
+    tools, _, world, _, answers, prompts, _ = driver
+    focused = world.package + '/.Private'
+    world.shell_answers = [
+        ('mCurrentFocus', '  mCurrentFocus=Window{123 u0 ' + focused + '}'),
+        ('^dumpsys window windows$', '  Window #0 Window{123 u0 ' + focused + '}:\n'
+         '    mAttrs={(0,0)(fillxfill) ty=BASE_APPLICATION\n      fl=NOT_FOCUSABLE SECURE\n    }\n    isVisible=true'),
+    ]
+    answers.extend([OK, OK])
+    assert invoke(tools).get('error') == 'masked'
+    assert not prompts and not world.inputs and ('shell', ['cmd', 'statusbar', 'collapse']) not in world.calls
+
+
+@pytest.mark.parametrize(('code', 'flags'), [(None, ''), (None, '      fl=NOT_FOCUSABLE\n'),
+                                              (0, ''), (0, '      fl=\n'), (0, '      fl=???\n'),
+                                              (0, '      fl=NOT_FOCUSABLE FLAG_SECURE\n'),
+                                              (0, '      fl=NOT_FOCUSABLE\n      ROTATION_90={ty=NOTIFICATION_SHADE\n          fl=SECURE\n      }}\n')])
+def test_r5_an_incomplete_shade_record_never_authorizes_collapse(driver, code, flags):
+    tools, _, world, _, _, prompts, _ = driver
+    world.focus_override = 'NotificationShade'
+    dump = ('  Window #0 Window{ab u0 NotificationShade}:\n    package=com.android.systemui\n'
+            '    mAttrs={(0,0)(fillxfill) ty=NOTIFICATION_SHADE\n' + flags +
+            '  Window #1 Window{ac u0 StatusBar}:\n    mAttrs={ty=STATUS_BAR\n      fl=NOT_FOCUSABLE\n    }\n')
+    world.shell_answers = [('^dumpsys window windows$', (dump, code))]
+    result = invoke(tools)
+    assert ('shell', ['cmd', 'statusbar', 'collapse']) not in world.calls
+    assert result.get('error') == 'masked' and not prompts and not world.inputs
+
+
+def set_status_frame(world, frame):
+    dump = FakeAdb(world).shell(['dumpsys', 'window', 'windows']).stdout
+    world.dumpsys_windows = dump.replace('frame=[0,0][1080,63]', frame)
+
+
+@pytest.mark.parametrize(('frame', 'y'), [('', 50), ('frame=[0,0][1080,63]', 42)])
+def test_w01_swipe_outside_the_default_or_measured_band_reaches_the_phone(driver, frame, y):
+    tools, _, world, _, answers, _, _ = driver
+    set_status_frame(world, frame)
+    answers.extend([reply(action='swipe', coordinate=[36, y], coordinate2=[36, 400]), OK, OK])
+    assert invoke(tools).get('verified')
+    touches = [points[0][:2] for kind, points in world.inputs if kind == 'touch']
+    assert touches[0] == (54, round(y * 2399 / 1599)) and touches[-1] == (54, 600)
+
+
+@pytest.mark.parametrize(('frame', 'y', 'reason'), [('frame=[0,0][1080,120]', 70, 'swipe_status_bar'),
+                                                   ('', 40, 'swipe_status_bar_fallback')])
+def test_r4_swipe_from_the_status_bar_never_reaches_the_phone(driver, caplog, frame, y, reason):
+    tools, _, world, _, answers, prompts, _ = driver
+    caplog.set_level('INFO')
+    set_status_frame(world, frame)
+    swipe = reply(action='swipe', coordinate=[370, y], coordinate2=[370, 450])
+    answers.extend([swipe, swipe])
+    result = invoke(tools)
+    assert result.get('error') == 'blocked' and 'status bar' in result['message'] and not world.inputs
+    assert result['planner_calls'] == 2 and result['steps'] == 0
+    instruction = json.loads(prompts[1][1]['content'][0]['text'])['instruction']
+    assert 'status bar' in instruction and 'Home or Back' in instruction
+    assert f'PhoneDriver re-planned ({reason})' in caplog.messages and f'PhoneDriver stopped ({reason})' in caplog.messages
+
+
+@pytest.mark.parametrize(('key', 'device_key'), [('home', 'GoHome'), ('back', 'GoBack')])
+def test_w01_task_inside_clock_reaches_settings(driver, monkeypatch, key, device_key):
+    tools, _, world, _, answers, prompts, _ = driver
+    settings = 'com.android.settings'
+    world.package, world.xml = CLOCK, screen_xml(node(text='Timer', package=CLOCK), package=CLOCK, title='Clock')
+    drawer = fixture('launcher_drawer.xml')
+    press, swipe = tools.Phone.key, tools.Phone.swipe
+
+    def navigate(phone, name):
+        press(phone, name)
+        if name == device_key and world.package == CLOCK:
+            world.package, world.xml = LAUNCHER, fixture('launcher_home.xml')
+
+    def open_drawer(phone, start, end, **kwargs):
+        swipe(phone, start, end, **kwargs)
+        if world.package == LAUNCHER and start[1] > end[1]:
+            world.xml = drawer
+
+    def open_settings(x, y):
+        if world.xml == drawer and 46 <= x < 293 and 1979 <= y < 2307:  # Settings in the drawer fixture
+            world.package, world.xml = settings, screen_xml(node(text='Display', package=settings), package=settings, title='Settings')
+
+    monkeypatch.setattr(tools.Phone, 'key', navigate)
+    monkeypatch.setattr(tools.Phone, 'swipe', open_drawer)
+    world.tap_hooks.append(open_settings)
+    answers.extend([reply(action='swipe', coordinate=[370, 40], coordinate2=[370, 450]), reply(action='key', key=key),
+                    reply(action='swipe', coordinate=[360, 1200], coordinate2=[360, 300]),
+                    reply(action='click', coordinate=[110, 1427]), OK, OK])
+    result = tools.call({'task': 'Open the Settings app'}, session_id='chat', task_id='settings-turn')
+    assert result.get('verified') and result['steps'] == 3, result
+    assert [json.loads(p[1]['content'][1]['text'])['package'] for p in prompts] == [CLOCK, CLOCK, LAUNCHER, LAUNCHER, settings, settings]
+    assert 'Home or Back' in json.loads(prompts[1][1]['content'][0]['text'])['instruction']
+    assert world.inputs[0][:2] == ('key', device_key) and world.inputs[1][0] == 'touch' and world.inputs[-1][0] == 'tap'
+
+
+def test_w01_navigation_key_rechecks_the_frame_before_dispatch(driver):
+    tools, _, world, _, answers, _, _ = driver
+
+    def move():
+        world.xml = screen_xml(node(text='New screen ' + str(world.dumps)))
+        return reply(action='key', key='back')
+
+    answers.extend([move, move])
+    result = invoke(tools)
+    assert result.get('error') == 'changed' and result['planner_calls'] == 2 and not world.inputs
+
+
+def test_w01_sensitive_swipe_replans_with_its_own_reason(driver, caplog):
+    tools, _, world, _, answers, prompts, _ = driver
+    world.xml = screen_xml(node(text='Factory reset'))
+    swipe = reply(action='swipe', coordinate=[360, 1200], coordinate2=[360, 300])
+    caplog.set_level('INFO')
+    answers.extend([swipe, swipe])
+    result = invoke(tools)
+    assert result.get('error') == 'blocked' and not world.inputs and result['planner_calls'] == 2
+    instruction = json.loads(prompts[1][1]['content'][0]['text'])['instruction']
+    assert 'sensitive control' in instruction and 'Factory reset' not in instruction
+    assert 'PhoneDriver stopped (swipe_sensitive_control)' in caplog.messages
+
+
+def test_r4_a_shade_title_alone_does_not_authorize_a_collapse(driver):
+    tools, _, world, _, _, prompts, _ = driver
+    world.focus_override = 'NotificationShade'
+    world.dumpsys_windows = ('  Window #0 Window{aa u0 NotificationShade}:\n    package=com.android.systemui.example\n'
+                             '    mAttrs={ty=NOTIFICATION_SHADE\n      fl=NOT_FOCUSABLE\n    }\n')
+    assert invoke(tools).get('error') == 'masked'
+    assert not prompts and not world.inputs and ('shell', ['cmd', 'statusbar', 'collapse']) not in world.calls
+
+
 @pytest.mark.parametrize('action', [
-    {'action': 'click', 'coordinate': [0, 1000]}, {'action': 'click', 'coordinate': [-1, 0]},
-    {'action': 'click', 'coordinate': [True, 0]}, {'action': 'click', 'coordinate': [1.5, 1]},
-    {'action': 'swipe', 'coordinate': [1, 1]}, {'action': 'wait', 'time': float('nan')},
+    {'action': 'click', 'coordinate': [0, 1600]}, {'action': 'click', 'coordinate': [720, 0]}, {'action': 'click', 'coordinate': [-1, 0]},
+    {'action': 'click', 'coordinate': [True, 0]}, {'action': 'click', 'coordinate': [1.5, 1]}, {'action': 'click', 'coordinate': [1, 2, 3]},
+    {'action': 'swipe', 'coordinate': [1, 1], 'coordinate2': [1, 1]}, {'action': 'swipe', 'coordinate': [1, 1]},
+    {'action': 'key', 'key': 'recents'}, {'action': 'key', 'key': 'enter'}, {'action': 'wait', 'time': float('nan')},
     {'action': 'type', 'text': 'a\nb'}, {'action': 'terminate', 'status': 'maybe'},
     {'action': 'shell', 'command': 'id'}, {'action': 'click', 'coordinate': [1, 2], 'extra': 5}])
 def test_strict_action_validation(driver, action):
     mod = driver[3]
     with pytest.raises(mod.Failure):
-        mod.parse(reply(**action))
-    assert mod.parse(reply(action='click', coordinate=[0, 999]))['coordinate'] == [0, 999]
+        mod.parse(reply(**action), SHOWN)
+    assert mod.parse(reply(action='click', coordinate=[719, 1599]), SHOWN)['coordinate'] == [719, 1599]
+    assert mod.parse(reply(action='click', coordinate=[0, 0]), SHOWN)['coordinate'] == [0, 0]
     with pytest.raises(mod.Failure):
-        mod.parse(OK + OK)
+        mod.parse(OK + OK, SHOWN)
     with pytest.raises(mod.Failure):
-        mod.parse(OK.replace('mobile_use', 'unexpected'))
+        mod.parse(OK.replace('mobile_use', 'unexpected'), SHOWN)
+
+
+def test_coordinates_are_pixels_of_the_exact_image_sent(driver):
+    """One frame (Q2, 22 Nov: the 0-999 prompt beside a 720x1600 picture drew pixel answers that were rejected or tapped elsewhere):
+    the prompt, the summary's size and the picture agree, and parse() bounds a reply by that picture alone, never rescaling it."""
+    from base64 import b64decode
+    from io import BytesIO
+    from PIL import Image
+    tools, _, world, mod, answers, prompts, _ = driver
+    assert '999' not in mod.PROMPT and 'Its size is the image field (width x height)' in mod.PROMPT
+    answers.extend([CLICK, OK, OK])
+    assert invoke(tools)['verified'] and world.inputs[0][:3] == ('tap', 540, 963)
+    summary, picture = prompts[0][1]['content'][1:]
+    with Image.open(BytesIO(b64decode(picture['image_url']['url'].split(',')[1]))) as image:
+        assert json.loads(summary['text'])['image'] == f'{image.width}x{image.height}' == '%dx%d' % SHOWN
+    # The bound is the image the reply answers, not a fixed grid: the same pixel fits a wider picture only.
+    wide = reply(action='click', coordinate=[900, 1700])
+    assert mod.parse(wide, (1080, 2400))['coordinate'] == [900, 1700]
+    with pytest.raises(mod.Failure):
+        mod.parse(wide, SHOWN)
+    # A reply outside the picture (a 0-999 grid answer on the right edge) is refused after one fresh re-plan; nothing is tapped.
+    world.inputs.clear()
+    answers.extend([reply(action='click', coordinate=[870, 847]), reply(action='swipe', coordinate=[360, 1700], coordinate2=[360, 400])])
+    result = tools.call({'task': 'Open Notes'}, session_id='chat', task_id='grid-turn')
+    assert result['error'] == 'invalid_plan' and result['planner_calls'] == 2 and not world.inputs
 
 
 def test_masks_reach_model_and_block_input(driver):
@@ -118,6 +305,34 @@ def test_masks_reach_model_and_block_input(driver):
     assert secret not in summary['text']
     with Image.open(BytesIO(b64decode(picture['image_url']['url'].split(',')[1]))) as image:
         assert max(image.getpixel((360, 638))) < 10
+
+
+def test_invalid_reply_replans_once_with_a_fresh_masked_screen(driver):
+    tools, _, world, _, answers, prompts, _ = driver
+    answers.extend(['unusable model reply', CLICK, OK, OK])
+    result = invoke(tools)
+    assert result['success'] and result['planner_calls'] == 4 and result['captures'] == 5
+    assert len(world.inputs) == 1 and 'unusable model reply' not in str(prompts)
+
+
+def test_two_invalid_replies_stop_without_input(driver, caplog):
+    tools, _, world, _, answers, _, _ = driver
+    caplog.set_level('INFO')
+    answers.extend(['private synthetic screen words', OK + OK])
+    result = invoke(tools)
+    assert result['error'] == 'invalid_plan' and result['planner_calls'] == result['captures'] == 2
+    assert not world.inputs
+    assert sum('PhoneDriver rejected a model reply (response format)' in r.getMessage() for r in caplog.records) == 2
+    assert 'private synthetic screen words' not in caplog.text
+
+
+def test_plain_json_accepts_only_a_complete_validated_mobile_call(driver):
+    module = driver[3]
+    call = CLICK.removeprefix('<tool_call>').removesuffix('</tool_call>')
+    assert module.parse(call, SHOWN) == module.parse(CLICK, SHOWN)
+    for invalid in (call + call, 'choose ' + call, call.replace('353', '720'), call.replace('mobile_use', 'other')):
+        with pytest.raises(module.Failure):
+            module.parse(invalid, SHOWN)
 
 
 def test_same_screen_retry_and_fresh_verification(driver):
@@ -158,7 +373,88 @@ def test_changes_during_inference_fail_without_input(driver, monkeypatch, change
             monkeypatch.setattr(tools.interrupt, 'is_interrupted', lambda: True)
         return CLICK
     answers.append(changed)
+    if change in ('tree', 'pixels'):
+        # R3-F1: a screen change before the input re-plans once from a fresh capture; a second change in the same step ends the task.
+        def changed_again():
+            if change == 'tree':
+                world.xml = screen_xml(node(text='Different again'))
+            else:
+                monkeypatch.setattr(FakeGrpc, 'screenshot', lambda self, *a, **kw: dict(width=kw.get('width') or 1080,
+                    height=kw.get('height') or 2400, image=bytes([7]) * ((kw.get('width') or 1080) * (kw.get('height') or 2400) * 3)))
+            return CLICK
+        answers.append(changed_again)
     assert invoke(tools_mod)['error'] == code and not world.inputs
+
+
+def test_r3_f1_a_screen_change_before_the_input_replans_once_from_a_fresh_capture(driver, caplog):
+    """Q2 R3-F1: a status-bar tick or a notification between the plan's capture and the input stopped half the tasks with "The phone
+    screen changed." Nothing was sent, so the step is planned again from a fresh capture, where every check runs again."""
+    tools, _, world, _, answers, prompts, _ = driver
+    caplog.set_level('INFO')
+    def notification():
+        world.xml = screen_xml(node(text='Notes'), node('android.widget.TextView', text='12:01', clickable=False, bounds=(900, 0, 1080, 60)))
+        return CLICK
+    world.after_input = screen_xml(node(text='Notes are open'))
+    answers.extend([notification, CLICK, OK, OK])
+    result = invoke(tools)
+    assert result.get('success') is True and result['planner_calls'] == 4 and len(world.inputs) == 1
+    assert '12:01' in str(prompts[1][1]['content'][1])  # the re-plan saw the fresh screen
+    assert any('PhoneDriver re-planned (changed)' in r.getMessage() for r in caplog.records)
+
+
+def test_r3_f1_a_change_that_goes_away_replans_the_same_input_on_the_same_screen(driver, monkeypatch):
+    """A caret blinks or a toast comes and goes: the input's check sees another screen once, and the re-plan sees the first one again and
+    proposes the same tap. It was never sent, so it is no repeat ("unchanged"); it runs once. A wait step resets the one re-plan."""
+    tools, _, world, _, answers, _, _ = driver
+    real_capture, blinked = tools.Call.do_capture, []
+    def capture(self, encode=True):
+        if encode or blinked:
+            return real_capture(self, encode)
+        blinked.append(1)
+        steady, world.xml = world.xml, screen_xml(node(text='Notes'), node('android.widget.TextView', text='Saved', clickable=False, bounds=(63, 2000, 1017, 2100)))
+        try:
+            return real_capture(self, encode)
+        finally:
+            world.xml = steady
+    monkeypatch.setattr(tools.Call, 'do_capture', capture)
+    world.after_input = screen_xml(node(text='Notes are open'))
+    answers.extend([CLICK, CLICK, OK, OK])
+    result = invoke(tools)
+    assert result.get('success') is True and len(world.inputs) == 1 and result['planner_calls'] == 4, result
+
+
+def test_validation_captures_skip_model_payload_encoding(driver, monkeypatch):
+    tools, _, world, _, answers, prompts, _ = driver
+    encoded, captures = [], []
+    real_b64, real_capture = tools.base64.b64encode, tools.Call.do_capture
+    monkeypatch.setattr(tools.base64, 'b64encode', lambda data: encoded.append(1) or real_b64(data))
+    monkeypatch.setattr(tools.Call, 'do_capture', lambda self, encode=True: captures.append(encode) or real_capture(self, encode))
+    answers.extend([CLICK, OK, OK])
+    assert invoke(tools).get('error') is None and world.inputs
+    assert False in captures and len(encoded) == len(prompts) == captures.count(True)
+
+
+def test_private_screen_at_validation_still_blocks_input_without_encoding(driver, monkeypatch):
+    tools, _, world, _, answers, _, _ = driver
+    encoded = []
+    real_b64 = tools.base64.b64encode
+    monkeypatch.setattr(tools.base64, 'b64encode', lambda data: encoded.append(1) or real_b64(data))
+    def private():
+        world.xml = screen_xml(node(text='synthetic-private-example', password=True))
+        return CLICK
+    # The validation capture is never encoded; the re-plan's capture is a masked planning frame, and its tap on the field is refused.
+    answers.extend([private, CLICK])
+    assert invoke(tools)['error'] == 'masked' and not world.inputs and len(encoded) == 2
+
+
+@pytest.mark.parametrize('withheld,code', [({'error': 'masked'}, 'masked'), ({'error': 'private'}, 'private'), ({}, 'masked')])
+def test_a_withheld_validation_frame_raises_and_dispatches_no_input(driver, monkeypatch, withheld, code):
+    tools, _, world, _, answers, _, _ = driver
+    real_capture = tools.Call.do_capture
+    # Planning sees a normal frame; the validation capture (encode=False, in before_effect) is withheld by the guard.
+    monkeypatch.setattr(tools.Call, 'do_capture', lambda self, encode=True: real_capture(self, encode) if encode else withheld)
+    answers.append(CLICK)
+    assert invoke(tools)['error'] == code and not world.inputs
 
 
 @pytest.mark.parametrize('answer,expected', [('denied', 'denied'), ('expired', 'expired')])
@@ -216,15 +512,36 @@ def test_unavailable_timeout_and_step_limit(driver, monkeypatch):
 
 def test_swipe_uses_exact_displayed_endpoints_and_checks_the_whole_path(driver):
     tools, _, world, _, answers, _, _ = driver
-    answers.extend([reply(action='swipe', coordinate=[50, 800], coordinate2=[60, 200]), OK, OK])
+    answers.extend([reply(action='swipe', coordinate=[36, 1280], coordinate2=[43, 320]), OK, OK])
     assert invoke(tools)['verified']
     touches = [v[1][0] for v in world.inputs if v[0] == 'touch']
     assert touches[0][:2] == (54, 1920) and touches[-1][:2] == (65, 480)
     world.inputs.clear()
     world.xml = screen_xml(node(text='private', password=True))
-    answers.append(reply(action='swipe', coordinate=[50, 399], coordinate2=[950, 399]))
+    answers.append(reply(action='swipe', coordinate=[36, 638], coordinate2=[684, 638]))
     result = tools.call({'task': 'Swipe across the form'}, session_id='chat', task_id='second-turn')
     assert result['error'] == 'masked' and not world.inputs
+
+
+def test_d2c_scrolling_a_priced_product_list_is_not_blocked(driver):
+    """D2c: every tile shows a price; before, each counted as a payment control and the scroll was blocked as crossing one."""
+    tools, _, world, _, answers, _, _ = driver
+    world.xml = SHOP_HOME
+    answers.extend([reply(action='swipe', coordinate=[180, 1300], coordinate2=[180, 500]), OK, OK])
+    result = invoke(tools)
+    assert result.get('verified'), result
+    assert [v for v in world.inputs if v[0] == 'touch']
+
+
+def test_r3_f11_a_task_scrolls_a_shop_page_past_its_buttons(driver):
+    """Q2 R3-F11 (state.db 494): a task's scroll on the store was "blocked" as crossing a sensitive control, since a footer Subscribe below
+    the fold made the page a checkout and every button the swipe crossed asked. A vertical scroll off a checkout crosses nothing sensitive."""
+    tools, _, world, _, answers, _, _ = driver
+    world.xml = _shop_page(node(text='SUBSCRIBE', rid='newsletter-subscribe-button', bounds=(0, 2337, 1080, 2337), package=CHROME))
+    answers.extend([reply(action='swipe', coordinate=[360, 1000], coordinate2=[360, 300]), OK, OK])
+    result = invoke(tools)
+    assert result.get('verified'), result
+    assert [v for v in world.inputs if v[0] == 'touch']
 
 
 def test_scripted_type_goes_through_the_existing_focused_field(driver):
@@ -438,13 +755,13 @@ def test_receipt_capacity_expiry_and_redelivery(driver, tmp_path, monkeypatch):
 
 def test_upstream_thought_is_discarded(driver):
     mod = driver[3]
-    assert mod.parse('Thought: hidden\nAction: done\n'+OK) == {'action': 'terminate', 'status': 'success'}
+    assert mod.parse('Thought: hidden\nAction: done\n'+OK, SHOWN) == {'action': 'terminate', 'status': 'success'}
 
 
 def test_prompt_examples_use_the_upstream_action_field(driver):
     mod = driver[3]
     examples = [line for line in mod.PROMPT.splitlines() if line.startswith('<tool_call>')]
-    assert [mod.parse(line) for line in examples] == [
-        {'action': 'click', 'coordinate': [500, 400]}, {'action': 'terminate', 'status': 'success'}]
+    assert [mod.parse(line, SHOWN) for line in examples] == [
+        {'action': 'click', 'coordinate': [212, 948]}, {'action': 'key', 'key': 'home'}, {'action': 'terminate', 'status': 'success'}]
     with pytest.raises(mod.Failure):
-        mod.parse('<tool_call>{"name":"mobile_use","arguments":{"click":[500,400]}}</tool_call>')
+        mod.parse('<tool_call>{"name":"mobile_use","arguments":{"click":[500,400]}}</tool_call>', SHOWN)

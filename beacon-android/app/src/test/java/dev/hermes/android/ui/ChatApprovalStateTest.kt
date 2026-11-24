@@ -5,6 +5,18 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class ChatApprovalStateTest {
+    @Test fun storedTranscriptCanPaintTheShieldAcrossAnUpgradeWithoutGuessingAnUnreportedBypass() {
+        val chat = dev.hermes.android.core.Scope("https://example.com", "owner", "default", "one", "fixture")
+        val owner = chat.copy(session = "").key
+        val mode = json("scope_key" to owner, "value" to "smart")
+        val raw = json("session_id" to chat.session, "profile" to chat.profile, "yolo" to true)
+        assertEquals("yolo", chatApprovalSelection(approvalFromProjection(raw, mode, chat), owner, "one"))
+        assertNull(approvalFromProjection(raw, mode, chat.copy(profile = "other")))
+        assertNull(approvalFromProjection(raw, mode, chat.copy(session = "two")))
+        assertNull(approvalFromProjection(raw, mode, chat.copy(owner = "other")))
+        raw.remove("yolo")
+        assertNull(approvalFromProjection(raw, mode, chat))
+    }
     private fun record(mode: String = "smart", bypass: Boolean = false) = json("scope_key" to "owner-profile", "session_id" to "chat-a", "profile_mode" to mode, "session_status_known" to true, "session_bypass" to bypass)
 
     @Test fun missingForeignOrUnreportedStateIsNeutral() {
@@ -39,7 +51,7 @@ class ChatApprovalStateTest {
 
     @Test fun autoAndBypassNeverFallBackToManual() {
         assertEquals("smart", chatApprovalSelection(record(), "owner-profile", "chat-a"))
-        assertEquals("Ask for risky ones", approvalChoiceLabel("smart"))
+        assertEquals("Hermes decides", approvalChoiceLabel("smart"))
         assertEquals("yolo", chatApprovalSelection(record(bypass = true), "owner-profile", "chat-a"))
         assertEquals("off", chatApprovalSelection(record("off").put("session_status_known", false), "owner-profile", "chat-a"))
     }

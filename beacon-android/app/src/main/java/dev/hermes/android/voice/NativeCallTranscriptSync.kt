@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicLong
 private val TIMELINE_TOOL_STATUSES = setOf("ready", "running", "needs_approval", "transferred", "completed", "failed", "denied", "expired", "uncertain",
     "cancelled", "unavailable", "not_sent", "submission_unconfirmed")
 private val TIMELINE_TOOL_CODE = Regex("http_[45][0-9]{2}|timeout|dns|tls|network|invalid_response|tool_http_failure|admission_rejected|" +
-    "memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating")
+    "memory_lookup_busy|memory_lookup_timeout|memory_lookup_failed|hermes_updating|phone_in_use")
 private val TIMELINE_IDENT = Regex("[A-Za-z0-9_-]{1,160}")
 /** What lost a call's link, in the plugin's closed set (mobile.py `CAUSE_CLASSES`); a plugin refuses a whole batch on any other. */
 private val TIMELINE_CAUSES = setOf("ssl_handshake", "ssl_peer", "ssl_protocol", "ssl_transport", "socket_timeout", "dns", "connect", "eof", "io", "other")

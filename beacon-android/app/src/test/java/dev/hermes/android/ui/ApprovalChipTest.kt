@@ -10,8 +10,8 @@ class ApprovalChipTest {
     }
 
     @Test fun aKnownModeIsNamedWithTheOwnersWords() {
-        assertEquals("Approvals: Always ask", shieldDescription("manual", "Approvals", approvalChoiceLabel("manual")))
-        assertEquals("Approvals: Ask for risky ones", shieldDescription("smart", "Approvals", approvalChoiceLabel("smart")))
+        assertEquals("Approvals: Ask for risky ones", shieldDescription("manual", "Approvals", approvalChoiceLabel("manual")))
+        assertEquals("Approvals: Hermes decides", shieldDescription("smart", "Approvals", approvalChoiceLabel("smart")))
         assertEquals("Approvals: Don't ask", shieldDescription("yolo", "Approvals", approvalChoiceLabel("yolo")))
         assertFalse(listOf("manual", "smart", "off", "yolo").any { shieldDescription(it, "Approvals", approvalChoiceLabel(it)).contains("Unknown") })
     }

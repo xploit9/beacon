@@ -39,11 +39,10 @@ def scoped(profile,fn,*,hydrate_secrets=True):
         return fn(Path(root) if root else Path(server._hermes_home))
 
 def config(root):
-    import yaml
     path=root/'config.yaml'
     if not path.is_file() or path.stat().st_size>1024*1024: return {}
-    try: value=yaml.safe_load(path.read_text(encoding='utf-8-sig'))
-    except (OSError,yaml.YAMLError): return {}
+    try: value=mobile.read_yaml(path)
+    except Exception: return {}
     return value if isinstance(value,dict) else {}
 
 def read_bounded(path,limit):
@@ -64,6 +63,8 @@ def personality(root):
 
 def builtin_memory(root,cfg):
     from tools.memory_tool import MemoryStore,get_builtin_memory_config,get_builtin_memory_store_flags
+    memory_on,user_on=get_builtin_memory_store_flags(cfg)
+    if not (memory_on or user_on): raise LookupError('Built-in memory is disabled')
     directory=root/'memories'
     if not directory.is_dir(): return ''
     # A store Beacon refuses to read is unavailable, never an empty one.
@@ -71,7 +72,6 @@ def builtin_memory(root,cfg):
     for name in ('MEMORY.md','USER.md'):
         path=directory/name
         if path.exists() and (path.is_symlink() or path.stat().st_size>128*1024): raise OSError('Built-in memory is unreadable')
-    memory_on,user_on=get_builtin_memory_store_flags(cfg)
     section=get_builtin_memory_config(cfg)
     store=MemoryStore(min(int(section.get('memory_char_limit',2200)),12000),min(int(section.get('user_char_limit',1375)),8000),memory_enabled=memory_on,user_profile_enabled=user_on)
     # Existing directory only: native loader sanitizes its frozen snapshot and never saves entries.
@@ -107,14 +107,45 @@ def bounded_memory_lookup(profile, fn):
     return future.result(timeout=_MEMORY_LOOKUP_TIMEOUT)
 
 
-def load_recall_provider(name, root, stored, owner):
+PROVIDER_AVAILABILITY = {}
+
+
+def record_provider(root, name, available):
+    key = (str(root), name)
+    with CALL_MEMORY_LOCK:
+        previous = PROVIDER_AVAILABILITY.get(key)
+        if previous != available:
+            PROVIDER_SCHEMAS.pop(key, None)
+        if key not in PROVIDER_AVAILABILITY and len(PROVIDER_AVAILABILITY) >= 64:
+            PROVIDER_AVAILABILITY.pop(next(iter(PROVIDER_AVAILABILITY)))
+        PROVIDER_AVAILABILITY[key] = available
+    return previous
+
+
+def available_provider(name, root):
+    """The same discovery and availability boundary as an agent turn, without installing a plugin."""
     from plugins.memory import load_memory_provider
-    matching = load_memory_provider(name, register_skills=False)
-    if matching is None:
-        raise LookupError('Configured memory provider unavailable')
     try:
-        if not matching.is_available():
-            raise LookupError('Configured memory provider unavailable')
+        matching = load_memory_provider(name, register_skills=False)
+    except (TimeoutError, BlockingIOError):
+        raise
+    except (ImportError, OSError):
+        matching = None
+    # Like Hermes, do not shut down an uninitialized provider. Some create their workers only in initialize().
+    available = matching is not None and matching.is_available()
+    previous = record_provider(root, name, bool(available))
+    if not available:
+        if previous is not False:
+            logger.warning('Beacon memory provider %s; using built-in memory when enabled',
+                           'could not be loaded' if matching is None else 'reported unavailable')
+        return None
+    return matching
+
+
+def load_recall_provider(name, root, stored, owner):
+    matching = available_provider(name, root)
+    if matching is None: return None
+    try:
         # Providers bind a session at initialize: keep this instance local to one read, with retention off.
         matching.initialize(session_id=stored, hermes_home=str(root), platform='dashboard',
                             agent_context='subagent', user_id=owner)
@@ -144,15 +175,18 @@ def external_provider(owner,provider,profile,stored,cfg,call_id=None,principal=N
     from tui_gateway import server
     # The open chat's manager, then the one this call already holds (warmed by the owner's first words).
     with CALL_MEMORY_LOCK: held=CALL_MEMORY.get(call_id)
+    target=server._profile_home(profile)
+    root=Path(target) if target else Path(server._hermes_home)
     managers=[getattr(agent,'_memory_manager',None) for agent in live_agents(owner,provider,profile,stored,principal)]
     for manager in managers+[held.manager if held is not None else None]:
         if manager is None or getattr(manager,'_shutting_down',False): continue  # a closed chat's manager no longer answers
         match=manager.get_provider(name) if hasattr(manager,'get_provider') else None
-        if match and callable(getattr(match,'prefetch',None)): return (manager,match),name
-    target=server._profile_home(profile)
-    root=Path(target) if target else Path(server._hermes_home)
+        if match and callable(getattr(match,'prefetch',None)):
+            record_provider(root,name,True)
+            return (manager,match),name
     subject=native.execution_subject(owner,provider,principal) if principal else owner
-    return (None,load_recall_provider(name,root,stored,subject)),name
+    matching=load_recall_provider(name,root,stored,subject)
+    return ((None,matching) if matching is not None else None),name
 
 def external_memory_configured(cfg):
     section = cfg.get('memory') if isinstance(cfg, dict) else None
@@ -222,10 +256,9 @@ def build_manager(root, owner, provider, profile, stored,principal=None):
         if manager is not None and not getattr(manager, '_shutting_down', False): return manager, False
     cfg = config(root)
     if not external_memory_configured(cfg): return None, False
+    matching = available_provider(str(cfg['memory']['provider']).strip(), root)
+    if matching is None: return None, False
     from agent.memory_manager import MemoryManager
-    from plugins.memory import load_memory_provider
-    matching = load_memory_provider(str(cfg['memory']['provider']).strip(), register_skills=False)
-    if matching is None or not matching.is_available(): return None, False
     row = verified_stored(owner,provider,profile,stored,principal)
     manager = MemoryManager()
     try:
@@ -285,10 +318,9 @@ def provider_tool_schemas(cfg):
     if cached and now < cached[0]: return cached[1]
     schemas = []
     try:
-        from agent.memory_manager import MemoryManager
-        from plugins.memory import load_memory_provider
-        matching = load_memory_provider(name, register_skills=False)
-        if matching is not None and matching.is_available():
+        matching = available_provider(name, get_hermes_home())
+        if matching is not None:
+            from agent.memory_manager import MemoryManager
             manager = MemoryManager()
             manager.add_provider(matching)
             schemas = manager.get_all_tool_schemas()
@@ -456,7 +488,10 @@ def warm_recall(owner, provider, profile, stored, call_id, words,principal=None)
     """The owner's first words start the provider's recall in the background, as the turn before a prompt does in Hermes; hermes_memory then finds it ready."""
     def run(root):
         from agent.memory_provider import is_trivial_prompt
-        if is_trivial_prompt(words) or not external_memory_configured(config(root)) or not memory_toolset_on(): return False
+        if is_trivial_prompt(words) or not memory_toolset_on(): return False
+        cfg = config(root)
+        if not external_memory_configured(cfg): return False
+        verified_stored(owner,provider,profile,stored,principal)
         manager = call_manager(root, owner, provider, profile, stored, call_id,principal=principal)
         if manager is None: return False
         manager.queue_prefetch_all(words, session_id=stored)
@@ -547,7 +582,8 @@ def profile_context(owner, provider, profile, stored, call_id,principal=None):
                + '\nNative curated memory:\n' + details['memory'][:5000]
                + '\nFor further memories use hermes_memory; for enabled instructions use hermes_skills. Tool discovery reads the current configured gateway.')
     return {'summary': summary[:12000], 'sources': [{'title': 'Current Hermes profile', 'ref': 'native-profile:' + profile}],
-            'capabilities': value['capabilities'], 'configured_memory_provider': value.get('configured_memory_provider'), 'observed_at': int(time.time())}
+            'capabilities': value['capabilities'], 'capability_details': value['capability_details'],
+            'configured_memory_provider': value.get('configured_memory_provider'), 'observed_at': int(time.time())}
 
 
 def search_status():
@@ -810,6 +846,24 @@ def ready_tools(profile):
     return hit[1] if hit and _clock()-hit[0]<TOOLS_READY_SECONDS else ''
 
 
+def recall_capability(root, cfg, name, readable):
+    # Admission reads only the built-in snapshot. Provider discovery happens during actual use.
+    from tools.memory_tool import get_builtin_memory_store_flags
+    builtin = readable and any(get_builtin_memory_store_flags(cfg))
+    external = external_memory_configured(cfg)
+    with CALL_MEMORY_LOCK:
+        observed = PROVIDER_AVAILABILITY.get((str(root), name)) if external else False
+    if observed:
+        return {'available': True, 'provider': name, 'reason': None}
+    detail = {'available': bool(builtin), 'provider': 'builtin' if builtin else None,
+              'reason': None if builtin else 'native_memory_unavailable'}
+    if observed is None:
+        detail.update(available=True if builtin else None, reason='verify_on_use')
+    elif external:
+        detail['reason'] = 'provider_unavailable'
+    return detail
+
+
 def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',native_backend=False,verify=None,with_history=False,principal=None):
     # Ownership is verified before any profile data is loaded. A call start runs no tool discovery: it names the tools a
     # background prefetch already found, and the live model finds others with discover_tools. Only the warm context reads the chat.
@@ -827,7 +881,9 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
         try: remembered=cached_owner_name(root,cfg)
         except Exception: remembered=''
         section=cfg.get('memory')
-        name=str(section.get('provider') or '') if isinstance(section,dict) else ''
+        name=str(section.get('provider') or '').strip() if isinstance(section,dict) else ''
+        memory_detail=({'available':None,'provider':None,'reason':'native_backend'} if native_backend else
+                       recall_capability(root,cfg,name,'memory' not in details))
         search=search_status()
         callback={}
         with mobile.connect() as conn:
@@ -870,9 +926,9 @@ def context(owner,provider,profile,stored,call_id,display_name='',owner_name='',
                 # Call contract v3 (section 7): the app builds its own instruction from these instead of system_instruction.
                 'persona':soul,'preferred_language':language,'local_time':clock,
                 'context':{'history':messages,'personality':soul,'memory':memory,**({'callback_reason':{'untrusted_text':callback.get('reason')},'callback_result':callback.get('result','')} if callback else {}),**({'language':language} if language else {})},
-                'configured_memory_provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,
-                'capabilities':{'profile_context':True} if native_backend else {'web_search':True,'memory_recall':bool(memory or external_memory_configured(cfg)),'skills':True,'profile_context':True},
-                'capability_details':{'web_search':search,'memory_recall':{'available':None if external_memory_configured(cfg) else bool(memory),'provider':name if external_memory_configured(cfg) else 'builtin' if memory else None,'reason':'verify_on_use' if external_memory_configured(cfg) else None if memory else 'native_memory_unavailable'},**details}}
+                'configured_memory_provider':name if external_memory_configured(cfg) else memory_detail['provider'],
+                'capabilities':{'profile_context':True} if native_backend else {'web_search':True,'memory_recall':memory_detail['available'] is not False,'skills':True,'profile_context':True},
+                'capability_details':{'web_search':search,'memory_recall':memory_detail,**details}}
     # Only files and this plugin's database are read, so no profile secrets are resolved for it.
     return scoped(profile,load,hydrate_secrets=False)
 
@@ -920,12 +976,8 @@ def recall(owner,provider,profile,stored,query,call_id=None,principal=None):
                 if manager is None: matching.shutdown()
             source={'title':'Native '+name+' memory','ref':'native-memory:'+name}
         else:
-            if external_memory_configured(cfg): raise LookupError('Configured memory provider unavailable')
             memory=builtin_memory(root,cfg)
-            words=set(re.findall(r'\w+',query.lower()))-set('what do does did you your remember know about me my myself the owner user profile memory memories saved tell please can have is are a an i for of to and in on with'.split())
-            general=bool(re.search(r'\b(?:remember|know)\b.{0,40}\b(?:me|myself|the owner)\b',query.lower()))
-            lines=[line for line in memory.splitlines() if words.intersection(re.findall(r'\w+',line.lower()))]
-            summary=clip('\n'.join(lines) if lines and not general else memory,8000).strip()
+            summary=clip(memory,8000).strip()  # the whole snapshot, as a Hermes turn sees it
             source={'title':'Native curated memory','ref':'native-memory:builtin'}
         return {'status':'completed' if summary else 'empty','summary':summary or ('Nothing came back from memory.' if unsure else 'No saved memories matched.'),
                 'sources':[source] if summary else [],'observed_at':int(time.time())}

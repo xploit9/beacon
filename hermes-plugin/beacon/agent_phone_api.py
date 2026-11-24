@@ -6,7 +6,7 @@
 - **The phone** (§7.1): status, start (the start checks first: no start without Hermes sign-in), stop, hand back.
 - **The setup view** (§4.2-§4.3): a 20 s single-use ticket for a linked phone of the owner and the phone's owning profile, then a
   WebSocket with the same checks as ``/gateway/ws`` (Hermes' client and origin checks, exactly two subprotocols, the binding
-  revalidated at accept and every few seconds while open). Accept takes the lease; ``agent_phone_stream.ViewSession`` runs it.
+  revalidated at accept and every few seconds while open). Control takes the lease; a watch ticket only streams frames; ``agent_phone_stream.ViewSession`` runs it.
 - **Approvals** (L3's contract, approvals-v1 §6): the five routes over ``agent_phone_approvals``.
 
 Every sibling module is loaded when a route needs it, by path, under ``beacon_<name>`` (as L1a's and L1b's loaders do), so this
@@ -804,7 +804,8 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
     async def hand_back(request: Request):
         """"Done" when the view's socket is already gone: the phone goes back to the agent at once (§4.3)."""
         owner, provider, profile, _ = await identity_async(request)
-        if await body(request, 256):
+        payload = await body(request, 256)
+        if not isinstance(payload, dict) or set(payload) != {'epoch'} or type(payload['epoch']) is not int or payload['epoch'] < 1:
             raise HTTPException(400, 'Invalid hand back')
         device = await bounded(linked_device, request, owner, provider, profile)
         _, _, folder = await bounded(phone_of, profile)
@@ -812,9 +813,9 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
         viewer = lease_mod.viewer_id(owner, provider, device)
 
         def give_back():
-            current = lease.release(viewer)
-            if current.holder == lease_mod.HUMAN and current.viewer_id == 'unreadable-lease':
-                current = lease.release()  # a damaged lease file is repaired by the owner's own hand-back
+            current = lease.release(viewer, payload['epoch'])
+            if current.holder == lease_mod.HUMAN:
+                raise HTTPException(409, 'The owner has the phone')
             return lease_mod.public_view(current, viewer)
         return JSONResponse({'lease': await bounded(give_back)}, headers=NO_STORE)
 
@@ -824,7 +825,9 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
         await refuse_while_updating()
         owner, provider, profile = await bounded(ct.authorize_request, request, mobile, dashboard_identity, enforce, profile_names,
                                                  check_device)
-        if await body(request, 256):
+        options = await body(request, 256)
+        watching = options == {'mode': 'watch'}
+        if options and not watching:
             raise HTTPException(400, 'Invalid ticket request')
         device = await bounded(linked_device, request, owner, provider, profile)
         session = request.state.session
@@ -833,7 +836,7 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
             raise HTTPException(401, 'Verified native session required')
         _, _, folder = await bounded(phone_of, profile)
         binding = {'owner': owner, 'provider': provider, 'profile': profile, 'device': device, 'expires': expires,
-                   'folder': str(folder), 'viewer': lease_mod.viewer_id(owner, provider, device)}
+                   'folder': str(folder), 'viewer': lease_mod.viewer_id(owner, provider, device), 'watch': watching}
         try:
             ticket = cache.issue(binding, loop=asyncio.get_running_loop())
         except ValueError:
@@ -904,8 +907,16 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
                 await socket.close(code=stream.CLOSE_DONE)
                 return
             viewer = binding['viewer']
-            await asyncio.to_thread(host.cleanup_frames)
-            await asyncio.to_thread(lease.acquire, viewer, 'setup')
+            watching = binding.get('watch', False)
+            if watching:
+                current = await asyncio.to_thread(lease.get)
+                if current.holder != lease_mod.AGENT:
+                    await socket.send_text(json.dumps({'t': 'bye', 'reason': 'replaced'}))
+                    await socket.close(code=stream.CLOSE_DONE)
+                    return
+            else:
+                await asyncio.to_thread(host.cleanup_frames)
+                current = await asyncio.to_thread(lease.acquire, viewer, 'setup', new_view=True)
             session = None
 
             def notice(kind, payload):
@@ -915,12 +926,12 @@ def build_router(mobile, identity_async, body, dashboard_identity, enforce, prof
             port = (state.get('ports') or {}).get('console', 'phone')
             guard = deps.guard()  # L3's agent_phone_guard: Android's debugging prompt answered No while the owner holds the phone
             session = stream.ViewSession(
-                socket, lease, viewer,
+                socket, lease, viewer, epoch=current.epoch, watching=watching,
                 open_frames=lambda on_frame: stream.MmapFrames(lambda: host.grpc(state, timeout=15.0).connect(),
-                                                               stream.frame_directory_for_view(host.folder), port,
+                                                               None if watching else stream.frame_directory_for_view(host.folder), port,
                                                                on_frame=on_frame),
                 open_control=lambda: host.grpc(state, timeout=10.0).connect(),
-                open_channel=lambda: deps.channel(host, state, notice),
+                open_channel=None if watching else lambda: deps.channel(host, state, notice),
                 keyboard_probe=lambda: keyboard_shown(host.adb(state).shell(KEYBOARD_PROBE, timeout=5).stdout),
                 revalidate=lambda: revalidate(socket, binding, at_accept=False), note_activity=host.note_activity,
                 phone_running=lambda: host.running(), update_in_progress=update_in_progress, size=device_size(folder),

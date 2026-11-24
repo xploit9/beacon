@@ -52,12 +52,34 @@ internal fun redactMcpServers(value: JSONObject): JSONObject {
     return JSONObject().put("servers", kept)
 }
 
-fun screenReadCacheable(path: String, query: Map<String, String>, profile: String): Boolean =
-    (path in screenReadPaths || path == MCP_SERVERS_PATH) && query.keys.all { it in SCREEN_QUERY_KEYS || it == "chat" && path == CHAT_PROJECT_READ } && (query["profile"] ?: profile) == profile
+internal const val CHAT_APPROVAL_PATH = "/api/approval/mode"
+/** Per-chat reads: each family keeps only the newest [ScreenCache.CHAT_PROJECT_ENTRIES], so opening chats never pushes other screens out. */
+private val CHAT_FAMILIES = listOf(CHAT_PROJECT_READ, "$CHAT_APPROVAL_PATH&", "/api/model/current&", "/api/reasoning&", "/api/mobile/beacon/reasoning&", "/api/projects/detail&")
+/** These keys serve multiple requests and must be looked up by their full identity at the point of use. */
+internal val exactScreenKeys = setOf("picker:approvals", "profile-defaults", "picker:model-current", "picker:reasoning", "history-filter")
+
+fun screenReadCacheable(path: String, query: Map<String, String>, profile: String): Boolean {
+    if ((query["profile"] ?: profile) != profile) return false
+    return when (path) {
+        CHAT_APPROVAL_PATH -> !query["session_id"].isNullOrBlank() && query.keys.all { it in setOf("profile", "session_id", "passive") }
+        PROFILE_DEFAULTS_PATH -> query.keys.all { it == "profile" || it == "session_id" }
+        "/api/session/usage", "/api/model/current" -> !query["session_id"].isNullOrBlank() && query.keys.all { it == "profile" || it == "session_id" }
+        "/api/reasoning", "/api/mobile/beacon/reasoning" -> !query["session_id"].isNullOrBlank() &&
+            query.keys.all { it in setOf("profile", "session_id", "model", "provider") }
+        "/api/projects/detail" -> !query["id"].isNullOrBlank() && query.keys.all { it == "profile" || it == "id" }
+        else -> (path in screenReadPaths || path == MCP_SERVERS_PATH) && query.keys.all { it in SCREEN_QUERY_KEYS || it == "chat" && path == CHAT_PROJECT_READ }
+    }
+}
 
 /** The answer's identity inside one profile: the profile is the scope, so it is not part of the request. */
 fun screenRequest(path: String, query: Map<String, String>): String =
-    path + query.filterKeys { it != "profile" }.toSortedMap().entries.joinToString("") { "&${it.key}=${it.value}" }
+    if (path in setOf("/api/reasoning", "/api/mobile/beacon/reasoning"))
+        path + "&" + JSONArray(listOf(query["session_id"], query["model"], query["provider"])).toString()
+    else path + query.filterKeys { it != "profile" && !(path == CHAT_APPROVAL_PATH && it == "passive") && !(path == PROFILE_DEFAULTS_PATH && it == "session_id") }
+        .toSortedMap().entries.joinToString("") { "&${it.key}=${it.value}" }
+
+internal fun historyFilterRequest(query: String, archived: Boolean, threads: Boolean, hidden: String, order: String): String =
+    "/api/sessions&filter=" + dev.hermes.android.core.sha256(JSONArray(listOf(query, archived, threads, hidden, order)).toString().toByteArray())
 
 /** A matching explicit profile and an omitted profile name the same read; JSON prevents path/query collisions. */
 internal fun screenReadIdentity(scope: Scope, path: String, query: Map<String, String>, generation: Int): String =
@@ -155,6 +177,20 @@ class ScreenCache(
         rows[account(scope).key]?.values.orEmpty().filter { it.profile == scope.profile }.groupBy { it.key }.values.mapNotNull { group -> group.maxByOrNull { it.at } }
     }
     fun exact(scope: Scope, key: String, request: String = ""): Entry? = synchronized(this) { rows[account(scope).key]?.get("${scope.profile}\u0000$key\u0000$request") }
+    /** The first-frame composer values. The approval read belongs to one conversation. Defaults come from profile configuration. */
+    internal fun composer(scope: Scope): Map<String, JSONObject> {
+        val owner = scope.copy(session = "")
+        val approval = exact(owner, "picker:approvals", screenRequest(CHAT_APPROVAL_PATH, mapOf("session_id" to scope.session)))
+        val defaults = exact(owner, "profile-defaults", PROFILE_DEFAULTS_PATH)
+        return buildMap {
+            approval?.value?.takeIf { it.optString("scope_key") == owner.key && it.optString("session_id") == scope.session }?.let {
+                put("picker:approvals", JSONObject(it.toString()).put("_stale", true))
+            }
+            defaults?.value?.takeIf { it.optString("scope_key") == owner.key && it.optString("profile") == scope.profile }?.let {
+                put("profile-defaults", JSONObject(it.toString()).put("session_id", scope.session).put("_stale", true))
+            }
+        }
+    }
     /** Two screens reading one resource under different keys share its newest answer. */
     fun sameRequest(scope: Scope, request: String): Entry? = synchronized(this) {
         rows[account(scope).key]?.values?.filter { it.profile == scope.profile && it.request == request }?.maxByOrNull { it.at }
@@ -166,27 +202,38 @@ class ScreenCache(
     /** A payload that is too large or credential-shaped replaces nothing on disk and removes the older copy. */
     fun put(scope: Scope, key: String, request: String, at: Long, answer: JSONObject, version: ScreenReadVersion? = null) {
         // Whatever the caller holds, the MCP list reaches the row only in its redacted form.
-        val value = if (request.startsWith(MCP_SERVERS_PATH)) redactMcpServers(answer) else answer
+        val value = when {
+            request.startsWith(MCP_SERVERS_PATH) -> redactMcpServers(answer)
+            request.startsWith("$CHAT_APPROVAL_PATH&") -> JSONObject().also { out ->
+                for (field in listOf("profile_mode", "session_status_known", "session_bypass", "session_id", "scope_key", "value")) {
+                    if (answer.has(field)) out.put(field, answer.opt(field))
+                }
+            }
+            else -> answer
+        }
         val text = value.toString()
         val bytes = text.toByteArray().size
         val account = account(scope)
         val keep = bytes <= MAX_ENTRY_BYTES && !hasSecretKey(value)
-        synchronized(this) {
+        val unchanged = synchronized(this) {
             if (version != null && !readCurrent(scope, request, version)) return
             val map = rows[account.key] ?: return
             val id = "${scope.profile}\u0000$key\u0000$request"
+            val same = keep && map[id]?.value?.toString() == text
             map.remove(id)
             if (keep) { map[id] = Entry(scope.profile, key, request, at, JSONObject(text), bytes); trim(map) }
+            same
         }
-        schedule(account)
+        // A re-read with the same answer only refreshes its time in memory; the saved row stays as it is.
+        if (!unchanged) schedule(account)
     }
     /** After a successful write to [path], the cached reads of the same family must not outlive it; the screen refreshes itself. */
-    fun invalidate(scope: Scope, path: String) {
+    fun invalidate(scope: Scope, path: String, request: String? = null) {
         val family = readFamily(path)
         val account = account(scope)
         val changed = synchronized(this) {
             val key = versionKey(scope, path); versions[key] = (versions[key] ?: 0L) + 1L
-            rows[account.key]?.values?.removeAll { it.profile == scope.profile && readFamily(it.request) == family } == true
+            rows[account.key]?.values?.removeAll { it.profile == scope.profile && readFamily(it.request) == family && (request == null || it.request == request) } == true
         }
         if (changed) schedule(account)
     }
@@ -233,7 +280,7 @@ class ScreenCache(
         }
     }
     private fun trim(map: LinkedHashMap<String, Entry>) {
-        map.values.filter { it.request.startsWith(CHAT_PROJECT_READ) }.sortedByDescending { it.at }.drop(CHAT_PROJECT_ENTRIES).forEach { map.remove(it.id) }
+        for (prefix in CHAT_FAMILIES) map.values.filter { it.request.startsWith(prefix) }.sortedByDescending { it.at }.drop(CHAT_PROJECT_ENTRIES).forEach { map.remove(it.id) }
         var total = map.values.sumOf { it.bytes }
         for (old in map.values.sortedBy { it.at }) {
             if (total <= MAX_ROW_BYTES && map.size <= MAX_ENTRIES) break

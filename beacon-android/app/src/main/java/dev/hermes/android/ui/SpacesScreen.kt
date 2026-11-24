@@ -171,7 +171,9 @@ internal val EditBlockedStrings = listOf("This file isn't plain text. Download i
         }
     }
     if (chooseFolder) PcFolderPicker(vm, "Browse computer folders", onDismiss = { chooseFolder = false }, onChoose = { chooseFolder = false; changeDirectory(it) })
-    val createFile = { vm.openForm(ActionForm("Create file", "/api/pc/file/create", listOf(Field("path", "File path", required = true), Field("content", "Initial content", FieldType.MULTILINE)), json("path" to actual.trimEnd('/', '\\') + "/"), onResult = { refresh() })) }
+    val inFolder = uiText("In {folder}")
+    val createFile = { vm.openForm(ActionForm("Create file", "/api/pc/file/create", listOf(Field("name", "File name", required = true, ltr = true, errorHere = true), Field("content", "Initial content", FieldType.MULTILINE)),
+        json("path" to actual.trimEnd('/', '\\') + "/"), explanation = inFolder.replace("{folder}", folderLabel(actual)), onResult = { refresh() }, shape = ::newFilePath)) }
     BoxWithConstraints(Modifier.fillMaxSize()) {
         val wide = maxWidth >= 720.dp * LocalDensity.current.fontScale.coerceAtLeast(1f)
         Column(Modifier.widthIn(max = 720.dp).fillMaxWidth().fillMaxHeight().align(Alignment.TopCenter).testTag("files-content")) {
@@ -335,3 +337,9 @@ internal val EditBlockedStrings = listOf("This file isn't plain text. Download i
 /** A file or folder row's list key. Windows shortcut folders (My Documents, Application Data) are listed under the path of the
  *  folder they point to, so a path alone repeats in one listing and a lazy list throws on the duplicate key while scrolling. */
 internal fun fileRowKey(row: org.json.JSONObject): String = row.string("path") + "\u0000" + row.string("name")
+
+/** The last folder name, for "In {folder}"; a bare drive like C: shows as it is. */
+internal fun folderLabel(folder: String): String = folder.trimEnd('/', '\\').substringAfterLast('/').substringAfterLast('\\').ifBlank { folder }
+
+/** The create form asks only for a name; the path is the shown folder plus the name. */
+internal fun newFilePath(body: JSONObject): JSONObject = body.copy().apply { put("path", body.optString("path") + body.optString("name").trim()); remove("name") }

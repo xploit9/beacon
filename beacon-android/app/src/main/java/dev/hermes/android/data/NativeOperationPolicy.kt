@@ -156,6 +156,11 @@ internal fun conversationPendingLabel(path: String): String = when (path) {
 }
 
 internal const val PROFILE_DEFAULTS_PATH = "/api/profile/defaults"
+
+internal fun sameApprovalForChange(shown: JSONObject?, live: JSONObject, turnOn: Boolean): Boolean =
+    shown != null && live.string("profile_mode") in setOf("manual", "smart") &&
+        listOf("scope_key", "session_id", "profile_mode").all { live.string(it).isNotBlank() && shown.string(it) == live.string(it) } &&
+        (!turnOn || listOf("session_status_known", "session_bypass").all { shown.opt(it) == live.opt(it) })
 /** How long a busy Hermes gets before the chat's defaults are asked for once more. */
 internal const val PROFILE_DEFAULTS_RETRY_MS = 2_000L
 

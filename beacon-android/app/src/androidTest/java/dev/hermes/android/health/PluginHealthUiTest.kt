@@ -83,7 +83,7 @@ class PluginHealthUiTest {
     @Test fun eachFaultNamesItsReason() {
         val broken = health(answer(dashboardCurrent = false, gatewayRunning = false, callsReady = false, callsReason = "timeout", pushReady = false))
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(broken, null, false) {} } }
-        compose.onNodeWithTag("plugin-health-status").assertTextContains("Not working")
+        compose.onNodeWithTag("plugin-health-status").assertTextContains("Not working · Hermes dashboard")
         compose.onNodeWithTag("plugin-health-dashboard").assertTextContains("Needs restart")
         compose.onNodeWithTag("plugin-health-gateway").assertTextContains("Stopped")
         compose.onNodeWithTag("plugin-health-calls").assertTextContains("Hermes took too long")
@@ -94,7 +94,7 @@ class PluginHealthUiTest {
         compose.showPage { SettingsSection("Beacon plugin") { PluginHealthRows(health(answer(dashboardCurrent = false)), null, false) {} } }
         compose.onNodeWithTag("plugin-health-dashboard").assertIsDisplayed().assertTextContains("Needs restart")
         compose.onNodeWithTag("plugin-health-gateway").assertDoesNotExist()
-        compose.onNodeWithTag("plugin-health-status").assertTextContains("Needs attention")
+        compose.onNodeWithTag("plugin-health-status").assertTextContains("Needs attention · Hermes dashboard")
     }
 
     @Test fun keepConnectedStandsInForPushAndABusyGatewayIsInProgressNotAFault() {
@@ -123,12 +123,42 @@ class PluginHealthUiTest {
         compose.onNodeWithTag("plugin-health-calls").performClick()
         compose.onNodeWithTag("plugin-health-notifications").performClick()
         compose.runOnIdle { assertEquals(listOf(HealthTarget.AppUpdates, HealthTarget.CheckNow, HealthTarget.VoiceCalls, HealthTarget.Notifications), opened) }
-        // Health and Version only report; every tappable row is a 48dp button.
-        compose.onNodeWithTag("plugin-health-status").assertHasNoClickAction()
+        // A verdict that names a cause leads to that row; Version only reports; every tappable row is a 48dp button.
+        compose.onNodeWithTag("plugin-health-status").assertHasClickAction()
         compose.onNodeWithTag("plugin-health-version").assertHasNoClickAction()
         for (tag in listOf("plugin-health-dashboard", "plugin-health-gateway", "plugin-health-calls", "plugin-health-notifications")) {
             compose.onNodeWithTag(tag).assertHasClickAction().assertHeightIsAtLeast(48.dp)
         }
+    }
+
+    @Test fun arabicAtDoubleSizeShowsTheWholeHealthCause() {
+        val trouble = health(answer(), keepConnected = true).copy(calls = HealthLine(SettingsStatus.Attention, "Add key", HealthTarget.VoiceCalls))
+        compose.setContent {
+            CompositionLocalProvider(LocalDensity provides Density(LocalDensity.current.density, 2f), LocalLayoutDirection provides LayoutDirection.Rtl) {
+                NativeLocalization("ar") {
+                    dev.hermes.android.BeaconTheme(dark = true) {
+                        Surface(Modifier.fillMaxSize()) {
+                            Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState())) {
+                                SettingsSection(uiText("Beacon plugin")) { PluginHealthRows(trouble, null, false) {} }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (word in listOf("المكالمات", "يحتاج إلى مراجعة")) {
+            val match = hasText(word, substring = true) and hasAnyAncestor(hasTestTag("plugin-health-status"))
+            compose.waitUntil(5_000) { compose.onAllNodes(match, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty() }
+            val node = compose.onNode(match, useUnmergedTree = true).assertIsDisplayed()
+            val layouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+            node.performSemanticsAction(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult) { it(layouts) }
+            val layout = layouts.single()
+            assertFalse("Health text is ellipsized: $word", layout.isLineEllipsized(layout.lineCount - 1))
+        }
+        val bitmap = requireNotNull(InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot())
+        val dir = File(compose.activity.filesDir, "plugin-health/synthetic").apply { mkdirs() }
+        File(dir, "ar-2x-calls.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+        bitmap.recycle()
     }
 
     @Test fun keepConnectedOffAloneReadsHealthyAndStillOffersTheSwitch() {

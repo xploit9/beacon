@@ -1,4 +1,5 @@
 package dev.hermes.android.push
+import android.app.Notification
 import android.app.NotificationManager
 import android.app.job.*
 import android.content.ComponentName
@@ -12,17 +13,35 @@ import kotlinx.coroutines.*
 import org.json.JSONObject
 import kotlinx.coroutines.flow.first
 import dev.hermes.android.preferences
-fun notificationFallback(kind: String): Pair<String, String> = when (kind) {
-    "working" -> "Beacon · Working" to "${dev.hermes.android.data.currentAssistantName} is working on your chat."
-    "failure" -> "Beacon · Work failed" to "Open Beacon to see what went wrong."
-    "completion" -> "Beacon · Reply ready" to "A reply is ready."
-    "approval" -> "Beacon · Approval needed" to "A chat needs your approval before continuing."
-    "clarify" -> "Beacon · Question for you" to "A chat needs your answer before continuing."
-    "task_result" -> "Beacon · Task update" to "A task has an update. Open Beacon to review it."
-    "test" -> "Beacon · Notification test" to "Test notification received."
-    "incoming_call" -> "Beacon · Call" to "Open Beacon to see the call."
-    else -> "Beacon · Activity" to "Open Beacon to see it."
+fun notificationFallback(kind: String, words: (String) -> String = { it }): Pair<String, String> {
+    val (title, body) = when (kind) {
+        "working" -> "Working" to "{0} is working on your chat."
+        "failure" -> "Work failed" to "Open Beacon to see what went wrong."
+        "completion" -> "Reply ready" to "A reply is ready."
+        "approval" -> "Approval needed" to "A chat needs your approval before continuing."
+        "clarify" -> "Question for you" to "A chat needs your answer before continuing."
+        "task_result" -> "Task update" to "A task has an update. Open Beacon to review it."
+        "test" -> "Notification test" to "Test notification received."
+        "incoming_call" -> "Call" to "Open Beacon to see the call."
+        else -> "Activity" to "Open Beacon to see it."
+    }
+    return "Beacon · ${words(title)}" to words(body).replace("{0}", dev.hermes.android.data.currentAssistantName)
 }
+/** R3-F4: the chat the screen shows right now (Beacon in front on it, nothing over it), or null. The chat screen's owner keeps it. */
+object ShownChat { @Volatile var scope: Scope? = null }
+/** R3-F4: a reply or thread post of the chat on screen shows there itself, so no alert covers it (Telegram). */
+internal fun shownChatNotice(shown: Scope?, account: Scope, session: String): Boolean = shown != null && session.isNotBlank() &&
+    shown.origin == account.origin && shown.owner == account.owner && shown.profile == account.profile && shown.session == session
+/**
+ * Whether Hermes' words keep a quiet alert quiet. One that came quietly because Beacon was open stays quiet, except an important one (Root's
+ * rule: an "Important from…" alert is never quieted by Beacon being open; the push cannot say so, its route can). One that came quietly
+ * because it was old or part of a burst stays quiet.
+ */
+internal fun updateStaysQuiet(postedQuiet: Boolean, oldOrBurst: Boolean, important: Boolean): Boolean = postedQuiet && (oldOrBurst || !important)
+/** The posted alert with Hermes' words. androidx's copy keeps the group but not the quiet alert behavior, so a quiet alert would peek on this update. */
+internal fun previewUpdate(context: Context, posted: Notification, title: String, body: String, important: Boolean = false): NotificationCompat.Builder =
+    NotificationCompat.Builder(context, posted).setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true)
+        .setSilent(updateStaysQuiet(posted.groupAlertBehavior == Notification.GROUP_ALERT_SUMMARY, posted.extras.getBoolean(QUIET_ALERT_EXTRA), important))
 fun boundedNotificationText(value: String, limit: Int, preserveWhitespace:Boolean=false): String {
     require(limit >= 2)
     val filtered = value.filter { !it.isISOControl() || it == '\n' || it == '\t' }
@@ -66,23 +85,33 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
                 presentNativeActivity(context,source,event,route.string("activity_ref"),"activity_end",route.optLong("expires_at"))
             return@withTimeout
         }
+        val important = isEmailAlertNotificationRoute(route, source, event, scope, conversation)
         // A scheduled post and an email alert both land in their chat; an open chat reads it at once.
         route.string("session_id").takeIf { kind == "task_result" && validOpaque(it) }?.let {
-            if (isEmailAlertNotificationRoute(route, source, event, scope, conversation)) app.push.emailAlerts.emit(scope.session(it))
+            if (important) app.push.emailAlerts.emit(scope.session(it))
             else app.push.conversationPosts.tryEmit(scope.session(it))
         }
+        if (kind in setOf("completion", "task_result") && !important && shownChatNotice(ShownChat.scope, scope, route.string("session_id"))) { manager.cancel(tag, 1); return@withTimeout }
         val preview = route.optJSONObject("preview") ?: return@withTimeout
         // The Beacon chat's own notices carry the assistant's name, never that chat's auto title (owner, 4 and 17 Nov). Hermes says which chat that is
         // (and keeps saying so after it moved the chat to a new session id); this phone also knows its own, which Hermes may not have been told yet.
         val beaconChat = app.cache.beaconChat(scope)
         val assistant = if (beaconChatNotice(route, beaconChat)) context.applicationContext.preferences.data.first().let(dev.hermes.android.data.AppPreferences::read).assistantName else ""
-        val title = boundedNotificationText(replyNotificationTitle(route, preview.opt("title") as? String ?: "", assistant, beaconChat), 120)
-        val body = boundedNotificationText(preview.opt("body") as? String ?: "", 640)
+        val rawTitle = preview.opt("title") as? String ?: ""
+        val rawBody = preview.opt("body") as? String ?: ""
+        val fixed = when (kind) {
+            "test" -> rawTitle == "Beacon notification test" && rawBody == "Synthetic test. Seeing this notification confirms arrival on this phone."
+            "failure" -> rawTitle == "Beacon work failed" && rawBody == "Open Beacon to see what went wrong."
+            else -> false
+        }
+        val translate = fixed && dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault()) != "en"
+        val (previewTitle, previewBody) = if (translate) notificationFallback(kind) { serviceText(context, it) } else rawTitle to rawBody
+        val title = boundedNotificationText(replyNotificationTitle(route, previewTitle, assistant, beaconChat), 120)
+        val body = boundedNotificationText(previewBody, 640)
         if (title.isBlank() || body.isBlank() || !authorized()) return@withTimeout
         // Recover the posted notification to retain tap/call actions and never re-ring a preview.
         val posted = active(1) ?: return@withTimeout
-        val builder = NotificationCompat.Builder(context, posted.notification)
-            .setContentTitle(title).setContentText(body).setStyle(NotificationCompat.BigTextStyle().bigText(body)).setOnlyAlertOnce(true)
+        val builder = previewUpdate(context, posted.notification, title, body, important)
         // A chat's reply can be answered from here; Hermes has just named the chat this notice belongs to.
         if (noticeAcceptsReply(route) && !carriesReply(posted.notification.actions.orEmpty().flatMap { action -> action.remoteInputs.orEmpty().map { it.resultKey } })) {
             builder.addAction(replyAction(context, source, event)).addExtras(android.os.Bundle().apply { putString(REPLY_CONVERSATION_EXTRA, conversation) })

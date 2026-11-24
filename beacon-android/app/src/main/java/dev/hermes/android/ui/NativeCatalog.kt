@@ -103,7 +103,7 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
                         Box(Modifier.weight(1f).fillMaxWidth()) { NativeToolSettings(vm, mcp = toolsMcp, containedActions = true) }
                     }
                     "Reasoning" -> {
-                        val value = data["picker:reasoning"]
+                        val value = vm.savedReasoning(data["picker:reasoning"])
                         val options = value?.optJSONArray("options")?.strings().orEmpty()
                         var level by remember(value?.toString()) { mutableStateOf(value?.string("value").orEmpty().takeIf { it in options }.orEmpty()) }
                         Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -160,7 +160,7 @@ internal fun pinSelectedModel(models: List<JSONObject>, selectedId: String, inCu
         val provider = group.string("provider", group.string("label", group.string("provider_id")))
         group to pinSelectedModel((group.rows("models") + group.rows("extra_models")).distinctBy { it.string("id") }.filter { modelSearchMatches(provider, it.string("id"), it.string("label"), query) }, chatModel, group.string("provider_id") == currentProvider)
     }.filter { it.second.isNotEmpty() }.sortedBy { it.first.string("provider_id") != currentProvider } }
-    val reasoning = data["picker:reasoning"]
+    val reasoning = vm.savedReasoning(data["picker:reasoning"])
     val options = reasoning?.optJSONArray("options")?.strings().orEmpty()
     val effort = chat.sessionReasoningEffort.ifBlank { chat.raw.string("reasoning_effort", chat.raw.string("reasoning")) }.ifBlank { reasoning?.string("value").orEmpty() }
     val currentGroup = catalogGroups.firstOrNull { it.string("provider_id") == currentProvider }

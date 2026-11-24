@@ -154,6 +154,7 @@ internal object CallHistoryMemory {
     private var owner: Any? = null
     private var calls = emptyList<CallHistoryEntry>()
     private var next: String? = null
+    @Synchronized fun hasPage(key: Any?) = key != null && key == owner
     @Synchronized fun calls(key: Any?) = if (key != null && key == owner) calls else emptyList()
     @Synchronized fun next(key: Any?) = if (key != null && key == owner) next else null
     @Synchronized fun remember(key: Any?, calls: List<CallHistoryEntry>, next: String?) {
@@ -162,16 +163,38 @@ internal object CallHistoryMemory {
     }
     /** Sign-out: the call list leaves memory with the account's other screens. */
     @Synchronized fun clear() { owner = null; calls = emptyList(); next = null }
+    @Synchronized fun forget(scope: dev.hermes.android.core.Scope) {
+        if ((owner as? dev.hermes.android.core.Scope)?.sameAccount(scope) == true) clear()
+    }
+}
+
+internal const val CALL_HISTORY_KEY = "call-history"
+internal const val CALL_HISTORY_PATH = "/api/plugins/beacon/mobile/calls"
+
+/** The first page needed to paint the list. A detail or transcript added to the response never reaches this cache. */
+internal fun callHistoryPage(response: JSONObject): JSONObject {
+    require(response.optJSONArray("calls") != null) { "Call history unavailable" }
+    val rows = org.json.JSONArray()
+    for (item in response.rows("calls").take(50)) {
+        if (CallHistoryEntry.from(item) == null) continue
+        val row = JSONObject()
+        for (name in listOf("id", "direction", "state", "started_at", "duration_s", "provider", "conversation_id", "reason", "email_notice_id", "has_transcript")) {
+            if (!item.isNull(name)) row.put(name, item.get(name))
+        }
+        rows.put(row)
+    }
+    return JSONObject().put("calls", rows).put("next", response.string("next"))
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: String, callId: String) -> Unit, onDismiss: () -> Unit) {
     val activeClient = vm.client
-    val requestScope = vm.authenticatedScope()?.copy(session = "")
+    val requestScope = activeClient?.scope ?: vm.restoredScope()
+    val saved = requestScope?.takeUnless(CallHistoryMemory::hasPage)?.let { vm.screens.exact(it, CALL_HISTORY_KEY)?.value }
     val client = remember(activeClient) { activeClient?.detached() }
-    var calls by remember(activeClient, requestScope) { mutableStateOf(CallHistoryMemory.calls(requestScope)) }
-    var next by remember(activeClient, requestScope) { mutableStateOf(CallHistoryMemory.next(requestScope)) }
+    var calls by remember(activeClient, requestScope) { mutableStateOf(CallHistoryMemory.calls(requestScope).ifEmpty { saved?.rows("calls").orEmpty().mapNotNull(CallHistoryEntry::from) }) }
+    var next by remember(activeClient, requestScope) { mutableStateOf(CallHistoryMemory.next(requestScope) ?: saved?.string("next")?.ifBlank { null }) }
     var loading by remember(activeClient, requestScope) { mutableStateOf(false) }
     var error by remember(activeClient, requestScope) { mutableStateOf("") }
     var retryAvailable by remember(activeClient, requestScope) { mutableStateOf(true) }
@@ -190,8 +213,9 @@ internal fun CallHistorySheet(vm: BeaconViewModel, onOpenCall: (conversationId: 
         try {
             val query = mutableMapOf("profile" to requestScope.profile, "limit" to "50")
             cursor?.let { query["before"] = it }
-            val response = client.get("/api/plugins/beacon/mobile/calls", query)
-            if (vm.client !== activeClient || vm.authenticatedScope()?.copy(session = "") != requestScope) return
+            val response = client.get(CALL_HISTORY_PATH, query)
+            if (vm.client !== activeClient || activeClient.scope != requestScope) return
+            if (cursor == null) vm.keepScreen(requestScope, CALL_HISTORY_KEY, callHistoryPage(response))
             val page = response.rows("calls").mapNotNull(CallHistoryEntry::from)
             calls = if (cursor == null) page else calls + page
             next = response.string("next").ifBlank { null }

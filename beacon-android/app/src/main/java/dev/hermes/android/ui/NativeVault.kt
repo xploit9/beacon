@@ -28,7 +28,7 @@ import org.json.JSONObject
 /** What the Vault page cached for this account and profile: metadata only, never a secret. */
 internal const val VAULT_CACHE_KEY = "vault"
 
-private enum class VaultForm(val kind: VaultKind, val title: String) {
+internal enum class VaultForm(val kind: VaultKind, val title: String) {
     Login(VaultKind.Login, "Add login"), Card(VaultKind.Payment, "Add payment card"), Address(VaultKind.Address, "Add address"),
 }
 
@@ -47,16 +47,18 @@ private class VaultPageState(initial: VaultSnapshot?) {
     var write: Job? = null
 }
 
-private fun vaultFields(form: VaultForm): List<SecureField> = when (form) {
+/** Plain text unless it is a secret: only the login password and key and the card number and security code are masked (each with an eye button). */
+internal fun vaultFields(form: VaultForm): List<SecureField> = when (form) {
     VaultForm.Login -> listOf(SecureField("site", "Site", masked = false), SecureField("identifier", "Username or email", masked = false),
         SecureField("password", "Password"), SecureField("otp_secret", "Authenticator key", required = false))
     VaultForm.Card -> listOf(SecureField("label", "Name", masked = false),
-        SecureField("card_number", "Card number"), SecureField("exp_month", "Expiration month"), SecureField("exp_year", "Expiration year"),
-        SecureField("cvc", "Security code"), SecureField("cardholder_name", "Cardholder name", required = false),
-        SecureField("billing_postal_code", "Billing postal code", required = false))
+        SecureField("card_number", "Card number"), SecureField("exp_month", "Expiration month", masked = false), SecureField("exp_year", "Expiration year", masked = false),
+        SecureField("cvc", "Security code"), SecureField("cardholder_name", "Cardholder name", required = false, masked = false),
+        SecureField("billing_postal_code", "Billing postal code", required = false, masked = false))
     VaultForm.Address -> listOf(SecureField("label", "Name", masked = false), SecureField("site", "Site", masked = false),
-        SecureField("address_line1", "Address line 1"), SecureField("address_line2", "Address line 2", required = false), SecureField("city", "City"),
-        SecureField("state", "State", required = false), SecureField("postal_code", "Postal code"), SecureField("country", "Country"))
+        SecureField("address_line1", "Address line 1", masked = false), SecureField("address_line2", "Address line 2", required = false, masked = false),
+        SecureField("city", "City", masked = false), SecureField("state", "State", required = false, masked = false),
+        SecureField("postal_code", "Postal code", masked = false), SecureField("country", "Country", masked = false))
 }
 
 /** Shown inside a Vault form that cannot be sent yet (the page is reading or saving something): the form stays open with what was typed. */

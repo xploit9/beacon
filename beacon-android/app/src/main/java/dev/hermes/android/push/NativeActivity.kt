@@ -15,15 +15,34 @@ internal fun ongoingNativeKind(kind: String) = kind in setOf("working", "approva
 internal fun completeNativePreview(route:JSONObject)=route.optJSONObject("preview")?.optBoolean("complete")==true
 internal fun validNativeAnswer(route: JSONObject, answer: String): Boolean = answer.length in 1..1024 &&
     ((completeNativePreview(route)&&route.optBoolean("text_reply")) || nativeVisibleActions(route,route.string("kind")).any { it.string("value") == answer })
-internal fun nativeActivityTimeout(kind:String,expires:Long,now:Long):Long {
+/** An alert lasts until its request's own expiry (a question or approval as long as Hermes waits); 4 h is the plugin's longest and keeps *1000 in range. */
+internal fun nativeActivityTimeout(expires:Long,now:Long):Long {
     if(expires<=now/1000) return 0
-    return ((expires-now/1000).coerceAtMost(if(kind=="working") 14400L else 300L)*1000-now%1000).coerceAtLeast(1)
+    return ((expires-now/1000).coerceAtMost(14400L)*1000-now%1000).coerceAtLeast(1)
+}
+/** During Beacon's own call a question or approval still pops up, without sound or vibration (the call has the audio). */
+internal const val IN_CALL_PROMPT_CHANNEL = "hermes-prompts-in-call"
+internal const val IN_CALL_PROMPT_CHANNEL_NAME = "Questions during calls"
+/** The quiet in-call channel while the call is live, unless the owner changed the prompt channel's importance or sound: their choice stands. */
+internal fun promptChannelFor(prompt: String, ownerChanged: Boolean, inCall: Boolean): String = if (inCall && !ownerChanged) IN_CALL_PROMPT_CHANNEL else prompt
+private fun promptChannel(context: Context, manager: NotificationManager, inCall: Boolean): String {
+    val prompt = promptNotificationChannel(manager)
+    val current = manager.getNotificationChannel(prompt)
+    val id = promptChannelFor(prompt, current != null && (current.hasUserSetImportance() || Build.VERSION.SDK_INT >= 30 && current.hasUserSetSound()), inCall)
+    if (id == IN_CALL_PROMPT_CHANNEL && manager.getNotificationChannel(id) == null) manager.createNotificationChannel(
+        NotificationChannel(id, serviceText(context, IN_CALL_PROMPT_CHANNEL_NAME), NotificationManager.IMPORTANCE_HIGH).apply { setSound(null, null); enableVibration(false) })
+    return id
 }
 /** The plugin's fixed notification words, said the way the app says them and in the phone's language; any other title is the request's own text. */
 internal fun activityTitleWords(context: Context, title: String): String = when (title) {
     "Beacon needs approval" -> serviceText(context, "Approval needed")
     "Beacon asks" -> serviceText(context, "Question for you")
+    in ActivityNotificationStrings -> serviceText(context, title)
     else -> title
+}
+private fun activityBodyWords(context: Context, body: String): String = when (body) {
+    "Open Beacon to answer.", "Open Beacon to review the request." -> serviceText(context, body)
+    else -> body
 }
 /** An approval's buttons carry the plugin's fixed English labels; a question's buttons are its own choices and stay as written. */
 internal fun activityLabelWords(context: Context, kind: String, label: String): String = if (kind != "approval") label else when (label) {
@@ -64,25 +83,26 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
     if (kind == "working") { manager.cancel(tag, 3); return }
     if (!ongoingNativeKind(kind) || expires <= System.currentTimeMillis() / 1000 || dismissed(context, tag)) return
     ensureActivityChannels(manager)
-    val channel = if(kind in setOf("approval","clarify")) promptNotificationChannel(manager) else alertingChannel(manager, notificationChannel(kind))
+    val channel = if(kind in setOf("approval","clarify")) promptChannel(context, manager, app.calls.state.value.active) else alertingChannel(manager, notificationChannel(kind))
     val tap = Intent(context, BeaconActivity::class.java).setData(android.net.Uri.parse("hermes://activity/${"$source\u0000$event".digest()}"))
         .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP).putExtra("push_source", source).putExtra("push_event", event)
-    val fallback = notificationFallback(kind)
+    val fallback = notificationFallback(kind) { serviceText(context, it) }
     val preview = route?.optJSONObject("preview")
     val content = (preview?.string("title")?.let { boundedNotificationText(activityTitleWords(context, it), 120) }?.takeIf { it.isNotBlank() } ?: fallback.first) to
-        (preview?.string("body")?.let { boundedNotificationText(it, 640,preserveWhitespace=true) }?.takeIf { it.isNotBlank() } ?: fallback.second)
-    val public = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("Beacon activity").setContentText("Open Beacon to review.").build()
+        (preview?.string("body")?.let { boundedNotificationText(activityBodyWords(context, it), 640, preserveWhitespace = true) }?.takeIf { it.isNotBlank() } ?: fallback.second)
+    val public = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_beacon_notification)
+        .setContentTitle(serviceText(context, "Beacon activity")).setContentText(serviceText(context, "Open Beacon to review.")).build()
     val delete = Intent(context, NativeActivityReceiver::class.java).setAction("dismiss").setData(android.net.Uri.parse("hermes://dismiss/$tag"))
         .putExtra("tag", tag)
     val builder = Notification.Builder(context, channel).setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle(content.first).setContentText(content.second)
         .setStyle(Notification.BigTextStyle().bigText(content.second)).setOngoing(true).setOnlyAlertOnce(true)
         .setCategory(if (kind == "working") Notification.CATEGORY_PROGRESS else Notification.CATEGORY_STATUS)
-        .setVisibility(Notification.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(nativeActivityTimeout(kind,expires,System.currentTimeMillis()).coerceAtLeast(1))
+        .setVisibility(Notification.VISIBILITY_PRIVATE).setPublicVersion(public).setTimeoutAfter(nativeActivityTimeout(expires,System.currentTimeMillis()).coerceAtLeast(1))
         .setContentIntent(PendingIntent.getActivity(context, 0, tap, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         .setExtras(android.os.Bundle().apply { putString("native_source", source) })
         .setDeleteIntent(PendingIntent.getBroadcast(context, 0, delete, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
     if (Build.VERSION.SDK_INT >= 36) {
-        builder.addExtras(android.os.Bundle().apply { putBoolean("android.requestPromotedOngoing", true) }).setShortCriticalText(if (kind == "working") "Working" else "Your turn")
+        builder.addExtras(android.os.Bundle().apply { putBoolean("android.requestPromotedOngoing", true) }).setShortCriticalText(serviceText(context, if (kind == "working") "Working" else "Your turn"))
     }
     fun action(value: String?, label: String, text: Boolean = false) {
         val intent = Intent(context, NativeActivityReceiver::class.java).setAction("answer")
@@ -90,17 +110,17 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
             .putExtra("source", source).putExtra("event", event).putExtra("activity", activity).putExtra("answer", value)
         val pending = PendingIntent.getBroadcast(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or if (text) PendingIntent.FLAG_MUTABLE else PendingIntent.FLAG_IMMUTABLE)
         val button = Notification.Action.Builder(null, label, pending)
-        if (text) button.addRemoteInput(RemoteInput.Builder("answer").setLabel("Your answer").build())
+        if (text) button.addRemoteInput(RemoteInput.Builder("answer").setLabel(serviceText(context, "Your answer")).build())
         if (Build.VERSION.SDK_INT >= 31) button.setAuthenticationRequired(true)
         builder.addAction(button.build())
     }
     route?.let { nativeVisibleActions(it, kind) }?.forEach { action(it.string("value"), boundedNotificationText(activityLabelWords(context, kind, it.string("label")), 80)) }
     if (route!=null&&!completeNativePreview(route)&&kind in setOf("approval","clarify")) {
-        val review=Notification.Action.Builder(null,"Review",PendingIntent.getActivity(context,0,tap,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+        val review=Notification.Action.Builder(null,serviceText(context, "Review", "Review notification action"),PendingIntent.getActivity(context,0,tap,PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         if(Build.VERSION.SDK_INT>=31) review.setAuthenticationRequired(true)
         builder.addAction(review.build())
     }
-    if (route?.optBoolean("text_reply") == true&&completeNativePreview(route)) action(null, "Answer", true)
+    if (route?.optBoolean("text_reply") == true&&completeNativePreview(route)) action(null, serviceText(context, "Answer"), true)
     try { manager.notify(tag, 3, builder.build()) } catch (_: SecurityException) { /* Notification permission may be revoked between fetch and post. */ }
 }
 

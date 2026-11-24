@@ -111,6 +111,11 @@ def test_native_conversation_store_errors_map_to_503(file_client, failure):
     assert 'native conversation store' in response.text.lower()
 
 
+def test_create_with_only_a_folder_path_asks_for_a_file_name(file_client, tmp_path):
+    response = file_client.post('/mobile/files/create', json={'path': str(tmp_path) + '/', 'content': 'x'})
+    assert response.status_code == 400 and 'Add a file name.' in response.text
+
+
 def test_pc_editor_enforces_native_root_and_sensitive_file_policy(file_client, tmp_path):
     protected = tmp_path / '.env'; protected.write_text('SECRET=private', encoding='utf-8')
     outside = tmp_path.parent / 'outside-native-files.txt'; outside.write_text('Preserve', encoding='utf-8')
@@ -233,3 +238,22 @@ def test_pc_editor_refuses_read_only_file_without_leaving_a_read_only_temp(file_
         assert list(tmp_path.iterdir()) == [target]
     finally:
         target.chmod(0o600)
+
+
+@pytest.mark.parametrize('raw, expected_status', [(b'\n', 200), (b'\r\n', 400)])
+def test_pc_editor_size_limit_uses_on_disk_line_endings(file_client, tmp_path, raw, expected_status):
+    target = tmp_path / 'many-lines.txt'
+    target.write_bytes(b'old' + raw)
+    content = 'abcd\n' * 98_304
+    response = file_client.post('/mobile/files/text', json={
+        'path': str(target), 'expected_content': 'old\n', 'content': content})
+    assert response.status_code == expected_status
+    assert target.read_bytes() == (content.encode() if expected_status == 200 else b'old' + raw)
+
+
+def test_create_rejects_unencodable_text_before_staging(file_client, tmp_path):
+    target = tmp_path / 'new.txt'
+    response = file_client.post('/mobile/files/create', content=json.dumps({
+        'path': str(target), 'content': '\ud800'}), headers={'content-type': 'application/json'})
+    assert response.status_code == 400 and 'UTF-8' in response.json()['detail']
+    assert list(tmp_path.iterdir()) == []

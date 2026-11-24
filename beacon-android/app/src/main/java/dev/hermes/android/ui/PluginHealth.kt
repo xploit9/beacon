@@ -15,6 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.core.PLUGIN_VERSION_PATTERN
@@ -53,10 +54,13 @@ internal data class PluginHealth(val version: String, val dashboard: HealthLine?
         val all = listOfNotNull(dashboard, gateway, calls, notifications).map { it.status }
         return when {
             SettingsStatus.Error in all -> SettingsStatus.Error
-            SettingsStatus.Attention in all -> SettingsStatus.Attention
+            SettingsStatus.Attention in all || version.isEmpty() -> SettingsStatus.Attention
             else -> SettingsStatus.Ok
         }
     }
+    /** The first row, in the order shown, that asks something of the owner: its English label, which names the cause beside the verdict. */
+    val cause: String? get() = listOf(dashboard to "Hermes dashboard", gateway to "Hermes gateway", calls to "Calls", notifications to "Notifications")
+        .firstOrNull { it.first?.needsAttention == true }?.second
     val overallText: String get() = when (overall) {
         SettingsStatus.Ok -> "Healthy"
         SettingsStatus.Attention -> "Needs attention"
@@ -69,7 +73,7 @@ internal val PluginHealthStrings = listOf(
     "Beacon plugin", "Health", "Version", "Hermes dashboard", "Hermes gateway", "Calls", "Notifications", "Check now", "Checking…", "Retry", "Can't reach Hermes",
     "Healthy", "Needs attention", "Not working", "Up to date", "Needs restart", "Running", "Working", "Stopped", "Ready", "Add key",
     "Slow to start", "Hermes is updating", "Hermes is busy", "Hermes took too long", "Not ready", "Keep connected is on", "Keep connected is off", "Not set up",
-    "Beacon isn't installed on this Hermes", "Update Beacon on your Hermes", "Hermes answered in {0} ms",
+    "Beacon isn't installed on this Hermes", "Update Beacon on your Hermes", "Hermes answered in {0} ms", "Unknown",
 )
 
 private fun JSONObject.flag(name: String): Boolean? = opt(name) as? Boolean
@@ -80,7 +84,9 @@ private fun JSONObject.flag(name: String): Boolean? = opt(name) as? Boolean
  */
 internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKeySaved: Boolean? = null): PluginHealth? {
     val plugin = answer?.optJSONObject("plugin") ?: return null
-    val version = listOf("installed", "running").map { plugin.optString(it).trim() }.firstOrNull { PLUGIN_VERSION_PATTERN.matches(it) } ?: return null
+    val reported = listOf("installed", "running").map { plugin.optString(it).trim() }
+    // A plugin that answers with no version at all (1.2.2 on a Hermes without PyYAML) is old, not missing: it still gets its rows and Repair.
+    val version = reported.firstOrNull { PLUGIN_VERSION_PATTERN.matches(it) } ?: if (reported.all { it.isEmpty() }) "" else return null
     val calls = answer.optJSONObject("calls") ?: return null
     val push = answer.optJSONObject("push") ?: return null
     // A restart is done from App updates; a row that is wrong in some other way is read again.
@@ -121,10 +127,10 @@ internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKe
 @Composable internal fun roundTripText(milliseconds: Long): String = uiText("Hermes answered in {0} ms").replace("{0}", milliseconds.toString())
 
 /** A verdict row: plain when nothing is asked of the owner, else a tappable row that goes where the problem is fixed. */
-@Composable private fun HealthRow(label: String, icon: ImageVector, line: HealthLine, tag: String, onOpen: (HealthTarget) -> Unit) {
+@Composable private fun HealthRow(label: String, icon: ImageVector, line: HealthLine, tag: String, onOpen: (HealthTarget) -> Unit, modifier: Modifier = Modifier) {
     val word = uiText(line.text)
-    if (line.target == HealthTarget.None) SettingsValueRow(label, icon = icon, status = line.status, statusLabel = word, testTag = tag)
-    else SettingsNavRow(label, { onOpen(line.target) }, icon = icon, status = line.status, statusLabel = word, testTag = tag,
+    if (line.target == HealthTarget.None) SettingsValueRow(label, modifier, icon = icon, status = line.status, statusLabel = word, testTag = tag)
+    else SettingsNavRow(label, { onOpen(line.target) }, modifier, icon = icon, status = line.status, statusLabel = word, testTag = tag,
         trailingIcon = if (line.target == HealthTarget.CheckNow) Icons.Rounded.Refresh else null)
 }
 
@@ -135,16 +141,29 @@ internal fun pluginHealthOf(answer: JSONObject?, keepConnected: Boolean, voiceKe
 @Composable internal fun PluginHealthRows(health: PluginHealth, roundTrip: Long?, checking: Boolean, onOpen: (HealthTarget) -> Unit = {}, resultSignal: Int = 0, onCheck: () -> Unit) {
     val result = remember { BringIntoViewRequester() }
     LaunchedEffect(resultSignal) { if (resultSignal > 0) result.bringIntoView() }
-    SettingsValueRow(uiText("Health"), icon = Icons.Rounded.MonitorHeart, status = health.overall, statusLabel = uiText(health.overallText), testTag = "plugin-health-status")
+    // A verdict that names a cause leads to that row, which is further down the page.
+    val problem = remember { BringIntoViewRequester() }
+    val scope = rememberCoroutineScope()
+    val first = health.cause
+    fun mark(label: String) = if (label == first) Modifier.bringIntoViewRequester(problem) else Modifier
+    val verdict = uiText(health.overallText)
+    if (first == null || health.overall == SettingsStatus.Ok) SettingsValueRow(uiText("Beacon plugin"), icon = Icons.Rounded.MonitorHeart, status = health.overall, statusLabel = verdict, testTag = "plugin-health-status")
+    else {
+        val largeText = LocalDensity.current.fontScale >= 1.5f
+        val cause = uiText(first)
+        SettingsNavRow(uiText("Beacon plugin"), { scope.launch { problem.bringIntoView() } }, icon = if (largeText) null else Icons.Rounded.MonitorHeart,
+            value = if (largeText) cause else "", valueMaxLines = 2, status = health.overall,
+            statusLabel = if (largeText) verdict else "$verdict · $cause", testTag = "plugin-health-status")
+    }
     SettingsDivider()
-    SettingsValueRow(uiText("Version"), icon = Icons.Rounded.Tag, value = health.version, testTag = "plugin-health-version")
+    SettingsValueRow(uiText("Version"), icon = Icons.Rounded.Tag, value = health.version.ifEmpty { uiText("Unknown") }, testTag = "plugin-health-version")
     // The dashboard and the gateway only appear when one of them needs the owner; "Healthy" above already says they are fine.
-    health.dashboard?.takeIf { it.needsAttention }?.let { SettingsDivider(); HealthRow(uiText("Hermes dashboard"), Icons.Rounded.Dashboard, it, "plugin-health-dashboard", onOpen) }
-    health.gateway?.takeIf { it.needsAttention }?.let { SettingsDivider(); HealthRow(uiText("Hermes gateway"), Icons.Rounded.Router, it, "plugin-health-gateway", onOpen) }
+    health.dashboard?.takeIf { it.needsAttention }?.let { SettingsDivider(); HealthRow(uiText("Hermes dashboard"), Icons.Rounded.Dashboard, it, "plugin-health-dashboard", onOpen, mark("Hermes dashboard")) }
+    health.gateway?.takeIf { it.needsAttention }?.let { SettingsDivider(); HealthRow(uiText("Hermes gateway"), Icons.Rounded.Router, it, "plugin-health-gateway", onOpen, mark("Hermes gateway")) }
     SettingsDivider()
-    HealthRow(uiText("Calls"), Icons.Rounded.Call, health.calls, "plugin-health-calls", onOpen)
+    HealthRow(uiText("Calls"), Icons.Rounded.Call, health.calls, "plugin-health-calls", onOpen, mark("Calls"))
     SettingsDivider()
-    HealthRow(uiText("Notifications"), Icons.Rounded.NotificationsNone, health.notifications, "plugin-health-notifications", onOpen)
+    HealthRow(uiText("Notifications"), Icons.Rounded.NotificationsNone, health.notifications, "plugin-health-notifications", onOpen, mark("Notifications"))
     SettingsDivider()
     SettingsActionRow(uiText("Check now"), onCheck, Modifier.bringIntoViewRequester(result), icon = Icons.Rounded.Refresh, value = roundTrip?.let { roundTripText(it) }.orEmpty(),
         busy = checking, busyLabel = uiText("Checking…"), testTag = "plugin-health-check")
@@ -221,7 +240,7 @@ private fun RepairFinding.line(): String? = when (this) {
     var finishedChecks by remember(scopeKey) { mutableIntStateOf(0) }
     val requests = rememberCoroutineScope()
     // Check now reads past the plugin's few-second memory and times the whole trip from this phone; the quiet read on opening does neither.
-    fun read(fresh: Boolean) {
+    fun read(fresh: Boolean, bypass: Boolean = fresh) {
         val active = vm.client
         if (active == null || checking) return
         checking = true
@@ -229,7 +248,7 @@ private fun RepairFinding.line(): String? = when (this) {
         requests.launch {
             try {
                 val started = SystemClock.elapsedRealtime()
-                val answer = active.nativeRequest(PLUGIN_HEALTH_PATH, params = if (fresh) mapOf("fresh" to "1") else emptyMap())
+                val answer = active.nativeRequest(PLUGIN_HEALTH_PATH, params = if (bypass) mapOf("fresh" to "1") else emptyMap())
                 val elapsed = SystemClock.elapsedRealtime() - started
                 if (vm.client === active) {
                     vm.keepScreen(active.scope, PLUGIN_HEALTH_KEY, answer)
@@ -265,7 +284,7 @@ private fun RepairFinding.line(): String? = when (this) {
     val health = remember(data[PLUGIN_HEALTH_KEY], keepConnected, voiceKeySaved) { pluginHealthOf(data[PLUGIN_HEALTH_KEY], keepConnected, voiceKeySaved) }
     val repair by vm.pluginRepair.state.collectAsStateWithLifecycle()
     // A finished repair changed what the plugin says about itself (its version, the dashboard's start), so the rows read it again instead of keeping the old answer.
-    LaunchedEffect(repair.stage) { if (repair.stage == RepairStage.Done && !pluginAbsent) read(false) }
+    LaunchedEffect(repair.stage) { if (repair.stage == RepairStage.Done && !pluginAbsent) read(false, bypass = true) }
     // When Beacon's routes do not answer, Hermes' own list tells "not installed" from "installed but off or not running".
     val found by produceState<RepairFinding?>(null, scopeKey, pluginAbsent, repair.working) {
         value = null
@@ -298,7 +317,7 @@ private fun RepairFinding.line(): String? = when (this) {
             health != null -> {
                 PluginHealthRows(health, roundTrip, checking && asked, open, finishedChecks) { read(true) }
                 SettingsDivider()
-                PluginRepairRow(vm)
+                PluginRepairRow(vm, RepairFinding.OutOfDate.takeIf { health.version.isEmpty() })
             }
             else -> SettingsSkeletonRows(2)
         }

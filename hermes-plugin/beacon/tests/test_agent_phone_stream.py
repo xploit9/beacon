@@ -144,7 +144,7 @@ async def until(cond, timeout=5.0):
 
 def make(tmp_path, socket, log, *, channel='ready', max_fps=0, gate=None, **extra):
     lease = lease_mod.PhoneLease(tmp_path)
-    lease.acquire(VIEWER)
+    epoch = lease.acquire(VIEWER).epoch
     holder = {}
 
     def open_frames(on_frame):
@@ -157,7 +157,7 @@ def make(tmp_path, socket, log, *, channel='ready', max_fps=0, gate=None, **extr
         holder['channel'] = FakeChannel(log, ready=channel == 'ready')
         return holder['channel']
 
-    session = stream.ViewSession(socket, lease, VIEWER, open_frames=open_frames, open_control=lambda: FakeControl(log, gate),
+    session = stream.ViewSession(socket, lease, VIEWER, epoch=epoch, open_frames=open_frames, open_control=lambda: FakeControl(log, gate),
                                  open_channel=open_channel, max_fps=max_fps, pace=0.005, lease_check_seconds=0.02,
                                  revalidate_seconds=0.05, **extra)
     return session, lease, holder
@@ -646,7 +646,7 @@ def test_keyboard_and_helper_state_reach_the_app(tmp_path, monkeypatch):
         session, _, _ = make(tmp_path, socket, log, keyboard_probe=lambda: True)
         task = asyncio.create_task(session.run())
         await until(lambda: any(s.get('helper') == 'ready' for s in socket.of('state')))
-        assert socket.of('state')[0] == {'t': 'state', 'keyboard': False, 'rotation': 0, 'helper': 'starting', 'prompt': None, 'lease': 'you'}
+        assert socket.of('state')[0] == {'t': 'state', 'keyboard': False, 'rotation': 0, 'helper': 'starting', 'prompt': None, 'lease': 'you', 'epoch': session.epoch}
         socket.push({'t': 'touch', 'points': [{'id': 0, 'x': 0.5, 'y': 0.5, 'phase': 'down'}]})
         socket.push({'t': 'touch', 'points': [{'id': 0, 'x': 0.5, 'y': 0.5, 'phase': 'up'}]})
         await until(lambda: any(s.get('keyboard') for s in socket.of('state')))
@@ -850,13 +850,13 @@ def test_a_helper_link_that_arrives_after_the_view_closed_is_closed(tmp_path):
         release = threading.Event()
         made = []
         lease = lease_mod.PhoneLease(tmp_path)
-        lease.acquire(VIEWER)
+        epoch = lease.acquire(VIEWER).epoch
 
         def slow_channel():
             release.wait(5)
             made.append(FakeChannel(log))
             return made[-1]
-        session = stream.ViewSession(socket, lease, VIEWER, open_frames=lambda cb: FakeFrames(cb), open_control=lambda: FakeControl(log),
+        session = stream.ViewSession(socket, lease, VIEWER, epoch=epoch, open_frames=lambda cb: FakeFrames(cb), open_control=lambda: FakeControl(log),
                                      open_channel=slow_channel, lease_check_seconds=0.02)
         task = asyncio.create_task(session.run())
         await asyncio.sleep(0.05)
@@ -885,11 +885,11 @@ def test_a_view_that_cannot_start_says_error_and_closes(tmp_path):
     async def main():
         socket, log = FakeSocket(), []
         lease = lease_mod.PhoneLease(tmp_path)
-        lease.acquire(VIEWER)
+        epoch = lease.acquire(VIEWER).epoch
 
         def broken(on_frame):
             raise OSError('no file')
-        session = stream.ViewSession(socket, lease, VIEWER, open_frames=broken, open_control=lambda: FakeControl(log))
+        session = stream.ViewSession(socket, lease, VIEWER, epoch=epoch, open_frames=broken, open_control=lambda: FakeControl(log))
         assert await session.run() == 'error'
         assert socket.closed == 1011
     run(main())

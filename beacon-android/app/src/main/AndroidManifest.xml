@@ -125,6 +125,8 @@
         <!-- "What {name} did on its phone" (L6): a done notification opens it at its row; the phone page can open it by class name. -->
         <activity android:name=".agentphone.AgentPhoneLogActivity" android:exported="false" android:resizeableActivity="true" />
         <service android:name=".voice.BeaconCallService" android:exported="false" android:foregroundServiceType="microphone|phoneCall|camera|mediaProjection" />
+        <activity android:name=".voice.IncomingDialerActivity" android:exported="false" android:excludeFromRecents="true"
+            android:taskAffinity="${applicationId}.incoming" android:showWhenLocked="true" android:turnScreenOn="true" />
         <service android:name=".voice.IncomingRingtoneService" android:exported="false" android:foregroundServiceType="phoneCall" />
         <service android:name=".push.KeepConnectedService" android:exported="false" android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Maintains an HTTPS notification event connection to the signed-in Hermes account so incoming Beacon calls can reach the phone while the user enables Keep connected." />

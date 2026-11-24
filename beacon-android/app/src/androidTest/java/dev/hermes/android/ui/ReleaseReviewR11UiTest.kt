@@ -150,7 +150,7 @@ class ReleaseReviewR11UiTest {
                 "picker:approvals" !in vm.refreshing.value
         }
         // The browsed chat shows its own saved choice (not YOLO), never Unknown, and still never resumes.
-        compose.onNodeWithContentDescription("Approvals: Always ask").assertIsDisplayed().performClick()
+        compose.onNodeWithContentDescription("Approvals: Ask for risky ones").assertIsDisplayed().performClick()
         compose.onNodeWithTag("approval-ask").assertExists()
         lateinit var read: kotlinx.coroutines.Job
         compose.runOnIdle { read = vm.loadChatApprovals() }

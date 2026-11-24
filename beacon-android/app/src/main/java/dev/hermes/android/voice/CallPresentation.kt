@@ -1,8 +1,29 @@
 package dev.hermes.android.voice
 
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import androidx.core.app.Person
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
+import dev.hermes.android.R
 import dev.hermes.android.core.Scope
 import kotlin.math.*
 import java.util.Locale
+
+private var callerBitmap: Bitmap? = null
+/** The caller on the system call cards: Beacon's own mark in the call screen's gold on its warm black, instead of Android's default lettered circle. */
+internal fun callerPerson(context: Context, name: String): Person = Person.Builder().setName(name).setImportant(true).setIcon(IconCompat.createWithBitmap(
+    callerBitmap ?: Bitmap.createBitmap(192, 192, Bitmap.Config.ARGB_8888).also { bitmap ->
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(0xff0b0b0a.toInt())
+        ContextCompat.getDrawable(context, R.drawable.ic_beacon_notification)?.mutate()?.let { mark ->
+            mark.setTint(0xffd5a64a.toInt())
+            mark.setBounds(36, 36, 156, 156)
+            mark.draw(canvas)
+        }
+        callerBitmap = bitmap
+    })).build()
 
 internal fun overlayOwnsCall(call: CallState, expectedId: String, owner: Scope?, authenticated: Boolean, unlocked: Boolean): Boolean =
     call.active && expectedId.isNotBlank() && call.callId == expectedId && authenticated && unlocked &&
@@ -30,7 +51,7 @@ internal fun callStatusLabel(call: CallState, withTool: Boolean = true): String 
         toolStatus != null -> toolStatus
         call.state == "thinking" -> "Thinking"
         call.remoteSpeaking || call.state == "speaking" -> "Speaking"
-        call.muted -> "Muted"
+        call.muted -> "You're muted"
         call.userSpeaking && !call.muted -> "Listening"
         call.state == "listening" -> "Listening"
         else -> call.state.replaceFirstChar { it.titlecase() }
@@ -38,12 +59,12 @@ internal fun callStatusLabel(call: CallState, withTool: Boolean = true): String 
 }
 /** Every fixed English label that reaches uiText through a variable ([callStatusLabel], [transcriptLabel], the call history error), so the translation test can read them. */
 internal val CallStrings = listOf(
-    "Call on hold", "Connecting", "Thinking", "Speaking", "Muted", "Listening", "Idle", "Ending",
+    "Call on hold", "Connecting", "Thinking", "Speaking", "You're muted", "Listening", "Idle", "Ending",
     "Some of this call wasn't saved to the chat", "Saving to the chat", "Saved to the chat",
     "Call history unavailable", CALL_DROPPED, CALL_VOICE_STOPPED,
 )
 internal fun callTimerLabel(startedAtMillis: Long, nowMillis: Long): String {
-    val elapsedSeconds = if (startedAtMillis > 0) ((nowMillis - startedAtMillis).coerceAtLeast(0) / 1000) else 0
+    val elapsedSeconds = (if (startedAtMillis > 0) nowMillis - startedAtMillis else 0).coerceAtLeast(0) / 1000
     return String.format(Locale.ROOT, "%02d:%02d", elapsedSeconds / 60, elapsedSeconds % 60)
 }
 internal fun CallState.voiceAmplitude(): Float {

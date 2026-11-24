@@ -296,7 +296,11 @@ internal fun pluginActionWord(plugin: PluginRow): String = when {
     // Chat join: EMU-JOIN's agent-phone page is remote too; CACHEFIX-A shows a page's saved copy instead of Reconnect.
     val remotePage = page in (settingsCategories.values.flatten() + listOf("Skills", "Memory", "Vault", "Beacon", "Notifications", "Bots", "Profiles", "Commands", "Session usage", AGENT_PHONE_ROUTE)) && page !in setOf("Beacon", "App updates")
     val savedData by vm.data.collectAsStateWithLifecycle()
-    if (remotePage && vm.client == null && !ui.loading && !savedPageHasCopy(page, savedData)) {
+    val chat by vm.chat.collectAsStateWithLifecycle()
+    val savedUsage = page == "Session usage" && chat.sessionId.isNotBlank() && savedData["native-usage:${ui.profile}:${chat.sessionId}"] != null
+    val prefs by vm.preferences.collectAsStateWithLifecycle()
+    val savedPhone = page == AGENT_PHONE_ROUTE && savedData[agentPhoneCacheKey(prefs.assistantProfile)] != null
+    if (remotePage && vm.client == null && !ui.loading && !savedUsage && !savedPhone && !savedPageHasCopy(page, savedData)) {
         SettingsStatePage(vm, page, back = page !in setOf("Skills", "Bots")) {
             item {
                 SettingsStatusHero(SettingsStatus.Error, uiText("Reconnect to Hermes"), line = uiText("Check your network"),

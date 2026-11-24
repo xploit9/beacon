@@ -4,6 +4,7 @@ import androidx.activity.ComponentActivity
 import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.unit.dp
 import dev.hermes.android.BeaconViewModel
 import dev.hermes.android.NativeExperienceFixture
 import dev.hermes.android.core.json
@@ -85,12 +86,55 @@ class NativeVaultPageUiTest {
         assertTrue("The form is gone and holds nothing", !shown("vault-field:password"))
     }
 
+    /** What the field draws (after the masking transformation), not what was typed. */
+    private fun displayed(tag: String): String {
+        val results = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        val node = compose.onNodeWithTag(tag).fetchSemanticsNode()
+        compose.runOnUiThread { node.config[androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult].action?.invoke(results) }
+        return results.single().layoutInput.text.text
+    }
+
+    @Test fun anAddressShowsPlainTextAndTheEyeRevealsOneSecretAtATime() = harness.run { vm, _ ->
+        openVault(vm)
+        await { usable("vault-add-address") }
+        compose.onNodeWithTag("vault-add-address").performClick()
+        await { shown("vault-field:address_line1") }
+        compose.onNodeWithTag("vault-field:address_line1").performTextInput("1 Example Street")
+        assertEquals("1 Example Street", compose.onNodeWithTag("vault-field:address_line1").fetchSemanticsNode().config[SemanticsProperties.EditableText].text)
+        assertFalse("An address has no eye button", shown("vault-eye:address_line1"))
+        compose.onNodeWithTag("vault-field:address_line1").assert(SemanticsMatcher("is not a password field") { SemanticsProperties.Password !in it.config })
+        compose.onNodeWithText("Cancel").performClick()
+        await { usable("vault-add-card") }
+        compose.onNodeWithTag("vault-add-card").performClick()
+        await { shown("vault-field:card_number") }
+        for (key in listOf("card_number", "cvc")) {
+            masked("vault-field:$key")
+            compose.onNodeWithTag("vault-eye:$key").assertContentDescriptionEquals(if (key == "cvc") "Show security code" else "Show card number").assertHeightIsAtLeast(48.dp).assertWidthIsAtLeast(48.dp)
+        }
+        compose.onNodeWithTag("vault-field:card_number").performTextInput("4242424242424242")
+        assertFalse("Typed card number is hidden", displayed("vault-field:card_number").contains("4242"))
+        compose.onNodeWithTag("vault-eye:card_number").performClick()
+        assertEquals("4242424242424242", displayed("vault-field:card_number"))
+        compose.onNodeWithTag("vault-eye:card_number").assertContentDescriptionEquals("Hide card number")
+        masked("vault-field:cvc")
+        compose.onNodeWithTag("vault-field:cvc").performTextInput("123")
+        assertFalse("Only the toggled field is revealed", displayed("vault-field:cvc").contains("123"))
+        compose.onNodeWithTag("vault-eye:cvc").assertContentDescriptionEquals("Show security code")
+        compose.onNodeWithText("Cancel").performClick()
+        await { usable("vault-add-card") }
+        compose.onNodeWithTag("vault-add-card").performClick()
+        await { shown("vault-field:card_number") }
+        masked("vault-field:card_number")
+        compose.onNodeWithTag("vault-eye:card_number").assertContentDescriptionEquals("Show card number")
+    }
+
     @Test fun addCardAndAddressSendOnlyHermesCanonicalFields() = harness.run { vm, fixture ->
         openVault(vm)
         await { usable("vault-add-card") }
         compose.onNodeWithTag("vault-add-card").performClick()
         await { shown("vault-field:card_number") }
-        for (tag in listOf("card_number", "exp_month", "exp_year", "cvc", "cardholder_name", "billing_postal_code")) masked("vault-field:$tag")
+        for (tag in listOf("card_number", "cvc")) masked("vault-field:$tag")
+        for (tag in listOf("exp_month", "exp_year", "cardholder_name", "billing_postal_code")) plain("vault-field:$tag")
         assertFalse("A card has no site field: it works on any site", shown("vault-field:site"))
         compose.onNodeWithText("Works on any site. Each payment asks you first.").assertExists()
         compose.onNodeWithTag("vault-field:label").performTextInput("Visa")
@@ -118,7 +162,7 @@ class NativeVaultPageUiTest {
         compose.onNodeWithTag("vault-field:label").performTextInput("Home")
         compose.onNodeWithTag("vault-field:site").performTextInput("https://shop.example/checkout")
         for ((key, value) in listOf("address_line1" to "1 Example Street", "city" to "Example", "postal_code" to "00000", "country" to "Example")) {
-            masked("vault-field:$key")
+            plain("vault-field:$key")
             compose.onNodeWithTag("vault-field:$key").performScrollTo().performTextInput(value)
         }
         compose.onNodeWithTag("vault-submit").performClick()

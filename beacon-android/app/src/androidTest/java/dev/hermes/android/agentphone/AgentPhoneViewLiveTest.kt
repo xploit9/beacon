@@ -121,7 +121,7 @@ class AgentPhoneViewLiveTest {
     private fun openView(label: String, capture: Boolean = true): Boolean {
         val t0 = now()
         val from = beacon()
-        main { from.startActivity(Intent(from, AgentPhoneActivity::class.java)) }
+        main { from.startActivity(Intent(from, AgentPhoneActivity::class.java).putExtra(AgentPhoneActivity.EXTRA_CONTROL, true)) }
         waitFor("view_activity", 15_000) { viewActivity() != null } ?: return false
         val activity = checkNotNull(viewActivity())
         main { model = ViewModelProvider(activity)[AgentPhoneViewModel::class.java] }
@@ -556,7 +556,7 @@ class AgentPhoneViewLiveTest {
             Thread.sleep(6_000)
             val away1 = version()
             // Back to the app (as from Recents): its task comes to the front with the view on top.
-            main { instrumentation.targetContext.startActivity(Intent(instrumentation.targetContext, AgentPhoneActivity::class.java)
+            main { instrumentation.targetContext.startActivity(Intent(instrumentation.targetContext, AgentPhoneActivity::class.java).putExtra(AgentPhoneActivity.EXTRA_CONTROL, true)
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)) }
             val front = waitFor("foreground", 10_000) { viewActivity() != null }
             val v0 = version()
@@ -741,7 +741,7 @@ class AgentPhoneViewLiveTest {
         try {
             waitFor("offline", 20_000) { !online() }
             val from = beacon()
-        main { from.startActivity(Intent(from, AgentPhoneActivity::class.java)) }
+        main { from.startActivity(Intent(from, AgentPhoneActivity::class.java).putExtra(AgentPhoneActivity.EXTRA_CONTROL, true)) }
             waitFor("view_activity", 15_000) { viewActivity() != null }
             val activity = checkNotNull(viewActivity())
             main { model = ViewModelProvider(activity)[AgentPhoneViewModel::class.java] }

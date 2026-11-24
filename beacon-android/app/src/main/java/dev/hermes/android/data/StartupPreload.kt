@@ -9,6 +9,7 @@ data class StartupRead(val key: String, val path: String, val query: Map<String,
 // Local configuration/catalog handlers only; no provider probes, MCP connect or mail reads.
 val startupReads = listOf(
     StartupRead("navigation-profiles", "/api/profiles"),
+    StartupRead("profile-defaults", PROFILE_DEFAULTS_PATH),
     StartupRead("native-tools", "/api/tools/toolsets"),
     StartupRead("slash:catalog", "/api/commands/catalog"),
     StartupRead("native-projects", "/api/projects"),

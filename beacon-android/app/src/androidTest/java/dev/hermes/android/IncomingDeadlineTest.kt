@@ -92,7 +92,7 @@ class IncomingDeadlineTest {
             assertEquals(first,app.push.deadlineInvitation(source,event))
             assertEquals(first,dev.hermes.android.push.PushManager(app).deadlineInvitation(source,event))
             ContextCompat.startForegroundService(app,Intent(app,IncomingRingtoneService::class.java)
-                .putExtra("push_source",source).putExtra("push_event",event).putExtra("notification",original))
+                .putExtra("push_source",source).putExtra("push_event",event).putExtra("notification",restartCard(app,original!!)))
             // Root ruling (msg_0ccbf1b46ebe): was 2000. The restarted service re-posts its card from onStartCommand; on a loaded emulator that took more than 2 s (fl6-base-1).
             // A re-armed 45 s card shows timeoutAfter 45000, never in 1..41000, however long this waits, so a longer wait does not weaken the check.
             await(10_000) { manager.activeNotifications.firstOrNull { it.id==42 }?.notification?.timeoutAfter?.let { it in 1..41000 }==true }
@@ -143,6 +143,57 @@ class IncomingDeadlineTest {
                 assertNull(app.push.missedInvitation(source,id))
                 assertTrue(manager.activeNotifications.none { it.tag==saved.key })
                 app.push.discardInvitation(source,id);assertTrue(prefs.edit().remove(key).commit())
+            }
+        }
+    }
+
+    /**
+     * The card the product hands the service is built fresh, before it is posted. The posted card read back from the manager carries system-shared
+     * bitmaps (the caller portrait), which cannot be written into an Intent extra ("Not allowed to write file descriptors here"), so the restart gets a plain rebuild.
+     */
+    private fun restartCard(app:BeaconApplication,posted:Notification):Notification =
+        androidx.core.app.NotificationCompat.Builder(app,posted.channelId).setSmallIcon(R.drawable.ic_beacon_notification)
+            .setCategory(posted.category).setContentTitle("Beacon is calling").build()
+
+    /** Makes a saved invitation 46 s old, so its 45 s ring is over. */
+    private fun ageRing(app:BeaconApplication,source:String,id:String) {
+        val key="incoming:${checkNotNull(app.push.deadlineInvitation(source,id)).key}"
+        val encoded=checkNotNull(app.getSharedPreferences("push-binding",Context.MODE_PRIVATE).getString(key,null))
+        val state=org.json.JSONObject(String(app.cipher.decrypt(android.util.Base64.decode(encoded,android.util.Base64.NO_WRAP),key)))
+        state.put("arrived_at",System.currentTimeMillis()-46000).put("arrived_elapsed",SystemClock.elapsedRealtime()-46000)
+        persist(app,key,state)
+    }
+
+    @Test fun aRingTimeoutReportsMissedOnceAndADeclineDoesNotAlsoReportMissed() {
+        fixture { app,source,event,_ ->
+            val missed=java.util.concurrent.atomic.AtomicInteger()
+            val declined=java.util.concurrent.atomic.AtomicInteger()
+            val declineId="$event-decline"
+            withIncomingHost(app,source,event,{ path ->
+                when {
+                    path=="/api/plugins/beacon/mobile/callbacks/$event/missed" -> { missed.incrementAndGet(); 200 to json("missed" to true,"state" to "missed") }
+                    path.endsWith("/$declineId/decline") -> { declined.incrementAndGet(); 200 to json("declined" to true) }
+                    path.endsWith("/notifications/events/$declineId") -> 200 to incomingRoute(source)
+                    path.endsWith("/missed") -> { missed.incrementAndGet(); 200 to json("missed" to true) }
+                    else -> null
+                }
+            }) {
+                // A ring that times out reports missed, once, however often the timeout is seen.
+                assertTrue(app.push.saveInvitation(IncomingCall(source,event,System.currentTimeMillis()/1000+120),receiptRequired=false))
+                ageRing(app,source,event)
+                app.push.expireInvitation(source,event)
+                app.push.expireInvitation(source,event)
+                val until=SystemClock.elapsedRealtime()+8_000
+                while(missed.get()==0&&SystemClock.elapsedRealtime()<until) SystemClock.sleep(50)
+                SystemClock.sleep(700)
+                assertEquals(1,missed.get())
+                // A Decline reports declined and never missed, even when its ring time then passes.
+                assertTrue(app.push.saveInvitation(IncomingCall(source,declineId,System.currentTimeMillis()/1000+120),receiptRequired=false))
+                kotlinx.coroutines.runBlocking { declineIncoming(app,source,declineId) }
+                assertEquals(1,declined.get())
+                app.push.expireInvitation(source,declineId)
+                SystemClock.sleep(700)
+                assertEquals("a Decline must not also report missed",1,missed.get())
             }
         }
     }

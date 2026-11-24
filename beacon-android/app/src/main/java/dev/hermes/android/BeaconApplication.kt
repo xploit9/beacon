@@ -81,13 +81,14 @@ internal fun removeLegacyIncidentJournal(dir: java.io.File): Boolean =
 internal fun notificationChannelIdsToDelete(existingIds: Set<String>, currentIds: Set<String>): Set<String> = existingIds - currentIds
 
 // shortcut: IDs stay with their services; centralize if adding channels makes this set hard to keep in sync.
-private val CURRENT_NOTIFICATION_CHANNEL_IDS = setOf(
+internal val CURRENT_NOTIFICATION_CHANNEL_IDS = setOf(
     "hermes-messages",
     "hermes-messages-v2",
     "hermes-tasks",
     "hermes-tasks-v2",
     "hermes-approvals",
     "hermes-prompts-v2",
+    "hermes-prompts-in-call",
     "xara-incoming-call-v2",
     "xara-calls",
     // The quiet first update category stays until UpdateManager has carried an "off" over to its replacement and removed it.

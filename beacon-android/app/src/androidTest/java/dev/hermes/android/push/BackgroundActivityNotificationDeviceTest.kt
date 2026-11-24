@@ -84,6 +84,26 @@ class BackgroundActivityNotificationDeviceTest {
         }
     }
 
+    // R3-F4: a thread post that lands while Beacon is open comes quietly, and stays quiet when Hermes' words replace the typed text: androidx's
+    // copy of a notification keeps its group but not its quiet alert behavior, so the update used to peek over the chat being read.
+    @Test fun aQuietAlertStaysQuietWhenItsWordsArrive() {
+        BackgroundActivityFixture(app).use { fixture ->
+            app.calls.uiVisible = true
+            // Quiet because Beacon is open, not because earlier alerts of this run made a burst (a burst stays quiet whatever it is).
+            Thread.sleep(BURST_WINDOW_MILLIS + 200)
+            val id = "quiet-${fixture.event}"
+            assertNotNull(receivePush(app, fixture.data("task_result", id).minus("activity_ref"), null, deferPreview = true))
+            fixture.await { fixture.card(id) != null }
+            val posted = checkNotNull(fixture.card(id))
+            assertFalse(posted.extras.getBoolean(QUIET_ALERT_EXTRA))
+            assertEquals(Notification.GROUP_ALERT_SUMMARY, posted.groupAlertBehavior)
+            assertNotEquals("androidx's copy alone", Notification.GROUP_ALERT_SUMMARY, androidx.core.app.NotificationCompat.Builder(app, posted).build().groupAlertBehavior)
+            assertEquals(Notification.GROUP_ALERT_SUMMARY, previewUpdate(app, posted, "Synthetic thread", "Synthetic post").build().groupAlertBehavior)
+            // Root's exception: an important alert's words arrive loud even while Beacon is open.
+            assertNotEquals(Notification.GROUP_ALERT_SUMMARY, previewUpdate(app, posted, "Important from Mail", "Synthetic alert", important = true).build().groupAlertBehavior)
+        }
+    }
+
     @Test fun syntheticDeliveryLogPreferencesAreRestoredAfterTheFixtureCloses() {
         val prefs = DeliveryLog.accountPreferences(app)
         val previous = prefs.all.toMap()

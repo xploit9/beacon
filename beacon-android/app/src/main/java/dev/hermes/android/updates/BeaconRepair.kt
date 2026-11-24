@@ -132,15 +132,20 @@ internal suspend fun runRepair(
         if (finding == RepairFinding.Newer) return RepairUi(RepairStage.Done, finding = finding)
         report(RepairStage.Repairing)
         var gatewayNeedsRestart = false
+        // The same version text can be old code (a repair reinstalls the pin over a build of the same version), so "restarted" is read from the dashboard's own start time.
+        var startedBefore: Long? = null
+        var unchanged = false
         when (finding) {
             RepairFinding.TurnedOff -> if (!endpoint.enable().optBoolean("ok", true)) return failed(RepairProblem.Refused, finding)
             else -> {
                 // A reply lost after the request left (a slow install outlasting the phone's read time) may still have installed Beacon:
                 // look at the versions, as the first-time install does, instead of calling it "Can't reach Hermes" and asking for a second install.
+                startedBefore = attempt { endpoint.dashboardStart() }
                 val answer = try { endpoint.install() } catch (error: CancellationException) { throw error } catch (error: Exception) { if (lostReply(error)) null else throw error }
                 if (answer != null) {
                     if (!answer.optBoolean("ok")) return failed(RepairProblem.Refused, finding)
                     gatewayNeedsRestart = answer.opt("restart_required") == true
+                    unchanged = answer.optBoolean("unchanged")
                 }
             }
         }
@@ -150,8 +155,12 @@ internal suspend fun runRepair(
         var now: PluginVersions?
         while (true) {
             now = attempt { endpoint.versions() }
-            if (now != null && now.restartKind() == RestartKind.None && !olderVersion(now.installed, published.version)) return RepairUi(RepairStage.Done, finding = finding)
-            if (waited >= CURRENT_WAIT_MS) break
+            val current = now != null && now.restartKind() == RestartKind.None && !olderVersion(now.installed, published.version)
+            // Nothing to wait for when the files did not change, the start time is unknown, or the dashboard already started again.
+            val restarted = !current || startedBefore == null || unchanged || attempt { endpoint.dashboardStart() }.let { it != null && it != startedBefore }
+            if (current && restarted) return RepairUi(RepairStage.Done, finding = finding)
+            // Still on the version it had, and no restart came: none was needed, so it is the same as before.
+            if (waited >= CURRENT_WAIT_MS) { if (current) return RepairUi(RepairStage.Done, finding = finding); break }
             pause(CURRENT_POLL_MS); waited += CURRENT_POLL_MS
         }
         // What is left is not the phone's to do: a gateway that did not take Beacon up needs a Hermes restart (the update screen offers it with its

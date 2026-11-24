@@ -28,6 +28,11 @@ def notices(api):
 def poster(harness, monkeypatch):
     api, client, cfg, _, _ = harness
     phone = load_private('phone_delivery')
+    from gateway.platform_registry import PlatformEntry, PlatformRegistry
+    registry = PlatformRegistry()
+    monkeypatch.setattr(importlib.import_module('gateway.platform_registry'), 'platform_registry', registry)
+    monkeypatch.setenv('PHONE_HOME_CHANNEL', 'phone')
+    phone.register(SimpleNamespace(register_platform=lambda **kwargs: registry.register(PlatformEntry(**kwargs))))
     monkeypatch.setattr(phone, '_modules', lambda: (api.mobile, api.native, api.proactive))
     monkeypatch.setattr(phone, '_profile_state', lambda: (api.mobile, cfg, 'default'))
     posts = []
@@ -310,3 +315,94 @@ def test_hermes_hands_the_thread_id_to_the_phone_platform(harness, monkeypatch):
     targets = _resolve_delivery_targets({'deliver': 'phone:' + THREAD})
 
     assert [(target['platform'], target['chat_id'], target['thread_id']) for target in targets] == [('phone', THREAD, None)]
+
+
+@pytest.fixture
+def app_thread(poster, monkeypatch, tmp_path):
+    """A thread made in the app on a stock Hermes: Hermes stamps its row with the host's owner, and Beacon binds it to the phone's login.
+    Real Hermes store, Beacon's real ownership check and real post; only the profile lookup is pinned to this store."""
+    from gateway.session_identity import authenticated_subject
+    from hermes_state import SessionDB
+    api = poster.api
+    spec = importlib.util.spec_from_file_location('thread_posts_real_native', Path(api.native.__file__))
+    real = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(real)
+    monkeypatch.setattr(api.native, 'verify', real.verify)
+    monkeypatch.setattr(api.native, 'post', lambda *args: poster.posts.append(args) or real.post(*args))
+    db = SessionDB(tmp_path / 'thread-posts-state.db')
+
+    @contextmanager
+    def profile_db(params, writer=False):
+        yield db
+    monkeypatch.setattr(sys.modules['tui_gateway'].server, '_profile_db', profile_db, raising=False)
+    principal = authenticated_subject({'provider': 'basic', 'issuer': 'https://issuer.example', 'user_id': 'owner'})
+    execution = api.native.execution_subject('owner', 'basic', principal)
+    assert execution != principal and execution != 'basic:owner'  # the host's owner: a login is proven only by Beacon's binding
+
+    def make(thread, owner='owner', profile='default'):
+        db.create_session(thread, 'local', user_id=execution)
+        assert api.mobile.bind_native_conversation({'home': api.native.profile_fingerprint(profile), 'profile': profile, 'session': thread,
+            'owner': owner, 'provider': 'basic', 'principal': authenticated_subject({'provider': 'basic', 'issuer': 'https://issuer.example', 'user_id': owner}),
+            'execution': execution, 'kind': 'canonical', 'request': 'synthetic-create-' + thread, 'runtime': ''})
+    make(THREAD)
+    try:
+        yield SimpleNamespace(api=api, phone=poster.phone, posts=poster.posts, db=db, principal=principal, make=make)
+    finally:
+        db.close()
+
+
+def thread_posts(db, thread):
+    return [m['content'] for m in db.get_messages(thread) if m.get('display_kind') == 'cron_delivery']
+
+
+def test_a_post_lands_in_a_thread_made_in_the_app(app_thread):
+    sent = asyncio.run(app_thread.phone.standalone_send({}, THREAD, envelope()))
+
+    assert sent.get('success') is True, sent
+    assert thread_posts(app_thread.db, THREAD) == ['[Cron delivery: Cybersecurity news]\nThree new advisories.']
+    with app_thread.api.mobile.connect() as conn:
+        (row,) = [dict(r) for r in conn.execute('SELECT * FROM notices')]
+    assert (row['conversation'], row['kind'], row['principal']) == (THREAD, 'task_result', app_thread.principal)
+    # The phones of that login see the notice (events route and push use this check); another login's do not.
+    assert app_thread.api._visible_notice(row, 'owner', 'basic', 'default', app_thread.principal)
+    other = app_thread.principal.replace('issuer.example', 'other.example')
+    assert not app_thread.api._visible_notice(row, 'owner', 'basic', 'default', other)
+
+
+def test_a_held_post_lands_in_a_thread_made_in_the_app_after_its_turn(app_thread, monkeypatch):
+    real_post = app_thread.api.native.post
+    busy = [True]
+
+    def post(*args):
+        if busy[0]:
+            raise SessionTurnLeaseLostError('Session has an active turn lease')
+        return real_post(*args)
+    monkeypatch.setattr(app_thread.api.native, 'post', post)
+    monkeypatch.setattr(app_thread.api, '_posts_until', {})
+
+    sent = asyncio.run(app_thread.phone.standalone_send({}, THREAD, envelope()))
+    assert sent.get('success') is True and sent['message_id'].startswith('held-'), sent
+    busy[0] = False
+    app_thread.api.flush_held_posts('owner', 'basic', 'default')
+
+    assert thread_posts(app_thread.db, THREAD) == ['[Cron delivery: Cybersecurity news]\nThree new advisories.']
+    assert app_thread.api.mobile.held_posts('owner', 'default') == []
+    assert [(r['conversation'], r['kind']) for r in notices(app_thread.api)] == [(THREAD, 'task_result')]
+    with app_thread.api.mobile.connect() as conn:
+        assert conn.execute('SELECT principal FROM notices').fetchone()[0] == app_thread.principal
+
+
+def test_a_deleted_app_thread_gets_nothing(app_thread):
+    app_thread.db.delete_session(THREAD)
+
+    assert asyncio.run(app_thread.phone.standalone_send({}, THREAD, envelope())) == {'error': GONE}
+    assert app_thread.posts == [] and notices(app_thread.api) == []
+
+
+@pytest.mark.parametrize('owner,profile', [('someone-else', 'default'), ('owner', 'work')])
+def test_an_app_thread_of_another_owner_or_profile_gets_nothing(app_thread, owner, profile):
+    other = '20261026_083012_0th3r0'
+    app_thread.make(other, owner=owner, profile=profile)
+
+    assert asyncio.run(app_thread.phone.standalone_send({}, other, envelope())) == {'error': GONE}
+    assert app_thread.posts == [] and notices(app_thread.api) == [] and thread_posts(app_thread.db, other) == []

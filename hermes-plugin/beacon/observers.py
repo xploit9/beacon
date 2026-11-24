@@ -159,6 +159,85 @@ def completion(mobile, native, cfg, profile, session_id, turn_id=None, completed
                       job_id if isinstance(job_id, str) and mobile.ID.fullmatch(job_id) else "", principal or ""))
 
 
+# Hermes' default clarify wait, kept when its own setting cannot be read; an unlimited wait keeps its alert this long at most
+# (the resolved hook ends one sooner, and a wait whose end never comes is settled once its alert expires).
+HUMAN_INPUT_SECONDS = 3600
+HUMAN_INPUT_MAX_SECONDS = 14400
+
+
+def human_wait_seconds(kind):
+    """How long Hermes waits for this answer (its clarify timeout or approvals.timeout), so the phone's alert lasts as long."""
+    try:
+        if kind == "clarify":
+            from tools.clarify_gateway import get_clarify_timeout
+            seconds = get_clarify_timeout()
+        else:
+            from tools.approval_context import _get_approval_timeout
+            seconds = _get_approval_timeout()
+        seconds = int(seconds)
+    except Exception:
+        return HUMAN_INPUT_SECONDS
+    return HUMAN_INPUT_MAX_SECONDS if seconds <= 0 else min(seconds, HUMAN_INPUT_MAX_SECONDS)
+
+
+def human_input(mobile, native, cfg, profile, kind=None, request_id=None, session_id=None, **kwargs):
+    """on_human_input_request: a turn in a chat the owner holds through a login waits for the owner's approval or answer.
+
+    That turn runs in Hermes' session authority, where activity.snapshot cannot see it, so the notice is made here, in the
+    turn's own process. It opens the chat, where the owner answers. A turn without a login proof (an owner-stamped chat) and a
+    legacy runtime are left to activity.snapshot, so one request never makes two notices. The prompt text is never stored."""
+    if kind not in ("approval", "clarify") or not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id):
+        return
+    owner, provider = cfg.get("owner_id"), cfg.get("owner_provider")
+    if not owner or not provider or not isinstance(session_id, str) or not session_id or not _profile_allowed(cfg, profile):
+        return
+    if native.call_principal.get() is not None:
+        return  # a call's own tool run: Beacon answers Hermes' gate there itself, from the owner's yes on the call screen
+    # Mid-turn the admission is long confirmed: no wait, so a wait in a chat Beacon never touched is not delayed.
+    principal = native.current_principal(owner, provider, profile, session_id, wait=0)
+    if not principal:
+        return
+    binding = mobile.native_conversation(owner, provider, profile, native.profile_fingerprint(profile), session_id, principal)
+    if binding and binding["kind"] == "legacy":
+        return
+    native.verify(owner, provider, profile, session_id, None, True, principal)
+    event, now, wait = "human-" + request_id, time.time(), human_wait_seconds(kind)
+    with mobile.LOCK, mobile.connect() as conn:
+        mobile.prune_notices(conn)
+        if conn.execute("SELECT COUNT(*) FROM notices").fetchone()[0] >= 10000:
+            raise ValueError("Notification capacity reached")
+        conn.execute("INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,principal) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (event, owner, profile, kind, session_id, now, now + wait, event, principal))
+
+
+def ended(mobile, conn, row, now):
+    """Settle a request's notice and tell the phone it ended, for as long as the alert could still show."""
+    conn.execute("UPDATE notices SET state='settled' WHERE id=?", (row["id"],))
+    conn.execute("INSERT OR IGNORE INTO notices(id,owner,profile,kind,conversation,created,expires,activity_key,principal) VALUES(?,?,?,?,?,?,?,?,?)",
+                 ("settled-" + row["id"], row["owner"], row["profile"], "activity_end", row["conversation"], now,
+                  max(now + 300, row["expires"]) if row["kind"] in ("approval", "clarify") else now + 300, row["activity_key"], row["principal"]))
+
+
+def human_input_resolved(mobile, cfg, profile, request_id=None, **kwargs):
+    """on_human_input_resolved: the wait ended (answered, denied, timed out or cancelled), so its notice goes, as activity.sync ends one."""
+    if not isinstance(request_id, str) or not mobile.ID.fullmatch(request_id):
+        return
+    with mobile.LOCK, mobile.connect() as conn:
+        row = conn.execute("SELECT * FROM notices WHERE id=? AND owner=? AND profile=? AND state='pending'",
+                           ("human-" + request_id, cfg.get("owner_id"), profile)).fetchone()
+        if row:
+            ended(mobile, conn, row, time.time())
+
+
+def settle_expired(mobile, owner, profile):
+    """The dashboard's pass: a wait whose end never came (Hermes stopped mid-wait) is settled once its alert expires."""
+    now = time.time()
+    with mobile.LOCK, mobile.connect() as conn:
+        for row in conn.execute("SELECT * FROM notices WHERE owner=? AND profile=? AND id LIKE 'human-%' AND state='pending' AND expires<=?",
+                                (owner, profile, now)).fetchall():
+            ended(mobile, conn, row, now)
+
+
 def _digest(value):
     return hashlib.sha256(value.strip().casefold().encode("utf-8")).hexdigest()
 

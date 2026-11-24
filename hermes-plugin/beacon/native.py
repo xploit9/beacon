@@ -465,8 +465,8 @@ def remote_admission_active(binding):
         return None
 
 
-def current_principal(owner,provider,profile,stored):
-    """An executing native row needs this exact remote authorization, never an inferred issuer."""
+def current_principal(owner,provider,profile,stored,wait=0.4):
+    """An executing native row needs this exact remote authorization, never an inferred issuer. [wait] covers a turn that just started."""
     try:
         call=call_principal.get()
         if call is not None and call[:4]==(owner,provider,profile,stored) and call[4]==profile_fingerprint(profile):
@@ -490,7 +490,7 @@ def current_principal(owner,provider,profile,stored):
             return None
         live=authority.sessions.get(stored)
         if live is None or not executing_admission.get() or viewer_turn.get() is not live: return None
-        deadline=time.monotonic()+0.4
+        deadline=time.monotonic()+wait
         while True:
             for row in list_session_admissions(authority.db,session_id=stored):
                 if (row['target_session_id']!=stored or row['status']!='started' or row['owner_epoch']!=authority.epoch or
@@ -564,6 +564,17 @@ def verify(owner,provider,profile,stored,runtime=None,history=True,principal=Non
                 or (record.get('profile_home') or None)!=expected_home):
             raise RuntimeError('Native runtime changed during verification')
     return result
+
+
+def verify_saved(owner,provider,profile,stored):
+    """Verify a saved chat for work that brings no login of its own (a scheduled post), under the one login Beacon bound the chat
+    to (a chat made in the app is stamped with the host's owner, which proves no login). Returns that login, or None."""
+    mobile=sys.modules.get('beacon_mobile')
+    binding=mobile.native_conversation(owner,provider,profile,profile_fingerprint(profile),stored,None) if mobile else None
+    principal=binding['principal'] if binding and binding['principal'] else None
+    if principal: verify(owner,provider,profile,stored,None,True,principal)
+    else: verify(owner,provider,profile,stored)
+    return principal
 
 
 def reserve_conversation(owner,provider,profile,stored,principal=None):

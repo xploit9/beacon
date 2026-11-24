@@ -88,7 +88,9 @@ class Tasks:
             db.execute('INSERT INTO secret SELECT randomblob(32) WHERE NOT EXISTS (SELECT 1 FROM secret)')
             db.execute('CREATE TABLE IF NOT EXISTS tasks (scope BLOB, id TEXT, digest BLOB, created INTEGER, '
                        'holder TEXT, deadline REAL, state TEXT, steps INTEGER, message TEXT, PRIMARY KEY(scope,id))')
-            db.execute('DELETE FROM tasks WHERE created<=?', (now - DAY_MS,))
+            # A request admitted near its ID's expiry can still own a live worker.
+            db.execute("DELETE FROM tasks WHERE created<=? AND (state!='running' OR deadline<?)",
+                       (now - DAY_MS, time.time()))
             digest = hmac.digest(db.execute('SELECT salt FROM secret').fetchone()[0], goal.encode(), 'sha256')
             old = self._get(db, task_id)
             if old:
@@ -114,7 +116,8 @@ class Tasks:
                 message = None if state == 'completed' else {
                     'vision_unavailable': 'Configure a working vision model for this Hermes profile.',
                     'denied': 'The owner declined the action.', 'expired': 'Approval expired.',
-                    'changed': 'The phone screen changed.', 'busy': 'Control of the phone changed.',
+                    'changed': 'The phone screen changed.',
+                    'busy': "You're using the phone" if result.get('not_started') else 'Control of the phone changed.',
                     'masked': 'The phone screen is protected.', 'timeout': 'The phone task timed out.',
                     'cancelled': 'The phone task was stopped.',
                 }.get(result.get('error'), 'The phone task could not be verified.')

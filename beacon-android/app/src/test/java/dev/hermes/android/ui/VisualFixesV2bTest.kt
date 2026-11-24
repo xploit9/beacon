@@ -92,10 +92,10 @@ class VisualFixesV2bTest {
 
     @Test fun approvalsSaysWhatManualAndAutoDo() {
         val code = source("NativeApprovalMenu.kt")
-        // The labels say it themselves now (Always ask / Ask for risky ones), so the caption that explained Manual and Auto is gone.
+        // The labels say it themselves now (Ask for risky ones / Hermes decides), so the caption that explained Manual and Auto is gone.
         assertFalse(code.contains("Manual asks every time"))
         assertFalse(code.contains("profile-approvals-caption"))
-        assertEquals(listOf("Always ask", "Ask for risky ones"), ProfileApprovalChoices.map(::approvalChoiceLabel))
+        assertEquals(listOf("Ask for risky ones", "Hermes decides"), ProfileApprovalChoices.map(::approvalChoiceLabel))
     }
 
     // Item 6: the plugin section shows its internal rows only when one needs attention.

@@ -87,6 +87,7 @@ internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<N
     onBack: () -> Unit, onToggle: (NativeSkill, Boolean) -> Unit,
     onEdit: (Boolean) -> Unit, onDraft: (String) -> Unit, onSave: () -> Unit,
     onRetry: () -> Unit, renderInstructions: @Composable (String) -> Unit = { SelectionContainer { Text(it) } }, readOnly: Boolean = false,
+    hasSavedContent: (NativeSkill) -> Boolean = { false },
 ) {
     // Read-only (saved copy, Hermes not reached): every control waits like it does for a save, with no progress bar.
     val working = state.loading || state.saving
@@ -104,7 +105,7 @@ internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<N
         // While instructions are being edited, a failed save shows beside the Save button, where the owner is looking.
         val editingInstructions = selected != null && state.editing && state.content != null
         state.error?.takeUnless { editingInstructions }?.let { error -> item(key = "error") { SettingsSection { SettingsErrorRow(uiText(error), if (busy) null else onRetry, uiText("Retry")) } } }
-        if (selected == null) skillList(state, filter, { filter = it }, busy, enableLabel, onSearch, onOpen, onToggle)
+        if (selected == null) skillList(state, filter, { filter = it }, busy, enableLabel, onSearch, onOpen, onToggle, hasSavedContent)
         else skillDetail(selected, state, busy, enableLabel, onToggle, onEdit, onDraft, onSave, renderInstructions)
     }
 }
@@ -112,6 +113,7 @@ internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<N
 private fun LazyListScope.skillList(
     state: NativeSkillsState, filter: String, onFilter: (String) -> Unit, busy: Boolean, enableLabel: String,
     onSearch: (String) -> Unit, onOpen: (NativeSkill) -> Unit, onToggle: (NativeSkill, Boolean) -> Unit,
+    hasSavedContent: (NativeSkill) -> Boolean,
 ) {
     val all = state.skills
     if (all.isEmpty() && state.loading) { item(key = "skeleton") { SettingsSection { SettingsSkeletonRows(4) } }; return }
@@ -142,7 +144,8 @@ private fun LazyListScope.skillList(
             SettingsSection(title = when { category == null -> ""; category.isBlank() -> uiText("Other"); else -> skillDisplayName(category) }) {
                 skills.forEachIndexed { index, skill ->
                     if (index > 0) SettingsDivider()
-                    SkillRow(skill, busy, state.toggling != null, enableLabel, { onOpen(skill) }) { onToggle(skill, it) }
+                    val canOpen = !state.saving && state.toggling == null && (!busy || hasSavedContent(skill))
+                    SkillRow(skill, busy, state.toggling != null, canOpen, enableLabel, { onOpen(skill) }) { onToggle(skill, it) }
                 }
             }
         }
@@ -153,10 +156,10 @@ private fun LazyListScope.skillList(
 internal fun skillDescriptionLines(fontScale: Float): Int = if (fontScale > 1.15f) 2 else 1
 
 /** A skill: its name, its description (one line, two at large text) and, when it can't work yet, a "Needs setup" pill. The row opens it; the switch is its own target. */
-@Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, switchSaving: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
+@Composable private fun SkillRow(skill: NativeSkill, busy: Boolean, switchSaving: Boolean, canOpen: Boolean, enableLabel: String, onOpen: () -> Unit, onToggle: (Boolean) -> Unit) {
     val descriptionLines = skillDescriptionLines(LocalDensity.current.fontScale)
     val unavailable = skillUnavailableHere(skill)
-    Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = !busy, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
+    Row(Modifier.fillMaxWidth().heightIn(min = 72.dp).clickable(enabled = canOpen, role = Role.Button, onClick = onOpen).padding(start = 16.dp, top = 12.dp, end = 16.dp, bottom = 12.dp).testTag("skill-row-${skill.name}"),
         verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
         SettingsIconTile(SkillsIcon)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {

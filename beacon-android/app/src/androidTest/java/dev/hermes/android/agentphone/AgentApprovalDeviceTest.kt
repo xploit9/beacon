@@ -181,6 +181,25 @@ class AgentApprovalDeviceTest {
         }
     }
 
+    /** Q2 R3-F11: the first card ended ("This request ended. Nothing was done.") and the next request waited behind it until it expired. */
+    @Test fun anEndedCardStepsAsideAtOnceForTheNextQuestion() {
+        val fake = Fake().apply {
+            add(id(9), "agent_phone_action", "risk" to "unlabeled", "app" to "Chrome", "purpose" to "Focus the search box")
+            open.last().put("expires_in_seconds", 2)
+            add(id(10), "agent_phone_action", "risk" to "unlabeled", "app" to "Chrome", "purpose" to "Scroll down to the results")
+        }
+        open(fake).use {
+            waitFor("agent-approval-purpose")
+            fun purpose() = compose.onAllNodesWithTag("agent-approval-purpose").fetchSemanticsNodes().joinToString { node ->
+                node.config.getOrElse(androidx.compose.ui.semantics.SemanticsProperties.Text) { emptyList() }.joinToString { it.text } }
+            assertTrue(purpose().contains("Focus the search box"))
+            // No Close tapped: once the first has ended, the next question is on screen and the first left no card behind.
+            compose.waitUntil(10_000) { purpose().contains("Scroll down to the results") }
+            assertTrue(compose.onAllNodesWithTag("agent-approval-close").fetchSemanticsNodes().isEmpty())
+            assertTrue(fake.decisions.isEmpty())
+        }
+    }
+
     @Test fun aSecondTapNeverAnswersTheNextQuestion() {
         val fake = Fake().apply {
             add(id(6), "agent_phone_action", "risk" to "payment", "app" to "Kanto Foods", "label" to "Place order", "amount" to "£12.40")

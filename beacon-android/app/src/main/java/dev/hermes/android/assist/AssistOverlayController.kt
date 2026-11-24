@@ -386,7 +386,8 @@ internal class AssistOverlayController(private val session: BeaconAssistSession)
             try { model.send().join() } finally { model.composer(kept) }
             // Hermes holds the question once it comes back, starts a reply, or the send is still settling; otherwise it was not sent.
             val accepted = withTimeoutOrNull(4_000) { while (answerFrom(model.chat.value, before, opened)?.accepted != true) delay(50); true }
-            if (accepted == null) notSent()
+            // R3 #5: a question the chat's box holds goes from there; handing it back too would ask it twice.
+            if (accepted == null) { if (queuedInBox(model.chat.value.queued, question)) state = reduce(state, OverlayEvent.NotSent).copy(line = OverlayLine.Queued) else notSent() }
         }
     }
 

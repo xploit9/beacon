@@ -252,6 +252,29 @@ class PluginUpdateStateTest {
         }))
     }
 
+    @Test fun aPluginThatReportsNoVersionIsOldAndTheAppUpdatesIt() = runBlocking {
+        val blank = object : PluginEndpoint {
+            var installed = false
+            var dashboardRestarts = 0
+            override suspend fun version(): PluginVersions = if (dashboardRestarts == 0) throw BlankPluginVersion() else PluginVersions("1.2.3", "1.2.3", "1.2.3")
+            override suspend fun update(): JSONObject { installed = true; return JSONObject().put("ok", true) }
+            override suspend fun restartDashboard(onReconnecting: (Boolean) -> Unit): DashboardRestartResult { dashboardRestarts++; return DashboardRestartResult.Completed }
+        }
+        assertEquals(PluginProbe.Unreadable, probePlugin(blank))
+        val row = pluginRowFor(PluginProbe.Unreadable, "1.2.3")
+        assertEquals(PluginStatus.Available, row.status)
+        assertFalse(pluginAllowsApp(row))
+        assertEquals(PluginRow(PluginStatus.Updated, "1.2.3", "1.2.3"), runPluginUpdate(blank, "1.2.3", pause = {}))
+        assertTrue(blank.installed)
+        assertEquals(1, blank.dashboardRestarts)
+        // A normal plugin and a plugin that does not answer read as before.
+        assertEquals(PluginProbe.Read(versions("1.2.2")), probePlugin(Fake(listOf(versions("1.2.2")))))
+        assertEquals(PluginProbe.Failed, probePlugin(object : PluginEndpoint {
+            override suspend fun version(): PluginVersions = throw IOException("offline")
+            override suspend fun update(): JSONObject = JSONObject()
+        }))
+    }
+
     @Test fun anUpdateWaitsForHermesToReportTheNewVersion() {
         val pauses = mutableListOf<Long>()
         val endpoint = Fake(listOf(versions("1.1.1"), versions("1.1.1"), versions("1.1.3")))

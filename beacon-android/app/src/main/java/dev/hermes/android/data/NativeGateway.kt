@@ -106,6 +106,13 @@ internal val NATIVE_ADMISSION_BUSY_PAUSES_MS = longArrayOf(150, 300, 600)
  * slow or down, and asking it four times only stacked about 25 s of waiting (REVIEW-121B P3-3).
  */
 internal const val NATIVE_ADMISSION_QUICK_MS = 1_000L
+/** S1: the chat sockets this app keeps open to one Hermes; a new one first ends idle ones of its own beyond that (the plugin admits 8, for every phone). */
+internal const val NATIVE_SOCKET_BUDGET = 6
+/** S1: a chat socket unused this long is idle ([NativeGateway.endIdleSockets]); once the plugin has refused a socket, [NATIVE_SOCKET_REFUSED_IDLE_MS] is. */
+internal const val NATIVE_SOCKET_IDLE_MS = 20_000L
+internal const val NATIVE_SOCKET_REFUSED_IDLE_MS = 2_000L
+/** The clock idle sockets are measured on (tests move it). */
+@Volatile internal var idleSocketNowMs: () -> Long = { System.nanoTime() / 1_000_000 }
 /** The plugin refused a canonical socket before it opened: its upgrade answered [status], never 101, [tookMs] after the upgrade was asked. */
 internal class NativeAdmissionRefused(val status: Int, cause: Throwable, val tookMs: Long = 0) : IOException("Native connection refused before it opened ($status)", cause)
 /**
@@ -144,6 +151,9 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         @Volatile var failure: IOException? = null
         /** What a file frame may carry (its ticket's answer); in pieces, it goes on a socket of its own ([attachFile]). */
         @Volatile var attachLimits = AttachmentLimits()
+        /** S1: requests in flight on this socket, and when it last carried one ([idleSocketNowMs]); a socket with neither for a while is idle. */
+        val busy = java.util.concurrent.atomic.AtomicInteger()
+        @Volatile var usedAt = idleSocketNowMs()
     }
     /** A binding names a runtime that lives on the socket that made it: once that socket is gone Hermes may reap the runtime. */
     private class Cursor(val binding: NativeSessionBinding, val connection: Connection?, var sequence: Long = 0, var epoch: String = "")
@@ -154,6 +164,26 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         private val secureFirstSeen = ConcurrentHashMap<String, Long>()
         /** Told when a secret question arrives and no screen is collecting events (the app is away); the app posts a notice. */
         @Volatile internal var secureAwaiting: ((Scope, String) -> Unit)? = null
+        /**
+         * S1: every chat socket this process holds open, held strongly: a client that nobody closed (a detached view dropped on a path that skipped its
+         * closeNative) keeps its socket open and pinging for the life of the process, and the plugin admits only MAX_SOCKETS (8) chat sockets at once for
+         * every phone. With all 8 held, every new socket is refused and every send fails until the process dies (R2C's dead Send, Q2's Hermes 22 Nov).
+         */
+        private val held = ConcurrentHashMap<Connection, NativeGateway>()
+
+        /** How many chat sockets this process held open, per Hermes origin (tests count with it). */
+        internal fun heldSockets(origin: String): Int = held.keys.count { it.identity.scope.origin == origin }
+
+        /**
+         * Ends this process's idle chat sockets to [origin], least recently used first, until at most [keep] are held: only a detached view's socket
+         * (never the app's own client's), with no request in flight, no reader of its events and no question of Hermes open, unused for [idleMs].
+         */
+        internal fun endIdleSockets(origin: String, keep: Int, idleMs: Long): Int {
+            val now = idleSocketNowMs()
+            val mine = held.entries.filter { it.key.identity.scope.origin == origin }
+            val idle = mine.filter { (socket, gateway) -> gateway.idle(socket, now, idleMs) }.sortedBy { it.key.usedAt }
+            return idle.take((mine.size - keep).coerceAtLeast(0)).count { (socket, gateway) -> gateway.endIdle(socket, now, idleMs) }
+        }
 
         /** Live, already-entitled prompts for the open conversation; values are never retained here. */
         internal fun pendingSecureRequests(scope: Scope, authorityVersion: Long? = null): List<JSONObject> {
@@ -219,6 +249,8 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         for (pause in NATIVE_ADMISSION_BUSY_PAUSES_MS) {
             try { return@withLock admit(attempt) }
             catch (e: Exception) { if (e is CancellationException || !admissionBusy(e, failedTicketMs)) throw e }
+            // S1: the plugin may be full of this app's own idle sockets; end them so the next ask gets in, in this process.
+            endIdleSockets(client.scope.origin, 0, NATIVE_SOCKET_REFUSED_IDLE_MS)
             delay(pause)
         }
         admit(attempt)
@@ -232,6 +264,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
         fun current(checkAdmission: Boolean = false) = attempt == generation.get() && client.gatewayIdentityCurrent(identity, checkAdmission) &&
             NativePairing.deviceHeader(CANONICAL_TICKET_PATH, identity.scope) == device
         check(current(true)) { "Native identity changed during ticket admission" }
+        endIdleSockets(identity.scope.origin, NATIVE_SOCKET_BUDGET - 1, NATIVE_SOCKET_IDLE_MS)
         val started = System.nanoTime()
         val admission = try {
             client.nativeRequest(CANONICAL_TICKET_PATH, "POST", JSONObject())
@@ -376,11 +409,16 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             try { withTimeout(15000) { mine.ready.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw IOException("Native connection admission timed out", e) }
             mine.failure?.let { throw it }
             check(current(true)) { "Native identity changed during connection admission" }
+            mine.usedAt = idleSocketNowMs()
+            held[mine] = this
+            // A socket that ended while it was being registered must not stay listed.
+            if (mine.failure != null) held.remove(mine)
             mine
         } catch (e: Throwable) { terminate(mine, IOException("Native connection admission ended", e)); mine.socket?.cancel(); throw e }
     }
     private fun terminate(mine: Connection, error: IOException) {
         synchronized(lifecycle) { if (connection === mine) connection = null; if (mine.failure == null) mine.failure = error }
+        held.remove(mine)
         mine.ready.completeExceptionally(error)
         mine.sessionAuthority.complete(null)
         mine.pending.values.forEach { it.completeExceptionally(unknown(error)) }; mine.pending.clear()
@@ -450,7 +488,7 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             sendFrame(mine, json("jsonrpc" to "2.0", "id" to id, "method" to method, "params" to wireParams).toString(), sendGuard, sendLock)
             val response = try { withTimeout(rpcTimeoutMs) { result.await() } } catch (e: TimeoutCancellationException) { currentCoroutineContext().ensureActive(); throw unknown(e) }
             return finishRpc(method, params, response, canonicalCreate, requestScope)
-        } finally { mine.pending.remove(id) }
+        } finally { mine.pending.remove(id); mine.usedAt = idleSocketNowMs() }
     }
 
     /** Sends one frame as text, after the same checks as always; anything that fails after it may have left the phone is an unknown outcome. */
@@ -1094,6 +1132,11 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
     /** Pin every operation to the connection and cursor captured before attachment or mutation. */
     suspend fun turnRpc(lease: NativeTurnLease, method: String, params: JSONObject, inline: InlineFile? = null): JSONObject {
         val mine = lease.connectionToken as? Connection ?: throw NativeTurnNotSent("Native operation has no connection")
+        // A file's pieces go on a socket of their own: the chat's socket is in use the whole time, never idle.
+        mine.busy.incrementAndGet()
+        try { return turnRpcOn(mine, lease, method, params, inline) } finally { mine.usedAt = idleSocketNowMs(); mine.busy.decrementAndGet() }
+    }
+    private suspend fun turnRpcOn(mine: Connection, lease: NativeTurnLease, method: String, params: JSONObject, inline: InlineFile?): JSONObject {
         val snapshot = lease.cursorToken as? Cursor ?: throw NativeTurnNotSent("Native operation has no conversation")
         fun bound() {
             if (lease.gateway !== this || snapshot.connection !== mine || snapshot.binding != lease.binding ||
@@ -1241,6 +1284,13 @@ internal class NativeGateway(private val client: BeaconClient, private val socke
             } }
             if (mine?.failure != null) mine.frames.cancel()
         }
+    }
+    private fun idle(mine: Connection, now: Long, idleMs: Long) = !client.ownsChatConnection && connection === mine && mine.failure == null && !consuming.get() &&
+        mine.busy.get() == 0 && mine.pending.isEmpty() && now - mine.usedAt >= idleMs && synchronized(mine.requestLock) { mine.serverRequests.isEmpty() }
+    private fun endIdle(mine: Connection, now: Long, idleMs: Long): Boolean {
+        synchronized(lifecycle) { if (!idle(mine, now, idleMs)) return false; connection = null }
+        terminate(mine, IOException("Native connection closed while idle")); mine.socket?.cancel()
+        return true
     }
     private fun gatewayAnswered(mine: Connection) {
         if (mine.ready.isCompleted && connection === mine && mine.failure == null && connectionIdentityCurrent(mine))

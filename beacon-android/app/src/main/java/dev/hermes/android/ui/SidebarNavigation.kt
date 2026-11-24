@@ -127,9 +127,8 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
     val currentProfileLabel = profileDisplayLabel(currentProfile, profileRows, ui.connected && (profileCatalog == null || profileCatalog.optBoolean("_loading")))
     LaunchedEffect(ui.origin, ui.owner, ui.connected) { if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
     var profilesOpen by remember(ui.origin, ui.owner, ui.profile) { mutableStateOf(false) }
-    var naming by rememberSaveable { mutableStateOf(false) }
     var moreOpen by rememberSaveable { mutableStateOf(false) }
-    if (naming) NewThreadDialog(vm, onDismiss = { naming = false })
+    if (NewThreadDraft.from == "sidebar") NewThreadDialog(vm, onDismiss = NewThreadDraft::close)
     // Bots is the one switch for Bot Mode: a tap turns it on, and off again (navigate("Bots") toggles).
     val openTile: (String) -> Unit = { name ->
         val bot = if (ui.botModeEnabled && name == "Memory") botModeCurrentBot(vm.botMode.state.value.activeBot?.profile, vm.botMode.usingBot()) else ""
@@ -179,7 +178,7 @@ internal fun drawerUpdateReady(state: AppUpdateUi): Boolean = state.supported &&
         }
         val secondary: @Composable (Modifier) -> Unit = { modifier ->
             if (botMode) DrawerAction(uiText("New space"), Icons.Rounded.Groups, "bot-mode-sidebar-new-chat", modifier, primary = false, enabled = !ui.botModeSwitching) { vm.botMode.startNewChat(); botDialog.value = "newChat:" }
-            else DrawerAction(uiText("New thread"), Icons.Rounded.Forum, "navigation-new-thread", modifier, primary = false, enabled = !ui.newChatOpening) { naming = true }
+            else DrawerAction(uiText("New thread"), Icons.Rounded.Forum, "navigation-new-thread", modifier, primary = false, enabled = !ui.newChatOpening) { NewThreadDraft.from = "sidebar" }
         }
         if (stacked) Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.fillMaxWidth()); secondary(Modifier.fillMaxWidth()) }
         else Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) { primary(Modifier.weight(1f)); secondary(Modifier.weight(1f)) }
