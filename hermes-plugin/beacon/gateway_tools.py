@@ -281,6 +281,41 @@ def outcome(value, read_only, depth=0, own=False):
     return 'completed'
 
 
+def auth_problem(value, depth=0):
+    """A tool result that only says an external account must be authorized. Its raw OAuth URL is reference material for a
+    browser, not something to read aloud in a call; the model gets one honest line instead."""
+    if depth>4: return False
+    if isinstance(value,str):
+        low=value.casefold()
+        return ('authorization url:' in low or 'action required:' in low) and ('authentication needed' in low or 'authorize' in low)
+    if isinstance(value,dict): return any(auth_problem(V, depth+1) for V in value.values())
+    if isinstance(value,list): return any(auth_problem(V, depth+1) for V in value)
+    return False
+
+
+def error_line(value, depth=0):
+    """One bounded, redacted line from a failed tool's own error text, so a call hears why it failed (receipt_v3 keeps
+    `reason`, not a failed result). URLs are left out: an authorization link is for a browser, not the model."""
+    if depth>4: return ''
+    if isinstance(value,str):
+        if 'authorization url:' in value.casefold() or 'action required:' in value.casefold(): return ''
+        line=plain_line(value,240)
+        return line if line else ''
+    if isinstance(value,dict):
+        for key in ('reason','error','message','detail','title'):
+            if key in value:
+                line=error_line(value[key],depth+1)
+                if line: return line
+        for child in value.values():
+            line=error_line(child,depth+1)
+            if line: return line
+    if isinstance(value,list):
+        for child in value:
+            line=error_line(child,depth+1)
+            if line: return line
+    return ''
+
+
 def native_trust_prompts(tool, arguments):
     """The exact prompts Hermes' MCP trust gate renders for this operation.
 
@@ -2003,6 +2038,10 @@ class Gateway:
             text=self.sanitize(raw,MAX_RESULT)
             try: result=json.loads(text)
             except ValueError: result={'text':text,'truncated':True}
+            needs_auth=state!='completed' and auth_problem(result)
+            if needs_auth:
+                result={'error':'This tool needs you to connect it in Hermes before it can run. Open Hermes, connect it, then ask again.',
+                        'error_code':'needs_auth'}
             oversized=len(encoded(result).encode())>MAX_RESULT
             if oversized: result={'text':text.encode()[:MAX_RESULT//8].decode('utf-8',errors='ignore'),'truncated':True}
             update={'status':state,'result':result,'truncated':len(raw)>MAX_RESULT or oversized}
@@ -2010,7 +2049,14 @@ class Gateway:
                     and isinstance(result,dict) and result.get('error')=='busy' and type(result.get('not_started')) is bool):
                 # A takeover during a write may follow an input. Keep its uncertainty and tell the call why the phone stopped.
                 update.update(status='failed' if result['not_started'] else state,_error_code='phone_in_use',reason="You're using the phone")
-            elif state!='completed': update['_error_code']='tool_error' if state=='failed' else 'outcome_unknown'
+            elif state!='completed':
+                update['_error_code']='needs_auth' if needs_auth else 'tool_error' if state=='failed' else 'outcome_unknown'
+                # receipt_v3 gives a call `reason`, not the failed result: without this the model saw only "failed" and
+                # guessed (owner's Google tools, 25 Nov). One short line, never the OAuth URL.
+                if needs_auth: update['reason']='This tool needs you to connect it in Hermes before it can run.'
+                else:
+                    line=error_line(result)
+                    if line: update['reason']=line
         except HTTPException as error:
             changed=not dispatched and error.detail in ('Tool configuration changed','Tool access classification changed')
             update={'status':'uncertain' if dispatched and not tool['read_only'] else 'failed',

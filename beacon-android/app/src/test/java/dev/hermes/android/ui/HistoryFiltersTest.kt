@@ -44,6 +44,12 @@ class HistoryFiltersTest {
         assertEquals(HistoryOrder.Recent, HistoryOrder.of("unknown"))
     }
 
+    @Test fun aLegacyNumericPinCountsForThePinnedViewAndSort() {
+        val legacy = json("id" to "legacy", "title" to "Legacy", "pinned" to 1)
+        assertEquals(listOf("legacy"), historyRows(listOf(legacy), HistoryView.Pinned, HistoryOrder.Recent).map { it.getString("id") })
+        assertEquals(listOf("legacy", "a"), historyRows(listOf(rows.first(), legacy), HistoryView.All, HistoryOrder.Recent).map { it.getString("id") })
+    }
+
     @Test fun assistantConversationIsHiddenAndAllProfileRowsHaveDistinctKeys() {
         val assistant = json("id" to "assistant", "profile" to "coder", "source" to "cli", "pinned" to true)
         val other = json("id" to "chat", "profile" to "coder", "source" to "android", "pinned" to true)

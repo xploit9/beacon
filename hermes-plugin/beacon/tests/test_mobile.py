@@ -1935,3 +1935,120 @@ def test_a_start_names_hermes_functions_this_hermes_no_longer_has(harness,monkey
     with caplog.at_level(logging.INFO):
         api.check_hermes()
     assert 'update Beacon: tui_gateway.server._gone (native.py)' in caplog.text
+
+
+def test_pin_route_unpins_a_keyed_legacy_row_through_hermes_own_store(harness,monkeypatch):
+    """The shape the canonical authority cannot adopt: session_key set, source cli, user_id NULL."""
+    from contextlib import contextmanager
+    api,c,cfg,tmp,_=harness
+    row={'id':'xara_synthetic_pin','source':'cli','created_source':'webui','session_key':'xara:synthetic-assistant',
+         'user_id':None,'pinned':1,'hidden':0}
+    writes=[]
+    class Store:
+        def get_session(self,session_id):
+            return dict(row) if session_id=='xara_synthetic_pin' else None
+        def get_meta(self,key):
+            return None  # a truly legacy row has no canonical creation receipt
+        def set_session_pinned(self,session_id,pinned):
+            writes.append((session_id,pinned))
+            row['pinned']=int(pinned)
+            return True
+    @contextmanager
+    def profile_db(params,*,writer=False):
+        assert params=={'profile':'default'} and writer is True
+        yield Store()
+    server=sys.modules['tui_gateway'].server
+    monkeypatch.setattr(server,'_profile_db',profile_db,raising=False)
+    answer=c.post('/api/plugins/beacon/mobile/session/pin',json={'profile':'default','session_id':'xara_synthetic_pin','pinned':False})
+    assert answer.status_code==200,answer.text
+    assert answer.json()=={'session_id':'xara_synthetic_pin','pinned':False}
+    assert writes==[('xara_synthetic_pin',False)]
+
+
+def test_pin_route_uses_a_real_session_db_and_leaves_a_missing_row_alone(harness,monkeypatch):
+    from contextlib import contextmanager
+    from hermes_state import SessionDB
+    api,c,cfg,tmp,_=harness
+    db=SessionDB(tmp/'state.db')
+    try:
+        db.create_session('xara_synthetic_pin',source='cli',user_id=None,
+                          session_key='xara:synthetic-assistant',profile_name='default')
+        db.set_session_title('xara_synthetic_pin','Synthetic keyed chat')
+        assert db.set_session_pinned('xara_synthetic_pin',True)
+        @contextmanager
+        def profile_db(params,*,writer=False):
+            assert params=={'profile':'default'} and writer is True
+            yield db
+        server=sys.modules['tui_gateway'].server
+        monkeypatch.setattr(server,'_profile_db',profile_db,raising=False)
+        answer=c.post('/api/plugins/beacon/mobile/session/pin',json={'profile':'default','session_id':'xara_synthetic_pin','pinned':False})
+        assert answer.status_code==200,answer.text
+        assert db.get_session('xara_synthetic_pin')['pinned']==0
+        missing=c.post('/api/plugins/beacon/mobile/session/pin',json={'profile':'default','session_id':'absent','pinned':False})
+        assert missing.status_code==404
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize('payload',[
+    {'profile':'default','session_id':'xara_synthetic_pin'},
+    {'profile':'default','session_id':'xara_synthetic_pin','pinned':'false'},
+    {'profile':'default','session_id':'bad/id','pinned':False},
+])
+def test_pin_route_refuses_malformed_requests(harness,payload):
+    api,c,cfg,tmp,_=harness
+    answer=c.post('/api/plugins/beacon/mobile/session/pin',json=payload)
+    assert answer.status_code==400,answer.text
+
+
+def test_pin_route_refuses_a_row_the_canonical_authority_already_owns(harness,monkeypatch):
+    """An adopted CLI chat keeps its legacy source but has no key: the canonical mutation owns it, so the
+    fallback must refuse rather than write the store behind that mutation's revision receipt."""
+    from contextlib import contextmanager
+    api,c,cfg,tmp,_=harness
+    row={'id':'xara_adopted_cli','source':'cli','created_source':'webui','session_key':None,
+         'chat_id':None,'origin_json':None,'user_id':None,'pinned':1,'hidden':0}
+    writes=[]
+    class Store:
+        def get_session(self,session_id):
+            return dict(row) if session_id=='xara_adopted_cli' else None
+        def get_meta(self,key):
+            return None
+        def set_session_pinned(self,session_id,pinned):
+            writes.append((session_id,pinned))
+            return True
+    @contextmanager
+    def profile_db(params,*,writer=False):
+        yield Store()
+    monkeypatch.setattr(sys.modules['tui_gateway'].server,'_profile_db',profile_db,raising=False)
+    answer=c.post('/api/plugins/beacon/mobile/session/pin',json={'profile':'default','session_id':'xara_adopted_cli','pinned':True})
+    assert answer.status_code==409,answer.text
+    assert writes==[],'the fallback must not write a row the canonical authority owns'
+
+
+@pytest.mark.parametrize('receipt_owner',['xara_adopted_keyed','local-adopted'])
+def test_pin_route_refuses_a_keyed_row_its_canonical_receipt_already_owns(harness,monkeypatch,receipt_owner):
+    """An adopted CLI/local row can carry all three key columns: its gateway.local_policy.v1 receipt is
+    the evidence that canonical session.mutate owns it, so this fallback must not write it either."""
+    from contextlib import contextmanager
+    api,c,cfg,tmp,_=harness
+    row={'id':'xara_adopted_keyed','source':'cli','created_source':'webui',
+         'session_key':'agent:main:local:dm:local-adopted','chat_id':'local-adopted',
+         'origin_json':'{"platform":"local"}','user_id':None,'pinned':1,'hidden':0}
+    receipts={'gateway.local_policy.v1:'+receipt_owner:'{"session_id":"xara_adopted_keyed"}'}
+    writes=[]
+    class Store:
+        def get_session(self,session_id):
+            return dict(row) if session_id=='xara_adopted_keyed' else None
+        def get_meta(self,key):
+            return receipts.get(key)
+        def set_session_pinned(self,session_id,pinned):
+            writes.append((session_id,pinned))
+            return True
+    @contextmanager
+    def profile_db(params,*,writer=False):
+        yield Store()
+    monkeypatch.setattr(sys.modules['tui_gateway'].server,'_profile_db',profile_db,raising=False)
+    answer=c.post('/api/plugins/beacon/mobile/session/pin',json={'profile':'default','session_id':'xara_adopted_keyed','pinned':True})
+    assert answer.status_code==409,answer.text
+    assert writes==[],'a keyed adopted row belongs to canonical session.mutate'

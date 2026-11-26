@@ -26,6 +26,7 @@ import androidx.core.content.ContextCompat
 import dev.hermes.android.BuildConfig
 import dev.hermes.android.BeaconActivity
 import dev.hermes.android.BeaconApplication
+import dev.hermes.android.LIVE_TURN
 import dev.hermes.android.R
 import dev.hermes.android.core.Scope
 import dev.hermes.android.core.digest
@@ -498,6 +499,34 @@ internal fun keepConnectedCallData(event: JSONObject, now: Long): Map<String, St
     "expires_at" to minOf(event.getLong("expires_at"), (now + RelayCallback.ringWindowMs()) / 1_000L).toString(),
 )
 
+/**
+ * chat-live: a turn that ended while the app was not in front saves its chat over the connection Keep connected already holds, so the
+ * return paints the reply at once. Only a chat the app followed (its own turn record) is written. A live frame saved in the last
+ * [KEEP_CONNECTED_CHAT_FRAME_FRESH_MILLIS] means the chat's own stream is writing the cache itself; a turn Hermes still runs keeps
+ * the record for that stream, and only a released turn deletes the record and its saved frame.
+ */
+internal suspend fun cacheSettledChat(cache: dev.hermes.android.data.ProjectionCache, client: BeaconClient, scope: Scope, session: String) {
+    if (session.isBlank() || !validOpaque(session) || !scope.sameAccount(client.scope) || scope.profile != client.auth.profile) return
+    val chat = scope.session(session)
+    val record = cache.read(chat, LIVE_TURN) ?: return
+    val stream = runCatching { JSONObject(record).string("stream_id") }.getOrDefault("")
+    val frameAt = stream.takeIf(::validOpaque)?.let { kind -> runCatching { cache.updatedAt(chat, "live:$kind") }.getOrNull() }
+    if (frameAt != null && frameAt > 0 && System.currentTimeMillis() - frameAt < KEEP_CONNECTED_CHAT_FRAME_FRESH_MILLIS) return
+    val reader = client.detached()
+    try {
+        val response = reader.get("/api/session", mapOf("session_id" to session))
+        val fresh = response.optJSONObject("session") ?: response
+        if (fresh.string("session_id") != session || fresh.string("profile") != chat.profile || fresh.optJSONArray("messages") == null) return
+        cache.writeSession(chat, response.toString())
+        // Hermes still runs a newer turn: its own stream owns the record, and only that stream may release it.
+        if (!(fresh.opt("active_stream_id") as? String).isNullOrBlank()) return
+        cache.delete(chat, LIVE_TURN)
+        if (stream.isNotBlank() && validOpaque(stream)) cache.delete(chat, "live:$stream")
+    } finally { reader.closeNative() }
+}
+/** How recently the chat's own stream saved a live frame, when the service leaves the cache to it. */
+internal const val KEEP_CONNECTED_CHAT_FRAME_FRESH_MILLIS = 15_000L
+
 internal fun keepConnectedLoopNeedsRestart(
     jobActive: Boolean,
     runningOrigin: String?,
@@ -887,6 +916,11 @@ class KeepConnectedService : Service() {
                         // This service already holds a live connection, so the real text replaces the placeholder now; the
                         // deferred preview job, which strict phones may hold back for a long time, is only the fallback.
                         serviceScope.launch { runCatching { refreshNotificationPreview(this@KeepConnectedService, data.getValue("source_ref"), data.getValue("event_id"), data.getValue("conversation_ref"), data.getValue("kind")) } }
+                    }
+                    // chat-live: the reply of a turn that ended while the app was away is saved on the chat's own cache now.
+                    if (event.optString("kind") in setOf("completion", "failure")) serviceScope.launch {
+                        val session = event.string("session_id").ifBlank { event.string("conversation_id") }
+                        runCatching { cacheSettledChat(app.cache, requireNotNull(client), Scope(origin, owner, profile, nativeProvider = nativeProvider), session) }
                     }
                 },
                 profileLabel = { profile -> profileDisplayNames[profile] ?: profile },

@@ -239,6 +239,57 @@ async def assistant_conversation(request:Request):
     await feature(verify_voice_stored,owner,provider,profile,stored,voice_principal(request,owner,provider),timeout=8,lookup_message='No assistant conversation')
     return JSONResponse({'conversation_id':stored},headers={'Cache-Control':'no-store'})
 
+@router.post('/mobile/session/pin')
+async def pin_legacy_session(request:Request):
+    """Pin/unpin a row the canonical authority cannot adopt as writable: a fallback, never a second writer.
+
+    Hermes refuses adoption for a keyed row only: hermes_state_local_migration.validate_legacy_row
+    rejects a row carrying session_key, chat_id or origin_json, and answers not_found. An ordinary
+    CLI or TUI chat keeps its legacy source but IS adopted history, so this route refuses that row
+    (409) and the canonical sidebar mutation stays its only writer, with its revision receipt and
+    its own hidden handling. For a refused row, Hermes' own ``hermes sessions pin|unpin`` writes the
+    durable store flag directly (hermes_cli/sessions_cmd.py:876-890 -> SessionDB.set_session_pinned);
+    this route uses that exact write for the phone's own profile.
+
+    A keyed row can also be adopted: state_meta then holds its gateway.local_policy.v1 creation
+    receipt and canonical session.mutate owns it too. That row is refused here as well, so this
+    fallback is never a second writer behind its own session.updated.
+    """
+    value=await body(request,1024)
+    if (set(value)!={'profile','session_id','pinned'} or not isinstance(value.get('profile'),str)
+            or not isinstance(value.get('session_id'),str) or not isinstance(value.get('pinned'),bool)):
+        raise HTTPException(400,'Profile, session_id and pinned are required')
+    session_id=value['session_id']
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}',session_id):
+        raise HTTPException(400,'Invalid session id')
+    _,_,profile,_=await identity_async(request,value['profile'])
+    def write():
+        from tui_gateway import server
+        with server._profile_db({'profile':profile},writer=True) as db:
+            if db is None: raise RuntimeError('session store unavailable')
+            row=db.get_session(session_id)
+            if row is None: raise LookupError(session_id)
+            # The same three columns Hermes judges, read from the very store this route would write.
+            if all(not row.get(k) for k in ('session_key','chat_id','origin_json')): raise NotLegacy(session_id)
+            # An adopted row carries the canonical creation receipt: session.mutate is its writer.
+            # The authority binds a local row through its own id and, when it has one, its chat_id.
+            from hermes_state_local import POLICY_PREFIX
+            owners={session_id,row.get('chat_id') or ''}-{''}
+            if any(db.get_meta(POLICY_PREFIX+owner) is not None for owner in owners): raise NotLegacy(session_id)
+            if not db.set_session_pinned(session_id,value['pinned']): raise LookupError(session_id)
+        return {'session_id':session_id,'pinned':value['pinned']}
+    try:
+        return await asyncio.to_thread(write)
+    except NotLegacy:
+        raise HTTPException(409,'This chat is edited in Hermes, not here.') from None
+    except LookupError:
+        raise HTTPException(404,'This chat is no longer on Hermes.') from None
+    except RuntimeError:
+        raise HTTPException(503,'Hermes session store unavailable') from None
+
+class NotLegacy(Exception):
+    """A row the canonical authority already owns, which the legacy fallback must not write behind its back."""
+
 def skill_scope(profile,fn):
     # Skills use import-bound directories; use the native router's shared profile lock.
     from hermes_cli.web_server_profiles import _profile_scope
@@ -1589,6 +1640,7 @@ async def get_context(call_id:str,request:Request):
     reason=callback.get('reason','') if isinstance(callback,dict) else ''
     result['reason']=reason if isinstance(reason,str) else ''
     if display: result['owner_display_name']=display
+    if not result.get('tool_catalogue'): result['tool_catalogue']=voice_context.ready_tools(row['profile'])
     result.update(await asyncio.to_thread(call_contract_fields,row['profile'],row.get('principal') or None,backend=='direct'))
     return result
 _SESSION_ID=re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}')
@@ -1605,9 +1657,12 @@ async def voice_session_context(request:Request):
     display=display[:120] if isinstance(display,str) else ''
     principal=voice_principal(request,owner,provider)
     args=(owner,provider,profile,stored,display,owner_name.strip())+((principal,) if principal else ())
-    result=await feature(voice_context.session_context,*args,timeout=8)
-    # A call entry is on screen: have the profile's tools ready (in the background) before the owner asks for one.
+    # A call entry is on screen: start the profile's tool list and give a just-restarted Hermes a moment to finish it.
+    # The request still answers without a slow MCP scan; declarations and discover_tools remain the sources of truth.
     voice_context.prefetch_tools(profile)
+    await asyncio.to_thread(voice_context.await_tools,profile,1.5)
+    result=await feature(voice_context.session_context,*args,timeout=8)
+    if not result.get('tool_catalogue'): result['tool_catalogue']=voice_context.ready_tools(profile)
     result['reason']=''
     if display: result['owner_display_name']=display
     result.update(await asyncio.to_thread(call_contract_fields,profile,principal))

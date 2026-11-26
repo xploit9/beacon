@@ -232,6 +232,10 @@ class CallController(private val app: BeaconApplication) {
             !app.getSystemService(KeyguardManager::class.java).isDeviceLocked)
     fun minimize(expectedId: String) { if(state.value.callId==expectedId) service?.minimize(expectedId) }
     fun resumeWindow() { service?.restoreWindow() }
+    private val callOnResume = java.util.concurrent.atomic.AtomicReference<String?>(null)
+    /** The owner left the agent phone during a call: the screen coming back opens that call's live surface once. */
+    internal fun requestCallOnResume(id: String) { if (id.isNotBlank()) callOnResume.set(id) }
+    internal fun takeCallOnResume(): String? = callOnResume.getAndSet(null)
     fun refreshOverlayPermission() { _state.update { it.withOverlayPermission(android.provider.Settings.canDrawOverlays(app)) } }
     /** The lock-screen dialer is on screen: a call answered there has a window, like one answered in the app. */
     @Volatile var dialerVisible = false

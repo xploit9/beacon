@@ -108,7 +108,8 @@ internal fun approvalFromProjection(raw: JSONObject, setting: JSONObject?, chat:
     }
     fun applyYolo(turnOn: Boolean) {
         if (saving || "${capturedScope?.key}|/api/approval/mode" in vm.conversationPending.value) return
-        if (!enabled || loading || record?.optBoolean("_stale") == true || profileMode !in nativeApprovalModes || profileMode == "off" || capturedClient == null || capturedScope == null || vm.client !== capturedClient || vm.authenticatedScope() != capturedScope) {
+        // The last read is enough to choose from: the action below reads the live mode again and refuses a change that no longer matches.
+        if (!enabled || record == null || profileMode !in nativeApprovalModes || profileMode == "off" || capturedClient == null || capturedScope == null || vm.client !== capturedClient || vm.authenticatedScope() != capturedScope) {
             vm.notice(reloadNotice); return
         }
         saving = true
@@ -120,7 +121,8 @@ internal fun approvalFromProjection(raw: JSONObject, setting: JSONObject?, chat:
     }
     Box {
         val description = shieldDescription(selection, uiText("Approvals"), uiText(approvalChoiceLabel(selection)))
-        IconButton(onClick = { open = true; vm.loadChatApprovals(passive = false, force = true) },
+        // The menu opens on the answer already on screen; the quiet effect above and the action's fresh check keep it honest.
+        IconButton(onClick = { open = true },
             enabled = enabled && capturedClient != null && capturedScope != null && !busy,
             modifier = Modifier.size(48.dp).testTag("composer-approvals").semantics { contentDescription = description }) {
             ApprovalShield(selection)
@@ -128,9 +130,10 @@ internal fun approvalFromProjection(raw: JSONObject, setting: JSONObject?, chat:
         DropdownMenu(open, { open = false }, modifier = Modifier.heightIn(max = 360.dp).testTag("approvals-menu")) {
             DropdownMenuItem({ Text(uiText("Approvals in this chat")) }, {}, enabled = false)
             if (loading || busy) DropdownMenuItem({ Text(uiText(if (busy) "Saving…" else "Checking…")) }, {}, enabled = false)
-            if ((record == null || record.optBoolean("_stale")) && !loading) DropdownMenuItem({ Text(uiText("Couldn't load approvals")) }, { vm.loadChatApprovals(passive = false, force = true) })
+            if (record == null && !loading) DropdownMenuItem({ Text(uiText("Couldn't load approvals")) }, { vm.loadChatApprovals(passive = false, force = true) })
             if (profileMode == "off") DropdownMenuItem({ Text(uiText("Approvals are off")) }, {}, enabled = false)
-            val choicesEnabled = enabled && !loading && !busy && record?.optBoolean("_stale") != true && profileMode in nativeApprovalModes && profileMode != "off"
+            // A saved answer is the first frame. A write re-reads Hermes before it changes anything (BeaconViewModel.action).
+            val choicesEnabled = enabled && !busy && record != null && profileMode in nativeApprovalModes && profileMode != "off"
             // Hermes keeps only YOLO per chat; Manual or Auto is the profile's mode and is changed in Profiles.
             if (profileMode != "off") listOf("ask", "yolo").forEach { choice ->
                 val isSelected = if (choice == "ask") selection in setOf("manual", "smart") else selection == "yolo"
@@ -247,7 +250,7 @@ internal fun approvalFromProjection(raw: JSONObject, setting: JSONObject?, chat:
                     optionLabels = ProfileApprovalChoices.associateWith(::approvalChoiceLabel),
                     optionIcons = mapOf("manual" to Icons.Rounded.FrontHand, "smart" to Icons.Rounded.AutoMode),
                     optionTestTags = ProfileApprovalChoices.associateWith { "profile-approval-$it" },
-                    enabled = active != null && !loading && !busy && !failed, style = ChoiceStyle.Segmented, fitSegments = true)
+                    enabled = active != null && !busy && !failed, style = ChoiceStyle.Segmented, fitSegments = true)
             }
         }
     }

@@ -95,6 +95,29 @@ def invoke(gateway,request='r1'):
     return gateway.invoke(SCOPE,{'request_id':request,'tool_id':'a'*64,'arguments':{'query':'weather'}})
 
 
+def test_an_external_auth_result_reaches_the_call_as_one_honest_line(gateway):
+    """Owner 25 Nov: a Google MCP tool answered with a full OAuth URL; a call should hear that the tool needs connecting,
+    not read an authorization URL aloud or treat it as a broken tool."""
+    api, backend, _ = gateway
+    backend.result = {'error': 'Error calling tool: **ACTION REQUIRED: Google Authentication Needed**\n'
+                               '1. Open this URL to authorize access:\nAuthorization URL: https://accounts.example.invalid/o/oauth2/auth?scope=mail'}
+    invoke(api)
+    settled(api)
+    receipt = api.status_v3(SCOPE, 'r1')
+    assert receipt['status'] == 'failed' and receipt['error_code'] == 'needs_auth'
+    assert 'connect it in Hermes' in receipt['reason']
+    assert 'accounts.example.invalid' not in json.dumps(receipt)
+
+
+def test_a_failed_tool_reason_is_not_empty_for_the_call(gateway):
+    api, backend, _ = gateway
+    backend.result = {'error': 'Synthetic remote service said: mailbox not connected.'}
+    invoke(api)
+    settled(api)
+    receipt = api.status_v3(SCOPE, 'r1')
+    assert receipt['status'] == 'failed' and 'mailbox not connected' in receipt['reason']
+
+
 def settled(gateway,request='r1'):
     for _ in range(100):
         receipt=gateway.status(SCOPE,request)

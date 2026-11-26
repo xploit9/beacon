@@ -250,7 +250,7 @@ private val publicErrorText = setOf(
     DELETE_KEPT_WAITING_ERROR,
     LOST_REPLY_HELD_ERROR,
     "End the call before changing this chat.",
-) + listOf("pin", "archive or restore", "rename", "branch", "load or change the model for", "load or change reasoning for", "check or change approvals for", "load the defaults for", "load toolsets for", "load the history for")
+) + listOf("pin", "unpin", "archive or restore", "rename", "branch", "load or change the model for", "load or change reasoning for", "check or change approvals for", "load the defaults for", "load toolsets for", "load the history for")
     .map { "Couldn't $it this chat. Refresh and try again." }
 
 /** Every fixed sentence this file returns, for the translation test: one answer per HTTP error status covers each branch of [apiFailureText]. */
@@ -293,7 +293,7 @@ private fun safeLocalErrorText(message: String): String {
 internal fun nativeErrorCodeText(detail: String): String? = when (detail) {
     "mutation_identity_required", "revision_conflict", "stale_generation", "retained_receipts" -> "This chat changed. Refresh and try again."
     "session_busy", "admission_conflict", "runtime_coordination_required" -> "This chat is busy with a reply. Try again when it finishes."
-    "permission_denied" -> "Hermes didn't allow that."
+    "permission_denied", "session_read_only" -> "Hermes didn't allow that."
     "device_removed" -> "This phone was removed on Hermes. Sign in again in Settings › Connection."
     "profile_mismatch" -> "That chat belongs to another profile."
     "runtime_draining" -> "Hermes is restarting. Try again in a moment."
@@ -303,6 +303,18 @@ internal fun nativeErrorCodeText(detail: String): String? = when (detail) {
     // A shared gateway's refusal of a command it does not run for this chat (gateway/session_commands.py:456-458).
     "unsupported_command" -> "This command works only on a computer."
     else -> if (Regex("[a-z]+(?:_[a-z]+)+").matches(detail)) "Hermes couldn't do that. Try again." else null
+}
+
+/**
+ * A pin/unpin refusal. Hermes' canonical not_found is its refusal to adopt a keyed legacy row as
+ * writable; the same code also means the row is gone. NativeOperations falls back to Hermes' store
+ * flag on that code, so this line is reached only when the fallback also fails.
+ */
+internal fun pinFailureText(error: ApiFailure): String {
+    if (error.detail == "not_found" || error.detail == "session not found") return apiFailureText(404, "")
+    nativeErrorCodeText(error.detail)?.let { return it }
+    if (error.status == 401) return "Reconnect before changing this chat."
+    return apiFailureText(error.status, error.detail)
 }
 
 internal fun nativeErrorMessage(result: JSONObject, status: Int): String {

@@ -142,6 +142,41 @@ internal data class BackgroundActivityItem(val id: String, val kind: String, val
     val running get() = status in setOf("Running", "Queued")
 }
 
+/** One row's Stop as the RPC Hermes answers: a process this chat owns (`process.kill`) or one of its background agents (`subagent.interrupt`). */
+internal data class BackgroundStopRequest(val method: String, val params: JSONObject)
+
+/** Null for a finished row or an id this app cannot stop: those rows carry no Stop action, and a queued agent has not started to cancel. */
+internal fun backgroundStopRequest(item: BackgroundActivityItem, runtimeSessionId: String, profile: String): BackgroundStopRequest? {
+    if (item.status != "Running" || runtimeSessionId.isBlank()) return null
+    val id = item.id.substringAfter(':', "")
+    if (id.isBlank()) return null
+    val params = JSONObject().put("session_id", runtimeSessionId).put("profile", profile)
+    return when {
+        item.id.startsWith("process:") -> BackgroundStopRequest("process.kill", params.put("process_id", id))
+        item.id.startsWith("agent:") -> BackgroundStopRequest("subagent.interrupt", params.put("subagent_id", id))
+        else -> null
+    }
+}
+
+/** Hermes' own answer, not the request having left: the kill receipt's status, or the child interrupt's `found`. */
+internal fun backgroundStopAccepted(method: String, result: JSONObject): Boolean = when (method) {
+    "process.kill" -> result.string("status") in setOf("killed", "already_exited", "not_found")
+    "subagent.interrupt" -> result.optBoolean("found")
+    else -> false
+}
+
+/** Hermes' own answer that the target is no longer live: a child that ended before the interrupt is found=false, not a refusal. */
+internal fun backgroundStopAlreadyGone(method: String, result: JSONObject): Boolean =
+    method == "subagent.interrupt" && !result.optBoolean("found")
+
+internal fun backgroundStopConfirmTitle(item: BackgroundActivityItem): String =
+    if (item.id.startsWith("agent:")) "Stop this background agent?" else "Stop this background process?"
+
+/** The honest failure: the row keeps its running status, so this says the work was not confirmed gone. */
+internal fun backgroundStopFailureMessage(item: BackgroundActivityItem): String =
+    if (item.id.startsWith("agent:")) "Couldn't stop this agent. It may still be running."
+    else "Couldn't stop this process. It may still be running."
+
 /** Both legacy runtimes and canonical owners publish the stored key in this read-only inventory. */
 internal fun backgroundActivityRuntime(inventory: JSONObject?, storedSessionId: String): String? {
     if (storedSessionId.isBlank() || inventory?.optJSONArray("sessions") == null) return null
@@ -179,7 +214,8 @@ internal fun conversationBackgroundActivity(roster: JSONObject?, processes: JSON
     val jobs = processes?.rows("processes").orEmpty().mapNotNull { row ->
         val id = row.string("session_id").takeIf(String::isNotBlank) ?: return@mapNotNull null
         val state = if (row.string("status") == "exited") when {
-            row.string("completion_reason") in setOf("killed", "cancelled", "interrupted", "stopped") -> "Cancelled"
+            row.string("completion_reason") == "killed" -> "Stopped"
+            row.string("completion_reason") in setOf("cancelled", "interrupted", "stopped") -> "Cancelled"
             row.opt("exit_code") is Number -> if (row.optInt("exit_code") == 0) "Completed" else "Failed"
             else -> "Status unknown"
         } else status(row.string("status"))

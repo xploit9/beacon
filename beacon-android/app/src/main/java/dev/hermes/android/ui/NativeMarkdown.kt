@@ -123,15 +123,8 @@ fun parseNativeMarkdown(source: String): Node = nativeMarkdownParser.parse(sourc
 
 private fun literalLink(address: String): Link = Link(address, null).apply { appendChild(Text(address)) }
 
-// A GFM table's delimiter row: "---", ":--:" cells between pipes.
-private val tableDelimiterRow = Regex("\\|?[ \\t]*:?-+:?[ \\t]*(?:\\|[ \\t]*:?-+:?[ \\t]*)*\\|?")
-
-/** Whether Markdown text holds a table: a delimiter row under a row with a pipe. Such a reply takes the transcript's width (D20). */
-internal fun holdsMarkdownTable(text: String): Boolean {
-    if ('|' !in text || '-' !in text) return false
-    val lines = text.lines()
-    return (1 until lines.size).any { i -> '|' in lines[i] && '|' in lines[i - 1] && tableDelimiterRow.matches(lines[i].trim()) }
-}
+/** Whether Markdown text holds a table, GFM or written with aligned spaces: such a reply takes the transcript's width (D20, D21). */
+internal fun holdsMarkdownTable(text: String): Boolean = holdsTableText(text)
 
 /** A paragraph that only delivers files (a MEDIA: line) shows its cards and no text of its own. */
 internal fun deliversOnlyFiles(node: Node): Boolean {

@@ -1,6 +1,8 @@
 package dev.hermes.android.data
 
 import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 data class NativeSkill(val name: String, val description: String, val category: String, val enabled: Boolean, val provenance: String, val requirements: List<String> = emptyList(), val essential: Boolean = false)
 data class NativeSkillContent(val name: String, val content: String, val revision: String = "")
@@ -26,7 +28,8 @@ class NativeSkills(private val client: BeaconClient) {
 
     suspend fun list(): List<NativeSkill> {
         val response = get("/api/plugins/beacon/mobile/skills")
-        val rows = parseNativeSkills(response)
+        // A big installed-skill list is Hermes' JSON, not Compose state: turn it into rows away from the frame.
+        val rows = withContext(Dispatchers.Default) { parseNativeSkills(response) }
         snapshot = response
         val notes = response.optJSONArray("warnings")
         warnings = (0 until (notes?.length() ?: 0)).map { notes!!.getString(it) }

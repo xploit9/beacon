@@ -17,6 +17,14 @@ import org.junit.Test
 
 /** Android system notifications only, synthetic identities; no service/model/mail/network call. */
 class NativeActivityDeviceTest {
+    /** R3-F8: alerts are said in the app's own language, so a test sets that language here, not the phone's. */
+    private fun setAppLanguage(context: android.content.Context, language: String) {
+        androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation
+            .executeShellCommand("cmd locale set-app-locales ${context.packageName} --user current --locales $language")
+            .use { java.io.FileInputStream(it.fileDescriptor).bufferedReader().readText() }
+        Thread.sleep(500)
+    }
+
     @Test fun ongoingRequestHasPrivateActionsFallbackAndLifecycle() = exercise("approval")
     @Test fun questionOffersChoicesAndFreeTextWithPrivateLifecycle() = exercise("clarify")
     @Test fun fetchedTestAndFailurePreviewsStayArabicAndChatWordsStayVerbatim() {
@@ -30,7 +38,6 @@ class NativeActivityDeviceTest {
         val oldBinding = prefs.getString(key, null)
         val oldAuth = app.auth.read(scope.origin)
         val oldFactory = KeepConnectedService.clientFactoryForTest
-        val oldLocale = java.util.Locale.getDefault()
         val tags = mutableListOf<String>()
         fun fetched(kind: String, title: String, body: String): Pair<String, String> {
             val route = fixture.emitTaskResult(conversationId = "chat-b").apply {
@@ -55,7 +62,7 @@ class NativeActivityDeviceTest {
             return notice.extras.getCharSequence(Notification.EXTRA_TITLE).toString() to notice.extras.getCharSequence(Notification.EXTRA_TEXT).toString()
         }
         try {
-            java.util.Locale.setDefault(java.util.Locale.forLanguageTag("ar"))
+            setAppLanguage(app, "ar")
             app.auth.write(fixture.client.auth.copy(bearer = NativeBearerRecord("fixture-access", "fixture-refresh", System.currentTimeMillis() + 3_600_000, scope.origin, scope.owner, scope.profile, "fixture")))
             KeepConnectedService.clientFactoryForTest = { current, store -> fixture.clientFor(current, store) }
             val binding = json("source" to source, "origin" to scope.origin, "owner" to scope.owner, "profile" to scope.profile, "native_provider" to scope.nativeProvider, "backend" to "hermes-dashboard", "target" to "fixture-target")
@@ -69,24 +76,116 @@ class NativeActivityDeviceTest {
             )
             assertEquals(listOf(failureTitle to failureBody, "Beacon · اختبار الإشعارات" to "تم استلام إشعار الاختبار.",
                 "Beacon · تعذّر إكمال العمل" to "افتح Beacon لمعرفة سبب المشكلة."), actual)
-            java.util.Locale.setDefault(java.util.Locale.ENGLISH)
+            setAppLanguage(app, "")
             assertEquals(failureTitle to failureBody, fetched("failure", failureTitle, failureBody))
         } finally {
             tags.forEach { manager.cancel(it, 1) }
-            java.util.Locale.setDefault(oldLocale)
+            setAppLanguage(app, "")
             KeepConnectedService.clientFactoryForTest = oldFactory
             prefs.edit().putString(key, oldBinding).commit()
             app.auth.write(oldAuth)
         }
     }
 
+    /**
+     * R3-F6: with the many reply alerts a busy shade collects, a question still posts interactive on its own group and never as a child of Android's
+     * "Aggregate_AlertingSection", which is what silenced it. Reproduces the shade state with real posted siblings, then posts the question.
+     */
+    @Test fun aQuestionAlertsWhileManyRepliesAlreadyFillTheShade() {
+        val context = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val source = "synthetic-busy-shade-source"
+        val origin = "https://notification-fixture.invalid"
+        val previousAuth = context.auth.read(origin)
+        val auth = AuthContext(origin, emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard", nativeProvider = "fixture")
+        val prefs = context.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE)
+        val key = "source:${source.digest()}"
+        val replies = (1..14).map { "synthetic-busy-reply-$it" }
+        val activity = "synthetic-busy-question-${System.currentTimeMillis()}"
+        try {
+            context.auth.write(auth)
+            val binding = json("source" to source, "origin" to origin, "owner" to auth.owner, "profile" to auth.profile, "native_provider" to auth.nativeProvider, "backend" to "hermes-dashboard")
+            assertTrue(prefs.edit().putString(key, android.util.Base64.encodeToString(context.cipher.encrypt(binding.toString().toByteArray(), key), android.util.Base64.NO_WRAP)).commit())
+            // The replies an app ordinarily leaves behind: the same channel, no group of ours, so Android's own aggregator takes them.
+            for (tag in replies) manager.notify(tag, 1, Notification.Builder(context, promptNotificationChannel(manager))
+                .setSmallIcon(R.drawable.ic_beacon_notification).setContentTitle("Beacon Â· Reply ready").setContentText("A reply is ready.").build())
+            Thread.sleep(300)
+            val route = json("kind" to "clarify", "text_reply" to true, "preview" to json("complete" to true, "title" to "Beacon asks", "body" to "Synthetic busy shade question"),
+                "actions" to JSONArray(listOf("red", "blue").map { json("value" to it, "label" to it) }))
+            presentNativeActivity(context, source, "synthetic-busy-question", activity, "clarify", System.currentTimeMillis()/1000+120, route)
+            val deadline = System.currentTimeMillis() + 3_000
+            while (manager.activeNotifications.none { it.notification.extras.getString("native_source") == source } && System.currentTimeMillis() < deadline) Thread.sleep(20)
+            val posted = manager.activeNotifications.single { it.notification.extras.getString("native_source") == source }.notification
+            // Its own group, so Android never folds it into the aggregated pile that goes silent; and the child still owns its alert.
+            assertEquals(PROMPT_GROUP, posted.group)
+            assertEquals(Notification.GROUP_ALERT_CHILDREN, posted.groupAlertBehavior)
+            // A prompt stays an ongoing request that can be answered, never a group summary (whose children Android silences).
+            assertTrue("a prompt is ongoing", posted.flags and Notification.FLAG_ONGOING_EVENT != 0)
+            assertEquals(0, posted.flags and Notification.FLAG_GROUP_SUMMARY)
+            assertEquals(NotificationManager.IMPORTANCE_HIGH, manager.getNotificationChannel(posted.channelId).importance)
+            // Q2 saw the busy-shade prompt arrive with Android's own SILENT flag. A repeated post of the same activity still alerts once by design; the
+            // silent behaviour Android added to the aggregated child is what must not be there.
+            assertEquals("an answerable prompt is never a group summary", 0, posted.flags and Notification.FLAG_GROUP_SUMMARY)
+            // A complete question offers its own disclosed answers and a free-text Answer; the plugin's blind Review button is not added.
+            assertEquals("its own answers are offered", listOf("red", "blue", "Answer"), posted.actions.map { it.title.toString() })
+            assertFalse(posted.actions.any { it.title.toString() == "Review" })
+            // Android's auto-grouped child is the one that goes silent; this prompt is outside that group and owns its alert.
+            assertEquals("not Android's aggregate section", PROMPT_GROUP, posted.group)
+        } finally {
+            replies.forEach { manager.cancel(it, 1) }
+            cancelNativeActivities(context, source)
+            prefs.edit().remove(key).commit()
+            context.auth.write(previousAuth)
+        }
+    }
+
+    /** R3-F8: with Android's per-app language set to Arabic but the phone left in English, the in-call question is still said in Arabic. */
+    @Test fun anInCallQuestionIsInTheAppsLanguageNotThePhones() {
+        val context = ApplicationProvider.getApplicationContext<BeaconApplication>()
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val previousDevice = java.util.Locale.getDefault()
+        val source = "synthetic-locale-source"
+        val origin = "https://notification-fixture.invalid"
+        val previousAuth = context.auth.read(origin)
+        val auth = AuthContext(origin, emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard", nativeProvider = "fixture")
+        val prefs = context.getSharedPreferences("push-binding", android.content.Context.MODE_PRIVATE)
+        val key = "source:${source.digest()}"
+        val activity = "synthetic-locale-question-${System.currentTimeMillis()}"
+        fun shell(command: String) = androidx.test.platform.app.InstrumentationRegistry.getInstrumentation().uiAutomation
+            .executeShellCommand(command).use { java.io.FileInputStream(it.fileDescriptor).bufferedReader().readText().trim() }
+        val packageName = context.packageName
+        try {
+            context.auth.write(auth)
+            java.util.Locale.setDefault(java.util.Locale.ENGLISH)
+            assertTrue(prefs.edit().putString(key, android.util.Base64.encodeToString(context.cipher.encrypt(json("source" to source, "origin" to origin,
+                "owner" to auth.owner, "profile" to auth.profile, "native_provider" to auth.nativeProvider, "backend" to "hermes-dashboard").toString().toByteArray(), key), android.util.Base64.NO_WRAP)).commit())
+            // Android 13+ per-app language: the app is shown in Arabic while the phone itself stays English.
+            shell("cmd locale set-app-locales $packageName --user current --locales ar")
+            Thread.sleep(500)
+            val route = json("kind" to "clarify", "text_reply" to true, "preview" to json("complete" to false, "title" to "Question for you", "body" to "Open Beacon to answer."), "actions" to JSONArray())
+            presentNativeActivity(context, source, "synthetic-locale-question", activity, "clarify", System.currentTimeMillis()/1000+120, route)
+            val deadline = System.currentTimeMillis() + 3_000
+            while (manager.activeNotifications.none { it.notification.extras.getString("native_source") == source } && System.currentTimeMillis() < deadline) Thread.sleep(20)
+            val posted = manager.activeNotifications.single { it.notification.extras.getString("native_source") == source }.notification
+            assertEquals("Arabic when Beacon owns the language", "سؤال لك", posted.extras.getString(Notification.EXTRA_TITLE))
+            assertEquals("افتح Beacon للإجابة.", posted.extras.getString(Notification.EXTRA_TEXT))
+            assertEquals("مراجعة", posted.actions.last().title.toString())
+        } finally {
+            shell("cmd locale set-app-locales $packageName --user current --locales ")
+            java.util.Locale.setDefault(previousDevice)
+            cancelNativeActivities(context, source)
+            prefs.edit().remove(key).commit()
+            context.auth.write(previousAuth)
+        }
+    }
+
     @Test fun pluginQuestionAndApprovalUseThePhoneLanguage() {
-        val prior = java.util.Locale.getDefault()
+        val app = ApplicationProvider.getApplicationContext<BeaconApplication>()
         val language = androidx.test.platform.app.InstrumentationRegistry.getArguments().getString("native_ui_language", "ar")
         try {
-            java.util.Locale.setDefault(java.util.Locale.forLanguageTag(language))
+            setAppLanguage(app, language)
             for (kind in listOf("clarify", "approval")) exercise(kind, translated = true)
-        } finally { java.util.Locale.setDefault(prior) }
+        } finally { setAppLanguage(app, "") }
     }
 
     private fun exercise(kind:String, translated: Boolean = false) {

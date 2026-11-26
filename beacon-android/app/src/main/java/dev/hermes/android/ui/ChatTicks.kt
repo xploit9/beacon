@@ -110,5 +110,5 @@ internal fun busyComposerCaption(slash: Boolean, hasFiles: Boolean, busyAction: 
     explicitQueue -> "Queue"
     slash -> "Run command"
     hasFiles || busyAction == "queue" -> "Queue"
-    else -> "Send now"
+    else -> "Steer"
 }

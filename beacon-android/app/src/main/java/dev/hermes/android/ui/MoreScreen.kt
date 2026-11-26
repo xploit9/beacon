@@ -375,7 +375,7 @@ private fun choiceTags(label: String, options: List<String>) = options.associate
                     // The stored values stay steer and queue, and the option tags keep the old English label, so saved choices and tests still find them.
                     SettingsChoiceRow(
                         assistantText("If you send while Beacon replies"), busyOverride ?: preferences.busySendAction, busyOptions, { vm.setBusySendAction(it) },
-                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Send now", "queue" to "Queue"),
+                        icon = Icons.AutoMirrored.Rounded.CallSplit, optionLabels = mapOf("steer" to "Steer", "queue" to "Queue"),
                         optionIcons = mapOf("steer" to Icons.AutoMirrored.Rounded.CallSplit, "queue" to Icons.AutoMirrored.Rounded.PlaylistAdd),
                         optionTestTags = choiceTags("While Beacon is replying", busyOptions), enabled = preferences.busySendLoaded, style = ChoiceStyle.Segmented, fitSegments = true,
                     )

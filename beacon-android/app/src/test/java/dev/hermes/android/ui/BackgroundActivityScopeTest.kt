@@ -210,7 +210,7 @@ class BackgroundActivityScopeTest {
         assertTrue(current.available)
         assertEquals(1, current.agents)
         assertEquals(0, current.processes)
-        assertEquals(listOf("Running", "Failed", "Completed", "Failed", "Cancelled"), current.items.map { it.status })
+        assertEquals(listOf("Running", "Failed", "Completed", "Failed", "Stopped"), current.items.map { it.status })
         assertEquals(listOf(50L, 30L, 40L, 40L, null), current.items.map { it.elapsedSeconds })
         assertEquals("Read synthetic notes", current.items.first().title)
     }

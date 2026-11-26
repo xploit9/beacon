@@ -108,8 +108,15 @@ class AgentPhoneActivity : ComponentActivity() {
                     ViewOrientation.Any -> ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
                 }
             }
-            // Back is the agent phone's Back while the picture is live; from any other state it leaves the view.
-            BackHandler { if (!model.watching && ui.phase == ViewPhase.Live) model.session.key("back") else model.session.close() }
+            // Back is the agent phone's Back while the picture is live; from any other state it leaves the view. A watching Back during
+            // a call asks the call screen to open its live surface as it resumes, instead of the page the emulator came from.
+            BackHandler {
+                if (!model.watching && ui.phase == ViewPhase.Live) model.session.key("back")
+                else {
+                    if (model.watching) app.calls.state.value.takeIf { it.active }?.let { app.calls.requestCallOnResume(it.callId) }
+                    model.session.close()
+                }
+            }
             val actions = remember(model) { model.actions(this@AgentPhoneActivity) }
             CompositionLocalProvider(LocalAssistantName provides preferences.assistantName) {
                 NativeLocalization(nativeLanguageFor(configuration.locales[0])) {

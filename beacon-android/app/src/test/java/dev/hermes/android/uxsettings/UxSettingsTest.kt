@@ -197,16 +197,15 @@ class UxSettingsTest {
         val page = source("MoreScreen.kt")
         assertTrue(page.contains("SettingsSection(uiText(\"When you send\"), testTag = \"settings-section:Sending\")"))
         assertTrue(page.contains("assistantText(\"If you send while Beacon replies\")"))
-        assertTrue(page.contains("optionLabels = mapOf(\"steer\" to \"Send now\", \"queue\" to \"Queue\")"))
-        assertFalse("the internal word is not a label", page.contains("to \"Steer\""))
+        assertTrue(page.contains("optionLabels = mapOf(\"steer\" to \"Steer\", \"queue\" to \"Queue\")"))
         // What is stored does not change, and the option tags keep the label saved layouts and tests know.
         assertTrue(page.contains("val busyOptions = listOf(\"steer\", \"queue\")"))
         assertTrue(page.contains("choiceTags(\"While Beacon is replying\", busyOptions)"))
         // The progress word "Sending" is not the section title any more.
         assertFalse(page.contains("SettingsSection(uiText(\"Sending\"))"))
-        // One vocabulary everywhere: Send now and Queue, as in the composer and the queue box.
-        assertTrue("Send now" in SettingsStrings && "Queue" in SettingsStrings)
-        assertFalse("Steer" in SettingsStrings || "Change the reply" in SettingsStrings || "Send after" in SettingsStrings)
+        // One vocabulary everywhere: Steer and Queue, as in the composer and the queue box.
+        assertTrue("Steer" in SettingsStrings && "Queue" in SettingsStrings)
+        assertFalse("Send now" in SettingsStrings || "Change the reply" in SettingsStrings || "Send after" in SettingsStrings)
     }
 
     @Test fun theOldWordsStillFindChatInSearch() {
@@ -241,7 +240,7 @@ class UxSettingsTest {
 
     private val newWords = listOf(
         "Beacon plugin", "Hermes dashboard", "Hermes gateway", "Beacon isn't installed on this Hermes", "When you send", "If you send while Beacon replies",
-        "Send now", "Queue", "Turn it on to get calls and alerts while Beacon is closed.",
+        "Steer", "Queue", "Turn it on to get calls and alerts while Beacon is closed.",
         "Notification delivery keep connected", "while replying steer queue change the reply send after",
     )
 

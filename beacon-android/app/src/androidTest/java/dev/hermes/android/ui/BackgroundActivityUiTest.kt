@@ -2,14 +2,21 @@ package dev.hermes.android.ui
 
 import androidx.activity.ComponentActivity
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.core.json
+import kotlinx.coroutines.CompletableDeferred
 import org.json.JSONArray
+import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
 
@@ -47,5 +54,72 @@ class BackgroundActivityUiTest {
         compose.setContent { MaterialTheme { ChatActivitySheet(current) {} } }
         compose.onNodeWithText("Synthetic worker 39").performScrollTo().assertIsDisplayed()
         compose.onNodeWithTag("chat-activity-close").performScrollTo().assertHeightIsAtLeast(48.dp).assertIsDisplayed()
+    }
+
+    private fun process(status: String, completion: String? = null) = conversationBackgroundActivity(
+        json("subagents" to JSONArray()),
+        json("processes" to JSONArray().put(json("session_id" to "process-a", "command" to "synthetic build", "status" to status,
+            "exit_code" to 1, "completion_reason" to completion, "started_epoch" to 110, "exited_at" to 140))), 150)
+
+    @Test fun aRunningRowStopsOnlyAfterItsConfirmation() {
+        var stops = 0
+        compose.setContent { MaterialTheme { ChatActivitySheet(process("running"), stopBackground = { stops += 1; null }, onDismiss = {}) } }
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Stop this background process?").assertIsDisplayed()
+        compose.onNodeWithText("synthetic build").assertExists()
+        compose.onNodeWithText("Cancel").performClick()
+        compose.onNodeWithText("Stop this background process?").assertDoesNotExist()
+        assertEquals("Cancel stops nothing", 0, stops)
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").performClick()
+        compose.onNodeWithTag("chat-activity-stop-confirm").performClick()
+        compose.waitForIdle()
+        assertEquals(1, stops)
+    }
+
+    @Test fun aFinishedRowNeverOffersStop() {
+        compose.setContent { MaterialTheme { ChatActivitySheet(process("exited", "exited"), stopBackground = { null }, onDismiss = {}) } }
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").assertDoesNotExist()
+        compose.onNodeWithText("Failed", substring = true).assertExists()
+    }
+
+    @Test fun aSheetShownWithoutAStopCallbackStaysReadOnly() {
+        compose.setContent { MaterialTheme { ChatActivitySheet(process("running"), onDismiss = {}) } }
+        compose.onNodeWithText("synthetic build").assertExists()
+        compose.onAllNodesWithTag("chat-activity-stop-process:process-a").assertCountEquals(0)
+    }
+
+    @Test fun aStopInFlightShowsStoppingAndCannotBeRepeated() {
+        val gate = CompletableDeferred<String?>()
+        compose.setContent { MaterialTheme { ChatActivitySheet(process("running"), stopBackground = { gate.await() }, onDismiss = {}) } }
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").performClick()
+        compose.onNodeWithTag("chat-activity-stop-confirm").performClick()
+        compose.onNodeWithText("Stopping…").assertExists()
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").assertIsNotEnabled()
+        compose.runOnIdle { gate.complete(null) }
+        compose.waitForIdle()
+        compose.onAllNodesWithText("Stopping…").assertCountEquals(0)
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").assertIsEnabled()
+    }
+
+    @Test fun aRefusedStopSaysItMayStillBeRunningAndLeavesTheRowStoppable() {
+        compose.setContent { MaterialTheme { ChatActivitySheet(process("running"), stopBackground = { "Couldn't stop this process. It may still be running." }, onDismiss = {}) } }
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").performClick()
+        compose.onNodeWithTag("chat-activity-stop-confirm").performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("Couldn't stop this process. It may still be running.").assertExists()
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").assertIsEnabled().performClick()
+        compose.onNodeWithText("Stop this background process?").assertIsDisplayed()
+    }
+
+    @Test fun theStopActionAndItsConfirmationStayReachableInRtlAtLargeText() {
+        compose.setContent {
+            val density = LocalDensity.current
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl, LocalDensity provides Density(density.density, 2f)) {
+                MaterialTheme { ChatActivitySheet(process("running"), stopBackground = { null }, onDismiss = {}) }
+            }
+        }
+        compose.onNodeWithTag("chat-activity-stop-process:process-a").assertIsDisplayed().performClick()
+        compose.onNodeWithText("Stop this background process?").assertIsDisplayed()
+        compose.onNodeWithTag("chat-activity-stop-confirm").assertIsDisplayed()
     }
 }

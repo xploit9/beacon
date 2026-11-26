@@ -132,7 +132,8 @@ internal fun mcpTestPill(testedTools: Int?, testFailed: Boolean): ToolPill = whe
                     if (index > 0) SettingsDivider()
                     val test = if (mcp) data["mcp-test:$name"]?.takeIf { row.optBoolean("enabled") } else null
                     val tools = if (mcp) test?.rows("tools")?.map { it.string("name") }.orEmpty() else row.optJSONArray("tools")?.strings().orEmpty()
-                    ToolRow(row, mcp, saving = busy == name, enabled = (busy.isBlank() || busy == name) && !loading, idle = idle,
+                    // A quiet refresh leaves the switches usable; only the row being saved shows its own spinner.
+                    ToolRow(row, mcp, saving = busy == name, enabled = busy.isBlank() || busy == name, idle = idle,
                         testedTools = test?.takeIf { it.optBoolean("ok") }?.rows("tools")?.size, testFailed = name in failedTests,
                         tools = tools, expanded = opened == name, onExpand = { opened = if (opened == name) "" else name },
                         onToggle = { operate(name, it) }, onTest = { operate(name) })

@@ -63,6 +63,26 @@ class NotificationContentTest {
         assertFalse(isEmailAlertNotificationRoute(route(kind = "completion"), "source", "event", scope, "chat"))
         assertFalse(isEmailAlertNotificationRoute(route(), "other", "event", scope, "chat"))
     }
+    /** R3-F8: the app's own language wins over the phone's, so an in-call question is said in Arabic when Beacon is. */
+    @Test fun anAlertsLanguageFollowsTheAppsOwnLocale() {
+        val arabic = java.util.Locale.forLanguageTag("ar")
+        assertEquals("ar", alertLanguage(arabic, java.util.Locale.ENGLISH))
+        assertEquals("en", alertLanguage(java.util.Locale.ENGLISH, arabic))
+        // No per-app language set: the phone's own, as before.
+        assertEquals("ar", alertLanguage(null, arabic))
+        // A language Beacon does not have falls back to English words rather than a half-translated alert.
+        assertEquals("en", alertLanguage(java.util.Locale.forLanguageTag("xx"), java.util.Locale.ENGLISH))
+    }
+
+    /** R3-F6: a prompt is never left in the group Android aggregates and silences, and the in-call channel stays quiet. */
+    @Test fun aPromptKeepsItsOwnAlertingGroupOutsideTheAggregatedShade() {
+        assertNotEquals("Its own group, never Android's Aggregate_AlertingSection", "", PROMPT_GROUP)
+        assertTrue("a prompt's group is its own, never the quiet summary's", PROMPT_GROUP != ALERT_GROUP)
+        assertEquals("the in-call prompt keeps its own quiet channel", IN_CALL_PROMPT_CHANNEL, promptChannelFor("hermes-prompts-v2", ownerChanged = false, inCall = true))
+        assertEquals("an owner's own channel choice stands", "hermes-prompts-v2", promptChannelFor("hermes-prompts-v2", ownerChanged = true, inCall = true))
+        assertEquals("outside a call the prompt channel is used", "hermes-prompts-v2", promptChannelFor("hermes-prompts-v2", ownerChanged = false, inCall = false))
+    }
+
     @Test fun completionNotificationIsSilentOnlyWhileBeaconIsVisible() {
         // R3-F4: a thread post is a chat's message too: quiet while Beacon is open, like a reply.
         listOf("completion", "task_result").forEach {

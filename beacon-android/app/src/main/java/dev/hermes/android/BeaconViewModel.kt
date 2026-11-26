@@ -648,6 +648,10 @@ internal fun steerRowText(row: JSONObject): String =
  * The saved user row of each steer bubble still waiting for one (local copy id to row id). Hermes saves a steer as its own user row with no submission identity,
  * so a row is told by being a saved steer of THIS turn (after the turn's prompt row, and listed by the turn's receipt when there is one) with the same words,
  * not held by another bubble, and each row pairs once. A bubble that cannot be paired stays on screen: nothing is hidden on doubt.
+ *
+ * A copy sent before the newest prompt outlived its turn (a later prompt was sent while it waited): its row is above that prompt, and the same words there are
+ * that row, the one nearest the copy's own time (a steer from an earlier turn reappeared below a much later message). Rows after the newest prompt stay this turn's.
+ * Without a time on the copy or on the newest prompt nothing is assumed, and the copy stays on screen.
  */
 internal fun steerRowPairs(items: List<QueuedMessage>, proofUserRows: List<Long>, rows: List<JSONObject>): Map<String, String> {
     val open = items.filter { it.kind == "steer" && it.rowId.isBlank() && it.state in setOf("accepted", "unknown") }.sortedBy { it.createdAt }
@@ -655,17 +659,32 @@ internal fun steerRowPairs(items: List<QueuedMessage>, proofUserRows: List<Long>
     fun id(row: JSONObject) = row.string("row_id", row.string("_row_id"))
     // The prompt: the receipt's first user row, else the newest user row that is neither a steer nor a steering note (the turn is still running).
     fun isPrompt(row: JSONObject) = row.string("role") == "user" && row.string("display_kind") != "steer" && !isSteeringText(messageContentText("user", historyRowContent(row)))
-    val prompt = proofUserRows.firstOrNull()?.toString() ?: rows.lastOrNull(::isPrompt)?.let(::id) ?: return emptyMap()
+    fun written(row: JSONObject) = recordedMessageTime(row.opt("timestamp")).takeIf { it > 0 }
+    val newestPromptAt = rows.indexOfLast(::isPrompt)
+    if (newestPromptAt < 0) return emptyMap()
+    val newestPrompt = rows[newestPromptAt]
+    val prompt = proofUserRows.firstOrNull()?.toString() ?: id(newestPrompt)
     val promptAt = rows.indexOfFirst { id(it) == prompt }
     if (promptAt < 0) return emptyMap()
     val listed = proofUserRows.drop(1).map(Long::toString).toSet()
     val claimed = items.map { it.rowId }.filter(String::isNotBlank).toMutableSet()
-    val saved = rows.drop(promptAt + 1).filter { row ->
-        row.string("role") == "user" && row.string("display_kind") == "steer" && id(row) !in claimed && (proofUserRows.isEmpty() || id(row) in listed)
-    }
+    val saved = rows.withIndex().filter { (_, row) -> row.string("role") == "user" && row.string("display_kind") == "steer" && id(row).isNotBlank() }
+    fun free(row: JSONObject, words: String) = id(row).isNotBlank() && id(row) !in claimed && sameWords(steerRowText(row)) == words
+    // The row nearest the copy's own time; a row with no time written stays eligible but behind every timed one.
+    fun nearest(candidates: List<IndexedValue<JSONObject>>, at: Long) = candidates.minWithOrNull(compareBy<IndexedValue<JSONObject>>(
+        { written(it.value)?.let { time -> if (time >= at) time - at else at - time } ?: Long.MAX_VALUE }, { it.index }))?.value
+    val newestPromptTime = written(newestPrompt)
+    val promptTime = written(rows[promptAt])
     val pairs = linkedMapOf<String, String>()
     for (item in open) {
-        val row = saved.firstOrNull { id(it) !in claimed && sameWords(steerRowText(it)) == sameWords(item.text) } ?: continue
+        val words = sameWords(item.text)
+        // A receipt names its turn's own rows: a copy made during that turn takes one of them, whatever a later prompt's time says.
+        val inReceiptTurn = proofUserRows.isNotEmpty() && (item.createdAt == 0L || promptTime == null || item.createdAt >= promptTime)
+        // A copy sent before the newest prompt outlived its turn: its row is a saved steer above that prompt, never one the receipt claims.
+        val older = !inReceiptTurn && newestPromptTime != null && item.createdAt > 0 && item.createdAt < newestPromptTime
+        val row = if (older) nearest(saved.filter { (at, row) -> at < newestPromptAt && id(row) !in listed && free(row, words) }, item.createdAt)
+        else saved.firstOrNull { (at, row) -> at > promptAt && (proofUserRows.isEmpty() || id(row) in listed) && free(row, words) }?.value
+        if (row == null) continue
         claimed += id(row); pairs[item.id] = id(row)
     }
     return pairs
@@ -1001,6 +1020,20 @@ internal fun paintedTurn(chat: ChatState, record: JSONObject?, frame: JSONObject
     val live = frame?.takeIf { owner.isBlank() || it.string("submission_id") == owner }
     if (live?.optBoolean("terminal") == true) return null
     return restoredLive(chat.copy(status = "Working"), live, stream)
+}
+/**
+ * chat-live: a followed turn's socket may keep running while Beacon is in the background only when Keep connected's foreground service
+ * keeps this process alive. The stream then saves its own frames and the saved chat, so a return paints the reply instead of a stale
+ * copy. Keep connected off, or nothing running: the stream stops as before and the return honestly reconnects.
+ */
+internal fun keepsFollowedStream(keepConnected: Boolean, followingTurn: Boolean): Boolean = keepConnected && followingTurn
+/** A saved chat draws over the open one on a return only when it holds a message row the open chat lacks (the reply that ended while it was away). */
+internal fun cachedChatAddsRows(saved: JSONObject, shown: ChatState): Boolean {
+    val chat = saved.optJSONObject("session") ?: saved
+    if (shown.sessionId != chat.string("session_id")) return true
+    fun key(row: JSONObject): String = row.string("row_id", row.string("_row_id", row.string("id")))
+    val known = shown.raw.rows("messages").map(::key).filter(String::isNotBlank).toSet()
+    return chat.rows("messages").map(::key).any { it.isNotBlank() && it !in known }
 }
 /**
  * R2C: a history read that names no running stream (Beacon's native reads never do: history is passive) does not end the turn the chat shows while
@@ -1351,8 +1384,10 @@ internal fun mergeChatProjection(previous: JSONObject, incoming: JSONObject, all
             if (last != null && !(allowRemoval && (rowId(last) in removedRows || parent == removedUserRowId)) &&
                 currentRows.none { rowId(it) == rowId(last) && it.string("role") == "assistant" }) {
                 val id = "unconfirmed-history:${rowId(last)}"
+                // A row Hermes recorded no time on keeps the turn boundary instead of none: the bubble must still say when it was said.
+                val keptAt = recordedMessageTime(last.opt("timestamp")).takeIf { it > 0 } ?: retained[id]?.let { recordedMessageTime(it.opt("timestamp")) }?.takeIf { it > 0 } ?: System.currentTimeMillis()
                 retained[id] = json("id" to id, "role" to "assistant", "display_kind" to "unconfirmed_reply", "actionable" to false,
-                    "session_id" to incoming.string("session_id"), "_history_row_id" to rowId(last), "_history_user_row_id" to parent, "timestamp" to last.opt("timestamp"),
+                    "session_id" to incoming.string("session_id"), "_history_row_id" to rowId(last), "_history_user_row_id" to parent, "timestamp" to keptAt,
                     "text" to messageContentText("assistant", historyRowContent(last)), "reasoning" to last.string("reasoning", last.string("reasoning_content")))
             }
         }
@@ -1413,10 +1448,31 @@ internal fun lastPromptRow(rows: List<JSONObject>): String =
  */
 internal fun keptTurnPrompt(row: JSONObject, rows: List<JSONObject>): String {
     row.string("_history_user_row_id").takeIf(String::isNotBlank)?.let { return it }
+    // The copy's own send names its turn even when the held prompt was never a row here: Hermes stamps the phone's submission id on the question row that turn saved.
+    row.string("submission_id").takeIf(String::isNotBlank)?.let { submission ->
+        rows.firstOrNull { isPromptRow(it) && rowSubmissionId(it) == submission }?.let {
+            return it.string("row_id", it.string("_row_id", it.string("id")))
+        }
+    }
     if (!row.has("_after_prompt")) return ""
     val after = row.string("_after_prompt")
     val start = if (after.isBlank()) 0 else rows.indexOfFirst { it.string("row_id", it.string("_row_id", it.string("id"))) == after }.let { if (it < 0) return "" else it + 1 }
     return rows.drop(start).firstOrNull(::isPromptRow)?.let { it.string("row_id", it.string("_row_id", it.string("id"))) }.orEmpty()
+}
+
+/**
+ * The clock of the turn a kept copy belongs to, so its bubble shows a time and it sits where it was said: the time Hermes recorded on the question that
+ * began the turn, else the phone's own send time for that turn, else the moment it was kept. A turn boundary does not move, so re-keeping the same copy
+ * never changes its time.
+ */
+internal fun keptTurnTime(chat: ChatState, prompt: String, now: Long): Long {
+    val question = chat.raw.rows("messages").firstOrNull {
+        prompt.isNotBlank() && it.string("row_id", it.string("_row_id", it.string("id"))) == prompt
+    }
+    recordedMessageTime(question?.opt("timestamp")).takeIf { it > 0 }?.let { return it }
+    val submission = chat.raw.string("_display_submission_id")
+    chat.queued.firstOrNull { submission.isNotBlank() && it.submissionId == submission }?.createdAt?.takeIf { it > 0 }?.let { return it }
+    return now
 }
 
 /** The rows of the turn whose prompt is the held row [prompt]: after it, up to the next question (a steer continues the turn); null when [rows] do not hold it. */
@@ -1534,11 +1590,16 @@ internal fun retainUnconfirmedReply(chat: ChatState): ChatState {
     val saved = historyToolIdentities(chat.raw.rows("messages"))
     val after = chat.liveTools.filter { toolIdentity(it).isBlank() || toolIdentity(it) !in saved }.groupBy { (segments.lastIndex - it.optInt(WORDS_AFTER)).coerceAtLeast(-1) }
     fun cards(at: Int) = JSONArray(after[at].orEmpty().map { it.copy().apply { remove(WORDS_AFTER) } })
+    // A kept reply is a message of its turn and shows that turn's time (owner, 25 Nov: a kept reply had no time and drew below a newer chat).
+    // The turn's clock does not move, so keeping the same copy again leaves its time alone.
+    val kept = chat.raw.rows(UNCONFIRMED_REPLIES).associateBy { it.string("id") }
+    val keptAt = keptTurnTime(chat, prompt, System.currentTimeMillis())
     val rows = segments.mapIndexed { j, words ->
         json("id" to "$key$j", "text" to words, "reasoning" to if (j == segments.lastIndex) chat.liveReasoning else "", "role" to "assistant",
             "session_id" to chat.sessionId, "actionable" to false, "display_kind" to "unconfirmed_reply", "_history_user_row_id" to prompt, "_after_prompt" to afterPrompt, "_segment" to if (!placed) 0 else if (exact) places[j] else chat.liveOrdinal - segments.lastIndex + j,
             "live_tools_before" to if (j == 0) cards(-1) else JSONArray(), "live_tools" to cards(j),
-            "submission_id" to chat.raw.string("_display_submission_id"), "admission_id" to chat.raw.string("_display_admission_id"))
+            "submission_id" to chat.raw.string("_display_submission_id"), "admission_id" to chat.raw.string("_display_admission_id"),
+            "timestamp" to (recordedMessageTime(kept["$key$j"]?.opt("timestamp")).takeIf { it > 0 } ?: keptAt))
     }
     return chat.copy(raw = chat.raw.copy().put(UNCONFIRMED_REPLIES,
         // Judged at once against the rows the phone holds: a reply whose saved copy is already here is not kept twice (an end Hermes' receipt did not prove).
@@ -1994,6 +2055,32 @@ private fun attachmentThumbnail(file: JSONObject): String? {
     return java.io.ByteArrayOutputStream().also { bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, it) }.toByteArray().let { android.util.Base64.encodeToString(it, android.util.Base64.NO_WRAP) }
 }
 
+/**
+ * The light settings warm-up's own gate: it may start beside a reply, never beside a live call. A return during a call waits
+ * here instead of firing the settings reads into it (REVIEW-124B must-fix 1); a reply alone no longer holds the warm-up back.
+ */
+internal suspend fun prefetchLightSteps(
+    steps: List<suspend () -> Unit>,
+    current: () -> Boolean,
+    callActive: () -> Boolean,
+    tickMillis: Long = 1_000,
+) = coroutineScope {
+    val slots = kotlinx.coroutines.sync.Semaphore(PREFETCH_PARALLELISM)
+    steps.forEach { step -> launch {
+        slots.acquire()
+        try {
+            while (current() && callActive()) delay(tickMillis)
+            if (current()) step()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            // a read that fails stays cold until its screen opens
+        } finally {
+            slots.release()
+        }
+    } }
+}
+
 class BeaconViewModel(application: Application, private val saved: SavedStateHandle) : AndroidViewModel(application) {
     private val _voiceHandoff=MutableStateFlow<VoiceHandoff?>(null)
     val voiceHandoff=_voiceHandoff.asStateFlow()
@@ -2197,6 +2284,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     private val streams = mutableMapOf<String, Job>()
     /** The dedicated native client consuming each scope's current reply. */
     private val streamClients = mutableMapOf<String, BeaconClient>()
+    /** chat-live: a turn's stream was kept through the background and must be replaced by a fresh one on the return. */
+    private var keptTurnStream = false
     /** The request each registered stream job started with (see [streamFollows]). */
     private val streamStarts = mutableMapOf<String, ScopeSettlement>()
     /** A stream silent this long asks Hermes about its turn, checked this often; fields so a device case can shorten them. */
@@ -2657,6 +2746,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 }
                 if (generation != originGeneration || client !== currentClient || !foreground) return@launch
                 if (!changed) return@launch
+                if (keptTurnStream) {
+                    keptTurnStream = false
+                    // The kept socket saved the chat while away; the return starts a fresh one from that saved copy (S1's reattach rules).
+                    streams.values.toList().forEach(Job::cancel); streams.clear(); streamClients.clear(); streamStarts.clear()
+                }
+                // chat-live: what the phone last saved is on screen before any network read on a return.
+                try { paintSavedChat(generation) } catch (e: CancellationException) { throw e } catch (_: Exception) { /* The saved copy is optional; recovery still runs. */ }
                 if (client == null && !_ui.value.loading) connect(_ui.value.origin)
                 // R2C: the open chat's own recovery starts before the warm-up reads, so they do not hold up its stream.
                 else { recoverForeground(); prepareStartup(); if (sourceScope == null) openInitialChat() }
@@ -2665,7 +2761,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         if (!changed) return
         if (!active) {
-            refreshSecurePrompt(); cancelStartup(); recoveryJob?.cancel(); sessionWatch?.cancel(); sideJob?.cancel(); streams.values.toList().forEach(Job::cancel)
+            refreshSecurePrompt(); cancelStartup(); recoveryJob?.cancel(); sessionWatch?.cancel(); sideJob?.cancel()
+            // chat-live: a followed turn keeps its socket only while Keep connected's foreground service keeps this process alive
+            // (Android freezes a cached process and the socket would die); its checkpoints then save the reply while the app is away.
+            val held = sourceScope?.let { dev.hermes.android.push.KeepConnectedService.isEnabledFor(app, it.copy(session = "")) } == true
+            val following = _chat.value.streamId.isNotBlank() && streams.values.any { it.isActive }
+            if (keepsFollowedStream(held, following)) keptTurnStream = true else { keptTurnStream = false; streams.values.toList().forEach(Job::cancel) }
             val shownOwner = client?.scope ?: cachedOwnerScope
             viewModelScope.launch {
                 runCatching { checkpointVisible() }.onFailure(::fail)
@@ -3078,6 +3179,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (settingsOwner == null) return client
         return settingsClient?.takeIf { settingsOwner === client && settingsEpoch == originGeneration && _ui.value.authenticated }
     }
+    /** The detail this phone read last for one profile: the page draws it while its own read refreshes. */
+    internal fun cachedProfileBot(profile: String): NativeBot? {
+        val owner = client?.scope ?: restoredScope() ?: return null
+        val value = screens.exact(owner.copy(profile = profile), profileBotCacheKey(profile))?.value ?: return null
+        if (value.string("profile") != profile) return null
+        return NativeBot(profile, value.string("title"), value.string("description"), value.string("soul"), value.string("provider"), value.string("model"))
+    }
     internal fun settingsProfileCurrent(active: BeaconClient) = settingsProfileClient() === active && client?.scope?.sameAccount(active.scope) == true
     internal fun settingsProfileVersion() = settingsAuthority
     /** The restored sign-in's scope while there is no client yet (a cold start, or offline with saved screens): what a page may show its saved copy under, read-only. */
@@ -3086,9 +3194,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     internal fun profileSettingsFailure(error: Throwable) { if (error is NativeAuthExpiredException || endsSignIn(error)) fail(error) }
 
     internal suspend fun authorizeSettingsProfile(active: BeaconClient, profile: String) {
-        val account = client ?: throw CancellationException("Settings authority changed")
         val version = settingsAuthority
         if (!settingsProfileCurrent(active, version)) throw CancellationException("Settings authority changed")
+        // A client already bound to this profile was admitted when it was built (the active sign-in, or forAuthorizedProfile):
+        // another profile-list round trip would only delay the page the owner just tapped.
+        if (active.scope.profile == profile) return
+        val account = client ?: throw CancellationException("Settings authority changed")
         val generation = originGeneration
         val reader = account.detached()
         try {
@@ -3127,7 +3238,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     ++settingsAuthority
                     settingsOwner = account; settingsClient = next; settingsEpoch = generation
                     _settingsProfile.value = profile
-                    phoneSettings.bind(force = true)
+                    // A profile open is not a profile change when the client is already on it: keep the lists and the host's
+                    // server data so the page draws its last answer. bind still resets them when the scope key really changes.
+                    phoneSettings.bind(force = true, keepLists = true)
                     if (previous != null && previous !== account) previous.closeNative()
                     if (migratingBot != null) {
                         try {
@@ -3154,9 +3267,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         settingsSelectionJob = job; job.start(); return job
     }
-    fun inspectSettingsProfile(profile: String) = selectSettingsProfile(profile) {
+    fun inspectSettingsProfile(profile: String, preview: NativeBot? = null) = selectSettingsProfile(profile) {
         val state = phoneSettings.bots.value
-        if (state.selected?.profile != profile || !state.editing) phoneSettings.openBot(profile)
+        if (state.selected?.profile != profile || !state.editing) phoneSettings.openBot(profile, preview ?: cachedProfileBot(profile))
     }
     fun openSettingsProfileTool(profile: String, page: String) = selectSettingsProfile(profile) { more(page) }
     fun closeSettingsProfile() {
@@ -5231,7 +5344,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         } catch (e: Throwable) {
             if (e is CancellationException) throw e
             if (e is DeleteKeptWaiting) restoreWithdrawn(target, e.withdrawn)
-            if (client === active) fail(conversationActionFailure(path, e))
+            if (client === active) fail(conversationActionFailure(path, e, body.optBoolean("pinned", true)))
         } finally { c.closeNative() }
         }
         conversationChanges[pendingKey] = job
@@ -5706,7 +5819,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             else initialDraft?.let { restoreDraft(it, preserveActiveInput = true) }
             // A transcript this process saved a moment ago draws in this frame, not after the disk reads below.
             if (initialResponse != null) renderSession(initialResponse, scope)
-            else if (!sameSession) app.cache.recentSession(scope)?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }?.let { renderSession(it, scope) }
+            else if (!sameSession) app.cache.recentSession(scope)?.let { raw -> withContext(Dispatchers.Default) { runCatching { JSONObject(raw) }.getOrNull() } }?.let { renderSession(it, scope) }
             try {
                 // Always read the marker: a known shell may still be one kept apart, and the write below must not turn it into a plain one.
                 val marked = readClientShell(scope)
@@ -5856,6 +5969,29 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         _data.update { it.filterKeys { key -> !isChatScreenKey(key) } }; clearDetails()
         sourceScope = null
     }
+    /**
+     * chat-live: on a return, the chat the phone last saved (its reply and its turn's own frame) is drawn before any network read. A saved
+     * chat only draws over the open one when it holds a row the open chat lacks, so a return never steps back to an older copy.
+     */
+    private suspend fun paintSavedChat(generation: Int): Boolean {
+        val scope = sourceScope ?: return false
+        if (generation != originGeneration || sourceScope != scope || followsHere(scope)) return false
+        val cached = app.cache.readMany(scope, listOf("session", LIVE_TURN))
+        if (generation != originGeneration || sourceScope != scope || followsHere(scope)) return false
+        var painted = false
+        cached["session"]?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }?.takeIf { cachedChatAddsRows(it, _chat.value) }?.let { saved ->
+            renderSession(saved.apply { remove("runtime_session_id") }, scope)
+            painted = true
+        }
+        val record = cached[LIVE_TURN]?.let { runCatching { JSONObject(it) }.getOrNull() }
+        val stream = record?.string("stream_id")?.takeIf { it.matches(streamIdPattern) }
+        // The saved chat ended the turn (its reply is the last row): the turn's own frame must not paint it running again.
+        if (stream != null && _chat.value.streamId.isNotBlank()) {
+            val frame = liveFrames["${scope.key}:$stream"] ?: try { app.cache.read(scope, "live:$stream")?.let(::JSONObject) } catch (e: Exception) { if (e is CancellationException) throw e; null }
+            paintedTurn(_chat.value, record, frame)?.let { _chat.value = it; painted = true }
+        }
+        return painted
+    }
     private suspend fun restoreCachedConversation(scope: Scope, generation: Int, preserveActiveInput: Boolean = false, paintTurn: Boolean = false): Boolean {
         fun current() = generation == sessionGeneration && sourceScope == scope && (client?.scope ?: cachedOwnerScope) == scope.copy(session = "")
         val cached = app.cache.readMany(scope, listOf("draft", "side-question", "session", "pending", "alerts") + if (paintTurn) listOf(LIVE_TURN) else emptyList())
@@ -5929,7 +6065,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         // Native live snapshots omit hidden state; preserve the native list/action receipt.
         (indexed as? Boolean ?: o.opt("archived") as? Boolean ?: prior as? Boolean)?.let { o.put("archived", it) }
         // They never carry the pinned state either; archiving drops the chat's History row, so keep what was last known.
-        (indexedRow?.opt("pinned") as? Boolean ?: o.opt("pinned") as? Boolean ?: priorRaw?.opt("pinned") as? Boolean)?.let { o.put("pinned", it) }
+        (nativeSessionFlagOrNull(indexedRow, "pinned") ?: nativeSessionFlagOrNull(o, "pinned") ?: nativeSessionFlagOrNull(priorRaw, "pinned"))?.let { o.put("pinned", it) }
         val userRows = o.rows("messages").filter { it.string("role") == "user" && it.string("row_id", it.string("_row_id")).isNotBlank() }
         val receipts = app.cache.readMany(scope, userRows.map { "attachments:${it.string("row_id", it.string("_row_id"))}" })
         for (row in userRows) {
@@ -7135,7 +7271,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val attachments = before.attachments.map { it.copy() }
         val item = QueuedMessage(text, attachments, state.raw.string("model"), state.raw.string("model_provider"),
             state = if (useSteer) "sending" else "queued", kind = if (useSteer) "steer" else "queue")
-        val turnClient = streamClients[scope.key]
         _chat.update { it.copy(queued = it.queued + item) }
         try {
             checkpointJob?.cancelAndJoin()
@@ -7168,11 +7303,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             notice("Couldn't save the latest edit. Keep this chat open and try again."); return@launch
         }
         if (!useSteer) { if (state.streamId.isBlank()) drainQueued(scope, active, generation, origin); return@launch }
-        sendSteer(scope, active, item, state.streamId, turnClient, generation, origin)
+        sendSteer(scope, active, item, state.streamId, generation, origin)
     }
     /** Sends [item] (already held as a steer, state "sending") into the reply running as [streamId]; a steer that did not go out goes back to the queue box. */
-    private suspend fun sendSteer(scope: Scope, active: BeaconClient, item: QueuedMessage, streamId: String, turnClient: BeaconClient?, generation: Int, origin: Int) {
-        if (turnClient == null || turnClient.scope != scope.copy(session = "")) {
+    private suspend fun sendSteer(scope: Scope, active: BeaconClient, item: QueuedMessage, streamId: String, generation: Int, origin: Int) {
+        val (turnClient, reopened) = steerClient(scope, active, streamId) ?: run {
             updateQueued(scope, item.id) { it.copy(state = "queued", kind = "queue") }
             notice("Couldn't send it now. It's in the queue.")
             if (_chat.value.streamId.isBlank()) drainQueued(scope, active, generation, origin)
@@ -7205,6 +7340,25 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 notice("Couldn't send it now. It's in the queue.")
                 if (_chat.value.streamId.isBlank()) drainQueued(scope, active, generation, origin)
             } else fail(e)
+        } finally { if (reopened) turnClient.closeNative() }
+    }
+    /**
+     * The client a steer goes out on. The chat's live collector is preferred: it already carries the running turn. A return from the
+     * background, or a reconnect, can drop that collector while the chat still shows the turn; the steer then binds a fresh client to
+     * the same running conversation instead of putting the owner's words back in the box as if nothing ran (owner, 24 Nov 19:08).
+     * The returned flag says the caller owns a recovered client and closes it after the answer.
+     */
+    private suspend fun steerClient(scope: Scope, active: BeaconClient, runtime: String): Pair<BeaconClient, Boolean>? {
+        streamClients[scope.key]?.takeIf { it.scope == scope.copy(session = "") }?.let { return it to false }
+        val c = active.detached()
+        return try {
+            val bound = c.nativeSession(scope.session, lazy = true)
+            if (bound.scope == scope.copy(session = "") && bound.storedSessionId == scope.session && bound.runtimeSessionId == runtime) c to true
+            else { c.closeNative(); null }
+        } catch (e: Throwable) {
+            c.closeNative()
+            if (e is CancellationException) throw e
+            null
         }
     }
     /** The Steer button on a queued message: send it now, into the reply that is running. It leaves the box and lands in the chat with the Steer marker. */
@@ -7221,14 +7375,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         val runtime = state.streamId
         val held = state.queued.firstOrNull { it.id == id } ?: return@launch
         if (!canSteerQueued(held, runtime.isNotBlank())) return@launch
-        val turnClient = streamClients[scope.key]
         // updateQueued says "the row exists", not "this call moved it": a second tap that waited for the draft lock finds the row already sending.
         // Only the call whose change really moved the row may steer (the same flag send() uses), so one instruction is never posted twice.
         var moved = false
         try { updateQueued(scope, id) { claimSteer(it, runtime.isNotBlank())?.also { moved = true } ?: it } }
             catch (e: Throwable) { if (e is CancellationException) throw e; if (sourceScope == scope) fail(e); return@launch }
         val item = _chat.value.queued.firstOrNull { it.id == id }?.takeIf { moved && it.state == "sending" && it.kind == "steer" } ?: return@launch
-        sendSteer(scope, active, item, runtime, turnClient, generation, origin)
+        sendSteer(scope, active, item, runtime, generation, origin)
     }
     fun removeQueued(id: String) = viewModelScope.launch {
         val scope = sourceScope ?: return@launch
@@ -7741,6 +7894,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                                 if (!listedOnFirstEvent && sourceScope == scope) { listedOnFirstEvent = true; refreshSessions() }
                                 if (sourceScope == scope) {
                                     val state = _chat.value
+                                    // chat-live: a saved projection the open chat just drew is on disk at once, so a return or a process
+                                    // kill paints it without waiting for another read.
+                                    if (event.type in setOf("done", "state_saved") && state.raw.has("messages")) app.cache.writeSession(scope, state.raw.toString())
                                     val progress = (liveBoundaries[frameKey] ?: LiveAssistantBoundary()).saveInto(json("cursor" to cursor.lastId, "text" to state.liveText, "reasoning" to state.liveReasoning, "tools" to JSONArray(state.liveTools), "sealed" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.liveSealed), "sealed_at" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.sealedPlaces()), "ordinal" to state.liveOrdinal, "base" to state.liveBase, "base_prompt" to state.liveBasePrompt, "error" to terminalError, "terminal" to terminalObserved, "wait" to savedWaitLine(state.status), "submission_id" to state.raw.string("_display_submission_id")))
                                     liveFrames[frameKey] = progress
                                     val now = android.os.SystemClock.elapsedRealtime()
@@ -8321,8 +8477,6 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         fun current() = generation == originGeneration && client === active && _ui.value.authenticated && foreground
         fun idle() = !app.calls.state.value.active && _chat.value.streamId.isBlank() && pending.isEmpty()
         prefetchJob = viewModelScope.launch {
-            var waited = 0L
-            while (current() && waited < PREFETCH_READY_WAIT && !(_ui.value.initialChatReady || _chat.value.projectionReady)) { delay(250); waited += 250 }
             delay(PREFETCH_DELAY)
             // The plugin's own reads wait for the probe that says whether it is there; asked too early they would be left out until the next warm-up.
             withTimeoutOrNull(PREFETCH_PROBE_WAIT) { optionalProbe?.join() }
@@ -8339,10 +8493,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 shown == null || (shown.optBoolean("_stale") || shown.has("_error")) && shown.optString("_requested_path").let { it.isEmpty() || it == read.query["path"] } }
             // Files lists the folder it will open in, worked out when this step runs, after the projects it may depend on.
             val files: suspend () -> Unit = { StartupRead("files", "/api/pc/files", mapOf("path" to filesFolder())).let { read -> if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } }
-            // Chat join: CACHEFIX-B's steps and EMU-JOIN's agent phone.
-            val steps = reads.map<StartupRead, suspend () -> Unit> { read -> { if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } } + files + listOf<suspend () -> Unit>(
-                { if (plugin) phoneSettings.loadBots()?.join() }, { prefetchKanban(active) }, { prefetchVault(active) }, { if (plugin) prefetchDevices(active) },
-                { if (plugin) prefetchPluginHealth(active) }, { if (plugin) prefetchProactive(active) }, { if (plugin) prefetchAgentPhone(active) },
+            // Chat join: CACHEFIX-B's steps and EMU-JOIN's agent phone. The small configuration reads are safe beside a reply and
+            // go first; the chat, file and board warm-up still waits for the chat to be ready and for a quiet moment.
+            val light: List<suspend () -> Unit> = reads.map<StartupRead, suspend () -> Unit> { read -> { if (cold(read)) ensureLoaded(read.key, read.path, read.query).join() } } + listOf<suspend () -> Unit>(
+                { if (plugin) phoneSettings.loadBots()?.join() }, { if (plugin) prefetchDevices(active) },
+                { if (plugin) prefetchPluginHealth(active) }, { if (plugin) prefetchProactive(active) },
                 { if (plugin) {
                     val c = active.detached()
                     try {
@@ -8350,11 +8505,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         if (current()) keepScreen(scope, dev.hermes.android.ui.CALL_HISTORY_KEY, dev.hermes.android.ui.callHistoryPage(page))
                     } finally { c.closeNative() }
                 } }) + listOf("Health", "Server updates", "Session checkpoints", "Logs").map { page -> suspend { phoneSettings.warmServer(active, page) } }
+            val heavy: List<suspend () -> Unit> = listOf(files, { prefetchKanban(active) }, { prefetchVault(active) }, { if (plugin) prefetchAgentPhone(active) })
             val slots = kotlinx.coroutines.sync.Semaphore(PREFETCH_PARALLELISM)
+            prefetchLightSteps(light, { current() }, { app.calls.state.value.active })
             coroutineScope {
-                steps.forEach { step -> launch {
+                heavy.forEach { step -> launch {
                     slots.acquire()
                     try {
+                        var waited = 0L
+                        while (current() && waited < PREFETCH_READY_WAIT && !(_ui.value.initialChatReady || _chat.value.projectionReady)) { delay(250); waited += 250 }
                         while (current() && !idle()) delay(1_000)
                         if (current()) step()
                     } catch (e: CancellationException) { throw e } catch (_: Exception) { /* a read that fails stays cold until its screen opens */ }

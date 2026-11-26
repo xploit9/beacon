@@ -64,7 +64,7 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                                 val active = activeProfile.isNotBlank() && summary.profile == activeProfile
                                 // A profile with no description shows only its name: "No purpose" read as a judgement.
                                 SettingsNavRow(profileLabel(summary.profile), { onOpen(summary.profile) }, icon = ProfilesIcon, value = summary.purpose,
-                                    status = if (active) SettingsStatus.Ok else null, statusLabel = if (active) uiText("Active") else "", enabled = !state.loading && !readOnly, testTag = "profile-open:${summary.profile}")
+                                    status = if (active) SettingsStatus.Ok else null, statusLabel = if (active) uiText("Active") else "", enabled = !readOnly, testTag = "profile-open:${summary.profile}")
                             }
                             if (onNewProfile != null) {
                                 if (state.profiles.isNotEmpty() || shown) SettingsDivider()
@@ -90,7 +90,7 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                             if (!state.editing) {
                                 if (state.error.isNotBlank() || state.notice.isNotBlank()) SettingsDivider()
                                 SettingsNavRow(uiText("Model"), onEditModel, icon = Icons.Rounded.Memory,
-                                    value = "${bot.provider.ifBlank { uiText("Provider not set") }} · ${bot.model.ifBlank { uiText("Model not set") }}", enabled = !state.loading, testTag = "profile-model")
+                                    value = "${bot.provider.ifBlank { uiText("Provider not set") }} · ${bot.model.ifBlank { uiText("Model not set") }}", enabled = !readOnly, testTag = "profile-model")
                             } else {
                                 if (state.error.isNotBlank()) SettingsDivider()
                                 ModelEditor(state, bot.provider, bot.model, models, modelSearch, { modelSearch = it }, moreModels, { moreModels = true }, customModel, { customModel = !customModel }, onModelDraft, onSaveModel, onCancel)
@@ -104,11 +104,11 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                         // renderer drew Beacon's own <!-- markers --> as empty cards.
                         SettingsSection(title = uiText("Behavior"), testTag = "profile-behavior-section") {
                             SettingsNavRow(uiText("Description"), { onEditDescription?.invoke() }, icon = Icons.Rounded.Edit, value = bot.description,
-                                enabled = onEditDescription != null && !state.loading && !state.saving, testTag = "profile-description")
+                                enabled = onEditDescription != null && !state.saving && !readOnly, testTag = "profile-description")
                             SettingsDivider()
                             SettingsNavRow(uiText("Instructions"), { onEditInstructions?.invoke() }, icon = Icons.Rounded.Description,
                                 value = profileInstructionsPreview(bot.soul).ifBlank { uiText("No instructions") },
-                                enabled = onEditInstructions != null && !state.loading && !state.saving, testTag = "profile-instructions")
+                                enabled = onEditInstructions != null && !state.saving && !readOnly, testTag = "profile-instructions")
                         }
                     }
                 }
@@ -126,7 +126,7 @@ internal fun profileModelsMatching(models: List<Pair<String, String>>, query: St
                 if (canDelete(bot.profile)) item(key = "delete") {
                     ProfileEntrance(5, motionEnabled) {
                         SettingsSection(testTag = "profile-delete-section") {
-                            SettingsDestructiveRow(uiText("Delete profile"), { onDelete(bot.profile) }, enabled = !state.loading && !state.saving, testTag = "delete-profile:${bot.profile}")
+                            SettingsDestructiveRow(uiText("Delete profile"), { onDelete(bot.profile) }, enabled = !state.saving && !readOnly, testTag = "delete-profile:${bot.profile}")
                         }
                     }
                 }

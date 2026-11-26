@@ -118,14 +118,17 @@ internal fun showsParagraphText(node: Node, tags: FileTags): Boolean = tags != F
     CompositionLocalProvider(LocalChecklist provides checklist) { SelectionContainer { Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) { document?.children()?.let { blocks ->
         // Only a document holding a table runs wider than a bubble: its table may use the whole (capped) width, its prose keeps a line length
         // people can read on a wide screen. Everything else renders as before.
-        val wide = blocks.any { it is TableBlock }
+        val wide = blocks.any { it is TableBlock || tableText(it)?.let(::holdsTableText) == true }
         blocks.forEach { block -> if (!wide || block is TableBlock) MarkdownBlock(block, vm, origin, snapshots) else Box(Modifier.widthIn(max = ReadableWidth)) { MarkdownBlock(block, vm, origin, snapshots) } }
     } } } }
 }
 @Composable private fun MarkdownBlock(block: Node, vm: BeaconViewModel, origin: Scope?, snapshots: Map<String, String>) {
     when (block) {
         is Heading -> RichInline(block, vm, origin, snapshots, when (block.level) { 1 -> MaterialTheme.typography.headlineMedium; 2 -> MaterialTheme.typography.headlineSmall; else -> MaterialTheme.typography.titleLarge })
-        is org.commonmark.node.Paragraph -> RichInline(block, vm, origin, snapshots)
+        is org.commonmark.node.Paragraph -> tableText(block)?.let(::tableRowsFromText)?.let { rows ->
+            // A table a reply wrote with aligned spaces, or with pipes but no delimiter row, still shows as a table (D21).
+            NativeTable(rows, vm = vm)
+        } ?: RichInline(block, vm, origin, snapshots)
         is FencedCodeBlock -> when(block.info.trim().substringBefore(' ').lowercase()) {
             "mermaid" -> RichSandbox(block.literal, diagram=true)
             "html" -> RichSandbox(block.literal)
@@ -320,7 +323,7 @@ internal fun Modifier.scrollEdgeFade(state: androidx.compose.foundation.ScrollSt
                 Row(Modifier.background(if(index==0) MaterialTheme.colorScheme.surfaceContainerHigh else Color.Transparent)) {
                     widths.indices.forEach { col ->
                         val cell=row.getOrNull(col).orEmpty()
-                        val modifier=Modifier.width(fitted[col].dp).heightIn(min=48.dp)
+                        val modifier=Modifier.width(fitted[col].dp).heightIn(min=48.dp).testTag("table-cell:$index:$col")
                         if(index==0) TextButton(onClick={ if(column==col) descending=!descending else { column=col; descending=false } }, modifier=modifier) { Text(cell + if(column==col) if(descending) " ↓" else " ↑" else "", fontWeight=FontWeight.SemiBold) }
                         else Column(modifier.padding(12.dp).semantics { contentDescription="${rows.first().getOrNull(col).orEmpty()}, $rowLabel $index: $cell" }) { if(cellContent != null) cellContent(order[index],col) else Text(cell,style=MaterialTheme.typography.bodyMedium) }
                     }

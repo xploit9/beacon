@@ -104,7 +104,7 @@ suspend fun refreshNotificationPreview(context: Context, source: String, event: 
             "failure" -> rawTitle == "Beacon work failed" && rawBody == "Open Beacon to see what went wrong."
             else -> false
         }
-        val translate = fixed && dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault()) != "en"
+        val translate = fixed && alertLanguageOf(context) != "en"
         val (previewTitle, previewBody) = if (translate) notificationFallback(kind) { serviceText(context, it) } else rawTitle to rawBody
         val title = boundedNotificationText(replyNotificationTitle(route, previewTitle, assistant, beaconChat), 120)
         val body = boundedNotificationText(previewBody, 640)

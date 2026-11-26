@@ -56,7 +56,8 @@ internal fun memoryCounterVisible(length: Int, limit: Int): Boolean = limit > 0 
     var explanation by rememberSaveable(state.scope) { mutableStateOf(false) }
     val target = state.editing.ifBlank { selected }
     val current = state.documents.firstOrNull { it.target == target } ?: state.documents.firstOrNull()
-    val canEdit = state.editing.isBlank() && !state.loading && !state.saving && !readOnly
+    // A background read keeps the notes and their Edit action usable; a save or an open draft still blocks them.
+    val canEdit = state.editing.isBlank() && !state.saving && !readOnly
     BackHandler(enabled = state.editing.isNotBlank() && !state.saving, onBack = onCancel)
     // Notes already loaded stay on screen while a refresh or save runs; the thin bar is the only sign of it.
     SettingsList(refreshing = (state.loading && state.documents.isNotEmpty()) || state.saving, testTag = "memory-page") {

@@ -85,7 +85,8 @@ class S1SendNeverSilentTest {
         val activity = File(module, "src/main/java/dev/hermes/android/BeaconActivity.kt").readText().replace("\r\n", "\n")
         val create = activity.substring(activity.indexOf("override fun onCreate("), activity.indexOf("setContent {"))
         assertTrue("onCreate sets vm before composition", create.contains("vm = androidx.lifecycle.ViewModelProvider(this)[BeaconViewModel::class.java]"))
-        assertTrue("onStart tells it", activity.contains("vm?.foreground(true) }"))
+        val start = activity.substring(activity.indexOf("override fun onStart("), activity.indexOf("override fun onResume("))
+        assertTrue("onStart tells it", start.contains("vm?.foreground(true)"))
     }
 
     /** S1d (R3 review #4): every replacement of the own client (profile switch, reconnect, sign-out, a notification's profile) closes the one it replaces. */

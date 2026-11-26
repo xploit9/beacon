@@ -118,6 +118,7 @@ class ToolsMcpGapsUiTest {
         compose.onNodeWithTag("tools-refresh").assertIsNotEnabled()
         compose.onNodeWithTag("settings-refreshing").assertExists()
         compose.onNodeWithTag("tool-row:alpha").assertIsDisplayed()
+        compose.onNodeWithTag("tool-row:alpha").assertIsEnabled()
         compose.runOnIdle { vm.refreshingFlow.value = emptySet() }
         compose.onNodeWithTag("tools-refresh").assertIsEnabled()
         compose.onNodeWithTag("settings-refreshing").assertDoesNotExist()

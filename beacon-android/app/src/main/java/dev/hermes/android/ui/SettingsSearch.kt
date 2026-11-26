@@ -132,7 +132,7 @@ internal val settingsPillWords = listOf("Connected", "Offline", "Sign in", "Key 
  * category titles, theme names and search words, the reasoning words and sentences, the offline and default error texts and the call card's title words.
  */
 internal val SettingsStrings = (settingsSearchRoutes.map(::settingsLabel) + settingsDescriptions.values + settingsHubSections.keys.filter(String::isNotBlank) +
-    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Send now", "Queue") + settingsPillWords + settingsSearchKeywords.values +
+    settingsCategories.keys + settingsThemeLabels.values + listOf("Tools and services", "Settings", "Steer", "Queue") + settingsPillWords + settingsSearchKeywords.values +
     ReasoningStrings + listOf(OfflineReadError, DefaultReadError) + CallTitleStrings).distinct()
 
 /**

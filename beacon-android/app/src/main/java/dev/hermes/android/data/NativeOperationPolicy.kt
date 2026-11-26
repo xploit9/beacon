@@ -126,8 +126,14 @@ internal fun chatCommandChangesProfile(name: String, argument: String): Boolean 
         name.lowercase() in setOf("memory", "skills") && argument.substringBefore(' ').lowercase() in setOf("approval", "mode") ||
         name.lowercase() in setOf("snapshot", "snap") && argument.substringBefore(' ').equals("restore", true)
 
-internal fun conversationActionFailure(path: String, error: Throwable): Throwable {
+internal fun conversationActionFailure(path: String, error: Throwable, pinned: Boolean? = null): Throwable {
     if (error is NativeAuthExpiredException || error is java.io.IOException && error !is ApiFailure) return error
+    if (path == "/api/session/pin") {
+        // Hermes' own refusal is the useful line here: not_found, permission_denied,
+        // profile_mismatch and the revision/session conflicts already have plain wording.
+        if (error is ApiFailure) return ApiFailure(error.status, pinFailureText(error), error.plugin)
+        return IllegalStateException("Couldn't ${if (pinned == false) "unpin" else "pin"} this chat. Refresh and try again.")
+    }
     val verb = when (path) {
         "/api/session/pin" -> "pin"
         "/api/session/archive" -> "archive or restore"
@@ -147,7 +153,8 @@ internal fun conversationActionFailure(path: String, error: Throwable): Throwabl
 
 internal fun conversationPendingLabel(path: String): String = when (path) {
     "/api/session/branch" -> "Branching…"
-    "/api/session/pin" -> "Updating pin…"
+    // A neutral line: the menu row already says Unpin when the chat is pinned.
+    "/api/session/pin" -> "Updating…"
     "/api/session/archive" -> "Updating archive…"
     "/api/session/rename" -> "Renaming…"
     "/api/session/update" -> "Applying model…"
@@ -156,6 +163,12 @@ internal fun conversationPendingLabel(path: String): String = when (path) {
 }
 
 internal const val PROFILE_DEFAULTS_PATH = "/api/profile/defaults"
+/**
+ * The plugin's owner-only fallback for a session the canonical authority keeps as read-only history.
+ * Canonical is always tried first, so an adopted row (even a keyed one) keeps its own session.updated
+ * and this route is reached only after a real not_found refusal; the route refuses an adopted row itself.
+ */
+internal const val LEGACY_SESSION_PIN_PATH = "/api/plugins/beacon/mobile/session/pin"
 
 internal fun sameApprovalForChange(shown: JSONObject?, live: JSONObject, turnOn: Boolean): Boolean =
     shown != null && live.string("profile_mode") in setOf("manual", "smart") &&

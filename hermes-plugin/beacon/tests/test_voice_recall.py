@@ -226,6 +226,29 @@ def test_timed_out_provider_keeps_capacity_until_it_exits(recall_env, monkeypatc
         assert finished.wait(2)
 
 
+def test_a_stuck_provider_read_still_returns_the_builtin_snapshot(recall_env, monkeypatch):
+    """Owner 25 Nov: the configured memory add-on timed out, so the call answered that memory failed although Hermes'
+    own curated snapshot had the answer. That snapshot is the same fallback a native turn uses."""
+    voice, _, _, _, _ = recall_env
+    provider = FakeProvider()
+    configured_provider(monkeypatch, voice, provider)
+    release = threading.Event()
+    finished = threading.Event()
+    provider.prefetch = lambda *args, **kwargs: release.wait(2) and 'Too late'
+    provider.shutdown = lambda: finished.set()
+    monkeypatch.setattr(voice, 'builtin_memory', lambda *args: 'Synthetic saved fact: boiler service Thursday.')
+    monkeypatch.setattr(voice, '_MEMORY_LOOKUP_TIMEOUT', 0.03)
+    try:
+        result = voice.recall('owner', 'basic', 'default', 'chat', 'boiler')
+        assert result['status'] == 'completed'
+        assert result['summary'] == 'Synthetic saved fact: boiler service Thursday.'
+        assert result['sources'] == [{'title': 'Native curated memory', 'ref': 'native-memory:builtin'}]
+        assert result['detail'] == 'memory_lookup_timeout'
+    finally:
+        release.set()
+        assert finished.wait(2)
+
+
 def test_a_provider_named_hindsight_is_asked_like_any_other(recall_env, monkeypatch):
     voice, _, _, _, _ = recall_env
     provider = FakeProvider()

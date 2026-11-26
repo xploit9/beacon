@@ -56,17 +56,28 @@ private val canonicalModelGuards = linkedMapOf<String, CanonicalModelGuard>()
 internal val nativeApprovalModes = listOf("manual", "smart", "off")
 /** Session detail keeps SQLite 0/1 flags; session lists expose booleans. */
 internal fun nativeSessionFlag(row: JSONObject, key: String): Boolean = row.optBoolean(key) || (row.opt(key) as? Number)?.toDouble() == 1.0
+/** The same flag, or null when the row does not carry it at all (so a caller can keep a better-known value). */
+internal fun nativeSessionFlagOrNull(row: JSONObject?, key: String): Boolean? =
+    row?.takeIf { it.has(key) }?.let { nativeSessionFlag(it, key) }
 /** True when Hermes' live counters hold no tokens (a runtime that was recycled), so its zeros say nothing about the chat. */
 internal fun liveUsageIsEmpty(live: JSONObject): Boolean =
     listOf("input", "input_tokens", "output", "output_tokens").all { (live.opt(it) as? Number)?.toLong().let { n -> n == null || n == 0L } }
 
-/** The live usage with the stored row's token totals (Hermes' `input_tokens`, `output_tokens`, cache and reasoning columns) when the row has any. */
+/**
+ * The live usage with the stored row's token totals (Hermes' `input_tokens`, `output_tokens`, cache and reasoning columns) when the row has any.
+ * A recycled runtime also leaves its other counters at zero under the live names, so the totals Hermes stores fill those in as well: its prompt is
+ * the input plus the cache it read (agent/turn_usage.py keeps `input_tokens` = prompt - cache read), its completion is the output, and it counted
+ * every call (R3-F2).
+ */
 internal fun usageWithStoredTotals(live: JSONObject, row: JSONObject): JSONObject {
     fun stored(key: String) = (row.opt(key) as? Number)?.toLong() ?: 0L
     if (stored("input_tokens") + stored("output_tokens") <= 0L) return live
     return live.copy().apply {
         for (zero in listOf("prompt", "completion", "input", "output", "reasoning")) remove(zero)
         for (key in listOf("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")) if (row.has(key)) put(key, stored(key))
+        put("prompt_tokens", stored("input_tokens") + stored("cache_read_tokens") + stored("cache_write_tokens"))
+        put("completion_tokens", stored("output_tokens"))
+        if (row.has("api_call_count")) put("api_calls", stored("api_call_count"))
     }
 }
 
@@ -451,6 +462,12 @@ internal class NativeOperations(private val c: BeaconClient) {
         }
         return result
     }
+    /** The plugin's owner-only store write, the same flag `hermes sessions pin|unpin` sets. */
+    private suspend fun legacyPin(sessionId: String, pinned: Boolean): JSONObject =
+        c.nativeRequest(LEGACY_SESSION_PIN_PATH, "POST",
+            json("session_id" to sessionId, "pinned" to pinned, "profile" to c.auth.profile)).also {
+            require(it.string("session_id") == sessionId && it.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
+        }
     /** What Hermes holds now: the first open prompt (null = none) and the ones behind it, oldest first. */
     private fun pendingPrompts(prompts: List<JSONObject>): JSONObject =
         json("pending" to prompts.firstOrNull(), "waiting" to JSONArray().apply { prompts.drop(1).forEach { put(it) } })
@@ -860,18 +877,28 @@ internal class NativeOperations(private val c: BeaconClient) {
             }
             "/api/session/pin" -> {
                 require(method == "POST" && sid().matches(storedSessionId) && d.opt("pinned") is Boolean) { "Choose a conversation to pin" }
+                val pinned = d.getBoolean("pinned")
                 if (c.nativeSessionAuthority()) {
-                    val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
-                    val pinned = d.getBoolean("pinned")
-                    val result = canonicalMutation(lease, canonicalSnapshot(lease), "sidebar", json("pinned" to pinned))
-                    require(result.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
-                    return result
+                    try {
+                        val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
+                        val result = canonicalMutation(lease, canonicalSnapshot(lease), "sidebar", json("pinned" to pinned))
+                        require(result.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
+                        return result
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        // Canonical is always tried first: an adopted row must publish its own session.updated.
+                        // Only a keyed legacy row is read-only history to the authority (session.resume ->
+                        // adopt_legacy_session -> validate_legacy_row -> not_found). Hermes still exposes the
+                        // pin flag itself; the plugin writes it through SessionDB, exactly `hermes sessions pin|unpin`.
+                        if (!nativeSessionNotFound(e)) throw e
+                    }
+                    return legacyPin(sid(), pinned)
                 }
                 // Hermes' own PATCH reaches a running gateway itself (web_server_sessions._mutate_session_request); it accepts a sidebar change only with
                 // its revision precondition and a fresh request id, as its own web client sends.
                 val snapshot = c.nativeGet("/api/sessions/${sid()}/mutation-snapshot", mapOf("profile" to c.auth.profile))
                 val identity = pinMutationIdentity(snapshot, java.util.UUID.randomUUID().toString())
-                val pinned = d.getBoolean("pinned")
                 return c.nativeRequest("/api/sessions/${sid()}", "PATCH", identity.put("pinned", pinned).put("profile", c.auth.profile)).also {
                     require(it.opt("pinned") == pinned) { "Pin change was not confirmed. Refresh before trying again." }
                 }

@@ -185,6 +185,8 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
     @Volatile var profileSessionIds = emptyMap<String, Set<String>>()
     /** Profile to (status, detail) for a failed list read, as Hermes answers it (sessions.get_sessions). */
     @Volatile var sessionListFailures = emptyMap<String, Pair<Int, String>>()
+    /** Milliseconds every synthetic REST answer waits, so a test can measure what a screen shows before a slow refresh lands. */
+    @Volatile var restDelayMs: Int = 0
     @Volatile var incomingNotification: JSONObject? = null
     val notificationWaits = CopyOnWriteArrayList<Long>()
     @Volatile var forceExpiredAccessToken: String? = null
@@ -819,6 +821,7 @@ internal class NativeExperienceFixture(private val ownerName: String = "syntheti
             if (refuseConnection) throw java.net.ConnectException("Synthetic connection refused")
             val request = chain.request()
             if (sessionReadDelayMs > 0 && request.url.encodedPath.startsWith("/api/sessions/")) Thread.sleep(sessionReadDelayMs)
+            if (restDelayMs > 0) Thread.sleep(restDelayMs.toLong())
             check(request.url.host == "ui-fixture.invalid") { "UI fixture may not access a real host" }
             if (request.url.encodedPath in setOf("/api/fs/download", "/api/files/download", "/api/file/raw")) {
                 val path = request.url.queryParameter("path").orEmpty()

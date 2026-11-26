@@ -16,6 +16,10 @@ import kotlinx.coroutines.flow.*
 private const val SERVER_HEALTH_KEY = "settings:health"
 private const val SERVER_UPDATE_KEY = "settings:update-check"
 private const val SERVER_BACKUPS_KEY = "settings:backups"
+/** One profile's last-read detail, so its page can open from that copy while the refresh runs. */
+internal fun profileBotCacheKey(profile: String) = "settings:bot:$profile"
+private fun botCacheValue(bot: NativeBot) = json("profile" to bot.profile, "title" to bot.title, "description" to bot.description,
+    "soul" to bot.soul, "provider" to bot.provider, "model" to bot.model)
 
 /** Shown when the model Hermes has is no longer the one a model draft was made from: the draft is kept, the new base is shown, nothing is saved. */
 internal const val MODEL_CHANGED_ELSEWHERE = "The model changed elsewhere. Review it and save again."
@@ -336,7 +340,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
     }
     fun skillSearch(value: String) { _skills.update { it.copy(search = value) } }
     fun skillDraft(value: String) { _skills.update { it.copy(draft = value) }; draftChanged() }
-    fun skillEdit(editing: Boolean) { if (!_skills.value.saving && (!editing || !_skills.value.loading && _skills.value.content != null)) { _skills.update { it.copy(editing = editing, draft = if (editing) it.content?.content.orEmpty() else "", error = null) }; draftChanged() } }
+    fun skillEdit(editing: Boolean) { if (!_skills.value.saving && (!editing || _skills.value.content != null)) { _skills.update { it.copy(editing = editing, draft = if (editing) it.content?.content.orEmpty() else "", error = null) }; draftChanged() } }
     fun closeSkill() { if (!_skills.value.saving) { skillJob?.cancel(); _skills.update { it.copy(selected = null, content = null, editing = false, draft = "", loading = false, error = null) }; draftChanged() } }
     /** The switch moves at once. Hermes confirms in the background (toggle reads the list back to check it, and that list is the refresh); a failure puts the switch back. */
     fun toggleSkill(skill: NativeSkill, enabled: Boolean) {
@@ -382,7 +386,8 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 val profile = mapOf("profile" to c.auth.profile)
                 val status = c.nativeGet("/api/memory", profile)
                 val notes = c.nativeGet("/api/plugins/beacon/memory/documents", profile)
-                val result = NativeMemoryState.parse(c.scope.key, status, notes)
+                // Notes can be long: parse them off the frame, then publish the ready state.
+                val result = withContext(Dispatchers.Default) { NativeMemoryState.parse(c.scope.key, status, notes) }
                 prepareMarkdown(result.documents.flatMap { memoryEntries(it.content) }) { current(active, revision) }
                 if (current(active, revision)) {
                     if (_memory.value.editing.isBlank()) { _memory.value = result; memoryAt = System.currentTimeMillis() }
@@ -395,11 +400,12 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         }
     }
     fun editMemory(target: String) {
-        if (_memory.value.saving || target.isNotBlank() && (_memory.value.loading || client() == null)) return
+        if (_memory.value.saving || target.isNotBlank() && client() == null) return
         val state = _memory.value
         val document = state.documents.firstOrNull { it.target == target }
         if (document != null) { memoryJob?.cancel(); memoryAt = 0L }
-        _memory.value = state.copy(editing = document?.target.orEmpty(), draft = document?.content.orEmpty(), error = "", message = "")
+        // The quiet read is what this edit supersedes; its cancelled job must not leave its spinner over the draft.
+        _memory.value = state.copy(loading = false, editing = document?.target.orEmpty(), draft = document?.content.orEmpty(), error = "", message = "")
         draftChanged()
         if (target.isBlank() && memoryAt == 0L) loadMemory(force = false)
     }
@@ -633,11 +639,14 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
         val row = c.nativeGet("/api/profiles").rows("profiles").firstOrNull { it.string("name") == profile } ?: throw ApiFailure(404, "Bot not found")
         return NativeBot.fromNative(row, c.nativeGet("/api/profiles/$profile/soul").string("content"))
     }
-    fun openBot(profile: String): Job? {
+    fun openBot(profile: String, preview: NativeBot? = null): Job? {
         val active = client() ?: return null
         val revision = bindingRevision
         if (_bots.value.saving || _bots.value.profiles.none { it.profile == profile }) return null
-        botJob?.cancel(); _bots.update { it.copy(loading = true, selected = null, editing = false, error = "", notice = "", unconfirmedModel = null) }; _botModels.value = emptyList()
+        botJob?.cancel()
+        val keeping = _bots.value.selected?.takeIf { it.profile == profile }
+        _bots.update { it.copy(loading = true, selected = keeping ?: preview, editing = false, error = "", notice = "", unconfirmedModel = null) }
+        if (keeping == null) _botModels.value = emptyList()
         botJob = jobs.launch {
             val c = active.detached()
             try {
@@ -645,7 +654,10 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 if (!current(active, revision)) return@launch
                 c.bindProfile(profile)
                 val bot = nativeBot(c, profile)
-                if (current(active, revision)) _bots.update { it.copy(selected = bot) }
+                if (current(active, revision)) {
+                    _bots.update { it.copy(selected = bot) }
+                    cacheAttempt { screens?.set(c.scope, profileBotCacheKey(profile), botCacheValue(bot)) }
+                }
                 val options = c.nativeGet("/api/model/options", mapOf("profile" to profile, "include_unconfigured" to "false"))
                 val choices = options.rows("providers").flatMap { row -> row.optJSONArray("models")?.strings().orEmpty().map { row.string("slug") to it } }.distinct()
                 if (current(active, revision) && _bots.value.selected?.profile == profile) { _botModels.value = choices; _bots.update { it.copy(loading = false) } }
@@ -661,7 +673,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
             state.copy(selected = bot.copy(description = description ?: bot.description, soul = soul ?: bot.soul)) } ?: state }
     }
     fun closeBot() { if (!_bots.value.saving) { botJob?.cancel(); _bots.update { it.copy(selected = null, editing = false, loading = false, unconfirmedModel = null) }; draftChanged() } }
-    fun editBot(editing: Boolean) { if (!_bots.value.saving && (!editing || !_bots.value.loading && _bots.value.selected != null)) { _bots.update { it.copy(editing = editing, draftProvider = it.selected?.provider.orEmpty(), draftModel = it.selected?.model.orEmpty(), error = "") }; draftChanged() } }
+    fun editBot(editing: Boolean) { if (!_bots.value.saving && (!editing || _bots.value.selected != null)) { _bots.update { it.copy(editing = editing, draftProvider = it.selected?.provider.orEmpty(), draftModel = it.selected?.model.orEmpty(), error = "") }; draftChanged() } }
     fun botDraft(provider: String, model: String) { _bots.update { it.copy(draftProvider = provider, draftModel = model) }; draftChanged() }
     fun saveBot() {
         val active = client() ?: return
@@ -695,6 +707,7 @@ class NativePhoneSettings(private val jobs: CoroutineScope, private val saved: S
                 if (current(active, revision)) {
                     _bots.update { it.copy(selected = confirmed, saving = false, editing = false, unconfirmedModel = if (stored == null) Triple(confirmed.profile, confirmed.provider, confirmed.model) else null,
                         notice = if (stored == null) MODEL_SAVED_UNCONFIRMED else "Default model saved for new chats.") }
+                    cacheAttempt { screens?.set(c.scope, profileBotCacheKey(bot.profile), botCacheValue(confirmed)) }
                     draftChanged()
                 }
             } catch (e: CancellationException) { throw e }

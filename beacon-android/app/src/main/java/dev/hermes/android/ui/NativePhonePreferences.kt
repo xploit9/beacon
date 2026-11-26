@@ -54,6 +54,8 @@ import kotlinx.coroutines.delay
     }
     BackHandler(onBack = back)
     LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client, target, profileClient) {
+        // The account row may not have been opened yet on a cold process; bind must see its saved copy before it seeds the page.
+        savedOwner?.let { vm.screens.open(it) }
         editor.bind()
         if (page == "Skills") editor.loadSkills(force = false) else editor.loadMemory(force = false)
     }
@@ -88,10 +90,13 @@ import kotlinx.coroutines.delay
 @Composable internal fun NativeServerPage(vm: BeaconViewModel, page: String) {
     val ui by vm.ui.collectAsStateWithLifecycle()
     val state by vm.phoneSettings.server.collectAsStateWithLifecycle()
+    val hostScope = vm.client?.scope ?: vm.restoredScope()
     var confirm by remember { mutableStateOf(false) }
     var reviewUnknown by remember { mutableStateOf(false) }
     val callBlocksUpdate = uiText("End the current call before updating Hermes.")
-    LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client) {
+    LaunchedEffect(page, ui.origin, ui.owner, ui.profile, ui.connected, vm.client, hostScope) {
+        // A cold process opens the saved row first, so bind can seed this page before its refresh starts.
+        hostScope?.let { vm.screens.open(it) }
         vm.phoneSettings.bind(); vm.phoneSettings.loadServer(page)
         while (page == "Server updates" && ui.connected) { delay(15_000); vm.phoneSettings.resumeServerUpdate() }
     }
@@ -145,7 +150,11 @@ import kotlinx.coroutines.delay
     }
     val back = { leave { if (state.editing) vm.phoneSettings.editBot(false) else if (state.selected != null) vm.closeSettingsProfile() else vm.backFromSettings() } }
     BackHandler(onBack = back)
-    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) { vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles") }
+    LaunchedEffect(ui.origin, ui.owner, ui.profile, ui.connected, vm.client) {
+        // A cold process opens the saved row first: the list and the open profile's cached detail then seed this frame.
+        savedBotsScope?.let { vm.screens.open(it) }
+        vm.phoneSettings.bind(); vm.phoneSettings.loadBots(); if (ui.connected) vm.ensureLoaded("navigation-profiles", "/api/profiles")
+    }
     // "Profile settings" on a bot in Bot Mode lands here with that profile asked for: show it once the list has loaded.
     LaunchedEffect(admin.open, state.loading, state.profiles) {
         if (admin.open.isNotBlank() && !state.loading && state.profiles.any { it.profile == admin.open }) { val profile = admin.open; vm.profileAdmin.opened(); vm.inspectSettingsProfile(profile) }
@@ -159,10 +168,10 @@ import kotlinx.coroutines.delay
     LaunchedEffect(state.profiles, state.loading) { state.selected?.profile?.let { open -> if (!state.loading && state.profiles.isNotEmpty() && state.profiles.none { it.profile == open }) vm.closeSettingsProfile() } }
     Column(Modifier.fillMaxSize()) {
         Header(uiText("Profiles"), back = back, menu = LocalOpenNavigationMenu.current)
-        NativeBotSettings(if (selecting) state.copy(loading = true) else state, { vm.inspectSettingsProfile(it) }, { leave(vm::closeSettingsProfile) }, { vm.phoneSettings.editBot(true) },
+        NativeBotSettings(if (selecting) state.copy(loading = true) else state, { profile -> vm.inspectSettingsProfile(profile, vm.cachedProfileBot(profile)) }, { leave(vm::closeSettingsProfile) }, { vm.phoneSettings.editBot(true) },
             vm.phoneSettings::botDraft, vm.phoneSettings::saveBot, { leave { vm.phoneSettings.editBot(false) } },
             onSettings = { profile, page -> leave { if (state.editing) vm.phoneSettings.editBot(false); vm.openSettingsProfileTool(profile, page) } },
-            onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile) } ?: vm.phoneSettings.loadBots() }, models = models,
+            onRefresh = { state.selected?.let { vm.phoneSettings.openBot(it.profile, vm.cachedProfileBot(it.profile)) } ?: vm.phoneSettings.loadBots() }, models = models,
             onEditDescription = { vm.profileAdmin.clearError(); describing = true }, onEditInstructions = { vm.profileAdmin.clearError(); instructing = true },
             profileLabel = { profile -> profileDisplayLabel(profile, profileRows, profileLoading) },
             onNewProfile = { creating = true }, canDelete = vm::canDeleteProfile, onDelete = { deleting = it },

@@ -84,6 +84,10 @@ def large(harness, monkeypatch, tmp_path):
     monkeypatch.setattr(voice, 'history', lambda *args: [{'role': 'user', 'content': 'Typed just before the call'}])
     monkeypatch.setattr(voice, 'load_recall_provider', forbidden)
     monkeypatch.setattr(voice, 'provider_tool_schemas', forbidden)
+    # 1.2.4 (voice-tools): the call entry starts the profile's warm-up and waits briefly for one already running,
+    # so that a call opened seconds after a restart still declares its tools. This fixture forbids discovery, so
+    # the warm-up is stubbed: it starts nothing, and the entry therefore declares nothing.
+    monkeypatch.setattr(voice, 'prefetch_tools', lambda profile: False)
     (root / 'memories').mkdir(exist_ok=True)
     (root / 'memories' / 'USER.md').write_text("Owner's name is Maya", encoding='utf-8')
     (root / 'config.yaml').write_text('memory:\n  user_profile_enabled: true\n', encoding='utf-8')

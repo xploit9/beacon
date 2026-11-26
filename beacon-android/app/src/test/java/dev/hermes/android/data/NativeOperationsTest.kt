@@ -13,7 +13,7 @@ import org.junit.Test
 
 class NativeOperationsTest {
     /** A Hermes whose chat has no agent until `approval.pending` starts it, like a lazily resumed runtime. */
-    internal class Fixture(val refuseBuild: Boolean = false, val canonical: Boolean = false) : WebSocket.Factory {
+    internal class Fixture(val refuseBuild: Boolean = false, val canonical: Boolean = false, val profile: String = "default") : WebSocket.Factory {
         val methods = java.util.concurrent.CopyOnWriteArrayList<String>()
         val calls = java.util.concurrent.CopyOnWriteArrayList<JSONObject>()
         val httpRequests = java.util.concurrent.CopyOnWriteArrayList<Request>()
@@ -154,7 +154,7 @@ class NativeOperationsTest {
                         "session.resume" -> snapshotOverride?.copy() ?: json("session_id" to if (canonical) "stored-a" else "runtime-a", "session_key" to "stored-a", "stored_session_id" to "stored-a", "message_count" to messages.length(), "messages" to JSONArray(messages.toString()),
                             // Hermes reports the chat's YOLO state only from a built agent.
                             "info" to json("model" to model, "provider" to "fixture", "lazy" to !agentBuilt).apply {
-                                if (canonical) put("profile_name", "default").put("profile_id", "synthetic-profile")
+                                if (canonical) put("profile_name", profile).put("profile_id", "synthetic-profile")
                                 if (agentBuilt) put("yolo", yolo)
                             }).apply {
                                 if (canonical) put("revision", revision).put("execution_generation", generation).put("running", running).put("pending", pending).put("prompts", prompts)

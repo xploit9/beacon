@@ -770,6 +770,41 @@ def test_a_cold_tool_list_declares_nothing_and_never_builds_one_in_the_context(h
     assert context['tool_declarations'] == [] and context['tool_declarations_complete'] is False
 
 
+def test_the_call_entry_waits_for_a_prefetch_started_after_a_restart(harness, monkeypatch):
+    """25 Nov: a call opened seconds after Hermes restarted declared nothing because the prefetch was still running.
+    """
+    api, client, _, root, _ = harness
+    voice = api.voice_context
+    monkeypatch.setattr(voice, 'scoped', lambda profile, fn, **kwargs: fn(root))
+    monkeypatch.setattr(voice, 'personality', lambda root: 'Warm and brief.')
+    monkeypatch.setattr(voice, 'builtin_memory', lambda root, cfg: '')
+    monkeypatch.setattr(voice, 'history', lambda *args: [])
+    module = sys.modules['beacon_gateway_tools']
+    with module.CATALOG_LOCK:
+        module.CATALOG_CACHE.pop(('default', 'synthetic-key'), None)
+        module.LAST_CATALOG.pop('default', None)
+    with voice.TOOLS_LOCK:
+        voice.TOOLS_READY.pop('default', None)
+        voice.TOOLS_WARMING.discard('default')
+
+    def slow_prefetch(profile):
+        with voice.TOOLS_LOCK: voice.TOOLS_WARMING.add(profile)
+        def build():
+            time.sleep(0.15)
+            rows = [row('read_file', True, 'hermes'), row('mcp_notes_search', True, server='notes')]
+            warm(api, profile, rows)
+            with voice.TOOLS_LOCK:
+                voice.TOOLS_READY[profile] = (voice._clock(), 'Hermes: file (1): read file')
+                voice.TOOLS_WARMING.discard(profile)
+        threading.Thread(target=build, name='synthetic-call-prefetch', daemon=True).start()
+        return True
+
+    monkeypatch.setattr(voice, 'prefetch_tools', slow_prefetch)
+    value = client.get(f'{BASE}/voice/context', params={'session': 'native-stored'}).json()
+    assert [item['name'] for item in value['tool_declarations']] == ['read_file', 'mcp_notes_search']
+    assert 'read file' in value['tool_catalogue']
+
+
 def test_context_declarations_budget(harness, monkeypatch):
     api, client, _, root, _ = harness
     voice = api.voice_context

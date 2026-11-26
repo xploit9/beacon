@@ -194,8 +194,8 @@ class QueueBoxUiTest {
         compose.waitUntil(15_000) { vm.chat.value.liveText == "Existing live output" }
         compose.onNodeWithText("Change the reply…").assertExists()
         compose.onNodeWithTag("message-input").performTextInput("Be concise")
-        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Send now")
-        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send now").performClick()
+        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Steer")
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Steer").performClick()
         compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
         assertEquals("Be concise", fixture.requests.single { it.string("method") == "session.steer" }.getJSONObject("params").string("text"))
         compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.kind == "steer" }
@@ -738,5 +738,40 @@ class QueueBoxUiTest {
         compose.onNodeWithText("Open a chat first.").assertExists()
         compose.mainClock.advanceTimeBy(6_000)
         compose.onAllNodesWithText("Open a chat first.").assertCountEquals(0)
+    }
+
+    /**
+     * R15: a steer sent hours earlier came back later as a stray "Send now" bubble under a newer message, although Hermes saved it in its own
+     * turn. The shape is built here with synthetic words and times: an old steer, its saved steer row before a much later prompt.
+     */
+    @Test fun anOldSteerWhoseRowIsSavedShowsOnceInItsOwnTurnAndNeverAtTheBottom() = withFixture(paintBackground = true) { vm, fixture ->
+        val steerAt = 1_780_000_000_000L
+        val newer = 1_780_007_450_000L
+        val oldWords = "use the other browser window instead"
+        // The chat as Hermes saved it: the steer row sits in the turn it changed, and a later prompt follows that turn.
+        // Hermes' history projection already hands a steer row its own words (tui_gateway/session_history._history_to_messages), never the model-facing wrapper.
+        fixture.sessions.getValue("chat-a").put("messages", org.json.JSONArray(listOf(
+            json("row_id" to 901, "role" to "user", "text" to "Fix the stray section", "timestamp" to (steerAt - 60_000) / 1000.0),
+            json("row_id" to 902, "role" to "assistant", "text" to "Looking at the file.", "timestamp" to (steerAt - 30_000) / 1000.0),
+            json("row_id" to 903, "role" to "user", "display_kind" to "steer", "text" to oldWords, "timestamp" to steerAt / 1000.0),
+            json("row_id" to 904, "role" to "assistant", "text" to "Got it, a different tool.", "timestamp" to (steerAt + 1_000) / 1000.0),
+            json("row_id" to 905, "role" to "user", "text" to "continue", "timestamp" to newer / 1000.0),
+            json("row_id" to 906, "role" to "assistant", "text" to "Continuing.", "timestamp" to (newer + 1_000) / 1000.0),
+        )))
+        // The phone still holds its own accepted copy of that older steer: no row, not sent.
+        val stale = QueuedMessage(oldWords, id = "stale-steer", createdAt = steerAt, state = "accepted", kind = "steer")
+        runBlocking { app.cache.write(fixture.scope.session("chat-a"), "draft", dev.hermes.android.core.Draft(queued = listOf(stale)).encode(), true) }
+        compose.runOnIdle { vm.selectSession("chat-a") }
+        compose.waitUntil(15_000) { vm.chat.value.messages.any { it.id == "903" } && vm.chat.value.queued.none { it.id == "stale-steer" && it.rowId.isBlank() } }
+        compose.waitForIdle()
+        // The saved row is in the chat, in its own turn, and the phone's copy is retired by it.
+        compose.onNodeWithTag("message-row:903", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("message-row:905", useUnmergedTree = true).assertExists()
+        compose.onAllNodesWithTag("queued-message:stale-steer", useUnmergedTree = true).assertCountEquals(0)
+        compose.onAllNodesWithTag("queue-box", useUnmergedTree = true).assertCountEquals(0)
+        val shown = chatTimelineMessages(vm.chat.value.messages, vm.chat.value.queued)
+        assertEquals("each saved row is drawn once", 1, shown.count { it.id == "903" })
+        assertEquals("and in its own turn, before the later prompt", listOf("901", "902", "903", "904", "905", "906"), shown.map { it.id })
+        captureShot("r15-old-steer-paired")
     }
 }

@@ -846,6 +846,17 @@ def ready_tools(profile):
     return hit[1] if hit and _clock()-hit[0]<TOOLS_READY_SECONDS else ''
 
 
+def await_tools(profile, timeout=1.5):
+    """Wait briefly for the prefetch this request just started, so a call opened seconds after a Hermes restart still
+    carries the profile's tool names instead of an empty declaration block. A slow MCP scan still answers without them;
+    the model keeps discover_tools either way."""
+    deadline=time.monotonic()+max(0.0,float(timeout))
+    while True:
+        with TOOLS_LOCK: warming=profile in TOOLS_WARMING
+        if not warming or time.monotonic()>=deadline: return ready_tools(profile)
+        time.sleep(0.05)
+
+
 def recall_capability(root, cfg, name, readable):
     # Admission reads only the built-in snapshot. Provider discovery happens during actual use.
     from tools.memory_tool import get_builtin_memory_store_flags
@@ -985,5 +996,15 @@ def recall(owner,provider,profile,stored,query,call_id=None,principal=None):
         return bounded_memory_lookup(profile,run)
     except Exception as exc:
         code='memory_lookup_busy' if isinstance(exc,BlockingIOError) else 'memory_lookup_timeout' if isinstance(exc,TimeoutError) else 'memory_lookup_failed'
+        # The configured add-on stays best effort: when it is stuck (not when it raised a real error) Hermes' own curated
+        # snapshot can still answer this read, as a native turn falls back to built-in memory. An empty or disabled store,
+        # and a provider that failed, stay unavailable rather than pretending the store answered.
+        fallback=''
+        if code in ('memory_lookup_busy','memory_lookup_timeout'):
+            try: fallback=scoped(profile,lambda root: clip(builtin_memory(root,config(root)),8000).strip())
+            except Exception: fallback=''
+        if fallback:
+            return {'status':'completed','summary':fallback,'sources':[{'title':'Native curated memory','ref':'native-memory:builtin'}],
+                    'detail':code,'observed_at':int(time.time())}
         return {'status':'unavailable','error_code':code,
                 'summary':'Memory lookup failed.','sources':[],'observed_at':int(time.time())}

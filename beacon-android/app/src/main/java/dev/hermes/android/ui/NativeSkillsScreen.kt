@@ -91,7 +91,8 @@ internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<N
 ) {
     // Read-only (saved copy, Hermes not reached): every control waits like it does for a save, with no progress bar.
     val working = state.loading || state.saving
-    val busy = working || readOnly
+    // A background read is not a save: the switches and rows it refreshes stay usable under the thin bar.
+    val busy = state.saving || readOnly
     val enableLabel = uiText("Enable")
     var filter by rememberSaveable(state.profile) { mutableStateOf("all") }
     val selected = state.selected
@@ -104,7 +105,7 @@ internal fun skillSections(skills: List<NativeSkill>): List<Pair<String?, List<N
         if (state.saving) item(key = "saving") { SettingsStatusPill(SettingsStatus.Working, uiText("Saving skill…")) }
         // While instructions are being edited, a failed save shows beside the Save button, where the owner is looking.
         val editingInstructions = selected != null && state.editing && state.content != null
-        state.error?.takeUnless { editingInstructions }?.let { error -> item(key = "error") { SettingsSection { SettingsErrorRow(uiText(error), if (busy) null else onRetry, uiText("Retry")) } } }
+        state.error?.takeUnless { editingInstructions }?.let { error -> item(key = "error") { SettingsSection { SettingsErrorRow(uiText(error), if (working || readOnly) null else onRetry, uiText("Retry")) } } }
         if (selected == null) skillList(state, filter, { filter = it }, busy, enableLabel, onSearch, onOpen, onToggle, hasSavedContent)
         else skillDetail(selected, state, busy, enableLabel, onToggle, onEdit, onDraft, onSave, renderInstructions)
     }

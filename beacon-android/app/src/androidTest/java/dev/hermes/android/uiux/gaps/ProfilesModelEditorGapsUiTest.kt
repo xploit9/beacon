@@ -49,9 +49,10 @@ class ProfilesModelEditorGapsUiTest {
         compose.onNodeWithTag("profile-retry").assertIsDisplayed()
     }
 
-    @Test fun whileTheListReloadsTheRowsAreOffUnderAThinBar() {
+    /** A quiet refresh leaves the list tappable; only a save blocks its own row. */
+    @Test fun whileTheListReloadsTheRowsStayTappableUnderAThinBar() {
         show(NativeBotsState(profiles = profiles, error = "Synthetic profiles failure", loading = true))
-        compose.onNodeWithTag("profile-open:default").assertIsNotEnabled()
+        compose.onNodeWithTag("profile-open:default").assertIsEnabled()
         compose.onNodeWithTag("settings-refreshing").assertExists()
     }
 

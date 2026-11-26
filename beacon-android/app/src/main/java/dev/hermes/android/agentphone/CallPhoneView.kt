@@ -45,13 +45,25 @@ import dev.hermes.android.voice.BeaconCallService
 import dev.hermes.android.voice.CallController
 import dev.hermes.android.voice.CallState
 import dev.hermes.android.voice.pendingApprovalFor
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withTimeoutOrNull
 
-/** Its own secure window keeps the phone out of recordings, including a screen shared during the call. */
-@Composable internal fun CallPhoneView(client: BeaconClient, call: CallState, actions: CallController, onDismiss: () -> Unit) {
+/** The call's account, once its service has taken the call: it can still be attaching when the owner taps the phone button. */
+internal suspend fun callHandOffClient(waitMs: Long = 15_000, resolve: suspend () -> BeaconClient?): BeaconClient? =
+    withTimeoutOrNull(waitMs) {
+        var found: BeaconClient? = null
+        while (found == null) { found = resolve(); if (found == null) delay(250) }
+        found
+    }
+
+/** Its own secure window keeps the phone out of recordings, including a screen shared during the call. [client] is asked for this
+ *  call's account when the picture first opens (and again on a retry): the call screen's button stays usable while the call's service
+ *  is still taking it over, instead of going dead for the rest of the call. */
+@Composable internal fun CallPhoneView(client: suspend () -> BeaconClient?, call: CallState, actions: CallController, onDismiss: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val decoder = remember(client) { FrameDecoder() }
-    val session = remember(client) { ViewSession(BeaconViewTransport(client, watching = true), decoder, scope) }
+    val decoder = remember { FrameDecoder() }
+    val session = remember { ViewSession(LazyViewTransport(watching = true, client), decoder, scope) }
     DisposableEffect(session) { onDispose { session.dispose(); decoder.close() } }
     LifecycleStartEffect(session) {
         session.open()
@@ -63,7 +75,7 @@ import dev.hermes.android.voice.pendingApprovalFor
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false, securePolicy = SecureFlagPolicy.SecureOn)) {
         Surface(Modifier.fillMaxSize(), color = CallBackground) {
             CallPhonePanel(call, actions::mute, { actions.hangup(); onDismiss() }, { actions.camera(false) }, actions::stopScreen,
-                sendText = { actions.sendText(call.callId, it) }, card = { CallApprovalOverPhone(call, client.scope, actions) }) {
+                sendText = { actions.sendText(call.callId, it) }, card = { CallApprovalOverPhone(call, call.conversationScope, actions) }) {
                 AgentPhoneViewScreen(ui, frame, LocalAssistantName.current,
                     ViewActions(done = onDismiss, close = onDismiss, retry = session::retry, turnOn = session::turnOn),
                     stageColor = CallBackground,

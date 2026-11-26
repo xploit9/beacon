@@ -2,6 +2,9 @@
 package dev.hermes.android.ui
 
 import dev.hermes.android.voice.failedCallConversation
+import dev.hermes.android.data.nativeSessionFlag
+import dev.hermes.android.data.nativeSessionFlagOrNull
+import dev.hermes.android.data.ApiFailure
 
 
 import android.Manifest
@@ -73,6 +76,7 @@ import androidx.compose.ui.semantics.onClick
 import androidx.compose.ui.semantics.onLongClick
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.animateScrollBy
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.CustomAccessibilityAction
 import androidx.compose.ui.semantics.LiveRegionMode
@@ -111,7 +115,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -149,6 +156,40 @@ internal suspend fun fetchBackgroundActivity(source: BeaconClient, profile: Stri
 } catch (error: Exception) {
     if (error is CancellationException) throw error
     BackgroundActivitySummary(available = false)
+}
+
+/** What one Stop produced: the refreshed sheet when Hermes accepted it, or the words to show when it did not. */
+internal data class BackgroundStopOutcome(val failure: String = "", val activity: BackgroundActivitySummary? = null)
+
+/**
+ * Stops one row through the RPC that owns it: `process.kill` for a process this chat owns, or the child's
+ * `subagent.interrupt`. The id is the one `process.list` / `subagent.list` gave this chat, never a PID.
+ */
+internal suspend fun stopBackgroundActivity(source: BeaconClient, profile: String, storedSessionId: String, item: BackgroundActivityItem): BackgroundStopOutcome {
+    if (source.scope.profile != profile || storedSessionId.isBlank()) return BackgroundStopOutcome(backgroundStopFailureMessage(item))
+    val scope = source.scope
+    return try {
+        withTimeoutOrNull(30_000L) {
+            val runtime = backgroundActivityRuntime(optionalBackgroundRead { source.nativeRpc("session.active_list", JSONObject()) }, storedSessionId)
+                ?: return@withTimeoutOrNull BackgroundStopOutcome(backgroundStopFailureMessage(item))
+            val request = backgroundStopRequest(item, runtime, profile)
+                ?: return@withTimeoutOrNull BackgroundStopOutcome("")
+            val result = try {
+                source.nativeRpc(request.method, request.params)
+            } catch (error: ApiFailure) {
+                // 4044 (legacy) or 4001/process_not_found (canonical) is Hermes saying this id is no longer one of the chat's live
+                // processes: it finished between polls.
+                if (error.status == 4044 || error.status == 4001 && request.method == "process.kill") null else throw error
+            }
+            if (result != null && !backgroundStopAccepted(request.method, result) && !backgroundStopAlreadyGone(request.method, result))
+                return@withTimeoutOrNull BackgroundStopOutcome(backgroundStopFailureMessage(item))
+            val refreshed = fetchBackgroundActivity(source, profile, storedSessionId)
+            BackgroundStopOutcome(activity = refreshed.takeIf { source.scope == scope })
+        } ?: BackgroundStopOutcome(backgroundStopFailureMessage(item))
+    } catch (error: Exception) {
+        if (error is CancellationException) throw error
+        BackgroundStopOutcome(backgroundStopFailureMessage(item))
+    }
 }
 
 internal suspend fun pollBackgroundActivity(
@@ -566,7 +607,7 @@ internal fun failureShownUnder(newest: dev.hermes.android.Message?, status: Stri
                 ChatListRow(
                     id = id, title = row.string("title").ifBlank { uiText("Untitled chat") },
                     preview = if (caption.isBlank()) line else if (line.isBlank()) caption else "$caption · $line",
-                    time = time, pinned = row.optBoolean("pinned"), thread = thread,
+                    time = time, pinned = nativeSessionFlag(row, "pinned"), thread = thread,
                     unread = chatUnread(activity, glance, glances.base[rowProfile] ?: Long.MAX_VALUE, open = openHere && ui.tab in setOf("Chat", "Beacon")),
                     streaming = row.string("active_stream_id").isNotBlank(), selected = openHere, cutOff = "$rowProfile:$id" in ui.lostChats,
                     modifier = Modifier.semantics { selected = openHere }.combinedClickable(onLongClickLabel = uiText("Chat actions"), onLongClick = { menuFor = rowKey }) { vm.tab("Chat"); vm.openConversation(row) }.testTag("history-row:$rowTag"),
@@ -647,11 +688,17 @@ internal fun transcriptStatusShown(status: String, streaming: Boolean, connected
 internal val ChatStrings get() = ToolOutcome.entries.map(::toolOutcomeLabel) + friendlyToolNames.values + listOf("typing…", "thinking…", "On a call",
     // The live status row and the line a turn ends on (TURN-121).
     "Thinking", "Responding", "Finishing", "Working", dev.hermes.android.TURN_STOPPED, dev.hermes.android.TURN_RESTARTED,
-    "Send now", "Queue", "Run command", "Not sent", "Not confirmed yet", "Delivered", "Answered", "Change the reply…", "Queue a message…",
+    "Steer", "Queue", "Run command", "Not sent", "Not confirmed yet", "Delivered", "Answered", "Change the reply…", "Queue a message…",
     // What Send in the queue box says when it cannot start (they reach the snackbar through a variable).
     "Tap your message to check it.", "Wait for the current reply first.", "Finish the call or answer the request first.", "Turn on", "Retry",
     // Why a box row was not sent (P2-14) and the live row while Hermes waits for the owner (P2-9).
     "Offline", "Upload failed", "Didn’t arrive", "Its chat was deleted", "Waiting for your answer")
+
+/** One transcript follow request: an unmeasured tail goes to its item, a measured tail moves by its distance to the bottom. */
+private sealed interface TranscriptFollow {
+    data class ToItem(val index: Int) : TranscriptFollow
+    data class By(val px: Float) : TranscriptFollow
+}
 
 private val WORKING_LINES = setOf("Working", "Thinking", "Responding", "Finishing")
 /**
@@ -732,18 +779,62 @@ internal fun placeKeptReplies(shown: List<Message>, kept: List<Pair<Message, Str
         val words = sameWords(reply.text)
         // A copy kept by its place in the turn is judged by Hermes' ids and order when history arrives (keptRowsNotSaved), never by its words.
         val answered = !reply.id.startsWith(dev.hermes.android.KEPT_IN_TURN) && reply.text.isNotBlank() && (at + 1 until end).any { shown[it].role == "assistant" && shown[it].displayKind != "unconfirmed_reply" && sameWords(shown[it].text) == words }
-        if (!answered) before.getOrPut(end) { mutableListOf() } += reply
+        // The time of the turn it ends, for a copy an older build kept with none: its bubble says when it was said instead of showing no time at all.
+        if (!answered) before.getOrPut(end) { mutableListOf() } += (if (reply.recordedAt > 0) reply else reply.copy(recordedAt = keptReplyTime(shown, end)))
     }
     val out = ArrayList<Message>(shown.size + kept.size)
     shown.forEachIndexed { index, message -> before[index]?.let { out += it }; out += message }
     before[shown.size]?.let { out += it }
     val (placedUnbound, noPlace) = unbound.partition { it.id.startsWith(dev.hermes.android.KEPT_IN_TURN) }
-    val legacy = (savedRepliesOnce(noPlace, shown.filterNot { it.displayKind.startsWith("local_input") }) + placedUnbound).sortedBy { it.recordedAt.takeIf { at -> at > 0 } ?: Long.MAX_VALUE }
-    return dev.hermes.android.voice.interleaveCallMessages(out, legacy)
+    val legacyKept = savedRepliesOnce(noPlace, shown.filterNot { it.displayKind.startsWith("local_input") }) + placedUnbound
+    // A copy kept by an older build recorded no time, and sorting that to Long.MAX_VALUE put it under every later message (owner, 25 Nov). It goes back to
+    // the place it was said, timed by the message there, so it stays with its own turn and shows a time. A copy that recorded its time keeps today's order.
+    val (untimed, timed) = legacyKept.partition { it.recordedAt <= 0 }
+    return dev.hermes.android.voice.interleaveCallMessages(withUntimedKept(out, untimed), timed.sortedBy { it.recordedAt })
+}
+
+/**
+ * [shown] with the kept replies that recorded no time put back where they were said. A reply rebuilt from a saved row names that row in its id, and Hermes'
+ * row ids grow with time, so it goes where that row is (or would be) instead of below every newer message.
+ */
+private fun withUntimedKept(shown: List<Message>, untimed: List<Message>): List<Message> {
+    if (untimed.isEmpty()) return shown
+    val slots = Array(shown.size + 1) { mutableListOf<Message>() }
+    for (reply in untimed) {
+        val at = untimedKeptPlace(shown, reply)
+        slots[at] += reply.copy(recordedAt = keptReplyTime(shown, at))
+    }
+    val out = ArrayList<Message>(shown.size + untimed.size)
+    shown.forEachIndexed { index, message -> out += slots[index]; out += message }
+    out += slots[shown.size]
+    return out
+}
+
+/**
+ * Where a kept reply that recorded no time belongs among [shown]. A copy rebuilt from a saved row names that row, and Hermes' row ids grow with time, so it
+ * stays where that row is; one whose turn the history no longer shows keeps the end, where it is judged against the newest turn (the rule for a copy with no
+ * prompt row), so only a copy whose own turn is in the window moves.
+ */
+private fun untimedKeptPlace(shown: List<Message>, reply: Message): Int {
+    val row = reply.id.removePrefix(UNCONFIRMED_HISTORY).takeIf { reply.id.startsWith(UNCONFIRMED_HISTORY) }
+    val id = row?.toLongOrNull()?.takeIf { it > 0 }
+    if (row == null) return shown.size
+    shown.indexOfFirst { it.id == row }.takeIf { it >= 0 }?.let { return it }
+    if (id != null) shown.indexOfFirst { (it.id.toLongOrNull() ?: 0L) > id }.takeIf { it >= 0 }?.let { return it }
+    return shown.size
+}
+
+/** The time at [at] among [shown]: the nearest message before it that recorded one, else the nearest after it, else none. */
+private fun keptReplyTime(shown: List<Message>, at: Int): Long {
+    shown.subList(0, at.coerceAtMost(shown.size)).lastOrNull { it.recordedAt > 0 }?.let { return it.recordedAt }
+    return shown.drop(at.coerceAtLeast(0)).firstOrNull { it.recordedAt > 0 }?.recordedAt ?: 0L
 }
 
 /** Every stop copy Hermes writes as an interrupted turn's text starts so (agent/turn_recovery.py, turn_api_error.py, turn_empty_response.py, turn_recovery_autorecover.py). */
 private const val HERMES_STOP_COPY = "Operation interrupted"
+
+/** A kept reply rebuilt from a saved row Hermes' history no longer returns; its id names that row (mergeChatProjection). */
+private const val UNCONFIRMED_HISTORY = "unconfirmed-history:"
 
 /** Hermes keeps a photo the owner sends in its own upload folder: ".../native-inputs/<hash>/upload_<id>.<image ending>". Only such a path is ever fetched for a thumbnail. */
 private val ownUploadPath = Regex("""(?i)(?:^|[\\/])native-inputs[\\/][0-9a-f]{16,128}[\\/]upload_[A-Za-z0-9_-]{1,64}\.(?:png|jpe?g|webp|gif|heic|avif)$""")
@@ -803,6 +894,9 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     val assistantName = botChatName(bot.activeBot?.profile, bot.sessionId, openChat.sessionId, profiles) ?: LocalAssistantName.current
     CompositionLocalProvider(LocalAssistantName provides assistantName) { ChatScreenBody(vm, beacon, onComposerHeight, navigationBack, titleOverride, feedbackInsetPx) }
 }
+
+/** Which body the chat column is showing; the transcript's list state is hoisted, so it survives either swap. */
+private enum class ChatStage { Conversation, Call, CallFailure }
 
 @Composable private fun ChatScreenBody(vm: BeaconViewModel, beacon: Boolean, onComposerHeight: (Int) -> Unit, navigationBack: (() -> Unit)?, titleOverride: String?, feedbackInsetPx: Int) {
     val ui by vm.ui.collectAsStateWithLifecycle()
@@ -1086,6 +1180,10 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
         val start = initialConversationPosition(messageIds, chat.anchorId, chat.anchor, chat.anchorOffset)
         rememberLazyListState(initialFirstVisibleItemIndex = start.first, initialFirstVisibleItemScrollOffset = start.second)
     }
+    DisposableEffect(list) {
+        TranscriptScrollProbe.state = list
+        onDispose { if (TranscriptScrollProbe.state === list) TranscriptScrollProbe.state = null }
+    }
     val motionEnabled = rememberNativeMotionEnabled()
     val sphereMotionEnabled = motionEnabled && settings.optBoolean("animate_background", true)
     val sphereStreaming = chat.streamId.isNotBlank()
@@ -1238,23 +1336,43 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                     anchorRestored = true
                 }
             }
-            LaunchedEffect(anchorRestored, follow, search, chat.messages.size, visibleMessages.size, chat.liveText, chat.callMessages, chat.queued.size) {
-                if (anchorRestored && follow && search.isBlank() && (chat.messages.isNotEmpty() || chat.queued.isNotEmpty())) {
+            // Re-arm on the empty-to-content transition only: a chat that composes empty has no collector until its first
+            // row or word arrives, while keying on the text or counts restarted the follow animation on every token.
+            val transcriptHasContent = chat.messages.isNotEmpty() || chat.liveText.isNotBlank() || chat.queued.isNotEmpty()
+            LaunchedEffect(anchorRestored, follow, search, transcriptHasContent) {
+                if (anchorRestored && follow && search.isBlank() && transcriptHasContent) {
                     if (chat.anchor > 0 || chat.anchorOffset > 0 || chat.anchorId.isNotBlank()) vm.anchor(0, 0, "")
                     // Markdown, media and fold layouts can grow after the first measurement.
                     // Keep following their measured tail, rather than only the incoming text/count.
+                    // One animation at a time; while it runs, only the newest tail request is kept. Starting a new animation on
+                    // every token cancelled the last one and snapped the list, which was the bump (owner, 25 Nov). A measured tail
+                    // moves by the small distance to its bottom, so the status row stays visible without a long jump.
+                    val requests = MutableSharedFlow<TranscriptFollow>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+                    launch { requests.collect { request -> when (request) {
+                        is TranscriptFollow.ToItem -> {
+                            // A far new tail moves in bounded steps; the measured tail's small bottom delta follows.
+                            var tries = 0
+                            while (tries++ < 30 && list.canScrollForward && list.layoutInfo.visibleItemsInfo.none { it.index == request.index })
+                                list.animateScrollBy(160f, tween(80))
+                        }
+                        is TranscriptFollow.By -> if (request.px > .5f) list.animateScrollBy(request.px, tween(120))
+                    } } }
                     snapshotFlow {
                         val layout = list.layoutInfo
                         // Rows shown, not raw messages: folded tool results and merged tool rounds take no row of their own.
                         if (list.canScrollForward && layout.totalItemsCount >= visibleMessages.size) {
                             val target = (layout.totalItemsCount - 1).coerceAtLeast(0)
-                            val available = (layout.viewportEndOffset - layout.viewportStartOffset - layout.beforeContentPadding - layout.afterContentPadding).coerceAtLeast(1)
-                            val offset = ((layout.visibleItemsInfo.firstOrNull { it.index == target }?.size ?: 0) - available).coerceAtLeast(0)
-                            target to offset
+                            val tail = layout.visibleItemsInfo.firstOrNull { it.index == target }
+                            if (tail == null) TranscriptFollow.ToItem(target)
+                            else {
+                                val visibleBottom = layout.viewportEndOffset - layout.afterContentPadding
+                                val delta = (tail.offset + tail.size - visibleBottom).coerceAtLeast(0)
+                                delta.takeIf { it > 0 }?.let { TranscriptFollow.By(it.toFloat()) }
+                            }
                         } else null
-                    }.collect { target ->
-                        // A clamped scroll must not request the same measurement forever.
-                        if (target != null && !ownerScrolling && follow && search.isBlank()) list.requestScrollToItem(target.first, target.second)
+                    }.distinctUntilChanged().collect { target ->
+                        // A clamped scroll must not request the same measurement forever; the conflation keeps only the latest move.
+                        if (target != null && !ownerScrolling && follow && search.isBlank()) requests.tryEmit(target)
                     }
                 }
             }
@@ -1367,6 +1485,8 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                                 keptRow?.rows("live_tools_before")?.takeIf { it.isNotEmpty() }?.let { Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity("", it) } }
                                 ChatBubble(own = false, groups[message.id] ?: BubbleGroup(startsRun = true, joinedTop = false, tail = true), if (holdsMarkdownTable(message.text)) transcriptMax else bubbleMax) {
                                     BubbleText(message.text.ifBlank { message.reasoning }, vm, null, interactive = false)
+                                    // A kept reply is an ordinary reply: it shows the time its turn was said, like the saved bubble it stands in for.
+                                    BubbleMeta(message.recordedAt, message.id, null)
                                 }
                                 keptRow?.rows("live_tools")?.takeIf { it.isNotEmpty() }?.let { Box(Modifier.widthIn(max = bubbleMax)) { MessageActivity("", it) } }
                             }
@@ -1449,6 +1569,7 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     }
     BoxWithConstraints(Modifier.fillMaxSize()) {
     // The chat menu may use the screen's height, so every action shows on a phone; a short window still scrolls.
+    val chatWidth = maxWidth
     val actionMenuHeight = (maxHeight - 16.dp).coerceAtLeast(48.dp)
     // Landscape with the keyboard open: the field gets the room the strip and header padding would take.
     val shortWindow = maxHeight < 420.dp
@@ -1534,15 +1655,72 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 }
             }
         }
-        if (activeHere) {
-            BeaconCallStage(vm, call, motionEnabled, showCallHistory, { showCallHistory = it }, Modifier.weight(1f), conversationContent)
-        } else if (failedHere) {
-            CallFailurePanel(call.failureReason, onRetry = { vm.retryCall(call.callId) }, onClose = { vm.closeCallFailure(call.callId) }, Modifier.weight(1f))
-        } else {
-            Column(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
-                if (!beacon && call.conversationScope == vm.authenticatedScope() && call.transcriptStatus.isNotBlank()) Text(call.transcriptLabel(), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
-                conversationContent(Modifier.weight(1f).widthIn(max = 840.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
+        // One body at a time: the transcript, a live call, or a failed call. The transcript's list is hoisted above, so it keeps its place across both sides.
+        val chatStage = when {
+            activeHere -> ChatStage.Call
+            failedHere -> ChatStage.CallFailure
+            else -> ChatStage.Conversation
+        }
+        // The outgoing screen keeps what it showed while it fades: a hang-up must not turn it into an idle call,
+        // and closing or retrying a failure must not empty its reason.
+        var lastActiveCall by remember { mutableStateOf<CallState?>(null) }
+        var lastFailedCall by remember { mutableStateOf<CallState?>(null) }
+        var lastShowCallHistory by remember { mutableStateOf(false) }
+        var lastCallTranscript by remember { mutableStateOf(false) }
+        var stageSettled by remember { mutableStateOf(true) }
+        val liveCallTranscript = chatWidth >= 700.dp || showCallHistory
+        SideEffect {
+            if (activeHere) {
+                lastActiveCall = call
+                lastShowCallHistory = showCallHistory
+                lastCallTranscript = liveCallTranscript
             }
+            if (failedHere) lastFailedCall = call
+        }
+        // Hold a View-chat tap until the outer swap is over, so the incoming panel cannot start a second LazyColumn on the one list.
+        LaunchedEffect(chatStage) {
+            stageSettled = false
+            delay(220)
+            stageSettled = true
+            if (chatStage != ChatStage.Call) lastShowCallHistory = false
+        }
+        val shownCall = if (activeHere) call else lastActiveCall ?: call
+        val shownFailure = if (failedHere) call else lastFailedCall ?: call
+        val shownHistory = if (activeHere) showCallHistory && stageSettled else lastShowCallHistory
+        val stageContent: @Composable (ChatStage, Modifier) -> Unit = { showing, area ->
+            when (showing) {
+                ChatStage.Call -> BeaconCallStage(vm, shownCall, motionEnabled, shownHistory, { if (activeHere) showCallHistory = it }, area, conversationContent)
+                ChatStage.CallFailure -> CallFailurePanel(shownFailure.failureReason, onRetry = { vm.retryCall(shownFailure.callId) }, onClose = { vm.closeCallFailure(shownFailure.callId) }, area)
+                ChatStage.Conversation -> Column(area.clipToBounds()) {
+                    if (!beacon && call.conversationScope == vm.authenticatedScope() && call.transcriptStatus.isNotBlank()) Text(call.transcriptLabel(), Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelSmall)
+                    conversationContent(Modifier.weight(1f).widthIn(max = 840.dp).fillMaxWidth().align(Alignment.CenterHorizontally))
+                }
+            }
+        }
+        if (!motionEnabled) stageContent(chatStage, Modifier.weight(1f).fillMaxWidth()) else {
+            // A call dissolves the transcript into the call surface and back; the only drift is a quiet 10 dp rise, no scale.
+            val drift = with(LocalDensity.current) { 10.dp.roundToPx() }
+            AnimatedContent(
+                targetState = chatStage,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                transitionSpec = {
+                    // The pair comes from the transition itself: a delayed "previous" stage would be wrong when a call ends before
+                    // the 220 ms settle. Only a call stage that carries its own transcript is immediate; the failure panel has none.
+                    val instant = (initialState == ChatStage.Conversation && targetState == ChatStage.Call && liveCallTranscript) ||
+                        (initialState == ChatStage.Call && targetState == ChatStage.Conversation && lastCallTranscript)
+                    when {
+                        instant -> EnterTransition.None togetherWith ExitTransition.None
+                        initialState == ChatStage.CallFailure -> (fadeIn(tween(200, easing = FastOutSlowInEasing)) + slideInVertically(tween(200, easing = FastOutSlowInEasing)) { drift }) togetherWith
+                            (fadeOut(tween(160, easing = FastOutSlowInEasing)) + shrinkVertically(tween(200, easing = FastOutSlowInEasing), shrinkTowards = Alignment.Top))
+                        targetState == ChatStage.CallFailure -> (fadeIn(tween(200, easing = FastOutSlowInEasing)) + expandVertically(tween(200, easing = FastOutSlowInEasing), expandFrom = Alignment.Top)) togetherWith
+                            fadeOut(tween(160, easing = FastOutSlowInEasing))
+                        else -> (fadeIn(tween(200, easing = FastOutSlowInEasing)) + slideInVertically(tween(200, easing = FastOutSlowInEasing)) { drift }) togetherWith
+                            (fadeOut(tween(160, easing = FastOutSlowInEasing)) + slideOutVertically(tween(200, easing = FastOutSlowInEasing)) { -drift })
+                    }
+                },
+                contentAlignment = Alignment.TopCenter,
+                label = "chat-stage",
+            ) { showing -> stageContent(showing, Modifier.fillMaxSize()) }
         }
         // Finding is reading: the composer steps aside so matches get the room, and comes back when find closes.
         val finding = canonical && showSearch
@@ -1553,9 +1731,23 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
                 onOlder = { if (findMatches.isNotEmpty()) findPosition = (findPosition + 1).coerceAtMost(findMatches.size - 1) },
                 onNewer = { findPosition = (findPosition - 1).coerceAtLeast(0) })
         }
-        if ((ready || beaconOpeningShown || keptWhileOpening) && !activeHere && !finding) Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
-            if (!shortWindow && ready) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
-            Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, activeHere, !call.active, callThisChat, composerDetails, { composerDetails = it }, opening = !ready) }
+        if ((ready || beaconOpeningShown || keptWhileOpening) && !finding) {
+            val composer: @Composable () -> Unit = {
+                Column(Modifier.fillMaxWidth().onSizeChanged { onComposerHeight(it.height) }) {
+                    if (!shortWindow && ready) Box(Modifier.fillMaxWidth().widthIn(max = 840.dp).align(Alignment.CenterHorizontally)) { ChatActivityStrip(backgroundActivity) { activitySheet = true } }
+                    // Leaving for a call, it keeps the look it had a moment before: the call state is read again only after it is gone.
+                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) { Composer(vm, false, !call.active || activeHere, callThisChat, composerDetails, { composerDetails = it }, opening = !ready) }
+                }
+            }
+            when {
+                !motionEnabled -> if (!activeHere) composer()
+                else -> AnimatedVisibility(
+                    visible = !activeHere,
+                    enter = fadeIn(tween(180, easing = FastOutSlowInEasing)) + expandVertically(tween(180, easing = FastOutSlowInEasing), expandFrom = Alignment.Top),
+                    exit = fadeOut(tween(180, easing = FastOutSlowInEasing)) + shrinkVertically(tween(180, easing = FastOutSlowInEasing), shrinkTowards = Alignment.Top),
+                    label = "composer",
+                ) { composer() }
+            }
         }
     }
     }
@@ -1563,7 +1755,14 @@ internal fun chatHeaderLine(streaming: Boolean, hasReplyText: Boolean, inCall: B
     // A command's long report, in the side question's own dialog: scrollable, Markdown drawn as in the chat, closed only by the person.
     commandReport?.takeIf { ready }?.let { report -> AlertDialog(onDismissRequest = vm::closeCommandReport, title = { Text(report.title) }, text = { Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).testTag("command-report")) { Markdown(report.text, vm, interactive = false) } }, confirmButton = { TextButton(onClick = vm::closeCommandReport, modifier = Modifier.testTag("command-report-close")) { Text(uiText("Close")) } }) }
     if (canonical) NativeCatalog(vm)
-    if (activitySheet && ready) ChatActivitySheet(backgroundActivity) { activitySheet = false }
+    if (activitySheet && ready) ChatActivitySheet(backgroundActivity, stopBackground = { item ->
+        val source = vm.client
+        if (source == null) backgroundStopFailureMessage(item) else {
+            val outcome = stopBackgroundActivity(source, ui.profile, chat.sessionId, item)
+            outcome.activity?.let { current -> backgroundActivity = reconcileBackgroundActivity(backgroundActivity, current) }
+            outcome.failure.ifBlank { null }
+        }
+    }, onDismiss = { activitySheet = false })
     if (threadPosts && chat.sessionId.isNotBlank()) ThreadSchedulesSheet(vm, chat.sessionId, chat.title) { threadPosts = false }
     if (showCallHistorySheet && beacon) CallHistorySheet(vm, onOpenCall = { conversationId, callId ->
         showCallHistorySheet = false
@@ -1892,7 +2091,7 @@ internal fun acceptsInitialConversationEdit(
                             val callPress = dev.hermes.android.voice.rememberCallEntryPrewarm(vm.client, chat.sessionId, callEnabled)
                             FilledIconButton(onClick = onCall, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("chat-call-beacon"), enabled = callEnabled, interactionSource = callPress) { Icon(Icons.Rounded.GraphicEq, assistantText("Call Beacon in this chat"), Modifier.size(composerActionIconSize)) }
                         } else {
-                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = composerSendEnabled(editable, preparing.isNotEmpty(), chat.uncertain.isNotBlank(), callActive, readOnly, retainedPage) && sendReady) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Queue" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Queue" else if (chat.streamId.isNotBlank()) "Send now" else "Send"), Modifier.size(composerActionIconSize)) }
+                            FilledIconButton(onClick = submit, shape = CircleShape, modifier = Modifier.minimumInteractiveComponentSize().size(composerActionSize).testTag("message-send"), enabled = composerSendEnabled(editable, preparing.isNotEmpty(), chat.uncertain.isNotBlank(), callActive, readOnly, retainedPage) && sendReady) { Icon(Icons.Rounded.ArrowUpward, uiText(if (explicitQueue != null) "Queue" else if (commandName != null) "Run command" else if (chat.streamId.isNotBlank() && (busyAction == "queue" || files.isNotEmpty()) || chat.streamId.isBlank() && chat.queued.any { it.kind == "queue" && it.state !in setOf("sent", "settled") }) "Queue" else if (chat.streamId.isNotBlank()) "Steer" else "Send"), Modifier.size(composerActionIconSize)) }
                         }
                     }
                 }
@@ -2035,7 +2234,7 @@ internal fun findRanges(text: String, query: String): List<IntRange> {
     Row(Modifier.align(Alignment.End).padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
         if (steer) Row(Modifier.testTag("steer-marker:$messageId"), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(2.dp)) {
             Icon(Icons.AutoMirrored.Rounded.CallSplit, null, Modifier.size(12.dp), tint = LocalContentColor.current.copy(alpha = .7f))
-            Text(uiText("Send now"), style = nativeMetadataStyle(), color = LocalContentColor.current.copy(alpha = .7f))
+            Text(uiText("Steer"), style = nativeMetadataStyle(), color = LocalContentColor.current.copy(alpha = .7f))
         }
         if (time != null) Text(time, Modifier.testTag("message-time:$messageId"), style = nativeMetadataStyle(), color = LocalContentColor.current.copy(alpha = .7f))
         else if (reserve) Text(" ", style = nativeMetadataStyle())
@@ -2163,7 +2362,7 @@ private fun localActionTag(action: LocalAction): String = when (action) {
             Text(words, Modifier.testTag("queue-text:${item.id}"), style = MaterialTheme.typography.bodyMedium.contentDirection(), maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
         }
         when (queueBoxAction(item, replying)) {
-            QueueBoxAction.Steer -> TextButton(onClick = { vm.steerQueued(item.id) }, modifier = Modifier.testTag("queue-steer:${item.id}")) { Text(uiText("Send now")) }
+            QueueBoxAction.Steer -> TextButton(onClick = { vm.steerQueued(item.id) }, modifier = Modifier.testTag("queue-steer:${item.id}")) { Text(uiText("Steer")) }
             QueueBoxAction.Send -> TextButton(onClick = { vm.retryQueued(item.id) }, modifier = Modifier.testTag("queue-send:${item.id}")) { Text(uiText("Send")) }
             QueueBoxAction.Retry -> TextButton(onClick = { vm.retryQueued(item.id) }, modifier = Modifier.testTag("queue-retry:${item.id}")) { Text(uiText("Retry")) }
             QueueBoxAction.None -> Unit
@@ -2885,7 +3084,15 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
     }
 }
 
-@Composable internal fun ChatActivitySheet(activity: BackgroundActivitySummary, onDismiss: () -> Unit) {
+@Composable internal fun ChatActivitySheet(
+    activity: BackgroundActivitySummary,
+    stopBackground: (suspend (BackgroundActivityItem) -> String?)? = null,
+    onDismiss: () -> Unit,
+) {
+    var confirming by remember { mutableStateOf<BackgroundActivityItem?>(null) }
+    var stopping by remember { mutableStateOf(emptySet<String>()) }
+    var stopFailure by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(Modifier.fillMaxWidth().testTag("chat-activity-sheet").heightIn(max = 560.dp).imePadding().verticalScroll(rememberScrollState()).padding(bottom = 24.dp)) {
             Row(Modifier.fillMaxWidth().padding(start = 20.dp, end = 8.dp, bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -2894,11 +3101,23 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
                 }
                 IconButton(onClick = onDismiss, modifier = Modifier.size(48.dp).testTag("chat-activity-close")) { Icon(Icons.Rounded.Close, uiText("Close background activity")) }
             }
+            if (stopFailure.isNotBlank()) Text(
+                uiText(stopFailure),
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 4.dp).testTag("chat-activity-stop-error").semantics { liveRegion = LiveRegionMode.Polite },
+                style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error,
+            )
             if (activity.items.isNotEmpty()) {
                 ActivitySection(uiText("Background"), activity.items.size)
                 activity.items.forEach { item ->
-                    val detail = listOfNotNull(uiText(item.status), item.elapsedSeconds?.let { uiText("{0}s elapsed").replace("{0}", "$it") }).joinToString(" · ")
-                    ActivityRow(item.title.ifBlank { uiText(item.kind) }, detail, item.running)
+                    val stoppingNow = item.id in stopping
+                    val detail = if (stoppingNow) uiText("Stopping…") else listOfNotNull(uiText(item.status), item.elapsedSeconds?.let { uiText("{0}s elapsed").replace("{0}", "$it") }).joinToString(" · ")
+                    ActivityRow(
+                        item.title.ifBlank { uiText(item.kind) }, detail, item.running && !stoppingNow,
+                        onStop = stopBackground?.takeIf { item.status == "Running" }?.let { { confirming = item } },
+                        stopTag = "chat-activity-stop-${item.id}",
+                        stopLabel = uiText("Stop {0}").replace("{0}", item.title.ifBlank { uiText(item.kind) }),
+                        stopping = stoppingNow,
+                    )
                 }
             } else if (!activity.active) Text(
                 uiText(if (activity.available) "Nothing running in the background." else "Background status unavailable."),
@@ -2912,18 +3131,52 @@ private fun resendLocalForm(vm: BeaconViewModel, id: String) = ActionForm("Resen
             }
         }
     }
+    confirming?.let { item ->
+        AlertDialog(
+            onDismissRequest = { confirming = null },
+            title = { Text(uiText(backgroundStopConfirmTitle(item))) },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirming = null
+                        stopFailure = ""
+                        stopping = stopping + item.id
+                        scope.launch {
+                            val failure = try { stopBackground?.invoke(item) } catch (cancelled: CancellationException) { throw cancelled } catch (_: Exception) { backgroundStopFailureMessage(item) }
+                            stopping = stopping - item.id
+                            if (!failure.isNullOrBlank()) stopFailure = failure
+                        }
+                    },
+                    modifier = Modifier.testTag("chat-activity-stop-confirm"),
+                ) { Text(uiText("Stop")) }
+            },
+            dismissButton = { TextButton(onClick = { confirming = null }) { Text(uiText("Cancel")) } },
+        )
+    }
 }
 
 @Composable private fun ActivitySection(label: String, count: Int) {
     Text("$label · $count", Modifier.padding(horizontal = 20.dp, vertical = 8.dp), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
-@Composable private fun ActivityRow(title: String, detail: String, spinning: Boolean, icon: androidx.compose.ui.graphics.vector.ImageVector = Icons.Rounded.Build) {
+@Composable private fun ActivityRow(
+    title: String,
+    detail: String,
+    spinning: Boolean,
+    icon: androidx.compose.ui.graphics.vector.ImageVector = Icons.Rounded.Build,
+    onStop: (() -> Unit)? = null,
+    stopTag: String = "",
+    stopLabel: String = "",
+    stopping: Boolean = false,
+) {
     Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 20.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(30.dp), contentAlignment = Alignment.Center) { if (spinning) CircularProgressIndicator(Modifier.size(17.dp), strokeWidth = 2.dp) else Icon(icon, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant) }
         Column(Modifier.weight(1f).padding(start = 10.dp)) {
             Text(title, style = MaterialTheme.typography.bodyMedium, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
             Text(detail, style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
+        }
+        if (onStop != null) IconButton(onClick = onStop, enabled = !stopping, modifier = Modifier.size(48.dp).testTag(stopTag)) {
+            if (stopping) CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp) else Icon(Icons.Rounded.Stop, stopLabel, Modifier.size(20.dp))
         }
     }
 }
@@ -3054,18 +3307,38 @@ private fun Modifier.promptSettle(settle: PromptSettle): Modifier = this
         }
     }
     BoxWithConstraints(modifier.fillMaxSize().testTag("beacon-call-stage")) {
-        if(maxWidth>=700.dp) Row(Modifier.fillMaxSize()) {
-            stage(Modifier.weight(1f));VerticalDivider();conversation(Modifier.width(320.dp).fillMaxHeight())
-        } else if(showHistory) Column(Modifier.fillMaxSize()) {
-            TextButton(onClick={onHistory(false)},modifier=Modifier.heightIn(min=48.dp).testTag("beacon-conversation-toggle")) { Text(uiText("Return to call")) }
-            conversation(Modifier.weight(1f)); LiveCallDock(call,actions,motionEnabled)
-        } else stage(Modifier.fillMaxSize())
+        if(maxWidth>=700.dp) {
+            // The conversation pane is the one transcript at this width and is shown at once; only the call pane rises into it.
+            val pane = remember { Animatable(if (motionEnabled) 0f else 1f) }
+            LaunchedEffect(Unit) { if (motionEnabled) pane.animateTo(1f, tween(200, easing = FastOutSlowInEasing)) }
+            Row(Modifier.fillMaxSize()) {
+                stage(Modifier.weight(1f).graphicsLayer { alpha = pane.value });VerticalDivider();conversation(Modifier.width(320.dp).fillMaxHeight())
+            }
+        } else {
+            // View chat swaps the conversation for the call window; each side keeps its own state and the dock holds the bottom.
+            val conversationPanel: @Composable () -> Unit = {
+                Column(Modifier.fillMaxSize()) {
+                    TextButton(onClick={onHistory(false)},modifier=Modifier.heightIn(min=48.dp).testTag("beacon-conversation-toggle")) { Text(uiText("Return to call")) }
+                    conversation(Modifier.weight(1f)); LiveCallDock(call,actions,motionEnabled)
+                }
+            }
+            if (!motionEnabled) {
+                if(showHistory) conversationPanel() else stage(Modifier.fillMaxSize())
+            } else AnimatedContent(
+                targetState = showHistory,
+                modifier = Modifier.fillMaxSize(),
+                transitionSpec = { fadeIn(tween(200, easing = FastOutSlowInEasing)) togetherWith fadeOut(tween(200, easing = FastOutSlowInEasing)) },
+                contentAlignment = Alignment.TopCenter,
+                label = "call-conversation",
+            ) { history -> if (history) conversationPanel() else stage(Modifier.fillMaxSize()) }
+        }
     }
 }
 
 /** Whether the open chat is pinned, as History lists it; the chat's own snapshot never carries it, so only an action in this chat leaves a mark there. */
 internal fun openChatPinned(rows: List<JSONObject>, chat: ChatState, profile: String): Boolean =
-    rows.firstOrNull { sessionRowId(it) == chat.sessionId && it.string("profile", profile) == profile }?.optBoolean("pinned") ?: chat.raw.optBoolean("pinned")
+    nativeSessionFlagOrNull(rows.firstOrNull { sessionRowId(it) == chat.sessionId && it.string("profile", profile) == profile }, "pinned")
+        ?: nativeSessionFlagOrNull(chat.raw, "pinned") ?: false
 
 /** Chat actions that destroy something: shown last in the menu, apart and in the error colour. */
 internal val destructiveConversationActions = setOf("Delete conversation")

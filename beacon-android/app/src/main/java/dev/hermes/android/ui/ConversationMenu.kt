@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconViewModel
+import dev.hermes.android.data.nativeSessionFlag
 import dev.hermes.android.core.*
 import org.json.JSONObject
 
@@ -48,7 +49,7 @@ import org.json.JSONObject
     val pending by vm.conversationPending.collectAsStateWithLifecycle()
     val targetKey = vm.client?.scope?.copy(profile = profile, session = id)?.key
     val busy = pending.any { it.startsWith("$targetKey|") }
-    val pinned = row.optBoolean("pinned")
+    val pinned = nativeSessionFlag(row, "pinned")
     val archived = row.optBoolean("archived")
     DropdownMenuItem({ Text(conversationMenuTitle(uiText(if (pinned) "Unpin" else "Pin"))) }, leadingIcon = { Icon(Icons.Rounded.PushPin, null) }, modifier = Modifier.testTag("conversation-pin"),
         enabled = !busy, onClick = { onDone(); vm.conversationAction(id, "/api/session/pin", json("pinned" to !pinned), if (pinned) "Unpinned" else "Pinned", profile) })

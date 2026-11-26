@@ -121,6 +121,13 @@ class LiveCallFitUiTest {
 
     private fun exists(tag: String) = compose.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
 
+    /** A caption clears its own semantics so TalkBack does not read it twice, so its tag lives only in the unmerged tree. */
+    private fun captionBounds(tag: String): DpRect {
+        val origin = compose.onNodeWithTag("fit-screen").getUnclippedBoundsInRoot()
+        val b = compose.onNodeWithTag(tag, useUnmergedTree = true).getUnclippedBoundsInRoot()
+        return DpRect(b.left - origin.left, b.top - origin.top, b.right - origin.left, b.bottom - origin.top)
+    }
+
     private fun presenceTag() = if (exists("beacon-call-hero")) "beacon-call-hero" else "beacon-voice-presence"
 
     private fun overlaps(a: DpRect, b: DpRect) =
@@ -261,6 +268,32 @@ class LiveCallFitUiTest {
             // And the fill is the call surface's own dark control colour, not the theme's near-white disabled fill.
             val corner = pixels[pixels.width / 2, 2]
             assertTrue("the speaker's fill is dark (dark theme: $dark, luminance ${corner.luminance()})", corner.luminance() < .2f)
+        }
+    }
+
+    /**
+     * R2-F26: at Arabic 2x on the unfolded and the phone widths, each control's caption keeps a visible gap from the next caption, so "الكاميرا"
+     * and "مشاركة" no longer run together as one word, and every caption stays inside the dock.
+     */
+    @Test fun arabicCaptionsAtTwiceTheTextStayUnderTheirOwnControl() {
+        (compose.activity.applicationContext as BeaconApplication).readTranslations()
+        show("ar")
+        val pairs = listOf("beacon-camera-caption" to "beacon-share-screen-caption", "beacon-mute-caption" to "beacon-speaker-caption")
+        for (s in listOf(Screen("unfolded", 840, 900, fontScale = 2f), Screen("unfolded square", 900, 900, fontScale = 2f),
+            Screen("unfolded short", 900, 560, fontScale = 2f), Screen("phone", 411, 891, fontScale = 2f),
+            Screen("small phone", 360, 640, fontScale = 2f)).map { it.copy(rtl = true) }) {
+            move(s, quietCall())
+            val dock = bounds("beacon-call-dock")
+            for (tag in pairs.flatMap { listOf(it.first, it.second) }) {
+                assertTrue("${s.name}: $tag is drawn", compose.onAllNodesWithTag(tag, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty())
+                val b = captionBounds(tag)
+                assertTrue("${s.name}: $tag stays inside the dock: $b vs $dock", b.left.value >= dock.left.value - .6f && b.right.value <= dock.right.value + .6f)
+            }
+            for ((a, b) in pairs) {
+                val left = captionBounds(a); val right = captionBounds(b)
+                val gap = if (left.left.value < right.left.value) right.left.value - left.right.value else left.left.value - right.right.value
+                assertTrue("${s.name}: $a and $b keep a gap of at least 2 dp, not $gap ($left vs $right)", gap >= 2f)
+            }
         }
     }
 

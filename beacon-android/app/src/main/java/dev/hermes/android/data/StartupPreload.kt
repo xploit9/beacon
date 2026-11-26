@@ -77,7 +77,8 @@ fun savedChatIds(indexJson: String?, pointers: List<String?>): Set<String> {
     return ids
 }
 const val PREFETCH_READY_WAIT = 15_000L
-const val PREFETCH_DELAY = 1_500L
+/** Only enough to let the first chat frame land; the small reads start while the chat opens. */
+const val PREFETCH_DELAY = 250L
 const val PREFETCH_REWARM_AFTER = 5 * 60_000L
 const val STARTUP_READ_TTL = 120_000L
 const val STARTUP_READ_PARALLELISM = 3

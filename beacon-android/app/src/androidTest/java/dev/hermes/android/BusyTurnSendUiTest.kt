@@ -2,6 +2,7 @@ package dev.hermes.android
 
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.text.input.TextFieldValue
@@ -17,7 +18,9 @@ import dev.hermes.android.core.*
 import dev.hermes.android.ui.ChatScreen
 import dev.hermes.android.ui.NativeLocalization
 import dev.hermes.android.ui.MoreScreen
+import dev.hermes.android.ui.TranscriptScrollProbe
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -26,6 +29,7 @@ import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
+import kotlin.math.abs
 
 /** Real chat controls with a synthetic native authority and held acknowledgements. */
 class BusyTurnSendUiTest {
@@ -42,10 +46,10 @@ class BusyTurnSendUiTest {
         BeaconViewModel::class.java.getDeclaredField(name).apply { isAccessible = true }.set(vm, value)
     }
 
-    private fun withFixture(canonical: Boolean = false, catalogUnavailable: Boolean = false, block: (BeaconViewModel, NativeExperienceFixture) -> Unit) {
+    private fun withFixture(canonical: Boolean = false, catalogUnavailable: Boolean = false, seed: (NativeExperienceFixture) -> Unit = {}, block: (BeaconViewModel, NativeExperienceFixture) -> Unit) {
         check(!app.calls.state.value.active && app.calls.service == null) { "Never replace an active real call" }
         val prior = runBlocking { app.preferences.data.first() }
-        val fixture = NativeExperienceFixture().apply { canonicalAuthority = canonical; commandCatalogFailure = catalogUnavailable }
+        val fixture = NativeExperienceFixture().apply { canonicalAuthority = canonical; commandCatalogFailure = catalogUnavailable; seed(this) }
         val store = ViewModelStore()
         val scope = fixture.scope.session("chat-a")
         val cacheScopes = listOf(scope, fixture.scope.session("chat-b"))
@@ -118,6 +122,15 @@ class BusyTurnSendUiTest {
         compose.waitUntil(15_000) { vm.chat.value.sessionId == id && vm.chat.value.projectionReady && (watcher.get(vm) as? Job)?.isActive == true }
     }
 
+    /** Enough rows that the transcript is a scrolled list, not one screen. */
+    private fun seedLongChat(fixture: NativeExperienceFixture, pairs: Int = 18) {
+        val rows = fixture.sessions.getValue("chat-a").getJSONArray("messages")
+        repeat(pairs) { i ->
+            rows.put(json("role" to "user", "text" to "Seed question $i", "row_id" to 2_000L + i * 2))
+            rows.put(json("role" to "assistant", "text" to "Seed answer $i.\n\nA short paragraph with enough height to make the transcript scroll.", "row_id" to 2_001L + i * 2))
+        }
+    }
+
     private fun enqueueThroughComposer(text: String) {
         compose.onNodeWithTag("message-input").performTextInput("/queue $text")
         compose.onNodeWithTag("message-send").performClick()
@@ -130,6 +143,25 @@ class BusyTurnSendUiTest {
 
     /** One of the two ticks a message Hermes has taken shows (grey: Hermes has it; blue: a reply is on its way or follows). */
     private fun hasDeliveredTick() = hasTestTag("send-tick:delivered") or hasTestTag("send-tick:answered")
+
+    /**
+     * The return from the background before recovery reattached (owner, 24 Nov 19:08): the stream job and its live collector
+     * are gone while the chat still shows the running turn (its runtime id and its tool rows). Nothing here writes Hermes.
+     */
+    private fun loseTheLiveCollector(vm: BeaconViewModel, fixture: NativeExperienceFixture) {
+        val key = fixture.scope.session("chat-a").key
+        @Suppress("UNCHECKED_CAST")
+        val streams = BeaconViewModel::class.java.getDeclaredField("streams").apply { isAccessible = true }.get(vm) as MutableMap<String, Job>
+        @Suppress("UNCHECKED_CAST")
+        val clients = BeaconViewModel::class.java.getDeclaredField("streamClients").apply { isAccessible = true }.get(vm) as MutableMap<String, dev.hermes.android.data.BeaconClient>
+        val watcher = BeaconViewModel::class.java.getDeclaredField("sessionWatch").apply { isAccessible = true }.get(vm) as? Job
+        compose.waitUntil(15_000) { clients[key] != null && streams[key]?.isActive == true && vm.chat.value.streamId == "runtime-chat-a" }
+        // No watcher may quietly put the collector back before the tap: this is the moment between the return and its reattach.
+        runBlocking { watcher?.cancelAndJoin(); streams[key]?.cancelAndJoin() }
+        compose.runOnIdle { streams.remove(key); clients.remove(key) }
+        compose.waitUntil(10_000) { streams[key] == null && clients[key] == null }
+        assertEquals("the chat still shows the running turn", "runtime-chat-a", vm.chat.value.streamId)
+    }
 
     private fun queueCanonicalHead(vm: BeaconViewModel, fixture: NativeExperienceFixture): Pair<String, String> {
         fixture.queueNextCanonicalSubmission.set(true)
@@ -598,16 +630,16 @@ class BusyTurnSendUiTest {
         startTurn(vm, fixture)
         fun controls(label: String) = compose.onAllNodes(hasClickAction() and (hasText(label) or hasContentDescription(label)))
         compose.onNodeWithTag("message-input").performTextInput("Steered words")
-        controls("Send now").assertCountEquals(1)
+        controls("Steer").assertCountEquals(1)
         controls("Stop").assertCountEquals(0)
-        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send now").performClick()
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Steer").performClick()
         compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
         compose.waitUntil(15_000) { vm.composer.value.text.isBlank() }
         compose.runOnIdle { vm.setBusySendAction("queue") }
         compose.waitUntil(15_000) { vm.preferences.value.busySendAction == "queue" }
         compose.onNodeWithTag("message-input").performTextInput("Queued words")
         controls("Queue").assertCountEquals(1)
-        controls("Send now").assertCountEquals(0)
+        controls("Steer").assertCountEquals(0)
         controls("Stop").assertCountEquals(0)
         compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Queue").performClick()
         compose.waitUntil(15_000) { vm.chat.value.queued.any { it.text == "Queued words" && it.kind == "queue" } }
@@ -629,8 +661,8 @@ class BusyTurnSendUiTest {
         assertNotSame(fixture.client, streamClient)
         fixture.holdSteerAcknowledgement = true
         compose.onNodeWithTag("message-input").performTextInput("Please be concise")
-        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Send now")
-        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Send now").performClick()
+        compose.onNodeWithTag("composer-queue-caption").assertTextEquals("Steer")
+        compose.onNodeWithTag("message-send").assertContentDescriptionEquals("Steer").performClick()
         compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "session.steer" } }
         val sent = fixture.requests.single { it.string("method") == "session.steer" }.getJSONObject("params")
         assertEquals("runtime-chat-a", sent.string("session_id")); assertEquals("default", sent.string("profile")); assertEquals("Please be concise", sent.string("text"))
@@ -649,6 +681,155 @@ class BusyTurnSendUiTest {
         compose.onNode(hasTestTag("send-tick:answered") and hasAnyAncestor(hasTestTag("queued-message:$steerId")), useUnmergedTree = true).assertExists()
         assertEquals("Existing live output", vm.chat.value.liveText)
         assertEquals(1, fixture.requests.count { it.string("method") == "prompt.submit" })
+    }
+
+    /**
+     * Owner, 24 Nov 19:08: with the setting on Send now, a message sent mid-turn after leaving and returning showed
+     * "Couldn't send it now. It's in the queue." and nothing reached Hermes. The chat still showed the turn; only its live
+     * collector was gone, so the steer must bind the turn again instead of returning the words to the box.
+     */
+    @Test fun aSteerAfterALostLiveCollectorStillReachesTheRunningTurn() = withFixture { vm, fixture ->
+        fixture.steerStatus = "queued"
+        startTurn(vm, fixture)
+        loseTheLiveCollector(vm, fixture)
+        compose.onNodeWithTag("message-input").performTextInput("Steer through the return")
+        compose.onNodeWithTag("message-send").performClick()
+        compose.waitUntil(20_000) {
+            fixture.requests.any { it.string("method") == "session.steer" } ||
+                vm.chat.value.queued.any { it.text == "Steer through the return" && it.state == "queued" }
+        }
+        assertTrue("a live turn steers; the words must not be put in the queue (notice: ${vm.ui.value.notice})",
+            fixture.requests.any { it.string("method") == "session.steer" })
+        assertEquals("Steer through the return", fixture.requests.single { it.string("method") == "session.steer" }.getJSONObject("params").string("text"))
+        compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.state == "accepted" }
+        assertTrue("nothing waits in the box", vm.chat.value.queued.none { it.state == "queued" })
+        assertEquals(1, fixture.requests.count { it.string("method") == "session.steer" })
+    }
+
+    /** The same return, through the queue box's own Steer action. */
+    @Test fun theQueueBoxSteerAfterALostLiveCollectorStillReachesTheRunningTurn() = withFixture { vm, fixture ->
+        fixture.steerStatus = "queued"
+        compose.runOnIdle { vm.setBusySendAction("queue") }
+        compose.waitUntil(15_000) { vm.preferences.value.busySendAction == "queue" && vm.preferences.value.busySendLoaded }
+        startTurn(vm, fixture)
+        compose.onNodeWithTag("message-input").performTextInput("Box steer through the return")
+        compose.onNodeWithTag("message-send").performClick()
+        compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.let { it.text == "Box steer through the return" && it.state == "queued" && it.kind == "queue" } == true && vm.composer.value.text.isBlank() }
+        val id = vm.chat.value.queued.single().id
+        loseTheLiveCollector(vm, fixture)
+        compose.onNodeWithTag("queue-steer:$id").performClick()
+        compose.waitUntil(20_000) {
+            fixture.requests.any { it.string("method") == "session.steer" } ||
+                (vm.chat.value.queued.singleOrNull()?.state == "queued" && vm.ui.value.notice == "Couldn't send it now. It's in the queue.")
+        }
+        assertTrue("the box's Steer must reach Hermes (notice: ${vm.ui.value.notice})",
+            fixture.requests.any { it.string("method") == "session.steer" })
+        assertEquals("Box steer through the return", fixture.requests.single { it.string("method") == "session.steer" }.getJSONObject("params").string("text"))
+        compose.waitUntil(15_000) { vm.chat.value.queued.singleOrNull()?.state == "accepted" }
+        assertEquals(1, fixture.requests.count { it.string("method") == "session.steer" })
+    }
+
+    /**
+     * Owner, 25 Nov: after Send, the thinking/working row appeared and bumped the transcript up and down. The list must
+     * follow its growing tail one way, never reverse while that row is placed; this measures the real LazyColumn scroll.
+     */
+    @Test fun aSentMessageDoesNotBounceTheTranscriptWhileTheThinkingRowAppears() = withFixture(seed = { seedLongChat(it) }) { vm, fixture ->
+        compose.waitUntil(15_000) { vm.chat.value.projectionReady && vm.chat.value.messages.count { it.role == "user" } >= 18 }
+        val list = compose.runOnIdle { TranscriptScrollProbe.state }
+        assertNotNull("the transcript state", list)
+        compose.waitUntil(15_000) { !list!!.canScrollForward }
+        val priorAuto = compose.mainClock.autoAdvance
+        compose.mainClock.autoAdvance = false
+        compose.runOnUiThread { vm.composer(TextFieldValue("Scroll check")); vm.send() }
+        val offsets = mutableListOf<Float>()
+        val sizes = mutableListOf<Int>()
+        var token = 0
+        repeat(180) { frame ->
+            compose.mainClock.advanceTimeByFrame()
+            // The frame clock is manual; give the app's own coroutines and stream a moment too.
+            if (frame % 4 == 0) Thread.sleep(2)
+            val layout = list!!.layoutInfo
+            // The live row keeps its key while it grows; its top is the thinking row's position on screen.
+            layout.visibleItemsInfo.firstOrNull { it.key == "live" }?.let { offsets += it.offset.toFloat(); sizes += it.size }
+            if (token < 40 && frame % 2 == 0 && vm.chat.value.streamId == "runtime-chat-a" && fixture.liveCollectorSubscriptions.get() > 0) {
+                runCatching { fixture.emitNativeEvent("message.delta", json("text" to "word $token ")) }
+                token++
+            }
+        }
+        compose.mainClock.autoAdvance = priorAuto
+        assertTrue("the send must reach Hermes", fixture.requests.any { it.string("method") == "prompt.submit" })
+        assertEquals("the thinking row must follow the send", "runtime-chat-a", vm.chat.value.streamId)
+        val steps = offsets.zipWithNext { a, b -> abs(b - a) }
+        val maxStep = steps.maxOrNull() ?: 0f
+        val bigSteps = steps.count { it > 300f }
+        var layout = list!!.layoutInfo
+        var tail = layout.visibleItemsInfo.firstOrNull { it.key == "live" }
+        var settled = tail != null && tail.offset + tail.size <= layout.viewportEndOffset + 1
+        var settleFrames = 0
+        while (!settled && settleFrames < 120) {
+            compose.mainClock.advanceTimeByFrame(); settleFrames++
+            layout = list.layoutInfo
+            tail = layout.visibleItemsInfo.firstOrNull { it.key == "live" }
+            settled = tail != null && tail.offset + tail.size <= layout.viewportEndOffset + 1
+        }
+        java.io.File(app.filesDir, "scroll-probe.txt").writeText("offsets=$offsets\nsizes=$sizes\nsteps=$steps\nmaxStep=$maxStep\nbigSteps=$bigSteps\nsettled=$settled\ntokens=$token\n")
+        runCatching {
+            val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+            java.io.File(app.filesDir, "scroll-capture.png").outputStream().use { out -> bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out) }
+        }
+        assertTrue("the thinking row did not settle in view: $settled", settled)
+        // One 300 px+ step stays: the ack replaces the pending bubble with the sent one and the tail is pinned to the bottom.
+        // The follow itself adds no jump: the base has two (that replacement plus its snap), the fixed build must have one.
+        assertTrue("transcript had $bigSteps jumps over 300 px while thinking: $steps", bigSteps <= 1)
+    }
+
+    /**
+     * Owner, 26 Nov (independent review 1.2.4): a chat that composes empty must arm follow when its first row and first streamed
+     * words arrive. The v2 effect keyed only on anchorRestored/follow/search ran once against the empty chat and never re-armed,
+     * so the reply streamed past the bottom with no follow and no Scroll-to-latest (follow stayed true).
+     */
+    @Test fun aFreshChatArmsFollowForItsFirstMessageAndStreamingReply() = withFixture(
+        seed = { it.sessions.getValue("chat-a").put("messages", org.json.JSONArray()) },
+    ) { vm, fixture ->
+        compose.waitUntil(15_000) { vm.chat.value.projectionReady && vm.chat.value.messages.isEmpty() && vm.chat.value.liveText.isEmpty() }
+        val list = compose.runOnIdle { TranscriptScrollProbe.state }
+        assertNotNull("the transcript state", list)
+        val widthDp = compose.runOnIdle { with(compose.activity.resources.displayMetrics) { widthPixels / density } }
+        assertTrue("this proof runs at phone width, not $widthDp dp", widthDp < 600f)
+        compose.waitUntil(15_000) { vm.preferences.value.busySendLoaded }
+        compose.onNodeWithTag("message-input").performTextInput("First words in a new chat")
+        compose.onNodeWithTag("message-send").performClick()
+        compose.waitUntil(15_000) { fixture.requests.any { it.string("method") == "prompt.submit" } }
+        compose.waitUntil(15_000) { vm.chat.value.streamId == "runtime-chat-a" && fixture.liveCollectorSubscriptions.get() > 0 }
+        // The first user row lands before the reply; the effect has to re-arm on that transition, not on every token.
+        compose.waitUntil(15_000) { vm.chat.value.messages.any { it.role == "user" && it.text == "First words in a new chat" } }
+        val lines = 40
+        repeat(lines) { i -> fixture.emitNativeEvent("message.delta", json("text" to "Streamed line $i with enough words to make the reply taller than the phone.\n\n")) }
+        compose.waitUntil(15_000) { vm.chat.value.liveText.contains("Streamed line ${lines - 1}") }
+        val followed = runCatching { compose.waitUntil(20_000) { !list!!.canScrollForward && list.canScrollBackward } }.isSuccess
+        val atBottom = list!!.layoutInfo
+        assertTrue(
+            "a fresh chat must follow its first streamed reply (first visible ${list.firstVisibleItemIndex} of ${atBottom.totalItemsCount}, " +
+                "canScrollForward=${list.canScrollForward}, canScrollBackward=${list.canScrollBackward})",
+            followed,
+        )
+        val tail = atBottom.visibleItemsInfo.firstOrNull { it.key == "live" }
+        assertNotNull("the streamed tail is in view", tail)
+        assertTrue("the streamed tail ends at the viewport bottom", tail!!.offset + tail.size <= atBottom.viewportEndOffset + 2)
+        // Scrolling up still turns follow off and offers the way back.
+        compose.onNodeWithTag("conversation-transcript").performTouchInput { swipeDown() }
+        compose.waitUntil(15_000) { compose.onAllNodesWithTag("scroll-to-latest").fetchSemanticsNodes().isNotEmpty() }
+        compose.onNodeWithTag("scroll-to-latest").performClick()
+        compose.waitUntil(15_000) { !list.canScrollForward && compose.onAllNodesWithTag("scroll-to-latest").fetchSemanticsNodes().isEmpty() }
+        runCatching {
+            val directory = java.io.File(app.filesDir, "scroll-fix-124").apply { mkdirs() }
+            java.io.File(directory, "fresh-chat-follow.txt").writeText(
+                "widthDp=$widthDp\nitems=${list.layoutInfo.totalItemsCount}\ncanScrollForward=${list.canScrollForward}\n" +
+                    "canScrollBackward=${list.canScrollBackward}\nfirstVisible=${list.firstVisibleItemIndex}\ntail=${tail.key}\n",
+            )
+            val bitmap = compose.onRoot().captureToImage().asAndroidBitmap()
+            java.io.File(directory, "fresh-chat-follow.png").outputStream().use { out -> bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out) }
+        }
     }
 
     @Test fun queuePrefixRequiresPayloadAndDoesNotCatchANearMatch() = withFixture(catalogUnavailable = true) { vm, fixture ->
@@ -686,7 +867,7 @@ class BusyTurnSendUiTest {
             showSettings.value = true
         }
         compose.onNodeWithText("If you send while Beacon replies").assertExists()
-        // The two choices say what they do (Send now, Queue), so the line that explained them is gone.
+        // The two choices say what they do (Steer, Queue), so the line that explained them is gone.
         compose.onNodeWithText("Steer changes the reply now. Queue sends it after.").assertDoesNotExist()
         // The page slides in over the chat: let the transition finish and a frame draw before the picture (the first attempt caught the chat underneath).
         compose.waitForIdle(); Thread.sleep(1_000); compose.waitForIdle()

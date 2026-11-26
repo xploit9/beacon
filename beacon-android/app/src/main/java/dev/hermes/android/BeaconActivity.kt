@@ -26,9 +26,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
+import androidx.compose.animation.*
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
@@ -254,7 +256,15 @@ class BeaconActivity : ComponentActivity() {
         try { startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName"))); overlayAsked = true }
         catch (_: RuntimeException) { vm?.notice("Floating calls aren't available; use the call notification.") }
     }
-    override fun onStart() { super.onStart(); (application as BeaconApplication).calls.let { it.uiVisible = true; if (it.state.value.active) it.resumeWindow() }; vm?.foreground(true) }
+    override fun onStart() {
+        super.onStart()
+        (application as BeaconApplication).calls.let { calls ->
+            calls.uiVisible = true
+            val returning = calls.takeCallOnResume()
+            if (calls.state.value.active) { calls.resumeWindow(); returning?.let { id -> vm?.openCurrentCall(id) } }
+        }
+        vm?.foreground(true)
+    }
     override fun onResume() { super.onResume(); NativeAuth.onActivityResumed(); (application as BeaconApplication).calls.refreshOverlayPermission(); checkOverlayAnswer() }
     /** Back from the overlay screen: a file install that is still not allowed was locked by Android, not declined. */
     private fun checkOverlayAnswer() {
@@ -609,7 +619,9 @@ private const val INCOMING_HALO_MILLIS = 1600L
                         // Signed in but Hermes stopped answering (a VPN that dropped): the same banner says so (owner, 4 Nov 2026).
                         val unreachableOrigins by dev.hermes.android.data.HermesReach.origins.collectAsState()
                         val cantReach = ui.connected && ui.origin in unreachableOrigins
-                        if (offlineBannerShown(ui.connected, ui.loading, cantReach, failedToConnect)) Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
+                        val showOffline = offlineBannerShown(ui.connected, ui.loading, cantReach, failedToConnect)
+                        val banner: @Composable () -> Unit = {
+                        Surface(color = MaterialTheme.colorScheme.surfaceContainerHigh, modifier = Modifier.fillMaxWidth().testTag("beacon-offline-banner")) {
                             Row(Modifier.padding(start = 16.dp).heightIn(min = 48.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                                 if (ui.loading) BeaconDustCore(18.dp) else Icon(Icons.Rounded.CloudOff, null, Modifier.size(18.dp), tint = MaterialTheme.colorScheme.onSurfaceVariant)
                                 Text(if (cantReach) uiText("Can't reach Hermes · check your connection") else if (ui.loading) uiText("Reconnecting…") else uiText("Offline · showing saved chats"), Modifier.weight(1f).semantics { liveRegion = LiveRegionMode.Polite }, style = MaterialTheme.typography.labelMedium)
@@ -618,12 +630,42 @@ private const val INCOMING_HALO_MILLIS = 1600L
                                 }
                             }
                         }
+                        }
+                        if (!motionEnabled) { if (showOffline) banner() }
+                        else AnimatedVisibility(
+                            visible = showOffline,
+                            enter = fadeIn(tween(180, easing = FastOutSlowInEasing)) + expandVertically(tween(180, easing = FastOutSlowInEasing), expandFrom = androidx.compose.ui.Alignment.Top),
+                            exit = fadeOut(tween(150, easing = FastOutSlowInEasing)) + shrinkVertically(tween(180, easing = FastOutSlowInEasing), shrinkTowards = androidx.compose.ui.Alignment.Top),
+                            label = "offline-banner",
+                        ) { banner() }
                         if (call.active && (ui.tab !in setOf("Chat","Beacon") && !botChatVisible || call.conversationScope != vm.authenticatedScope())) CallBanner(call, onOpen = { vm.openCurrentCall() }, onHangUp = vm.app.calls::hangup)
-                        Box(Modifier.weight(1f).then(modeMotion)) {
-                        if (vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban") && !savedPageHasCopy(ui.tab, savedScreens)) {
-                            Header(when(ui.tab) { "Tasks" -> uiText("Schedules"); "Spaces" -> uiText("Files"); else -> uiText(ui.tab) }, menu = openMenu)
-                            EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network. Drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
-                        } else when (ui.tab) { "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0); "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0); "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm) }
+                        Box(Modifier.weight(1f).then(modeMotion).testTag("beacon-tab-body")) {
+                        val savedOnly = vm.client == null && !ui.loading && ui.tab in setOf("Tasks", "Spaces", "Projects", "Kanban") && !savedPageHasCopy(ui.tab, savedScreens)
+                        val body = if (savedOnly) "saved:${ui.tab}" else ui.tab
+                        val bodyContent: @Composable (String) -> Unit = { key ->
+                            if (key.startsWith("saved:")) {
+                                val page = key.removePrefix("saved:")
+                                Header(when(page) { "Tasks" -> uiText("Schedules"); "Spaces" -> uiText("Files"); else -> uiText(page) }, menu = openMenu)
+                                EmptyState(uiText("Reconnect to Hermes"), uiText("Check your network. Drafts stay on this phone."), action = uiText("Reconnect"), onAction = { vm.connect(ui.origin) })
+                            } else when (key) {
+                                "Beacon" -> ChatScreen(vm, beacon = true, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0)
+                                "Chat" -> ChatScreen(vm, onComposerHeight = { composerHeightPx = it }, feedbackInsetPx = if (hasComposer) feedbackHeightPx else 0)
+                                "Tasks" -> TasksScreen(vm); "Spaces" -> SpacesScreen(vm); "Projects" -> NativeProjectsScreen(vm); "Kanban" -> KanbanScreen(vm); else -> MoreScreen(vm)
+                            }
+                        }
+                        // Only the new body is composed: the outgoing one is gone at once, and the shell around it does not move.
+                        // The first body is shown whole; every later one fades in.
+                        val bodyComposed = remember { mutableStateOf(false) }
+                        if (!motionEnabled) bodyContent(body) else key(body) {
+                            val entered = remember { MutableTransitionState(!bodyComposed.value).apply { targetState = true } }
+                            SideEffect { bodyComposed.value = true }
+                            androidx.compose.animation.AnimatedVisibility(
+                                visibleState = entered,
+                                enter = fadeIn(tween(150, easing = FastOutSlowInEasing)),
+                                exit = ExitTransition.None,
+                                label = "tab-body",
+                            ) { bodyContent(body) }
+                        }
                         }
                     }
                 }

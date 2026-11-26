@@ -1,5 +1,8 @@
 package dev.hermes.android.ui
 
+import androidx.compose.animation.*
+import androidx.compose.animation.core.*
+
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import kotlinx.coroutines.delay
 
@@ -24,6 +27,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.agentphone.CallPhoneView
+import dev.hermes.android.agentphone.callHandOffClient
 import androidx.compose.ui.Alignment
 
 import androidx.compose.ui.Modifier
@@ -225,10 +229,15 @@ internal data class CallUiActions(
     }
 }
 
-/** One short word under a control, on two lines when a language needs them. The button carries the full name, so TalkBack does not read the caption a second time. */
-@Composable private fun CallControlLabel(text: String) {
-    if (text.isNotBlank()) Text(text, Modifier.clearAndSetSemantics {}, color = CallText, style = MaterialTheme.typography.labelMedium,
-        maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+/**
+ * One short word under a control, on two lines when a language needs them. The button carries the full name, so TalkBack does not read the caption
+ * a second time; [testTag] keeps the caption findable for the layout checks. The caption fills its own control's width and no more (R2-F26): a long
+ * Arabic word at 2x text then wraps or ends in an ellipsis under its own circle instead of growing into the next control's caption.
+ */
+@Composable private fun CallControlLabel(text: String, testTag: String) {
+    if (text.isNotBlank()) Text(text, Modifier.fillMaxWidth().padding(horizontal = ControlCaptionGutter).testTag(testTag).clearAndSetSemantics {},
+        color = CallText, style = MaterialTheme.typography.labelMedium, maxLines = 2,
+        overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
 }
 
 /**
@@ -267,7 +276,7 @@ internal data class CallUiActions(
                 ),
             ) { Icon(icon, description) }
         }
-        CallControlLabel(caption)
+        CallControlLabel(caption, "$tag-caption")
     }
 }
 
@@ -316,10 +325,15 @@ internal data class CallUiActions(
                 }
             }
         } }
-        CallControlLabel(speakerLabel)
+        CallControlLabel(speakerLabel, "beacon-speaker-caption")
     }
 }
 
+/**
+ * The gutter a caption keeps from the columns beside it (R2-F26). The caption may use its own column and no more, and this keeps two Arabic
+ * captions at 2x text from meeting: without it the labels of two neighbouring controls draw edge to edge and read as one word.
+ */
+private val ControlCaptionGutter = 6.dp
 private val CallControlSize = 56.dp
 private val CallSecondarySize = 48.dp
 private val CallHangupSize = 68.dp
@@ -472,7 +486,7 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
     }, minimizedSeen = minimizedSeen, missingSeen = missingSeen)
 }
 
-@Composable private fun CallHeader(call: CallState, onConversation: () -> Unit, modifier: Modifier = Modifier) {
+@Composable private fun CallHeader(call: CallState, onConversation: () -> Unit, motionEnabled: Boolean, modifier: Modifier = Modifier) {
     var now by remember(call.callId) { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(call.callId, call.active, call.startedAt) {
         if (!call.active) return@LaunchedEffect
@@ -485,22 +499,34 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
     val controller = (context.applicationContext as BeaconApplication).calls
     var showPhone by remember(call.callId) { mutableStateOf(false) }
     if (showPhone && call.active) {
-        val client = remember(call.callId) { runCatching { controller.service?.clientForHandoff(call.callId) }.getOrNull() }
-        if (client != null) CallPhoneView(client, call, actions = controller, onDismiss = { showPhone = false })
-        else LaunchedEffect(Unit) { showPhone = false }
+        // The view waits for the call's account when it opens: a hand-off a moment away must not leave this button dead for the rest
+        // of the call (owner, 25 Nov: the button was there and did nothing).
+        CallPhoneView({ callHandOffClient { runCatching { controller.service?.clientForHandoff(call.callId) }.getOrNull() } }, call,
+            actions = controller, onDismiss = { showPhone = false })
     }
     val name: @Composable (Modifier) -> Unit = { area ->
         Text(LocalAssistantName.current, area.testTag("beacon-call-name"), color = CallText,
             style = MaterialTheme.typography.headlineSmall, maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis)
     }
     val status: @Composable (Modifier) -> Unit = { area ->
-        Text(callStatusText(call, withTool = false), area.testTag("beacon-call-status"), color = CallGoldBright,
-            style = MaterialTheme.typography.labelMedium)
+        val words = callStatusText(call, withTool = false)
+        // One node at rest; a state change fades through, so Connecting -> Listening is not a hard cut.
+        if (!motionEnabled) Text(words, area.testTag("beacon-call-status"), color = CallGoldBright, style = MaterialTheme.typography.labelMedium)
+        else AnimatedContent(
+            targetState = words,
+            modifier = area,
+            transitionSpec = { fadeIn(tween(150, easing = FastOutSlowInEasing)) togetherWith fadeOut(tween(150, easing = FastOutSlowInEasing)) },
+            contentAlignment = Alignment.CenterStart,
+            label = "call-status",
+        ) { shown ->
+            Text(shown, Modifier.testTag("beacon-call-status"), color = CallGoldBright, style = MaterialTheme.typography.labelMedium)
+        }
     }
     val controls: @Composable RowScope.() -> Unit = {
         Text(callTimerLabel(call.startedAt, now), Modifier.testTag("beacon-call-timer"), color = CallText,
             style = MaterialTheme.typography.titleMedium.copy(fontFeatureSettings = "tnum"))
-        val phoneEnabled = call.callId.isNotBlank() && controller.service != null
+        // The call has an id: the phone view resolves the account itself, so it can open even while the service is still taking over.
+        val phoneEnabled = call.callId.isNotBlank()
         IconButton(onClick = { showPhone = true }, enabled = phoneEnabled,
             modifier = Modifier.size(48.dp).testTag("beacon-call-phone")) {
             Icon(Icons.Rounded.Smartphone, uiText("View phone"), tint = if (phoneEnabled) CallGoldBright else CallMuted)
@@ -525,17 +551,30 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
 }
 
 /** The tool window and the sharing and error lines. Only this block scrolls, and only when it is given less height than its lines need. */
-@Composable private fun CallNotices(call: CallState) {
+@Composable private fun CallNotices(call: CallState, motionEnabled: Boolean) {
     val tool = call.toolReceipts.lastOrNull { it.chipLabel() != null }
-    if (tool == null && !call.screenSharing && !call.screenBusy && !call.cameraBusy && call.error.isBlank()) return
-    Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        tool?.let { CallToolChip(it, unreachable = call.hermesUnreachable) }
-        if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
-        if (call.screenBusy) Text(uiText("Starting screen share…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
-        if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
-        if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
-            modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+    val hasContent = tool != null || call.screenSharing || call.screenBusy || call.cameraBusy || call.error.isNotBlank()
+    // The lines leave with the call they belonged to: keep the last non-empty state for the length of the collapse.
+    var lastShown by remember { mutableStateOf<CallState?>(null) }
+    SideEffect { if (hasContent) lastShown = call }
+    val shown = if (hasContent) call else lastShown ?: call
+    val lines: @Composable (CallState) -> Unit = { call ->
+        Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            tool?.let { CallToolChip(it, unreachable = call.hermesUnreachable) }
+            if (call.screenSharing) Text(assistantText("Screen shared with Beacon"), color = CallText, style = MaterialTheme.typography.labelLarge)
+            if (call.screenBusy) Text(uiText("Starting screen share…"), color = CallMuted, style = MaterialTheme.typography.labelLarge)
+            if (call.cameraBusy) Text(uiText("Starting camera…"), color = CallMuted, style = MaterialTheme.typography.labelLarge, modifier = Modifier.testTag("beacon-camera-starting"))
+            if (call.error.isNotBlank()) Text(call.error, color = Color(0xffffb4ab), style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.semantics { liveRegion = LiveRegionMode.Polite })
+        }
     }
+    if (!motionEnabled) { if (hasContent) lines(shown) }
+    else AnimatedVisibility(
+        visible = hasContent,
+        enter = fadeIn(tween(180, easing = FastOutSlowInEasing)) + expandVertically(tween(180, easing = FastOutSlowInEasing), expandFrom = Alignment.Top),
+        exit = fadeOut(tween(150, easing = FastOutSlowInEasing)) + shrinkVertically(tween(180, easing = FastOutSlowInEasing), shrinkTowards = Alignment.Top),
+        label = "call-notices",
+    ) { lines(shown) }
 }
 
 /** The controls: the one block that is always whole and pinned to the bottom. The call screen carries no explanatory lines; what the chat saved of the call is in its record afterwards. */
@@ -566,7 +605,7 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
             BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing)) {
                 val landscape = maxWidth > maxHeight
                 val compact = maxHeight < 600.dp
-                val header: @Composable () -> Unit = { CallHeader(call, onConversation, Modifier.fillMaxWidth()) }
+                val header: @Composable () -> Unit = { CallHeader(call, onConversation, motionEnabled, Modifier.fillMaxWidth()) }
                 val presence: @Composable () -> Unit = { VoicePresence(call, Modifier.fillMaxSize().testTag("beacon-call-hero"), motionEnabled) }
                 if (landscape) {
                     // The header runs over both panes, so the timer and the buttons end at the screen's edge, not mid-screen.
@@ -577,7 +616,7 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
                             CallFit(Modifier.weight(1f).fillMaxHeight(), presence = presence)
                             CallFit(
                                 Modifier.weight(1.2f).fillMaxHeight(),
-                                notices = { CallNotices(call) },
+                                notices = { CallNotices(call, motionEnabled) },
                                 captions = { LiveCallCaptions(call, compact = compact) },
                                 controls = { CallControls(call, actions, motionEnabled, compact) },
                             )
@@ -589,7 +628,7 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
                             .padding(horizontal = if (maxWidth >= 720.dp) 32.dp else 16.dp, vertical = 8.dp),
                         header = header,
                         presence = presence,
-                        notices = { CallNotices(call) },
+                        notices = { CallNotices(call, motionEnabled) },
                         captions = { LiveCallCaptions(call, compact = compact) },
                         controls = { CallControls(call, actions, motionEnabled, compact) },
                     )

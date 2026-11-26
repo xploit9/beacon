@@ -20,6 +20,12 @@ internal fun nativeActivityTimeout(expires:Long,now:Long):Long {
     if(expires<=now/1000) return 0
     return ((expires-now/1000).coerceAtMost(14400L)*1000-now%1000).coerceAtLeast(1)
 }
+/**
+ * A question or approval is grouped apart from the replies that pile up in the shade: Android silences a child of its own "Aggregate_AlertingSection"
+ * once one app has many active notifications, which muted the one alert that can still be answered (R3-F6). The group is never a summary, so the
+ * prompt keeps its own alert: `GROUP_ALERT_CHILDREN` means the child owns the sound and the heads-up.
+ */
+internal const val PROMPT_GROUP = "beacon-prompts"
 /** During Beacon's own call a question or approval still pops up, without sound or vibration (the call has the audio). */
 internal const val IN_CALL_PROMPT_CHANNEL = "hermes-prompts-in-call"
 internal const val IN_CALL_PROMPT_CHANNEL_NAME = "Questions during calls"
@@ -101,6 +107,7 @@ fun presentNativeActivity(context: Context, source: String, event: String, activ
         .setContentIntent(PendingIntent.getActivity(context, 0, tap, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
         .setExtras(android.os.Bundle().apply { putString("native_source", source) })
         .setDeleteIntent(PendingIntent.getBroadcast(context, 0, delete, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE))
+    if (kind in setOf("approval", "clarify")) builder.setGroup(PROMPT_GROUP).setGroupAlertBehavior(Notification.GROUP_ALERT_CHILDREN)
     if (Build.VERSION.SDK_INT >= 36) {
         builder.addExtras(android.os.Bundle().apply { putBoolean("android.requestPromotedOngoing", true) }).setShortCriticalText(serviceText(context, if (kind == "working") "Working" else "Your turn"))
     }

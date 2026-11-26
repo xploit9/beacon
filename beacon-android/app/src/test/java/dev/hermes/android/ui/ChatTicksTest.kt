@@ -262,9 +262,9 @@ class ChatTicksTest {
     }
 
     @Test fun queueAndSteerAreTheOnlyWordsForTheBusyChoice() {
-        assertTrue("Send now" in ChatStrings && "Queue" in ChatStrings && "Run command" in ChatStrings)
+        assertTrue("Steer" in ChatStrings && "Queue" in ChatStrings && "Run command" in ChatStrings)
         assertFalse("Will send after this reply" in ChatStrings || "Change the reply" in ChatStrings || "Send after" in ChatStrings)
-        assertEquals("Send now", busyComposerCaption(slash = false, hasFiles = false, busyAction = "steer", explicitQueue = false))
+        assertEquals("Steer", busyComposerCaption(slash = false, hasFiles = false, busyAction = "steer", explicitQueue = false))
         assertEquals("Queue", busyComposerCaption(slash = false, hasFiles = false, busyAction = "queue", explicitQueue = false))
         assertEquals("Queue", busyComposerCaption(slash = false, hasFiles = true, busyAction = "steer", explicitQueue = false))
         assertEquals("Queue", busyComposerCaption(slash = false, hasFiles = false, busyAction = "steer", explicitQueue = true))

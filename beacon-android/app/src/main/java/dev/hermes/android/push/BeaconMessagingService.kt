@@ -710,9 +710,19 @@ internal object AlertBurst {
 internal fun quietAlertCount(active: Array<android.service.notification.StatusBarNotification>, justPosted: String): Int =
     1 + active.count { it.id == 1 && it.tag != justPosted && it.notification.group == ALERT_GROUP && it.notification.extras.getBoolean(QUIET_ALERT_EXTRA) }
 
+/**
+ * The language a notice is said in. Android's per-app language (`android:localeConfig`, set by `cmd locale set-app-locales`) lives in the app's
+ * configuration, not in `Locale.getDefault()`, so an alert raised from a service read English while the app was Arabic (R3-F8).
+ */
+internal fun alertLanguage(config: java.util.Locale?, device: java.util.Locale): String = dev.hermes.android.ui.nativeLanguageFor(config ?: device)
+
+/** The app's own language for words said outside Compose, falling back to the phone's when no configuration is readable. */
+internal fun alertLanguageOf(context: Context): String =
+    alertLanguage(runCatching { context.applicationContext.resources.configuration.locales[0] }.getOrNull(), java.util.Locale.getDefault())
+
 /** Services have no Compose strings: the line comes from the same catalog, in the language of the phone. */
 internal fun serviceText(context: Context, english: String, key: String = english): String {
-    val language = dev.hermes.android.ui.nativeLanguageFor(java.util.Locale.getDefault())
+    val language = alertLanguageOf(context)
     if (language == "en") return english
     val strings = runCatching { (context.applicationContext as BeaconApplication).readTranslations().optJSONObject(language) }.getOrNull() ?: return english
     return strings.optString(dev.hermes.android.ui.normalized(key)).ifBlank { english }

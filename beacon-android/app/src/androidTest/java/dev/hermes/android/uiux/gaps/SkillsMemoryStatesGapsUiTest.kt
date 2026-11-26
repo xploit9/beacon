@@ -172,12 +172,21 @@ class SkillsMemoryStatesGapsUiTest {
         compose.onNodeWithTag("memory-document").assertDoesNotExist()
     }
 
-    @Test fun aLaterReadKeepsTheNotesUnderAThinBarAndTurnsEditingOff() {
+    /** The notes and their Edit action stay usable while the refresh lands; only a save or an open draft blocks them. */
+    @Test fun aLaterReadKeepsTheNotesUnderAThinBarAndKeepsEditingAvailable() {
         memory(NativeMemoryState("s", loading = true, documents = listOf(doc())))
         compose.onNodeWithText("Prefers quiet places").assertIsDisplayed()
         compose.onNodeWithTag("settings-refreshing").assertExists()
         compose.onNodeWithTag("settings-skeleton").assertDoesNotExist()
-        compose.onNodeWithTag("memory-edit").assertIsNotEnabled()
+        compose.onNodeWithTag("memory-edit").assertIsEnabled()
+    }
+
+    /** A background read is not a save: the switches and rows it refreshes stay usable under the thin bar. */
+    @Test fun aRefreshKeepsSkillSwitchesUsableUnderAThinBar() {
+        skills(work.copy(loading = true))
+        compose.onNodeWithTag("settings-refreshing").assertExists()
+        compose.onNodeWithContentDescription("Enable apple-notes").assertIsEnabled()
+        compose.onNodeWithTag("skill-row-apple-notes").assertIsEnabled()
     }
 
     @Test fun aFailedReadIsARowWithoutRetryAndNoDraftLine() {

@@ -57,6 +57,32 @@ class E3PolishTest {
         assertSame(live, usageWithStoredTotals(live, json("input_tokens" to 0, "output_tokens" to 0)))
     }
 
+    /** R3-F2: the detail rows read the same stored totals as the header instead of the recycled runtime's zeros. */
+    @Test fun recycledRuntimeDetailRowsShowHermesStoredFigures() {
+        // Hermes' own reply for a runtime it no longer holds: every live counter is zero, and only the context window survives.
+        val live = json("input_tokens" to 0, "output_tokens" to 0, "cache_read_tokens" to 0, "cache_write_tokens" to 0, "prompt_tokens" to 0,
+            "completion_tokens" to 0, "total_tokens" to 0, "reasoning_tokens" to 0, "api_calls" to 0, "context_length" to 200000)
+        // The stored row of a chat Q2 measured: 51,708 in, 2,057 out, 212,480 cache read, 17 API calls.
+        val row = json("input_tokens" to 51708, "output_tokens" to 2057, "cache_read_tokens" to 212480, "cache_write_tokens" to 0,
+            "reasoning_tokens" to 0, "api_call_count" to 17)
+        val merged = usageWithStoredTotals(live, row)
+        // Hermes counts a prompt as the uncached input plus the cache it read (agent/usage_pricing.py CanonicalUsage.prompt_tokens).
+        assertEquals(51708L + 212480L, merged.getLong("prompt_tokens"))
+        assertEquals(2057L, merged.getLong("completion_tokens"))
+        assertEquals(17L, merged.getLong("api_calls"))
+        assertEquals(212480L, merged.getLong("cache_read_tokens"))
+        assertEquals(200000L, merged.getLong("context_length"))
+        // Details lists what the header's figures did not take. Q2 read Prompt tokens, Completion tokens and Api calls there, so those rows must now
+        // show the stored totals instead of the recycled runtime's zeros (R3-F2); the header's own two figures are not repeated.
+        val figures = sessionUsageFigures(merged)
+        val extra = merged.keys().asSequence().filter { !it.startsWith('_') && it !in figures.consumed }.toList()
+        for (key in listOf("prompt_tokens", "completion_tokens", "api_calls"))
+            assertTrue("$key is a Details row", key in extra)
+        for (key in listOf("input_tokens", "output_tokens"))
+            assertFalse("$key is the header's own figure, not a detail", key in extra)
+        assertEquals(51708L + 212480L, merged.getLong("prompt_tokens"))
+    }
+
     @Test fun theNewThreadDialogStateIsNotTiedToOneSidebar() {
         NewThreadDraft.from = "sidebar"; NewThreadDraft.name = "News"
         assertEquals("sidebar", NewThreadDraft.from); assertEquals("News", NewThreadDraft.name)

@@ -11,7 +11,8 @@ class StartupPreloadTest {
         assertTrue("startup reads are warmed separately", prefetchReads.none { read -> startupReads.any { it.path == read.path } })
         assertTrue(prefetchReads.all { it.path in screenReadPaths || it.path == "/api/mcp/servers" })
         assertTrue(prefetchReads.none { read -> read.query.keys.any { it == "session_id" || it == "chat" } })
-        assertTrue("the warm-up waits for the chat before starting", PREFETCH_DELAY > 0 && PREFETCH_READY_WAIT > PREFETCH_DELAY)
+        // The small reads start while the first chat frame opens; only the heavy warm-up waits the longer readiness window.
+        assertTrue("the warm-up starts early", PREFETCH_DELAY in 1L..500L && PREFETCH_READY_WAIT > PREFETCH_DELAY)
         assertTrue("a return to the foreground re-warms after a while, not every time", PREFETCH_REWARM_AFTER > STARTUP_READ_TTL)
     }
     @Test fun recentHistoryIsBoundedAndDoesNotRepeatBeacon() {

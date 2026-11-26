@@ -17,6 +17,7 @@ import dev.hermes.android.core.sessionRowId
 import dev.hermes.android.core.sessionRowKey
 import dev.hermes.android.data.BEACON_THREAD_SOURCE
 import dev.hermes.android.data.THREAD_SOURCES
+import dev.hermes.android.data.nativeSessionFlag
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Calendar
@@ -100,10 +101,10 @@ internal fun historyRows(rows: List<JSONObject>, view: HistoryView, order: Histo
     val shown = when (view) {
         HistoryView.All -> visible
         HistoryView.Threads -> visible.filter { isThreadSource(it.string("source")) }
-        HistoryView.Pinned -> visible.filter { it.optBoolean("pinned") }
+        HistoryView.Pinned -> visible.filter { nativeSessionFlag(it, "pinned") }
     }
     // Pinned chats stay on top in every order (as in Telegram); the sort is stable, so the rest keep Hermes' order.
-    return if (order == HistoryOrder.Title) shown.sortedWith(compareByDescending<JSONObject> { it.optBoolean("pinned") }.thenBy { it.string("title").lowercase(Locale.ROOT) }) else shown.sortedByDescending { it.optBoolean("pinned") }
+    return if (order == HistoryOrder.Title) shown.sortedWith(compareByDescending<JSONObject> { nativeSessionFlag(it, "pinned") }.thenBy { it.string("title").lowercase(Locale.ROOT) }) else shown.sortedByDescending { nativeSessionFlag(it, "pinned") }
 }
 
 /** Hermes rejects a duplicate title (the first-turn title is then dropped), so a repeated thread name gets a number. */

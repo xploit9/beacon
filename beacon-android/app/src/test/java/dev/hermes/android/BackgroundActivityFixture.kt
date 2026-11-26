@@ -33,6 +33,10 @@ internal class BackgroundActivityFixture : WebSocket.Factory, AutoCloseable {
     var failMethod = ""
     var holdMethod = ""
     var beforeReply: ((String) -> Unit)? = null
+    var killReply = json("status" to "killed", "session_id" to "process-b", "exit_code" to 1, "completion_reason" to "killed")
+    var interruptReply = json("found" to true, "subagent_id" to "worker-a")
+    var stopError: JSONObject? = null
+    var onStop: ((String, JSONObject) -> Unit)? = null
     val held = CompletableDeferred<Unit>()
     val client = BeaconClient(AuthContext("https://activity-fixture.invalid", emptyList(), "synthetic-owner", "default", backend = "hermes-dashboard"), null, this) { builder ->
         builder.addInterceptor { chain ->
@@ -60,12 +64,16 @@ internal class BackgroundActivityFixture : WebSocket.Factory, AutoCloseable {
                 requests += method to params.copy()
                 if (method == holdMethod) { held.complete(Unit); return true }
                 val response = json("jsonrpc" to "2.0", "id" to frame.getString("id"))
+                if (method in setOf("process.kill", "subagent.interrupt")) onStop?.invoke(method, params)
                 if (method == failMethod) response.put("error", json("code" to 5030, "message" to "unsupported_projection"))
+                else if (method in setOf("process.kill", "subagent.interrupt") && stopError != null) response.put("error", stopError!!)
                 else response.put("result", when (method) {
                     "client.capabilities" -> JSONObject()
                     "session.active_list" -> inventory
                     "subagent.list" -> checkNotNull(rosters[params.getString("session_id")])
                     "process.list" -> checkNotNull(processes[params.getString("session_id")])
+                    "process.kill" -> killReply
+                    "subagent.interrupt" -> interruptReply
                     else -> error("Unexpected RPC activity read: $method")
                 })
                 beforeReply?.invoke(method)
