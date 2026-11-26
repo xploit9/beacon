@@ -8,6 +8,7 @@ import dev.hermes.android.data.ApiFailure
 
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -57,7 +58,9 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
@@ -67,6 +70,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
@@ -86,6 +90,8 @@ import androidx.compose.ui.semantics.heading
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -179,7 +185,7 @@ internal suspend fun stopBackgroundActivity(source: BeaconClient, profile: Strin
             } catch (error: ApiFailure) {
                 // 4044 (legacy) or 4001/process_not_found (canonical) is Hermes saying this id is no longer one of the chat's live
                 // processes: it finished between polls.
-                if (error.status == 4044 || error.status == 4001 && request.method == "process.kill") null else throw error
+                if (error.status == 4044 || error.status == 4001 && request.method == PROCESS_KILL_METHOD) null else throw error
             }
             if (result != null && !backgroundStopAccepted(request.method, result) && !backgroundStopAlreadyGone(request.method, result))
                 return@withTimeoutOrNull BackgroundStopOutcome(backgroundStopFailureMessage(item))
@@ -1785,11 +1791,33 @@ internal fun acceptsInitialConversationEdit(
 ): Boolean = sameClient && newChatOpening && !callActive && inputScope?.session.isNullOrBlank() &&
     ownerScope != null && currentScope?.copy(session = "") == ownerScope
 
+/** The chat fields the composer reads. Streaming changes only the live text, so collecting this snapshot keeps the text field, menus and attachments out
+ *  of every token's recomposition. */
+internal data class ComposerChat(
+    val sessionId: String = "", val raw: JSONObject = JSONObject(), val queued: List<QueuedMessage> = emptyList(),
+    val status: String = "", val streamId: String = "", val uncertain: String = "", val projectionReady: Boolean = true,
+    val sessionReasoningEffort: String = "", val lostChoice: Boolean = false, val sendInFlight: Boolean = false, val hasReplies: Boolean = false,
+)
+internal fun composerChat(state: ChatState) = ComposerChat(state.sessionId, state.raw, state.queued, state.status, state.streamId, state.uncertain,
+    state.projectionReady, state.sessionReasoningEffort, lostChoiceShown(state), chatSendInFlight(state), state.messages.any { it.role == "assistant" })
+
+/** The composer's context share: Hermes' own used and window figures, never a sum of the token totals. */
+internal data class ComposerContextUsage(val percent: Int, val used: Long, val window: Long)
+
+/** What the tiny ring may claim: null when Hermes did not count this chat, or did not send both figures. */
+internal fun composerContextUsage(figures: SessionUsageFigures, hasReplies: Boolean): ComposerContextUsage? {
+    if (sessionUsageUnreported(figures, hasReplies)) return null
+    val used = figures.used ?: return null
+    val window = figures.window?.takeIf { it > 0 } ?: return null
+    return ComposerContextUsage(figures.percent ?: return null, used, window)
+}
+
 /** [opening]: Beacon's conversation is still opening, so the composer holds its place but is idle and shows nothing of the chat that was open before. */
+@SuppressLint("StateFlowValueCalledInComposition") // the current value is only the first frame; the collected flow observes every later change
 @Composable private fun Composer(vm: BeaconViewModel, callActive: Boolean, callAvailable: Boolean, onCall: () -> Unit, details: Boolean, onDetails: (Boolean) -> Unit, opening: Boolean = false) {
     val ui by vm.ui.collectAsStateWithLifecycle()
-    val liveChat by vm.chat.collectAsStateWithLifecycle()
-    val chat = if (opening) ChatState() else liveChat
+    val liveChat by remember(vm) { vm.chat.map(::composerChat).distinctUntilChanged() }.collectAsStateWithLifecycle(composerChat(vm.chat.value))
+    val chat = if (opening) ComposerChat() else liveChat
     val liveDraft by vm.composer.collectAsStateWithLifecycle()
     val draft = if (opening) TextFieldValue() else liveDraft
     val preferences by vm.preferences.collectAsStateWithLifecycle()
@@ -1802,7 +1830,7 @@ internal fun acceptsInitialConversationEdit(
     // A chat that stays on screen only because it cannot open now (Beacon off for the profile, or access refused) has no send: its own line says why.
     val retainedPage = !opening && vm.onRetainedPage()
     // A new chat with no conversation behind it opens one by itself; a missed start (a setup that ended another way, the app away at that moment) is asked for again here.
-    val wantsChat = !opening && initialChatNeedsOpening(ui, liveChat)
+    val wantsChat = !opening && initialChatNeedsOpening(ui, chat.sessionId)
     LaunchedEffect(wantsChat, ui.connected) { if (wantsChat) vm.openInitialChat() }
     val composerScope = rememberCoroutineScope()
     val liveFiles by vm.attachments.collectAsStateWithLifecycle()
@@ -1959,7 +1987,7 @@ internal fun acceptsInitialConversationEdit(
             }
             // Hermes restarted during the last reply and the owner's messages wait behind it: they go only on this Send (Hermes' own Discard).
             // UX-121 P3-17 (Root): why, then what to do, at body size; the transcript's own restart line stays hidden meanwhile, so it is never said twice.
-            if (lostChoiceShown(chat)) Column(Modifier.fillMaxWidth().padding(start = 14.dp).testTag("lost-reply-choice")) {
+            if (chat.lostChoice) Column(Modifier.fillMaxWidth().padding(start = 14.dp).testTag("lost-reply-choice")) {
                 Text(uiText(LOST_REPLY_STATUS), Modifier.padding(top = 6.dp), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(uiText("Your waiting message hasn't been sent."), Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -1970,7 +1998,7 @@ internal fun acceptsInitialConversationEdit(
             if (queueBox.isNotEmpty()) QueueBox(vm, queueBox, replying = chat.streamId.isNotBlank())
             val voiceAction = composerUsesVoice(draft.text, files.size, preparing.size)
             val streaming = chat.streamId.isNotBlank()
-            val sending = chatSendInFlight(chat)
+            val sending = chat.sendInFlight
             val heldBySend = sending && !opening && vm.heldBySend()
             // D7: Send is off while a tap would be refused (no conversation yet, the chat still loading), and the line says why; with no
             // connection Send still works and the message waits as "Not sent" (P2-2).
@@ -2045,6 +2073,7 @@ internal fun acceptsInitialConversationEdit(
                         }
                         // Attach stays at the left; run controls sit together at the right edge.
                         Box(Modifier.weight(1f), contentAlignment = Alignment.CenterEnd) { Row(verticalAlignment = Alignment.CenterVertically) {
+                        ComposerContextIndicator(vm, chat, ui.profile, ui.connected)
                         NativeApprovalMenu(vm, enabled = canonical && !callActive && !readOnly)
                         Box(Modifier.weight(1f, fill = false).widthIn(max = 168.dp)) {
                             val modelLabel = chatModelTitle(chatModelLabel(chat.raw.string("model"), defaults?.string("model").orEmpty()), data["picker:models"]?.rows("groups").orEmpty())
@@ -2114,6 +2143,51 @@ internal fun acceptsInitialConversationEdit(
             if (files.isEmpty() && preparing.isEmpty()) Text(uiText("No attachments"), color = MaterialTheme.colorScheme.onSurfaceVariant)
             files.forEachIndexed { index, file -> Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text(file.string("name", file.string("filename", uiText("Attachment"))), Modifier.weight(1f)); IconButton(onClick = { vm.removeAttachment(index) }) { Icon(Icons.Rounded.Close, uiText("Remove attachment")) } } }
         }
+    }
+}
+
+/** The chat's context window as a tiny ring and its share, immediately leading the approval shield; the whole 48 dp target opens the Usage page. */
+@Composable private fun ComposerContextIndicator(vm: BeaconViewModel, chat: ComposerChat, profile: String, connected: Boolean) {
+    val data by vm.data.collectAsStateWithLifecycle()
+    val session = chat.sessionId
+    val key = "native-usage:$profile:$session"
+    // Hermes' own cached record: read once the chat is on screen and again when its reply settles, never per frame or per token.
+    LaunchedEffect(key, connected) {
+        if (session.isNotBlank() && connected) vm.load(key, "/api/session/usage", mapOf("session_id" to session), quiet = true)
+    }
+    var streaming by remember(key) { mutableStateOf(false) }
+    LaunchedEffect(key, chat.streamId, connected) {
+        if (chat.streamId.isNotBlank()) streaming = true
+        else if (streaming) {
+            streaming = false
+            if (session.isNotBlank() && connected) vm.load(key, "/api/session/usage", mapOf("session_id" to session), quiet = true)
+        }
+    }
+    if (session.isBlank()) return
+    val usage = data[key] ?: return
+    val share = composerContextUsage(remember(usage) { sessionUsageFigures(usage) }, chat.hasReplies) ?: return
+    val locale = uiLocale()
+    val percent = formatContextPercent(share.percent, locale)
+    val description = uiText("Context {0} used, {1} of {2} tokens")
+        .replace("{0}", percent).replace("{1}", formatTokenCount(share.used, locale)).replace("{2}", formatTokenCount(share.window, locale))
+    // At the largest text sizes the numeral would crowd the shield: the ring stays, and TalkBack still says the figures.
+    val showPercent = LocalDensity.current.fontScale <= 1.2f
+    Row(Modifier.heightIn(min = 48.dp).widthIn(min = 48.dp).clip(RoundedCornerShape(12.dp))
+        .clickable(role = Role.Button) { vm.more("Session usage") }
+        .semantics(mergeDescendants = true) { contentDescription = description }
+        .padding(horizontal = 4.dp).testTag("composer-context"),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+        val usedColor = ProgressIndicatorDefaults.linearColor
+        val trackColor = ProgressIndicatorDefaults.linearTrackColor
+        Canvas(Modifier.size(15.dp).clearAndSetSemantics { this[SemanticsProperties.TestTag] = "composer-context-ring" }) {
+            val stroke = 2.dp.toPx()
+            val inset = stroke / 2
+            val side = size.minDimension - stroke
+            drawArc(trackColor, -90f, 360f, false, topLeft = Offset(inset, inset), size = Size(side, side), style = Stroke(stroke))
+            if (share.percent > 0) drawArc(usedColor, -90f, 360f * share.percent / 100f, false, topLeft = Offset(inset, inset), size = Size(side, side),
+                style = Stroke(stroke, cap = StrokeCap.Round))
+        }
+        if (showPercent) Text(percent, Modifier.clearAndSetSemantics { this[SemanticsProperties.TestTag] = "composer-context-percent" }, style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
     }
 }
 
@@ -3029,8 +3103,9 @@ private fun toolIcon(name: String): androidx.compose.ui.graphics.vector.ImageVec
 
 /** A send Hermes has not answered yet; an unknown outcome is shown separately, once the request has failed or been interrupted. */
 /** The Chat tab shows a new chat with no conversation behind it and nothing is opening one: its controls stay idle until one exists, so it is asked for. */
-internal fun initialChatNeedsOpening(ui: AppState, chat: ChatState): Boolean =
-    ui.authenticated && ui.tab == "Chat" && ui.initialChatReady && !ui.setupWizard && !ui.newChatOpening && ui.newChatError.isBlank() && chat.sessionId.isBlank()
+internal fun initialChatNeedsOpening(ui: AppState, chat: ChatState): Boolean = initialChatNeedsOpening(ui, chat.sessionId)
+internal fun initialChatNeedsOpening(ui: AppState, sessionId: String): Boolean =
+    ui.authenticated && ui.tab == "Chat" && ui.initialChatReady && !ui.setupWizard && !ui.newChatOpening && ui.newChatError.isBlank() && sessionId.isBlank()
 /** Attach works in a conversation, and in a new chat that can be written to (its tap opens the conversation first); never while a call runs, the chat is read-only, or it is a retained page (nothing can be sent from there). */
 internal fun composerAttachEnabled(canonical: Boolean, editable: Boolean, callActive: Boolean, readOnly: Boolean, retainedPage: Boolean = false): Boolean = (canonical || editable) && !callActive && !readOnly && !retainedPage
 /** The menu row that sends (or queues) a draft starting with "/" as plain text: like Send, never on a retained page. */

@@ -22,6 +22,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
@@ -240,6 +242,20 @@ class UxTourShotsTest {
         vm.storeData(key, json("input_tokens" to 18400, "output_tokens" to 2300, "context_window" to 32000, "context_used" to 4200))
         compose.waitForIdle()
         shoot("usage-figures")
+        // The owner's screenshot: a 1M window Hermes reports as fully used while the two token totals stay different, and a Details row.
+        vm.storeData(key, json("input_tokens" to 628_000, "output_tokens" to 67_000, "context_window" to 1_000_000, "context_used" to 1_000_000,
+            "provider_note" to "kept on the server"))
+        compose.waitForIdle()
+        shoot("usage-context-full")
+        // A chat named by a long URL keeps the hero inside the 360 dp width.
+        val chat = flow<ChatState>(vm, "_chat").value
+        flow<ChatState>(vm, "_chat").value = chat.copy(title = "https://example.com/clients/acme/reports/2026/q4/final?view=usage&source=dashboard")
+        compose.waitForIdle()
+        shoot("usage-long-title")
+        // Details opens over the same figures without moving them.
+        compose.onNodeWithText("Details").performClick()
+        compose.waitForIdle()
+        shoot("usage-details-open")
     }
 
     @Test fun commands() = withFixture { vm, _ ->

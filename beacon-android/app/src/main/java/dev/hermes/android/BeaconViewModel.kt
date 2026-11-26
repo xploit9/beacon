@@ -2817,7 +2817,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     val response = c.get("/api/session", mapOf("session_id" to scope.session))
                     if (!request.current() || !foreground) return@launch
                     renderSession(response, scope)
-                    app.cache.writeSession(scope, response.toString())
+                    app.cache.writeSession(scope, encodeProjection(response))
                     if (!request.current() || !foreground) return@launch
                 }
                 launch { refreshChatEffort() }
@@ -2900,7 +2900,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         renderSession(response, scope)
                         val held = savedTurnHoldsReply((response.optJSONObject("session") ?: response).rows("messages"))
                         _chat.update { if (liveCopyUnbound(it)) releaseTerminalChat(it, "", replyConfirmed = unboundReleaseConfirmed(it, held), terminalStatus = "") else it }
-                        if (_chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, _chat.value.raw.toString())
+                        if (_chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, encodeProjection(_chat.value.raw))
                     }
                     "lost" -> showLostChoice(scope)
                 }
@@ -3030,7 +3030,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 }
                 // Hermes wrote its note on the cut turn: the chat is read again (the same passive read the open made).
                 val response = try { probe.get("/api/session", mapOf("session_id" to scope.session)) } catch (e: Throwable) { if (e is CancellationException) throw e; null }
-                if (response != null && request.current() && idle()) { renderSession(response, scope); app.cache.writeSession(scope, response.toString()) }
+                if (response != null && request.current() && idle()) { renderSession(response, scope); app.cache.writeSession(scope, encodeProjection(response)) }
             }
             if (request.current() && idle()) _chat.update { if (it.streamId.isBlank() && it.status.isBlank() && !it.lostWaiting) it.copy(status = LOST_REPLY_STATUS) else it }
             return if (gone) LostOnOpen.Closed else LostOnOpen.Held
@@ -3891,13 +3891,17 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         catch (error: Throwable) { _ui.update { it.copy(loading = false, error = signInErrorText(error)) } }
     }
     private suspend fun restoreCachedOwner(scope: Scope, generation: Int) {
-        val index = app.cache.read(scope, "conversation-index")?.let(::JSONObject)
+        // One storage pass for the small rows the first frame needs; each separate read takes the cache lock and a transaction.
+        val cached = app.cache.readMany(scope, listOf("conversation-index", "profile-settings", "selected-session", "new-chat-shell"))
         openGlances(scope.copy(session = ""))
-        val settings = app.cache.read(scope, "profile-settings")?.let(::JSONObject)
         val beacon = readBeaconCache(scope)
-        val selected = chatTabSelection(saved.get<String>("session:${scope.key}") ?: app.cache.read(scope, "selected-session"), beacon)
-        val shell = app.cache.read(scope, "new-chat-shell")
-        val screenData = cachedScreens(scope)
+        val (index, settings) = withContext(Dispatchers.Default) {
+            (cached["conversation-index"]?.let(::JSONObject)) to (cached["profile-settings"]?.let(::JSONObject))
+        }
+        val selected = chatTabSelection(saved.get<String>("session:${scope.key}") ?: cached["selected-session"], beacon)
+        val shell = cached["new-chat-shell"]
+        // The screen row is opened now for the composer's first-frame approvals; the rest of it hydrates after the chat is on screen.
+        val screenData = cachedScreens(scope, prepareMemory = false)
         if (generation != originGeneration) return
         cachedOwnerScope = scope
         restoreBotMode(scope)
@@ -4783,7 +4787,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 val reader = active.detached()
                 try {
                     val response = reader.get("/api/session", mapOf("session_id" to id), maxBytes = 1024 * 1024)
-                    if (current() && sourceScope != owner.session(id)) app.cache.writeSession(owner.session(id), response.toString())
+                    if (current() && sourceScope != owner.session(id)) app.cache.writeSession(owner.session(id), encodeProjection(response))
                 } catch (e: Throwable) { if (e is CancellationException) throw e; if (current() && e is ApiFailure && e.status == 401) fail(e) }
                 finally { reader.closeNative() }
             }
@@ -5313,15 +5317,18 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         try {
             val result = c.call(path, method = "POST", data = body.copy().put("session_id", id).put("scope_key", target.key))
             if (client !== active) return@launch
-            if (sourceScope == target) _chat.update { chat ->
-                when (path) {
-                    "/api/session/rename" -> {
-                        val title = result.optJSONObject("session")?.string("title")?.takeIf(String::isNotBlank) ?: result.string("title").takeIf(String::isNotBlank) ?: body.string("title")
-                        chat.copy(title = title, raw = chat.raw.copy().put("title", title))
+            if (sourceScope == target) {
+                ++chatHistoryRevision
+                _chat.update { chat ->
+                    when (path) {
+                        "/api/session/rename" -> {
+                            val title = result.optJSONObject("session")?.string("title")?.takeIf(String::isNotBlank) ?: result.string("title").takeIf(String::isNotBlank) ?: body.string("title")
+                            chat.copy(title = title, raw = chat.raw.copy().put("title", title))
+                        }
+                        "/api/session/pin" -> chat.copy(raw = chat.raw.copy().put("pinned", body.getBoolean("pinned")))
+                        "/api/session/archive" -> chat.copy(raw = chat.raw.copy().put("archived", result.optBoolean("hidden", body.optBoolean("archived"))))
+                        else -> chat
                     }
-                    "/api/session/pin" -> chat.copy(raw = chat.raw.copy().put("pinned", body.getBoolean("pinned")))
-                    "/api/session/archive" -> chat.copy(raw = chat.raw.copy().put("archived", result.optBoolean("hidden", body.optBoolean("archived"))))
-                    else -> chat
                 }
             }
             if (path == "/api/session/archive") rememberArchived(target, id, result.optBoolean("hidden", body.optBoolean("archived")))
@@ -5879,7 +5886,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 }
                 if (!current()) return@launch
                 renderSession(response, scope)
-                app.cache.writeSession(scope, response.toString())
+                app.cache.writeSession(scope, encodeProjection(response))
                 client?.let { refreshChatAlerts(scope, it) }
                 val session = response.optJSONObject("session") ?: response
                 if (session.rows("messages").isNotEmpty() || session.optInt("message_count") > 0 || session.string("active_stream_id").isNotBlank()) {
@@ -5978,12 +5985,16 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         if (generation != originGeneration || sourceScope != scope || followsHere(scope)) return false
         val cached = app.cache.readMany(scope, listOf("session", LIVE_TURN))
         if (generation != originGeneration || sourceScope != scope || followsHere(scope)) return false
+        val (saved, record) = withContext(Dispatchers.Default) {
+            (cached["session"]?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }) to
+                (cached[LIVE_TURN]?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() })
+        }
+        if (generation != originGeneration || sourceScope != scope || followsHere(scope)) return false
         var painted = false
-        cached["session"]?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }?.takeIf { cachedChatAddsRows(it, _chat.value) }?.let { saved ->
-            renderSession(saved.apply { remove("runtime_session_id") }, scope)
+        saved?.takeIf { cachedChatAddsRows(it, _chat.value) }?.let { cachedSession ->
+            renderSession(cachedSession.apply { remove("runtime_session_id") }, scope)
             painted = true
         }
-        val record = cached[LIVE_TURN]?.let { runCatching { JSONObject(it) }.getOrNull() }
         val stream = record?.string("stream_id")?.takeIf { it.matches(streamIdPattern) }
         // The saved chat ended the turn (its reply is the last row): the turn's own frame must not paint it running again.
         if (stream != null && _chat.value.streamId.isNotBlank()) {
@@ -6029,12 +6040,15 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             _side.value = SideQuestion(scope, side.string("question"), side.getString("session_id"), side.getString("stream_id"), side.string("text"), side.string("status"), side.string("cursor"), side.string("error"))
             if (client != null) resumeSideQuestion()
         }
-        val session = cached["session"]?.let(::JSONObject)
+        // The saved transcript can be large; parse it off the frame thread before it is rendered.
+        val (session, record) = withContext(Dispatchers.Default) {
+            (cached["session"]?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() }) to
+                (cached[LIVE_TURN]?.let { raw -> runCatching { JSONObject(raw) }.getOrNull() })
+        }
         if (!current()) return false
         // A cached runtime id is not a live binding; opening history must remain passive.
         session?.let { renderSession(it.apply { remove("runtime_session_id") }, scope) }
         // R2C: a cold start paints the turn the chat last showed, with its words so far; Hermes' answer settles it once connected (selectSession).
-        val record = cached[LIVE_TURN]?.let { runCatching { JSONObject(it) }.getOrNull() }
         val turnStream = record?.string("stream_id")?.takeIf { it.matches(streamIdPattern) }
         if (turnStream != null) {
             val frame = liveFrames["${scope.key}:$turnStream"] ?: try { app.cache.read(scope, "live:$turnStream")?.let(::JSONObject) } catch (e: Exception) { if (e is CancellationException) throw e; null }
@@ -6055,6 +6069,8 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         return true
     }
+    /** A transcript JSON is large: encode it away from the frame thread before it is compared or saved. */
+    private suspend fun encodeProjection(value: JSONObject): String = withContext(Dispatchers.Default) { value.toString() }
     private suspend fun renderSession(response: JSONObject, scope: Scope, expectedRevision: Long? = null, allowRemoval: Boolean = false, removedUserRowId: String = "") {
         if (sourceScope != scope || expectedRevision != null && expectedRevision != chatHistoryRevision) return
         val o = mergeChatProjection(_chat.value.raw, storedSessionSettings(response.optJSONObject("session") ?: response), allowRemoval, removedUserRowId)
@@ -6077,15 +6093,21 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         }
         if (sourceScope != scope || expectedRevision != null && expectedRevision != chatHistoryRevision) return
         ++chatHistoryRevision
-        renderedServerProjection = scope to response.toString()
+        val revision = chatHistoryRevision
+        val encoded = encodeProjection(response)
+        if (sourceScope != scope || revision != chatHistoryRevision) return
+        renderedServerProjection = scope to encoded
         val held = heldTitle?.takeIf { it.first == scope }
         val loadedTitle = o.string("title")
         if (held != null && loadedTitle.isNotBlank() && loadedTitle != held.third) heldTitle = null
         val shownTitle = if (held != null) titleAfterLoad(held.second, held.third, loadedTitle) else loadedTitle
         val queuedBefore = _chat.value.queued
         val picker = screens.exact(scope.copy(session = ""), "picker:reasoning", screenRequest(reasoningPath(), reasoningQuery(scope.session, o)))?.value
+        val rows = o.rows("messages")
+        // Decoding a long transcript is not frame work.
+        val mapped = withContext(Dispatchers.Default) { rows.mapIndexed { i, m -> Message.from(m, i, scope.session) } }
+        if (sourceScope != scope || revision != chatHistoryRevision) return
         _chat.update { old ->
-            val rows = o.rows("messages")
             val active = (o.opt("active_stream_id") as? String)?.takeIf { it.matches(streamIdPattern) }
             val boundary = liveBoundaries["${scope.key}:${old.streamId}"] ?: LiveAssistantBoundary()
             val proof = persistedTurns["${scope.key}:${old.streamId}"]
@@ -6093,7 +6115,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val ended = live.streamEnded && !(old.sessionId == scope.session && passiveReadKeepsTurn(old.streamId, o.has("active_stream_id"), rows))
             old.copy(projectionReady = true,
                 sessionReasoningEffort = reloadedEffort(old, scope.session, o, picker),
-                sessionId = scope.session, title = shownTitle.ifBlank { old.title.takeIf { old.sessionId == scope.session } ?: "New conversation" }, messages = rows.mapIndexed { i, m -> Message.from(m, i, scope.session) },
+                sessionId = scope.session, title = shownTitle.ifBlank { old.title.takeIf { old.sessionId == scope.session } ?: "New conversation" }, messages = mapped,
                 raw = if (old.sessionId == scope.session) carryDisplayIdentity(o, old.raw) else o,
                 status = renderedChatStatus(old, active, ended),
                 streamId = active?.takeIf { it.isNotBlank() } ?: if (ended) "" else old.streamId,
@@ -6159,7 +6181,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 val response = active.detached().get("/api/session", mapOf("session_id" to scope.session))
                 if (!foreground || !request.current() || _chat.value.streamId.isNotBlank() || pending.containsKey(scope.key)) return@launch
                 renderSession(response, scope)
-                app.cache.writeSession(scope, response.toString())
+                app.cache.writeSession(scope, encodeProjection(response))
             } catch (e: Throwable) { if (e is CancellationException) throw e }
         }
     }
@@ -6210,7 +6232,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 }
                 if (!foreground || !request.current()) return@launch
                 renderSession(response, scope)
-                app.cache.writeSession(scope, response.toString())
+                app.cache.writeSession(scope, encodeProjection(response))
             } catch (e: Throwable) { if (e is CancellationException) throw e }
         }
     }
@@ -6286,7 +6308,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             val encoded = current.encode(); app.cache.write(scope, draftKind(scope), encoded, current.text.isNotBlank() || current.attachments.isNotEmpty() || current.queued.isNotEmpty()); savedDraft(scope, encoded)
             keepGoneChatWithWords(scope, current)
         }
-        if (sourceScope == scope && _chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, _chat.value.raw.toString())
+        if (sourceScope == scope && _chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, encodeProjection(_chat.value.raw))
     }
     /** REVIEW-FIXCHAT-121 P2: the next start reopens a gone chat that holds the owner's words again (the 404 let its selection go while it was empty). */
     private suspend fun keepGoneChatWithWords(scope: Scope, current: Draft) {
@@ -7896,12 +7918,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                                     val state = _chat.value
                                     // chat-live: a saved projection the open chat just drew is on disk at once, so a return or a process
                                     // kill paints it without waiting for another read.
-                                    if (event.type in setOf("done", "state_saved") && state.raw.has("messages")) app.cache.writeSession(scope, state.raw.toString())
+                                    if (event.type in setOf("done", "state_saved") && state.raw.has("messages")) app.cache.writeSession(scope, encodeProjection(state.raw))
                                     val progress = (liveBoundaries[frameKey] ?: LiveAssistantBoundary()).saveInto(json("cursor" to cursor.lastId, "text" to state.liveText, "reasoning" to state.liveReasoning, "tools" to JSONArray(state.liveTools), "sealed" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.liveSealed), "sealed_at" to JSONArray(if (terminalObserved || event.terminal) emptyList() else state.sealedPlaces()), "ordinal" to state.liveOrdinal, "base" to state.liveBase, "base_prompt" to state.liveBasePrompt, "error" to terminalError, "terminal" to terminalObserved, "wait" to savedWaitLine(state.status), "submission_id" to state.raw.string("_display_submission_id")))
                                     liveFrames[frameKey] = progress
                                     val now = android.os.SystemClock.elapsedRealtime()
-                                    if (now - lastCheckpoint >= 200 || event.type in setOf("done", "state_saved") || event.terminal) { app.cache.write(scope, "live:$stream", progress.toString()); lastCheckpoint = now }
-                                    if (event.type == "state_saved" && state.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, state.raw.toString())
+                                    if (now - lastCheckpoint >= 200 || event.type in setOf("done", "state_saved") || event.terminal) { app.cache.write(scope, "live:$stream", encodeProjection(progress)); lastCheckpoint = now }
+                                    if (event.type == "state_saved" && state.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, encodeProjection(state.raw))
                                 }
                             }
                         }
@@ -7918,7 +7940,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         val response = c.get("/api/session", mapOf("session_id" to scope.session))
                         if (sourceScope == scope && revision != chatHistoryRevision) continue
                         renderSession(response, scope, revision)
-                        app.cache.writeSession(scope, response.toString())
+                        app.cache.writeSession(scope, encodeProjection(response))
                         active = ((response.optJSONObject("session") ?: response).opt("active_stream_id") as? String)
                             ?.takeIf { it.matches(streamIdPattern) }
                         if (!active.isNullOrBlank() && active != stream) {
@@ -7983,7 +8005,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                             settleOpenSteers(c, scope, identity, rows, turnUsers) { ownsCompletion() }
                             if (!ownsCompletion()) return@launch
                             terminalReplyVisible = replyShownInHistory(checked, rows)
-                            app.cache.writeSession(scope, _chat.value.raw.toString())
+                            app.cache.writeSession(scope, encodeProjection(_chat.value.raw))
                             // An unproven ending keeps the streamed reply on screen like any other reply; only a real turn error is worded.
                             if (!terminalReplyVisible) _chat.update { it.copy(status = terminalError) }
                         } else if (sourceScope == scope && client?.scope == c.scope) {
@@ -8022,7 +8044,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                         _chat.update { releaseTerminalChat(it, stream, terminalReplyVisible, terminalError, followedSubmission) }
                         // A turn that ended by its own events uses up a stale mark without a line.
                         if (endedByLook) showQuietLostClose(scope) else quietLostCloses.remove(scope.key)
-                        if (_chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, _chat.value.raw.toString())
+                        if (_chat.value.raw.has(UNCONFIRMED_REPLIES)) app.cache.writeSession(scope, encodeProjection(_chat.value.raw))
                         pollPrompts(c, scope); refreshSessions()
                         if (drainsQueueAfterTerminal(terminalReplyVisible, alreadyEnded, terminalError)) client?.let { drainQueued(scope, it) }
                         // A failure trying again cannot fix, a stop or a restart: each waiting message is held, saved with the draft, until the owner's Send.
@@ -8117,7 +8139,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                 if (!waiting() || revision != chatHistoryRevision) continue
                 renderSession(response, scope, revision)
                 // Saved for a cold open, as the reconnect read saves its render, but only when this render ran: a skipped one would save a copy without the chat's kept keys.
-                if (chatHistoryRevision == revision + 1) app.cache.writeSession(scope, response.toString())
+                if (chatHistoryRevision == revision + 1) app.cache.writeSession(scope, encodeProjection(response))
             } catch (e: Throwable) { if (e is CancellationException) throw e }
             finally { reader.closeNative() }
         }
@@ -8257,12 +8279,12 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     }
                     val response = c.get("/api/session", mapOf("session_id" to scope.session))
                     if (!foreground || !request.current() || revision != chatHistoryRevision) continue
-                    val projection = scope to response.toString()
+                    val projection = scope to encodeProjection(response)
                     val historyMoved = renderedServerProjection != projection
                     if (historyMoved) {
                         renderSession(response, scope, revision)
                         if (!foreground || !request.current() || renderedServerProjection != projection) continue
-                        app.cache.writeSession(scope, response.toString())
+                        app.cache.writeSession(scope, projection.second)
                     }
                     if (!foreground || !request.current() || renderedServerProjection != projection) continue
                     observedMetadata = displayedNativeHistoryStamp(_chat.value.raw)
@@ -8394,11 +8416,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
 
     fun closeSideQuestion() { sideJob?.cancel(); sideCheckpointJob?.cancel(); val side = _side.value; _side.value = null; if (side != null) viewModelScope.launch { app.cache.delete(side.scope, "side-question") } }
     /** The newest cached answer of each screen key under [scope], marked stale until a fetch confirms it. */
-    private suspend fun cachedScreens(scope: Scope): Map<String, JSONObject> = try {
+    private suspend fun cachedScreens(scope: Scope, prepareMemory: Boolean = true): Map<String, JSONObject> = try {
         val generation = originGeneration
         screens.open(scope)
         val version = screens.readVersion(scope, "settings:memory")
-        phoneSettings.prepareSavedMemory(scope) { generation == originGeneration && screens.readCurrent(scope, "settings:memory", version) }
+        if (prepareMemory) phoneSettings.prepareSavedMemory(scope) { generation == originGeneration && screens.readCurrent(scope, "settings:memory", version) }
         val invalidatedAt = readInvalidations[scope.key] ?: (app.cache.read(scope, "read-invalidated-at")?.toLongOrNull() ?: 0L).also { readInvalidations[scope.key] = it }
         val now = System.currentTimeMillis()
         withContext(Dispatchers.Default) {
@@ -8785,7 +8807,7 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
                     val response = c.get("/api/session", mapOf("session_id" to selected.session))
                     if (current() && revision == chatHistoryRevision) {
                         renderSession(response, selected, revision, allowRemoval = true, removedUserRowId = removedUser)
-                        if (current()) app.cache.writeSession(selected, _chat.value.raw.toString())
+                        if (current()) app.cache.writeSession(selected, encodeProjection(_chat.value.raw))
                         undoReconciled = true
                     }
                 }

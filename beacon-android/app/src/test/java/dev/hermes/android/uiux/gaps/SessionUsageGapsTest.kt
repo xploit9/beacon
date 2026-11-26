@@ -3,6 +3,7 @@ package dev.hermes.android.uiux.gaps
 import dev.hermes.android.core.json
 import dev.hermes.android.ui.formatTokenCount
 import dev.hermes.android.ui.sessionUsageFigures
+import dev.hermes.android.ui.usageContextStatus
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.*
@@ -61,6 +62,24 @@ class SessionUsageGapsTest {
         assertNull("A negative window cannot be divided by", sessionUsageFigures(json("context_window" to -10, "total_tokens" to 5)).percent)
     }
 
+    @Test fun aFullWindowIsNeverDerivedFromTheTwoTokenTotals() {
+        // The owner's screenshot: 628K in and 67K out under a window Hermes reports as fully used.
+        val withoutUsed = sessionUsageFigures(json("input_tokens" to 628_000, "output_tokens" to 67_000, "context_window" to 1_000_000))
+        assertNull("No used figure means no context share, even with both token totals", withoutUsed.percent)
+        assertEquals("Only Hermes' used figure fills the window",
+            100, sessionUsageFigures(json("input_tokens" to 628_000, "output_tokens" to 67_000, "context_window" to 1_000_000, "context_used" to 1_000_000)).percent)
+    }
+
+    @Test fun theContextStatusStaysCalmUntilTheWindowIsNearlyOrFullyUsed() {
+        assertNull(usageContextStatus(null))
+        assertNull(usageContextStatus(0))
+        assertNull(usageContextStatus(70))
+        assertNull(usageContextStatus(89))
+        assertEquals("Nearly full", usageContextStatus(90))
+        assertEquals("Nearly full", usageContextStatus(99))
+        assertEquals("Context full", usageContextStatus(100))
+    }
+
     @Test fun nothingIsConsumedFromAnUnknownPayload() {
         val figures = sessionUsageFigures(json("model" to "m", "note" to "x", "nested" to json("input_tokens" to 4)))
         assertTrue(figures.input == null && figures.output == null && figures.window == null && figures.used == null)
@@ -95,8 +114,18 @@ class SessionUsageGapsTest {
         }
     }
 
+    @Test fun everyLanguageKeepsBothPlaceholdersOfTheUsedOfWindowLabel() {
+        for (language in GapsAssets.languages - "en") {
+            val text = GapsAssets.translated(language, "{0} of {1} used")
+            assertTrue("$language has no translation of the used-of-window label", text.isNotBlank())
+            assertTrue("$language drops {0}: \"$text\"", text.contains("{0}"))
+            assertTrue("$language drops {1}: \"$text\"", text.contains("{1}"))
+        }
+    }
+
     @Test fun theUsagePageStringsAreTranslatedInEveryLanguage() {
-        val shown = listOf("Session usage", "Refresh usage", "Open a chat first", "Input", "Output", "Context", "Details", "Retry")
+        val shown = listOf("Session usage", "Refresh usage", "Open a chat first", "Tokens in", "Tokens out", "Context window", "Context used",
+            "Cumulative tokens for this chat.", "{0} of {1} used", "{0}% of context", "Nearly full", "Context full", "Details", "Expanded", "Collapsed", "Retry")
         val missing = shown.flatMap { text -> GapsAssets.languages.filter { it != "en" && GapsAssets.translated(it, text).isBlank() }.map { "$it: $text" } }
         assertTrue("Session usage text without a translation:\n" + missing.joinToString("\n"), missing.isEmpty())
     }

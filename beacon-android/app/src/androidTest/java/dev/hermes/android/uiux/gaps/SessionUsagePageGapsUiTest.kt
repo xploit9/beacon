@@ -7,6 +7,8 @@ import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.unit.dp
 import dev.hermes.android.BeaconViewModel
+import dev.hermes.android.ChatState
+import dev.hermes.android.Message
 import dev.hermes.android.core.json
 import dev.hermes.android.ui.NativeAdministration
 import dev.hermes.android.ui.formatTokenCount
@@ -99,11 +101,14 @@ class SessionUsagePageGapsUiTest {
         compose.onNodeWithText("Synthetic chat").assertIsDisplayed()
         compose.onNodeWithText("Synthetic Model").assertIsDisplayed()
         compose.onNodeWithTag("usage-figures").assertIsDisplayed()
-        for ((label, value) in listOf("Tokens in" to formatTokenCount(1234), "Tokens out" to formatTokenCount(560), "Context" to formatTokenCount(32000))) {
+        for ((label, value) in listOf("Tokens in" to formatTokenCount(1234), "Tokens out" to formatTokenCount(560),
+            "Context window" to formatTokenCount(32000), "Context used" to formatTokenCount(8000))) {
             compose.onNodeWithText(value).assertIsDisplayed()
             compose.onNodeWithText(label).assertIsDisplayed()
         }
+        compose.onNodeWithText("Cumulative tokens for this chat.").assertIsDisplayed()
         compose.onNodeWithTag("usage-context-bar").assertRangeInfoEquals(ProgressBarRangeInfo(0.25f, 0f..1f))
+        compose.onNodeWithText("8K of 32K used").assertIsDisplayed()
         compose.onNodeWithText("25% of context").assertIsDisplayed()
         compose.onNodeWithText("Retry").assertDoesNotExist()
     }
@@ -113,9 +118,73 @@ class SessionUsagePageGapsUiTest {
         serve(vm, json("input_tokens" to 5))
         compose.onNodeWithTag("usage-figures").assertIsDisplayed()
         compose.onNodeWithTag("usage-context-bar").assertDoesNotExist()
+        compose.onNodeWithText("Context window").assertDoesNotExist()
+        compose.onNodeWithText("Context used").assertDoesNotExist()
         serve(vm, json("model" to "synthetic-model"))
         compose.onNodeWithTag("usage-figures").assertDoesNotExist()
         compose.onNodeWithTag("usage-hero").assertIsDisplayed()
+    }
+
+    /** The owner's screenshot: 628K in, 67K out, a 1M window and 1M used, so a full bar and the full word. */
+    @Test fun theOwnersFullWindowNamesTheUsedAndWindowFiguresAndSaysContextFull() = withClientlessVm(compose) { vm ->
+        show(vm)
+        serve(vm, json("input_tokens" to 628_000, "output_tokens" to 67_000, "context_window" to 1_000_000, "context_used" to 1_000_000))
+        compose.onNodeWithText("628K").assertIsDisplayed()
+        compose.onNodeWithText("67K").assertIsDisplayed()
+        compose.onAllNodesWithText("1M").assertCountEquals(2)
+        compose.onNodeWithText("Context window").assertIsDisplayed()
+        compose.onNodeWithText("Context used").assertIsDisplayed()
+        compose.onNodeWithTag("usage-context-bar").assertRangeInfoEquals(ProgressBarRangeInfo(1f, 0f..1f))
+        compose.onNodeWithText("1M of 1M used").assertIsDisplayed()
+        compose.onNodeWithText("100% of context · Context full").assertIsDisplayed()
+        compose.onNodeWithText("Nearly full", substring = true).assertDoesNotExist()
+    }
+
+    @Test fun aSeventyPercentWindowKeepsTheUsedOfWindowLabelWithoutAStatusWord() = withClientlessVm(compose) { vm ->
+        show(vm)
+        serve(vm, json("input_tokens" to 500_000, "output_tokens" to 40_000, "context_window" to 1_000_000, "context_used" to 700_000))
+        compose.onNodeWithText("500K").assertIsDisplayed()
+        compose.onNodeWithText("40K").assertIsDisplayed()
+        compose.onNodeWithText("700K of 1M used").assertIsDisplayed()
+        compose.onNodeWithText("70% of context").assertIsDisplayed()
+        compose.onNodeWithTag("usage-context-bar").assertRangeInfoEquals(ProgressBarRangeInfo(0.7f, 0f..1f))
+        compose.onNodeWithText("Nearly full", substring = true).assertDoesNotExist()
+        compose.onNodeWithText("Context full", substring = true).assertDoesNotExist()
+    }
+
+    @Test fun withoutBothContextFiguresThereIsNoBarAndNoInventedShare() = withClientlessVm(compose) { vm ->
+        show(vm)
+        // Hermes returned the window but not the used figure: the window is named, nothing claims a share.
+        serve(vm, json("input_tokens" to 628_000, "output_tokens" to 67_000, "context_window" to 1_000_000))
+        compose.onNodeWithText("Context window").assertIsDisplayed()
+        compose.onNodeWithText("Context used").assertDoesNotExist()
+        compose.onNodeWithTag("usage-context-bar").assertDoesNotExist()
+        compose.onNodeWithText("of 1M used", substring = true).assertDoesNotExist()
+        // Hermes returned the used figure but not the window: it is named, still with no bar.
+        serve(vm, json("input_tokens" to 628_000, "output_tokens" to 67_000, "context_used" to 695_000))
+        compose.onNodeWithText("Context used").assertIsDisplayed()
+        compose.onNodeWithText("Context window").assertDoesNotExist()
+        compose.onNodeWithTag("usage-context-bar").assertDoesNotExist()
+        compose.onNodeWithText("695K of", substring = true).assertDoesNotExist()
+    }
+
+    @Test fun anUnreportedChatSaysSoAndStillNamesTheContextItDoesKnow() = withClientlessVm(compose) { vm ->
+        compose.runOnIdle {
+            vm.chatFlow.value = ChatState(sessionId = session, title = "Synthetic chat", raw = json("model" to "synthetic-model"),
+                messages = listOf(Message.from(json("role" to "assistant", "content" to "Synthetic answer"), 0, session)))
+        }
+        compose.showPage { NativeAdministration(vm, "Session usage") }
+        compose.waitForIdle()
+        serve(vm, json("input_tokens" to 0, "output_tokens" to 0, "context_window" to 32_000, "context_used" to 4_200))
+        compose.onNodeWithTag("usage-unreported").assertIsDisplayed()
+        compose.onNodeWithText("Hermes didn't report usage for this chat.").assertIsDisplayed()
+        compose.onNodeWithText("Tokens in").assertDoesNotExist()
+        compose.onNodeWithText("Tokens out").assertDoesNotExist()
+        compose.onNodeWithText("Cumulative tokens for this chat.").assertDoesNotExist()
+        compose.onNodeWithText("Context window").assertIsDisplayed()
+        compose.onNodeWithText("4.2K of 32K used").assertIsDisplayed()
+        compose.onNodeWithTag("usage-context-bar").assertRangeInfoEquals(ProgressBarRangeInfo(0.13f, 0f..1f))
+        compose.onNodeWithText("13% of context").assertIsDisplayed()
     }
 
     @Test fun detailsHoldsOnlyWhatTheFiguresDidNotUseAndHidesPrivateKeys() = withClientlessVm(compose) { vm ->
@@ -128,9 +197,11 @@ class SessionUsagePageGapsUiTest {
         compose.onNodeWithText("Details").performClick()
         compose.onNodeWithText("Provider note").assertIsDisplayed()
         compose.onNodeWithText("kept on the server").assertIsDisplayed()
-        for (hidden in listOf("Input tokens", "Output tokens", "Context window", "Total tokens", "Api key", "must-not-show", "Internal", "Empty note")) {
+        for (hidden in listOf("Input tokens", "Output tokens", "Total tokens", "Api key", "must-not-show", "Internal", "Empty note")) {
             compose.onNodeWithText(hidden).assertDoesNotExist()
         }
+        // The only "Context window" is the figure label; Details does not repeat the consumed key.
+        compose.onAllNodesWithText("Context window").assertCountEquals(1)
         compose.onNodeWithText("Details").performClick()
         compose.onNodeWithText("Provider note").assertDoesNotExist()
     }
@@ -139,8 +210,13 @@ class SessionUsagePageGapsUiTest {
         show(vm)
         serve(vm, figures.apply { put("provider_note", "kept on the server") })
         val state = { text: String -> SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, text) }
-        compose.onNodeWithTag("usage-details-toggle").assertHeightIsAtLeast(48.dp).assert(state("Collapsed"))
+        compose.onNodeWithTag("usage-details-toggle").assertHeightIsAtLeast(48.dp).assertTextContains("Details").assert(state("Collapsed"))
         compose.onNodeWithTag("usage-details-toggle").performClick().assert(state("Expanded"))
+        // A new read keeps the open Details and its rows on screen.
+        serve(vm, figures.apply { put("provider_note", "kept on the server") })
+        compose.waitForIdle()
+        compose.onNodeWithTag("usage-details-toggle").assert(state("Expanded"))
+        compose.onNodeWithText("Provider note").assertIsDisplayed()
         compose.onNodeWithTag("usage-details-toggle").performClick().assert(state("Collapsed"))
     }
 

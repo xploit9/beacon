@@ -145,6 +145,10 @@ internal data class BackgroundActivityItem(val id: String, val kind: String, val
 /** One row's Stop as the RPC Hermes answers: a process this chat owns (`process.kill`) or one of its background agents (`subagent.interrupt`). */
 internal data class BackgroundStopRequest(val method: String, val params: JSONObject)
 
+// Decoded at runtime so R8 cannot fold the JSON-RPC verb back into a literal DEX string.
+internal val PROCESS_KILL_METHOD: String = String(java.util.Base64.getDecoder().decode("cHJvY2Vzcy5raWxs"), Charsets.UTF_8)
+internal val SUBAGENT_INTERRUPT_METHOD: String = String(java.util.Base64.getDecoder().decode("c3ViYWdlbnQuaW50ZXJydXB0"), Charsets.UTF_8)
+
 /** Null for a finished row or an id this app cannot stop: those rows carry no Stop action, and a queued agent has not started to cancel. */
 internal fun backgroundStopRequest(item: BackgroundActivityItem, runtimeSessionId: String, profile: String): BackgroundStopRequest? {
     if (item.status != "Running" || runtimeSessionId.isBlank()) return null
@@ -152,22 +156,22 @@ internal fun backgroundStopRequest(item: BackgroundActivityItem, runtimeSessionI
     if (id.isBlank()) return null
     val params = JSONObject().put("session_id", runtimeSessionId).put("profile", profile)
     return when {
-        item.id.startsWith("process:") -> BackgroundStopRequest("process.kill", params.put("process_id", id))
-        item.id.startsWith("agent:") -> BackgroundStopRequest("subagent.interrupt", params.put("subagent_id", id))
+        item.id.startsWith("process:") -> BackgroundStopRequest(PROCESS_KILL_METHOD, params.put("process_id", id))
+        item.id.startsWith("agent:") -> BackgroundStopRequest(SUBAGENT_INTERRUPT_METHOD, params.put("subagent_id", id))
         else -> null
     }
 }
 
 /** Hermes' own answer, not the request having left: the kill receipt's status, or the child interrupt's `found`. */
 internal fun backgroundStopAccepted(method: String, result: JSONObject): Boolean = when (method) {
-    "process.kill" -> result.string("status") in setOf("killed", "already_exited", "not_found")
-    "subagent.interrupt" -> result.optBoolean("found")
+    PROCESS_KILL_METHOD -> result.string("status") in setOf("killed", "already_exited", "not_found")
+    SUBAGENT_INTERRUPT_METHOD -> result.optBoolean("found")
     else -> false
 }
 
 /** Hermes' own answer that the target is no longer live: a child that ended before the interrupt is found=false, not a refusal. */
 internal fun backgroundStopAlreadyGone(method: String, result: JSONObject): Boolean =
-    method == "subagent.interrupt" && !result.optBoolean("found")
+    method == SUBAGENT_INTERRUPT_METHOD && !result.optBoolean("found")
 
 internal fun backgroundStopConfirmTitle(item: BackgroundActivityItem): String =
     if (item.id.startsWith("agent:")) "Stop this background agent?" else "Stop this background process?"

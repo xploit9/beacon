@@ -294,6 +294,50 @@ class LostReplyChoiceUiTest {
         compose.onAllNodesWithText("Working").assertCountEquals(0)
     }
 
+    /** Root review (26 Nov): the caller's expected revision is checked before the bump; after the decode the render must compare the revision it bumped, or every explicit-revision render is dropped. */
+    @Test fun anExplicitRevisionRenderStillShowsItsMessages() = withFixture { vm, fixture, scope ->
+        val text = "Synthetic explicit revision render"
+        val response = runBlocking { requireNotNull(vm.client).get("/api/session", mapOf("session_id" to scope.session)) }
+        val session = response.optJSONObject("session") ?: response
+        session.put("messages", JSONArray().put(json("role" to "assistant", "text" to text)))
+        val revision = BeaconViewModel::class.java.getDeclaredField("chatHistoryRevision").apply { isAccessible = true }.getLong(vm)
+        val render = BeaconViewModel::class.java.declaredMethods.first { it.name == "renderSession" && it.parameterTypes.size == 6 }.apply { isAccessible = true }
+        runBlocking(kotlinx.coroutines.Dispatchers.Main) {
+            kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn<Any?> { cont -> render.invoke(vm, response, scope, revision, false, "", cont) }
+        }
+        assertEquals("an explicit-revision render shows the decoded messages", 1, vm.chat.value.messages.count { it.text == text })
+    }
+
+    /** F1: a slow older render must not record its projection after a newer null-revision render has won. */
+    @Test fun aSupersededSlowRenderCannotBecomeTheNewestProjection() = withFixture { vm, _, scope ->
+        fun response(title: String, padding: String): JSONObject {
+            val raw = runBlocking { requireNotNull(vm.client).get("/api/session", mapOf("session_id" to scope.session)) }
+            val session = raw.optJSONObject("session") ?: raw
+            session.put("title", title)
+            session.put("messages", JSONArray().put(json("role" to "assistant", "text" to title)))
+            if (padding.isNotEmpty()) session.put("padding", padding)
+            return raw
+        }
+        val older = response("Older projection", "o".repeat(8_000_000))
+        val newer = response("Newer projection", "")
+        val render = BeaconViewModel::class.java.declaredMethods.first { it.name == "renderSession" && it.parameterTypes.size == 6 }.apply { isAccessible = true }
+        suspend fun renderNow(value: JSONObject) {
+            kotlin.coroutines.intrinsics.suspendCoroutineUninterceptedOrReturn<Unit> { cont ->
+                render.invoke(vm, value, scope, null, false, "", cont)
+            }
+        }
+        val jobs = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main)
+        val olderJob = jobs.launch { renderNow(older) }
+        Thread.sleep(20)
+        val newerJob = jobs.launch { renderNow(newer) }
+        runBlocking { olderJob.join(); newerJob.join() }
+        val field = BeaconViewModel::class.java.getDeclaredField("renderedServerProjection").apply { isAccessible = true }
+        @Suppress("UNCHECKED_CAST")
+        val projection = field.get(vm) as Pair<Scope, String>
+        assertTrue("the newer projection survives", projection.second.contains("Newer projection"))
+        assertFalse("the superseded projection is not recorded", projection.second.contains("Older projection"))
+    }
+
     /** rules24 (b): the chat's live state, to put it in the state restart 17 ended in (whatever the cause). */
     @Suppress("UNCHECKED_CAST")
     private fun chatFlow(vm: BeaconViewModel) =

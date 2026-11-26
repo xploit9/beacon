@@ -394,6 +394,14 @@ internal fun sessionUsageFigures(usage: JSONObject): SessionUsageFigures {
 internal fun sessionUsageUnreported(figures: SessionUsageFigures, hasReplies: Boolean): Boolean =
     hasReplies && (figures.input ?: 0L) == 0L && (figures.output ?: 0L) == 0L
 
+/** The calm words for a context window at or near its end; null below 90%. */
+internal fun usageContextStatus(percent: Int?): String? = when {
+    percent == null -> null
+    percent >= 100 -> "Context full"
+    percent >= 90 -> "Nearly full"
+    else -> null
+}
+
 /** Whether a usage record holds anything to show: a key that is not a marker (`_…`) or the server's own error, success or message fields, with a value. */
 internal fun sessionUsageReadable(usage: JSONObject): Boolean = usage.keys().asSequence().any { key ->
     !key.startsWith('_') && key !in setOf("error", "success", "message") && usage.opt(key).let { it != null && it != JSONObject.NULL && it.toString().isNotBlank() }
@@ -409,6 +417,10 @@ internal fun formatTokenCount(value: Long, locale: Locale = Locale.getDefault())
         else -> number.format(value / 1_000_000.0) + "M"
     }
 }
+
+/** 38 -> "38%" in the shown language's own digits and percent sign ("٣٨٪", "%38"). */
+internal fun formatContextPercent(percent: Int, locale: Locale = Locale.getDefault()): String =
+    NumberFormat.getPercentInstance(locale).apply { maximumFractionDigits = 0; minimumFractionDigits = 0 }.format(percent / 100.0)
 
 /** Each administration destination has a native operation or a concrete reader. */
 @Composable fun NativeAdministration(vm: BeaconViewModel, page: String) {
@@ -519,18 +531,38 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
                 item { SettingsStatusHero(null, title, line = modelLine, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
                 // "0 in, 0 out" under a chat full of replies is Hermes not counting, not the chat using nothing.
                 val unreported = sessionUsageUnreported(figures, chat.messages.any { it.role == "assistant" })
-                if (unreported || figures.input != null || figures.output != null || figures.window != null || figures.percent != null) item { SettingsSection(testTag = "usage-figures") {
-                    val metrics = listOfNotNull(
+                val hasTokens = !unreported && (figures.input != null || figures.output != null)
+                val hasContext = figures.window != null || figures.used != null
+                if (unreported || hasTokens || hasContext) item { SettingsSection(testTag = "usage-figures") {
+                    val tokens = listOfNotNull(
                         figures.input?.takeUnless { unreported }?.let { uiText("Tokens in") to formatTokenCount(it) },
                         figures.output?.takeUnless { unreported }?.let { uiText("Tokens out") to formatTokenCount(it) },
-                        figures.window?.let { uiText("Context") to formatTokenCount(it) },
+                    )
+                    val context = listOfNotNull(
+                        figures.window?.let { uiText("Context window") to formatTokenCount(it) },
+                        figures.used?.let { uiText("Context used") to formatTokenCount(it) },
                     )
                     if (unreported) SettingsValueRow(uiText("Hermes didn't report usage for this chat."), icon = Icons.Rounded.Info, testTag = "usage-unreported")
-                    if (metrics.isNotEmpty()) SettingsMetricRow(metrics)
-                    figures.percent?.let { percent ->
-                        Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp, top = if (metrics.isEmpty()) 16.dp else 0.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (tokens.isNotEmpty()) {
+                        SettingsMetricRow(tokens)
+                        // These two are the chat's whole history; the context figures below are the window as it stands now.
+                        Text(uiText("Cumulative tokens for this chat."), Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
+                            style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    if (tokens.isNotEmpty() && context.isNotEmpty()) SettingsDivider()
+                    if (context.isNotEmpty()) SettingsMetricRow(context)
+                    val percent = figures.percent
+                    val used = figures.used
+                    val window = figures.window
+                    if (percent != null && used != null && window != null && window > 0) {
+                        Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             LinearProgressIndicator(progress = { percent / 100f }, modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)).testTag("usage-context-bar"))
-                            Text(uiText("{0}% of context").replace("{0}", "$percent"), style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            // Hermes' own used and window figures, never a sum of the two token totals above (they can differ).
+                            Text(uiText("{0} of {1} used").replace("{0}", formatTokenCount(used)).replace("{1}", formatTokenCount(window)),
+                                style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            val share = uiText("{0}% of context").replace("{0}", "$percent")
+                            val state = usageContextStatus(percent)?.let { uiText(it) }
+                            Text(if (state.isNullOrBlank()) share else "$share · $state", style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
                         }
                     }
                 } }
@@ -539,7 +571,10 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
                     val stateText = uiText(if (details) "Expanded" else "Collapsed")
                     SettingsNavRow(uiText("Details"), { details = !details }, Modifier.semantics { stateDescription = stateText }, icon = Icons.Rounded.Info,
                         minHeight = SettingsKit.RowMinHeight, trailingIcon = if (details) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, testTag = "usage-details-toggle")
-                    if (details) Box(Modifier.fillMaxWidth().padding(16.dp)) { StructuredRead(JSONObject(usage, extra.toTypedArray())) }
+                    if (details) {
+                        SettingsDivider()
+                        Box(Modifier.fillMaxWidth().padding(16.dp)) { StructuredRead(JSONObject(usage, extra.toTypedArray())) }
+                    }
                 } }
                 // A failed refresh keeps the figures already read; its error sits under them.
                 if (error.isNotBlank()) item(key = "refresh-error") { SettingsSection { SettingsErrorRow(uiText(error), reload, uiText("Retry")) } }

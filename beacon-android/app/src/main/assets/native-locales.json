@@ -1817,6 +1817,7 @@
     "this chat": "This chat",
     "{0} keeps more than these notes": "{0} keeps more than these notes",
     "{0}% of context": "{0}% of context",
+    "context {0} used, {1} of {2} tokens": "Context {0} used, {1} of {2} tokens",
     "after a force stop, open beacon once": "After a force stop, open Beacon once",
     "alerts are muted": "Alerts are muted",
     "allow background use": "Allow background use",
@@ -5814,6 +5815,7 @@
     "this chat": "Questa chat",
     "{0} keeps more than these notes": "{0} conserva più di queste note",
     "{0}% of context": "{0}% del contesto",
+    "context {0} used, {1} of {2} tokens": "Contesto: {0} usato, {1} di {2} token",
     "3–4 a day, 10:00–22:00": "3–4 al giorno, 10:00–22:00",
     "add a key to call": "Aggiungi una chiave per chiamare",
     "add it to get calls and alerts": "Aggiungilo per ricevere chiamate e avvisi",
@@ -7154,7 +7156,13 @@
     "stop this background agent?": "Fermare questo agente in background?",
     "stop {0}": "Ferma {0}",
     "couldn't stop this process. it may still be running.": "Impossibile fermare questo processo. Potrebbe essere ancora in esecuzione.",
-    "couldn't stop this agent. it may still be running.": "Impossibile fermare questo agente. Potrebbe essere ancora in esecuzione."
+    "couldn't stop this agent. it may still be running.": "Impossibile fermare questo agente. Potrebbe essere ancora in esecuzione.",
+    "context window": "Finestra di contesto",
+    "context used": "Contesto usato",
+    "cumulative tokens for this chat.": "Token cumulativi di questa chat.",
+    "{0} of {1} used": "{0} di {1} usati",
+    "nearly full": "Quasi pieno",
+    "context full": "Contesto pieno"
   },
   "ja": {
     "you're using the phone": "あなたがスマートフォンを操作中です",
@@ -10322,6 +10330,7 @@
     "this chat": "このチャット",
     "{0} keeps more than these notes": "{0} はこれらのノート以外も保持します",
     "{0}% of context": "コンテキストの {0}%",
+    "context {0} used, {1} of {2} tokens": "コンテキスト {0} 使用済み、{1}/{2} トークン",
     "3–4 a day, 10:00–22:00": "1日3〜4回、10:00〜22:00",
     "add a key to call": "通話するにはキーを追加",
     "add it to get calls and alerts": "追加すると通話とアラートが届きます",
@@ -11662,7 +11671,13 @@
     "stop this background agent?": "このバックグラウンドエージェントを停止しますか？",
     "stop {0}": "{0}を停止",
     "couldn't stop this process. it may still be running.": "このプロセスを停止できませんでした。まだ実行中の可能性があります。",
-    "couldn't stop this agent. it may still be running.": "このエージェントを停止できませんでした。まだ実行中の可能性があります。"
+    "couldn't stop this agent. it may still be running.": "このエージェントを停止できませんでした。まだ実行中の可能性があります。",
+    "context window": "コンテキストウィンドウ",
+    "context used": "使用中のコンテキスト",
+    "cumulative tokens for this chat.": "このチャットの累計トークンです。",
+    "{0} of {1} used": "{1} のうち {0} 使用",
+    "nearly full": "まもなく満杯",
+    "context full": "コンテキスト満杯"
   },
   "ru": {
     "you're using the phone": "Вы используете телефон",
@@ -14830,6 +14845,7 @@
     "this chat": "Этот чат",
     "{0} keeps more than these notes": "{0} хранит больше, чем эти заметки",
     "{0}% of context": "{0}% контекста",
+    "context {0} used, {1} of {2} tokens": "Контекст использован на {0}: {1} из {2} токенов",
     "3–4 a day, 10:00–22:00": "3–4 раза в день, 10:00–22:00",
     "add a key to call": "Добавьте ключ для звонков",
     "add it to get calls and alerts": "Добавьте его, чтобы получать звонки и оповещения",
@@ -16170,7 +16186,13 @@
     "stop this background agent?": "Остановить этого фонового агента?",
     "stop {0}": "Остановить {0}",
     "couldn't stop this process. it may still be running.": "Не удалось остановить этот процесс. Возможно, он всё ещё работает.",
-    "couldn't stop this agent. it may still be running.": "Не удалось остановить этого агента. Возможно, он всё ещё работает."
+    "couldn't stop this agent. it may still be running.": "Не удалось остановить этого агента. Возможно, он всё ещё работает.",
+    "context window": "Окно контекста",
+    "context used": "Занятый контекст",
+    "cumulative tokens for this chat.": "Суммарные токены этого чата.",
+    "{0} of {1} used": "Использовано {0} из {1}",
+    "nearly full": "Почти заполнено",
+    "context full": "Контекст заполнен"
   },
   "es": {
     "you're using the phone": "Estás usando el teléfono",
@@ -19302,6 +19324,7 @@
     "this chat": "Este chat",
     "{0} keeps more than these notes": "{0} guarda más que estas notas",
     "{0}% of context": "{0}% del contexto",
+    "context {0} used, {1} of {2} tokens": "Contexto: {0} usado, {1} de {2} tokens",
     "3–4 a day, 10:00–22:00": "3–4 al día, 10:00–22:00",
     "add a key to call": "Añade una clave para llamar",
     "add it to get calls and alerts": "Añádelo para recibir llamadas y alertas",
@@ -20642,7 +20665,13 @@
     "stop this background agent?": "¿Detener este agente en segundo plano?",
     "stop {0}": "Detener {0}",
     "couldn't stop this process. it may still be running.": "No se pudo detener este proceso. Puede que siga en ejecución.",
-    "couldn't stop this agent. it may still be running.": "No se pudo detener este agente. Puede que siga en ejecución."
+    "couldn't stop this agent. it may still be running.": "No se pudo detener este agente. Puede que siga en ejecución.",
+    "context window": "Ventana de contexto",
+    "context used": "Contexto usado",
+    "cumulative tokens for this chat.": "Tokens acumulados de este chat.",
+    "{0} of {1} used": "{0} de {1} usados",
+    "nearly full": "Casi lleno",
+    "context full": "Contexto lleno"
   },
   "de": {
     "you're using the phone": "Du verwendest das Telefon",
@@ -23764,6 +23793,7 @@
     "this chat": "Dieser Chat",
     "{0} keeps more than these notes": "{0} speichert mehr als diese Notizen",
     "{0}% of context": "{0}% des Kontexts",
+    "context {0} used, {1} of {2} tokens": "Kontext zu {0} genutzt, {1} von {2} Tokens",
     "3–4 a day, 10:00–22:00": "3–4-mal täglich, 10:00–22:00",
     "add a key to call": "Schlüssel hinzufügen, um anzurufen",
     "add it to get calls and alerts": "Fügen Sie es hinzu, um Anrufe und Hinweise zu erhalten",
@@ -25104,7 +25134,13 @@
     "stop this background agent?": "Diesen Hintergrundagenten stoppen?",
     "stop {0}": "{0} stoppen",
     "couldn't stop this process. it may still be running.": "Dieser Prozess konnte nicht gestoppt werden. Er läuft möglicherweise noch.",
-    "couldn't stop this agent. it may still be running.": "Dieser Agent konnte nicht gestoppt werden. Er läuft möglicherweise noch."
+    "couldn't stop this agent. it may still be running.": "Dieser Agent konnte nicht gestoppt werden. Er läuft möglicherweise noch.",
+    "context window": "Kontextfenster",
+    "context used": "Kontext verwendet",
+    "cumulative tokens for this chat.": "Kumulative Token dieses Chats.",
+    "{0} of {1} used": "{0} von {1} verwendet",
+    "nearly full": "Fast voll",
+    "context full": "Kontext voll"
   },
   "zh": {
     "you're using the phone": "你正在使用这部手机",
@@ -28226,6 +28262,7 @@
     "this chat": "此聊天",
     "{0} keeps more than these notes": "{0} 保存的内容不止这些备注",
     "{0}% of context": "已用上下文 {0}%",
+    "context {0} used, {1} of {2} tokens": "已用上下文 {0}，{1}/{2} Token",
     "3–4 a day, 10:00–22:00": "每天 3–4 次，10:00–22:00",
     "add a key to call": "添加密钥后即可通话",
     "add it to get calls and alerts": "添加后即可接收通话和提醒",
@@ -29566,7 +29603,13 @@
     "stop this background agent?": "停止这个后台代理？",
     "stop {0}": "停止 {0}",
     "couldn't stop this process. it may still be running.": "无法停止这个进程。它可能仍在运行。",
-    "couldn't stop this agent. it may still be running.": "无法停止这个代理。它可能仍在运行。"
+    "couldn't stop this agent. it may still be running.": "无法停止这个代理。它可能仍在运行。",
+    "context window": "上下文窗口",
+    "context used": "已用上下文",
+    "cumulative tokens for this chat.": "此聊天累计使用的 Token。",
+    "{0} of {1} used": "已用 {0} / {1}",
+    "nearly full": "即将用满",
+    "context full": "上下文已满"
   },
   "zh-Hant": {
     "you're using the phone": "你正在使用這部手機",
@@ -32734,6 +32777,7 @@
     "this chat": "此聊天",
     "{0} keeps more than these notes": "{0} 保存的內容不只這些備註",
     "{0}% of context": "已用脈絡 {0}%",
+    "context {0} used, {1} of {2} tokens": "已用脈絡 {0}，{1}/{2} 個 Token",
     "3–4 a day, 10:00–22:00": "每天 3–4 次，10:00–22:00",
     "add a key to call": "新增金鑰後即可通話",
     "add it to get calls and alerts": "新增後即可接收通話和提醒",
@@ -34074,7 +34118,13 @@
     "stop this background agent?": "停止這個背景代理？",
     "stop {0}": "停止 {0}",
     "couldn't stop this process. it may still be running.": "無法停止這個程序。它可能仍在執行。",
-    "couldn't stop this agent. it may still be running.": "無法停止這個代理。它可能仍在執行。"
+    "couldn't stop this agent. it may still be running.": "無法停止這個代理。它可能仍在執行。",
+    "context window": "脈絡視窗",
+    "context used": "已用脈絡",
+    "cumulative tokens for this chat.": "此聊天累計使用的 Token。",
+    "{0} of {1} used": "已用 {0} / {1}",
+    "nearly full": "即將用滿",
+    "context full": "脈絡已滿"
   },
   "pt": {
     "you're using the phone": "Você está usando o telefone",
@@ -37098,6 +37148,7 @@
     "this chat": "Este chat",
     "{0} keeps more than these notes": "{0} guarda mais do que estas notas",
     "{0}% of context": "{0}% do contexto",
+    "context {0} used, {1} of {2} tokens": "Contexto: {0} usado, {1} de {2} tokens",
     "3–4 a day, 10:00–22:00": "3–4 por dia, 10:00–22:00",
     "add a key to call": "Adicione uma chave para ligar",
     "add it to get calls and alerts": "Adicione-o para receber chamadas e alertas",
@@ -38441,7 +38492,13 @@
     "stop this background agent?": "Parar este agente em segundo plano?",
     "stop {0}": "Parar {0}",
     "couldn't stop this process. it may still be running.": "Não foi possível parar este processo. Pode ainda estar em execução.",
-    "couldn't stop this agent. it may still be running.": "Não foi possível parar este agente. Pode ainda estar em execução."
+    "couldn't stop this agent. it may still be running.": "Não foi possível parar este agente. Pode ainda estar em execução.",
+    "context window": "Janela de contexto",
+    "context used": "Contexto usado",
+    "cumulative tokens for this chat.": "Tokens acumulados deste chat.",
+    "{0} of {1} used": "{0} de {1} usados",
+    "nearly full": "Quase cheio",
+    "context full": "Contexto cheio"
   },
   "ko": {
     "you're using the phone": "휴대전화를 사용 중입니다",
@@ -41609,6 +41666,7 @@
     "this chat": "이 채팅",
     "{0} keeps more than these notes": "{0}은(는) 이 노트보다 더 많은 것을 보관합니다",
     "{0}% of context": "컨텍스트의 {0}%",
+    "context {0} used, {1} of {2} tokens": "컨텍스트 {0} 사용됨, {1}/{2} 토큰",
     "3–4 a day, 10:00–22:00": "하루 3–4회, 10:00–22:00",
     "add a key to call": "통화하려면 키를 추가하세요",
     "add it to get calls and alerts": "추가하면 통화와 알림을 받을 수 있습니다",
@@ -42949,7 +43007,13 @@
     "stop this background agent?": "이 백그라운드 에이전트를 중지할까요?",
     "stop {0}": "{0} 중지",
     "couldn't stop this process. it may still be running.": "이 프로세스를 중지하지 못했습니다. 아직 실행 중일 수 있습니다.",
-    "couldn't stop this agent. it may still be running.": "이 에이전트를 중지하지 못했습니다. 아직 실행 중일 수 있습니다."
+    "couldn't stop this agent. it may still be running.": "이 에이전트를 중지하지 못했습니다. 아직 실행 중일 수 있습니다.",
+    "context window": "컨텍스트 창",
+    "context used": "사용한 컨텍스트",
+    "cumulative tokens for this chat.": "이 채팅의 누적 토큰입니다.",
+    "{0} of {1} used": "{1} 중 {0} 사용",
+    "nearly full": "거의 참",
+    "context full": "컨텍스트 가득 참"
   },
   "fr": {
     "you're using the phone": "Vous utilisez le téléphone",
@@ -46117,6 +46181,7 @@
     "this chat": "Ce chat",
     "{0} keeps more than these notes": "{0} conserve plus que ces notes",
     "{0}% of context": "{0} % du contexte",
+    "context {0} used, {1} of {2} tokens": "Contexte : {0} utilisé, {1} sur {2} jetons",
     "3–4 a day, 10:00–22:00": "3–4 par jour, 10:00–22:00",
     "add a key to call": "Ajoutez une clé pour appeler",
     "add it to get calls and alerts": "Ajoutez-le pour recevoir appels et alertes",
@@ -47457,7 +47522,13 @@
     "stop this background agent?": "Arrêter cet agent en arrière-plan ?",
     "stop {0}": "Arrêter {0}",
     "couldn't stop this process. it may still be running.": "Impossible d'arrêter ce processus. Il est peut-être toujours en cours.",
-    "couldn't stop this agent. it may still be running.": "Impossible d'arrêter cet agent. Il est peut-être toujours en cours."
+    "couldn't stop this agent. it may still be running.": "Impossible d'arrêter cet agent. Il est peut-être toujours en cours.",
+    "context window": "Fenêtre de contexte",
+    "context used": "Contexte utilisé",
+    "cumulative tokens for this chat.": "Jetons cumulés de ce chat.",
+    "{0} of {1} used": "{0} sur {1} utilisés",
+    "nearly full": "Presque plein",
+    "context full": "Contexte plein"
   },
   "cs": {
     "you're using the phone": "Telefon právě používáte vy",
@@ -50625,6 +50696,7 @@
     "this chat": "Tento chat",
     "{0} keeps more than these notes": "{0} uchovává víc než tyto poznámky",
     "{0}% of context": "{0} % kontextu",
+    "context {0} used, {1} of {2} tokens": "Kontext: {0} využito, {1} z {2} tokenů",
     "3–4 a day, 10:00–22:00": "3–4× denně, 10:00–22:00",
     "add a key to call": "Pro volání přidejte klíč",
     "add it to get calls and alerts": "Přidejte ho, aby dostával hovory a upozornění",
@@ -51965,7 +52037,13 @@
     "stop this background agent?": "Zastavit tohoto agenta na pozadí?",
     "stop {0}": "Zastavit {0}",
     "couldn't stop this process. it may still be running.": "Tento proces se nepodařilo zastavit. Může stále běžet.",
-    "couldn't stop this agent. it may still be running.": "Tohoto agenta se nepodařilo zastavit. Může stále běžet."
+    "couldn't stop this agent. it may still be running.": "Tohoto agenta se nepodařilo zastavit. Může stále běžet.",
+    "context window": "Okno kontextu",
+    "context used": "Využitý kontext",
+    "cumulative tokens for this chat.": "Kumulativní tokeny tohoto chatu.",
+    "{0} of {1} used": "Využito {0} z {1}",
+    "nearly full": "Téměř plné",
+    "context full": "Kontext plný"
   },
   "tr": {
     "you're using the phone": "Telefonu siz kullanıyorsunuz",
@@ -55133,6 +55211,7 @@
     "this chat": "Bu sohbet",
     "{0} keeps more than these notes": "{0} bu notlardan fazlasını saklar",
     "{0}% of context": "Bağlamın %{0}'i",
+    "context {0} used, {1} of {2} tokens": "Bağlam: {0} kullanıldı, {1}/{2} token",
     "3–4 a day, 10:00–22:00": "Günde 3–4 kez, 10:00–22:00",
     "add a key to call": "Aramak için anahtar ekle",
     "add it to get calls and alerts": "Çağrı ve uyarı almak için ekle",
@@ -56473,7 +56552,13 @@
     "stop this background agent?": "Bu arka plan ajanı durdurulsun mu?",
     "stop {0}": "{0} öğesini durdur",
     "couldn't stop this process. it may still be running.": "Bu işlem durdurulamadı. Hâlâ çalışıyor olabilir.",
-    "couldn't stop this agent. it may still be running.": "Bu ajan durdurulamadı. Hâlâ çalışıyor olabilir."
+    "couldn't stop this agent. it may still be running.": "Bu ajan durdurulamadı. Hâlâ çalışıyor olabilir.",
+    "context window": "Bağlam penceresi",
+    "context used": "Kullanılan bağlam",
+    "cumulative tokens for this chat.": "Bu sohbetin toplam tokenları.",
+    "{0} of {1} used": "{0} / {1} kullanıldı",
+    "nearly full": "Neredeyse dolu",
+    "context full": "Bağlam dolu"
   },
   "pl": {
     "you're using the phone": "Korzystasz z telefonu",
@@ -59641,6 +59726,7 @@
     "this chat": "Ten czat",
     "{0} keeps more than these notes": "{0} przechowuje więcej niż te notatki",
     "{0}% of context": "{0}% kontekstu",
+    "context {0} used, {1} of {2} tokens": "Kontekst: {0} użyte, {1} z {2} tokenów",
     "3–4 a day, 10:00–22:00": "3–4 razy dziennie, 10:00–22:00",
     "add a key to call": "Dodaj klucz, aby dzwonić",
     "add it to get calls and alerts": "Dodaj go, aby otrzymywać rozmowy i alerty",
@@ -60981,7 +61067,13 @@
     "stop this background agent?": "Zatrzymać tego agenta w tle?",
     "stop {0}": "Zatrzymaj {0}",
     "couldn't stop this process. it may still be running.": "Nie udało się zatrzymać tego procesu. Może nadal działać.",
-    "couldn't stop this agent. it may still be running.": "Nie udało się zatrzymać tego agenta. Może nadal działać."
+    "couldn't stop this agent. it may still be running.": "Nie udało się zatrzymać tego agenta. Może nadal działać.",
+    "context window": "Okno kontekstu",
+    "context used": "Użyty kontekst",
+    "cumulative tokens for this chat.": "Łączne tokeny tego czatu.",
+    "{0} of {1} used": "Wykorzystano {0} z {1}",
+    "nearly full": "Prawie pełny",
+    "context full": "Kontekst pełny"
   },
   "vi": {
     "you're using the phone": "Bạn đang dùng điện thoại",
@@ -64149,6 +64241,7 @@
     "this chat": "Cuộc trò chuyện này",
     "{0} keeps more than these notes": "{0} lưu nhiều hơn các ghi chú này",
     "{0}% of context": "{0}% ngữ cảnh",
+    "context {0} used, {1} of {2} tokens": "Ngữ cảnh đã dùng {0}, {1}/{2} token",
     "3–4 a day, 10:00–22:00": "3–4 lần/ngày, 10:00–22:00",
     "add a key to call": "Thêm khóa để gọi",
     "add it to get calls and alerts": "Thêm lại để nhận cuộc gọi và cảnh báo",
@@ -65489,7 +65582,13 @@
     "stop this background agent?": "Dừng tác nhân nền này?",
     "stop {0}": "Dừng {0}",
     "couldn't stop this process. it may still be running.": "Không thể dừng tiến trình này. Nó có thể vẫn đang chạy.",
-    "couldn't stop this agent. it may still be running.": "Không thể dừng tác nhân này. Nó có thể vẫn đang chạy."
+    "couldn't stop this agent. it may still be running.": "Không thể dừng tác nhân này. Nó có thể vẫn đang chạy.",
+    "context window": "Cửa sổ ngữ cảnh",
+    "context used": "Ngữ cảnh đã dùng",
+    "cumulative tokens for this chat.": "Tổng token tích lũy của cuộc trò chuyện này.",
+    "{0} of {1} used": "Đã dùng {0} trên {1}",
+    "nearly full": "Sắp đầy",
+    "context full": "Ngữ cảnh đầy"
   },
   "ar": {
     "you're using the phone": "أنت تستخدم الهاتف",
@@ -67264,6 +67363,7 @@
     "this chat": "هذه المحادثة",
     "{0} keeps more than these notes": "{0} يحتفظ بأكثر من هذه الملاحظات",
     "{0}% of context": "{0}% من السياق",
+    "context {0} used, {1} of {2} tokens": "السياق المستخدم {0}، {1} من {2} رمز",
     "3–4 a day, 10:00–22:00": "3–4 مرات يوميًا، 10:00–22:00",
     "add a key to call": "أضف مفتاحًا لإجراء المكالمات",
     "add it to get calls and alerts": "أضفه لتلقي المكالمات والتنبيهات",
@@ -68618,6 +68718,12 @@
     "stop this background agent?": "أوقف هذا الوكيل في الخلفية؟",
     "stop {0}": "أوقف {0}",
     "couldn't stop this process. it may still be running.": "تعذّر إيقاف هذه العملية. قد تكون لا تزال تعمل.",
-    "couldn't stop this agent. it may still be running.": "تعذّر إيقاف هذا الوكيل. قد يكون لا يزال يعمل."
+    "couldn't stop this agent. it may still be running.": "تعذّر إيقاف هذا الوكيل. قد يكون لا يزال يعمل.",
+    "context window": "نافذة السياق",
+    "context used": "السياق المستخدم",
+    "cumulative tokens for this chat.": "إجمالي الرموز المتراكمة لهذه المحادثة.",
+    "{0} of {1} used": "المستخدم {0} من {1}",
+    "nearly full": "شبه ممتلئ",
+    "context full": "السياق ممتلئ"
   }
 }
