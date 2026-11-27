@@ -401,8 +401,8 @@ internal fun sessionUsageFigures(usage: JSONObject): SessionUsageFigures {
         if (window != null) value.coerceIn(0, window) else value.coerceAtLeast(0)
     }
     return SessionUsageFigures(
-        input = counter("input_tokens", "prompt_tokens"),
-        output = counter("output_tokens", "completion_tokens"),
+        input = counter("input_tokens", "prompt_tokens", "input", "prompt"),
+        output = counter("output_tokens", "completion_tokens", "output", "completion"),
         window = window,
         used = used,
         consumed = consumed,
@@ -415,7 +415,7 @@ internal fun sessionUsageFigures(usage: JSONObject): SessionUsageFigures {
 
 /** The keys [sessionUsageFigures] interprets, so Details shows neither a second copy nor the lifetime totals it refuses as occupancy. */
 internal val sessionUsageContextKeys = setOf(
-    "input_tokens", "prompt_tokens", "output_tokens", "completion_tokens",
+    "input_tokens", "prompt_tokens", "output_tokens", "completion_tokens", "input", "prompt", "output", "completion",
     "context_used", "context_tokens", "last_prompt_tokens",
     "context_max", "context_length", "context_window",
     "context_percent", "context_source", "context_estimated", "context_breakdown", "context_files",
@@ -437,7 +437,12 @@ internal fun contextUsageBreakdown(usage: JSONObject): ContextUsageBreakdown? {
         val row = rows.optJSONObject(index) ?: return@mapNotNull null
         val id = row.optString("id").trim()
         val label = row.optString("label").trim()
-        val tokens = (row.opt("tokens") as? Number)?.toLong()?.takeIf { it >= 0 } ?: return@mapNotNull null
+        // Hermes may serialise a count as text; the figures above read both forms, so a row must too.
+        val tokens = when (val raw = row.opt("tokens")) {
+            is Number -> raw.toLong()
+            is String -> raw.trim().toLongOrNull()
+            else -> null
+        }?.takeIf { it >= 0 } ?: return@mapNotNull null
         id.takeIf { it.isNotBlank() && label.isNotBlank() }?.let { ContextUsageCategory(it, label, tokens, row.optString("color")) }
     }
     if (categories.isEmpty()) return null
@@ -450,7 +455,11 @@ internal fun contextCategoryShare(tokens: Long, total: Long): Int =
 
 /** The CSS colour token Hermes' breakdown sends, mapped to the app's palette; the category id is the fallback for a token we do not know. */
 internal fun contextCategoryBaseColor(category: ContextUsageCategory): Color {
-    val token = category.colorToken.substringAfter("--", category.colorToken).substringBefore(')').trim()
+    // var(--context-usage-x), var(--context-usage-x, #hex) and a raw colour all name the same category.
+    val inner = category.colorToken.trim().removePrefix("var(").removeSuffix(")").trim()
+    val named = inner.substringAfter("--", "").substringBefore(',').trim()
+    val token = named.ifBlank { inner }
+    if (token.startsWith("#")) runCatching { return Color(android.graphics.Color.parseColor(token)) }
     return when (token) {
         "context-usage-system" -> Color(0xFF7C7D81)
         "context-usage-tools" -> Color(0xFF9E94D5)
