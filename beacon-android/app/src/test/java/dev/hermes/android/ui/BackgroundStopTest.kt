@@ -68,7 +68,7 @@ class BackgroundStopTest {
         assertEquals(40L, after.items.single().elapsedSeconds)
     }
 
-    @Test(timeout = 30_000) fun stopSendsHermesOwnProcessKillAndRefreshesTheSheet() = runBlocking {
+    @Test(timeout = 30_000) fun stopSendsHermesOwnProcessKillAndSettlesTheSheet() = runBlocking {
         BackgroundActivityFixture().use { fixture ->
             fixture.onStop = { method, _ ->
                 if (method == "process.kill") fixture.processes["runtime-b"] = json("processes" to JSONArray().put(json(
@@ -78,13 +78,15 @@ class BackgroundStopTest {
             val before = fetchBackgroundActivity(fixture.client, "default", "stored-b")
             val row = before.items.single()
             assertEquals("process:process-b", row.id)
-            val outcome = stopBackgroundActivity(fixture.client, "default", "stored-b", row)
+            val listsBefore = fixture.requests.count { it.first == "process.list" }
+            val outcome = stopBackgroundActivity(fixture.client, "default", "stored-b", row, before)
             assertEquals("", outcome.failure)
             val sent = fixture.requests.single { it.first == "process.kill" }
             assertEquals("runtime-b", sent.second.getString("session_id"))
             assertEquals("process-b", sent.second.getString("process_id"))
             assertEquals("default", sent.second.getString("profile"))
-            assertTrue("the list was refreshed after the kill", fixture.requests.count { it.first == "process.list" } == 2)
+            assertEquals("the sheet's runtime is used, with no read before the kill", 1, fixture.requests.count { it.first == "session.active_list" })
+            assertEquals("the receipt settles the row; the poll refreshes later", listsBefore, fixture.requests.count { it.first == "process.list" })
             assertEquals("Stopped", outcome.activity?.items?.single()?.status)
             assertFalse(outcome.activity?.working ?: true)
             assertTrue("never the registry-wide kill_all", fixture.requests.none { it.first == "process.stop" })
@@ -135,11 +137,12 @@ class BackgroundStopTest {
                 if (method == "subagent.interrupt") fixture.rosters["runtime-a"] = json("subagents" to JSONArray().put(json(
                     "subagent_id" to "worker-a", "goal" to "Check synthetic notes", "status" to "completed", "started_at" to 100)))
             }
-            val row = fetchBackgroundActivity(fixture.client, "default", "stored-a").items.single()
+            val before = fetchBackgroundActivity(fixture.client, "default", "stored-a")
+            val row = before.items.single()
             assertEquals("agent:worker-a", row.id)
-            val outcome = stopBackgroundActivity(fixture.client, "default", "stored-a", row)
+            val outcome = stopBackgroundActivity(fixture.client, "default", "stored-a", row, before)
             assertEquals("a child that ended first is already gone", "", outcome.failure)
-            assertEquals("Completed", outcome.activity?.items?.single()?.status)
+            assertEquals("No longer listed", outcome.activity?.items?.single()?.status)
             assertTrue(fixture.requests.any { it.first == "subagent.interrupt" })
         }
     }
@@ -150,16 +153,32 @@ class BackgroundStopTest {
                 if (method == "subagent.interrupt") fixture.rosters["runtime-a"] = json("subagents" to JSONArray().put(json(
                     "subagent_id" to "worker-a", "goal" to "Check synthetic notes", "status" to "completed", "started_at" to 100)))
             }
-            val row = fetchBackgroundActivity(fixture.client, "default", "stored-a").items.single()
+            val before = fetchBackgroundActivity(fixture.client, "default", "stored-a")
+            val row = before.items.single()
             assertEquals("agent:worker-a", row.id)
-            val outcome = stopBackgroundActivity(fixture.client, "default", "stored-a", row)
+            val outcome = stopBackgroundActivity(fixture.client, "default", "stored-a", row, before)
             assertEquals("", outcome.failure)
             val sent = fixture.requests.single { it.first == "subagent.interrupt" }
             assertEquals("runtime-a", sent.second.getString("session_id"))
             assertEquals("worker-a", sent.second.getString("subagent_id"))
-            assertEquals("Completed", outcome.activity?.items?.single()?.status)
+            assertEquals("Cancelled", outcome.activity?.items?.single()?.status)
             assertFalse(outcome.activity?.working ?: true)
             assertTrue("agents never use the process verbs", fixture.requests.none { it.first in setOf("process.kill", "process.stop") })
         }
+    }
+
+    @Test fun theReceiptNamesTheRowWithoutARead() {
+        val process = item("process:process-b", "Running")
+        val before = BackgroundActivitySummary(processes = 1, items = listOf(process), runtimeSessionId = "runtime-b")
+        val killed = backgroundActivityAfterStop(before, process, "process.kill", json("status" to "killed"))
+        assertEquals("Stopped", killed.items.single().status)
+        assertEquals(0, killed.processes)
+        assertFalse(killed.working)
+        assertEquals("No longer listed", backgroundActivityAfterStop(before, process, "process.kill", json("status" to "already_exited")).items.single().status)
+        assertEquals("No longer listed", backgroundActivityAfterStop(before, process, "process.kill", json("status" to "not_found")).items.single().status)
+        val agent = item("agent:worker-a", "Running")
+        val agents = BackgroundActivitySummary(agents = 1, items = listOf(agent), runtimeSessionId = "runtime-a")
+        assertEquals("Cancelled", backgroundActivityAfterStop(agents, agent, "subagent.interrupt", json("found" to true)).items.single().status)
+        assertEquals("No longer listed", backgroundActivityAfterStop(agents, agent, "subagent.interrupt", json("found" to false)).items.single().status)
     }
 }

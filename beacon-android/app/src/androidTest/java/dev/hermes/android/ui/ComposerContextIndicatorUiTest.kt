@@ -87,6 +87,21 @@ class ComposerContextIndicatorUiTest {
         compose.onNodeWithTag("composer-context").assertContentDescriptionContains("Context 100% used, 1M of 1M tokens", substring = true)
     }
 
+    /** The owner's record: lifetime total 8.7M must not become the ring's or the page's context. */
+    @Test fun theOwnerRecordShowsTheOccupancyInTheRingAndThePage() = withClientlessVm(compose) { vm ->
+        compose.runOnIdle { open(vm) }
+        show(vm)
+        seed(vm, json("input_tokens" to 24_000, "output_tokens" to 30_000, "total_tokens" to 8_700_000,
+            "context_tokens" to 384_000, "context_length" to 1_000_000))
+        compose.waitForIdle()
+        compose.onNodeWithTag("composer-context").assertContentDescriptionEquals("Context 38% used, 384K of 1M tokens")
+        compose.onNodeWithTag("composer-context-percent", useUnmergedTree = true).assertExists()
+        compose.onNodeWithTag("composer-context").performClick()
+        compose.waitUntil(5_000) { vm.ui.value.morePage == "Session usage" }
+        compose.onNodeWithText("384K of 1M used").assertIsDisplayed()
+        compose.onNodeWithText("38% of context").assertIsDisplayed()
+    }
+
     @Test fun unknownUsageShowsNothing() = withClientlessVm(compose) { vm ->
         compose.runOnIdle { open(vm) }
         show(vm)
@@ -105,6 +120,14 @@ class ComposerContextIndicatorUiTest {
         compose.runOnIdle { open(vm, replies = true) }
         show(vm)
         seed(vm, usage(window = 32_000, used = 4_200, input = 0, output = 0))
+        compose.waitForIdle()
+        compose.onNodeWithTag("composer-context").assertDoesNotExist()
+    }
+
+    @Test fun aLifetimeTotalWithoutOccupancyShowsNothing() = withClientlessVm(compose) { vm ->
+        compose.runOnIdle { open(vm) }
+        show(vm)
+        seed(vm, json("input_tokens" to 24_000, "output_tokens" to 30_000, "total_tokens" to 8_700_000, "context_length" to 1_000_000))
         compose.waitForIdle()
         compose.onNodeWithTag("composer-context").assertDoesNotExist()
     }

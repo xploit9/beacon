@@ -1,5 +1,6 @@
 package dev.hermes.android.ui
 
+import dev.hermes.android.core.json
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -35,6 +36,25 @@ class ContextIndicatorTest {
 
     @Test fun aFullWindowIsOneHundredPercent() {
         assertEquals(100, composerContextUsage(figures(window = 1_000_000, used = 1_000_000), hasReplies = true)?.percent)
+    }
+
+    /** The owner's screenshot: 8.7M lifetime tokens under a 1M window is not 100% of the context. */
+    @Test fun theLifetimeTotalIsNeverTheRingShare() {
+        val usage = sessionUsageFigures(json("input_tokens" to 24_000, "output_tokens" to 30_000,
+            "total_tokens" to 8_700_000, "context_tokens" to 384_000, "context_length" to 1_000_000))
+        val share = composerContextUsage(usage, hasReplies = true)
+        assertEquals(38, share?.percent)
+        assertEquals(384_000L, share?.used)
+        assertEquals(1_000_000L, share?.window)
+        assertNull("A lifetime total alone is no share", composerContextUsage(sessionUsageFigures(json("input_tokens" to 24_000, "output_tokens" to 30_000,
+            "total_tokens" to 8_700_000, "context_length" to 1_000_000)), hasReplies = true))
+    }
+
+    @Test fun hermesReportedPercentAndEstimateReachTheRingAndTheCaption() {
+        val usage = sessionUsageFigures(json("input_tokens" to 24_000, "output_tokens" to 30_000,
+            "context_used" to 300_000, "context_max" to 1_000_000, "context_percent" to 38, "context_estimated" to true))
+        assertEquals(38, composerContextUsage(usage, hasReplies = true)?.percent)
+        assertTrue(usage.estimated)
     }
 
     @Test fun theVisibleShareUsesTheShownLanguagesDigits() {

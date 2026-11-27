@@ -1015,10 +1015,27 @@ internal class NativeOperations(private val c: BeaconClient) {
             "/api/session/usage" -> {
                 val b = binding(); val lease = c.nativeTurnLease(b.storedSessionId, b.runtimeSessionId)
                 val live = c.nativeTurnRpc(lease, if (lease.authority) "session.stats" else "session.usage", json("session_id" to b.runtimeSessionId))
+                // The category split is Hermes' own session.context_breakdown; an older gateway without it still gets the plain figures.
+                val breakdown = try {
+                    c.nativeTurnRpc(lease, "session.context_breakdown", json("session_id" to b.runtimeSessionId))
+                } catch (e: CancellationException) { throw e }
+                catch (e: ApiFailure) { if (e.status == 401 || e.status == 403) throw e else null }
+                catch (_: Exception) { null }
                 // A recycled runtime counts from zero; Hermes keeps the chat's real totals on its stored row.
-                if (!liveUsageIsEmpty(live)) return live
-                val row = try { c.nativeGet("/api/sessions/${b.storedSessionId}", mapOf("profile" to c.auth.profile)) } catch (e: CancellationException) { throw e } catch (_: Exception) { return live }
-                return usageWithStoredTotals(live, row)
+                val result = if (!liveUsageIsEmpty(live)) live else {
+                    val row = try { c.nativeGet("/api/sessions/${b.storedSessionId}", mapOf("profile" to c.auth.profile)) } catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+                    if (row != null) usageWithStoredTotals(live, row) else live
+                }
+                if (breakdown != null) {
+                    // The breakdown carries the same occupancy the dashboard reads; fill what the live counters omitted.
+                    for (key in listOf("context_used", "context_max")) {
+                        (breakdown.opt(key) as? Number)?.toLong()?.takeIf { it > 0 }?.let { result.put(key, it) }
+                    }
+                    for (key in listOf("context_percent", "context_source", "context_estimated")) if (breakdown.has(key)) result.put(key, breakdown.opt(key))
+                    breakdown.optString("model").takeIf(String::isNotBlank)?.let { result.put("model", it) }
+                    result.put("context_breakdown", breakdown)
+                }
+                return result
             }
             "/api/session/update" -> {
                 val b = binding()

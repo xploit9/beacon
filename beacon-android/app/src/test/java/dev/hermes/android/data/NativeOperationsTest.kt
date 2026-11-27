@@ -201,6 +201,9 @@ class NativeOperationsTest {
                                 if (params.string("operation") == "rewind") put("rewound_count", 2).put("target_message", json("id" to params.getJSONObject("payload").getLong("target_message_id"), "role" to "user"))
                             }).also { result -> if (params.string("operation") == "model" && result.string("status").isBlank()) model = result.string("model") }
                         "session.stats" -> json("input_tokens" to 12, "output_tokens" to 3)
+                        "session.context_breakdown" -> json("categories" to JSONArray().put(json("id" to "conversation", "label" to "Conversation",
+                            "tokens" to 384_000, "color" to "var(--context-usage-conversation)")),
+                            "context_used" to 384_000, "context_max" to 1_000_000, "context_percent" to 38, "context_estimated" to false, "model" to model)
                         "session.interrupt" -> json("ref" to json("session_id" to "stored-a", "profile_id" to "synthetic-profile"), "execution_generation" to 7)
                         "approval.respond", "clarify.respond" -> responseOverride?.copy() ?: json("status" to "resolved", "prompt_id" to params.string("prompt_id"))
                         "session.events.since" -> json("epoch" to "fixture", "latest_seq" to 0, "events" to JSONArray())

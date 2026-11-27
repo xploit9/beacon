@@ -16,6 +16,9 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeUp
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -43,7 +46,7 @@ import java.io.File
 class ComposerContextShotsTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     private val app get() = ApplicationProvider.getApplicationContext<BeaconApplication>()
-    private val shots by lazy { File(requireNotNull(app.getExternalFilesDir(null)), "ctx-125-shots").apply { mkdirs() } }
+    private val shots by lazy { File(requireNotNull(app.getExternalFilesDir(null)), "data-126-shots").apply { mkdirs() } }
     private val session = "synthetic-chat"
 
     private enum class Look(val key: String, val dark: Boolean, val arabic: Boolean, val fontScale: Float) {
@@ -89,7 +92,17 @@ class ComposerContextShotsTest {
             vm.appFlow.value = AppState(origin = "https://hermes.example.com", owner = "synthetic", profile = "default", authenticated = true,
                 connected = true, loading = true, restoringSession = false, bootstrap = json("optional_features" to json("plugin" to "available")))
             vm.storeData("native-usage:${vm.ui.value.profile}:$session",
-                json("input_tokens" to 18_400, "output_tokens" to 2_300, "context_window" to 1_000_000, "context_used" to 384_000))
+                json("input_tokens" to 24_000, "output_tokens" to 30_000, "total_tokens" to 8_700_000,
+                    "context_tokens" to 384_000, "context_length" to 1_000_000, "context_estimated" to true,
+                    "context_breakdown" to json("categories" to org.json.JSONArray()
+                        .put(json("id" to "system_prompt", "label" to "System prompt", "tokens" to 64_000, "color" to "var(--context-usage-system)"))
+                        .put(json("id" to "tool_definitions", "label" to "Tool definitions", "tokens" to 96_000, "color" to "var(--context-usage-tools)"))
+                        .put(json("id" to "rules", "label" to "Rules", "tokens" to 24_000, "color" to "var(--context-usage-rules)"))
+                        .put(json("id" to "skills", "label" to "Skills", "tokens" to 16_000, "color" to "var(--context-usage-skills)"))
+                        .put(json("id" to "mcp", "label" to "MCP", "tokens" to 8_000, "color" to "var(--context-usage-mcp)"))
+                        .put(json("id" to "memory", "label" to "Memory", "tokens" to 8_000, "color" to "var(--context-usage-memory)"))
+                        .put(json("id" to "conversation", "label" to "Conversation", "tokens" to 168_000, "color" to "var(--context-usage-conversation)")),
+                        "context_estimated" to true)))
         }
         compose.setContent {
             val current = look.value
@@ -119,6 +132,31 @@ class ComposerContextShotsTest {
         compose.onNodeWithTag("composer-context").performClick()
         compose.waitUntil(5_000) { vm.ui.value.morePage == "Session usage" }
         compose.waitForIdle()
-        capture("composer-context-usage-from-tap")
+        capture("usage-en-light")
+        compose.onNodeWithTag("usage-details-toggle").performClick()
+        compose.waitForIdle()
+        capture("usage-details-en-light")
+        compose.onNodeWithTag("usage-breakdown-conversation").performScrollTo()
+        compose.onNodeWithTag("usage-page").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        capture("usage-details-bottom-en-light")
+        look.value = Look.ArabicDark
+        compose.waitForIdle()
+        compose.onNodeWithTag("usage-details-toggle").performScrollTo()
+        compose.waitForIdle()
+        capture("usage-details-ar-dark")
+        compose.onNodeWithTag("usage-breakdown-conversation").performScrollTo()
+        compose.onNodeWithTag("usage-page").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        capture("usage-details-bottom-ar-dark")
+        look.value = Look.LargeLight
+        compose.waitForIdle()
+        compose.onNodeWithTag("usage-details-toggle").performScrollTo()
+        compose.waitForIdle()
+        capture("usage-details-large-light")
+        compose.onNodeWithTag("usage-breakdown-conversation").performScrollTo()
+        compose.onNodeWithTag("usage-page").performTouchInput { swipeUp() }
+        compose.waitForIdle()
+        capture("usage-details-bottom-large-light")
     }
 }

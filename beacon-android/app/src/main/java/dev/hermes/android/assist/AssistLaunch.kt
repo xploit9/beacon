@@ -10,6 +10,15 @@ internal const val EXTRA_ASSIST_TOKEN = "dev.hermes.android.extra.ASSIST_TOKEN"
 /** A gesture older than this is not served: the owner pressed it a while ago and has moved on. */
 internal const val ASSIST_WINDOW_MILLIS = 30_000L
 
+/**
+ * Who may start a call from the exported assist entry: only the platform's own gesture reaches it as the system server
+ * (android), System UI, the current home/assistant host, or the app itself. Any other package, or an unprovable caller,
+ * is served the assistant chat instead. The launched-from package is set by the system on API 34+; older versions
+ * fall back to the referrer host, which is also set by the system and cannot be spoofed by the caller.
+ */
+internal fun assistCallerTrusted(caller: String?, home: String?, ownPackage: String): Boolean =
+    !caller.isNullOrBlank() && (caller == ownPackage || caller == "android" || caller == "com.android.systemui" || caller == home)
+
 /** Whether a gesture made at [issuedAt] can still be served at [now]. */
 internal fun assistFresh(issuedAt: Long, now: Long): Boolean = now - issuedAt in 0..ASSIST_WINDOW_MILLIS
 

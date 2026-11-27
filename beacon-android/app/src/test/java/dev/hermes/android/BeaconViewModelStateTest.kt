@@ -1,6 +1,7 @@
 package dev.hermes.android
 
 import dev.hermes.android.core.Scope
+import dev.hermes.android.core.copy
 import dev.hermes.android.core.json
 import dev.hermes.android.core.rows
 import dev.hermes.android.core.string
@@ -10,6 +11,32 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class BeaconViewModelStateTest {
+    @Test fun aModelTapShowsAtOnceAndARefusalRestoresOnlyItsOwnOptimism() {
+        val old = ChatState(sessionId = "chat", raw = json("model" to "old", "model_provider" to "p"))
+        val optimistic = chatWithModelSelection(old, "new", "q")
+        assertEquals("new", optimistic.raw.getString("model"))
+        assertEquals("q", optimistic.raw.getString("model_provider"))
+        assertEquals("old", restoreModelSelection(optimistic, "new", "q", old.raw).raw.getString("model"))
+        assertEquals("p", restoreModelSelection(optimistic, "new", "q", old.raw).raw.getString("model_provider"))
+        // Hermes' own answer landed first: a late refusal must not overwrite it.
+        val echoed = optimistic.copy(raw = optimistic.raw.copy().put("model", "server").put("model_provider", "r"))
+        assertSame(echoed, restoreModelSelection(echoed, "new", "q", old.raw))
+        // A key the old chat did not have stays absent after a refusal.
+        val bare = ChatState(sessionId = "chat", raw = JSONObject())
+        assertFalse(restoreModelSelection(chatWithModelSelection(bare, "new", "q"), "new", "q", bare.raw).raw.has("model"))
+    }
+
+    @Test fun aReasoningTapShowsAtOnceAndARefusalRestoresOnlyItsOwnOptimism() {
+        val old = ChatState(sessionId = "chat", raw = json("reasoning_effort" to "low"))
+        val optimistic = chatWithReasoningSelection(old, "high")
+        assertEquals("high", optimistic.raw.getString("reasoning_effort"))
+        assertEquals("low", restoreReasoningSelection(optimistic, "high", old.raw.opt("reasoning_effort")).raw.getString("reasoning_effort"))
+        val echoed = optimistic.copy(raw = optimistic.raw.copy().put("reasoning_effort", "medium"))
+        assertSame(echoed, restoreReasoningSelection(echoed, "high", old.raw.opt("reasoning_effort")))
+        val bare = ChatState(sessionId = "chat", raw = JSONObject())
+        assertFalse(restoreReasoningSelection(chatWithReasoningSelection(bare, "high"), "high", null).raw.has("reasoning_effort"))
+    }
+
     @Test fun registeredAssistantConversationIsAdoptedOnlyWhenItChanges() {
         assertEquals("shared-chat", assistantConversationToAdopt("phone-chat", "shared-chat"))
         assertNull(assistantConversationToAdopt("shared-chat", "shared-chat"))

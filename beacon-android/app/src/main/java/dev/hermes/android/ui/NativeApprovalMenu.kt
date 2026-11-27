@@ -114,10 +114,12 @@ internal fun approvalFromProjection(raw: JSONObject, setting: JSONObject?, chat:
         }
         saving = true
         askedYolo = turnOn
+        // The shield already shows the choice; the menu closes at the tap and the action's refusal puts the old one back.
+        open = false
         vm.storeData(triedKey, JSONObject())
         val job = vm.action("/api/approval/mode", json("yolo" to turnOn, "session_id" to capturedScope.session, "scope_key" to capturedScope.key), refresh = false,
             successNotice = if (turnOn) skippedNotice else restoredNotice) { _, result -> vm.storeData(chosenKey, json("yolo" to turnOn)); vm.storeData(key, result) }
-        scope.launch { try { job.join(); open = false } finally { saving = false; askedYolo = null } }
+        scope.launch { try { job.join() } finally { saving = false; askedYolo = null } }
     }
     Box {
         val description = shieldDescription(selection, uiText("Approvals"), uiText(approvalChoiceLabel(selection)))

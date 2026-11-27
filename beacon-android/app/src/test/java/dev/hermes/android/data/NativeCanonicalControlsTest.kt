@@ -102,6 +102,20 @@ class NativeCanonicalControlsTest {
         } finally { f.client.closeNative() }
     }
 
+    @Test fun canonicalUsageCarriesHermesContextBreakdown() = runBlocking {
+        val f = NativeOperationsTest.Fixture(canonical = true)
+        try {
+            val usage = f.client.get("/api/session/usage", mapOf("session_id" to "stored-a"))
+            assertTrue(f.methods.contains("session.context_breakdown"))
+            assertEquals(384_000L, usage.getLong("context_used"))
+            assertEquals(1_000_000L, usage.getLong("context_max"))
+            assertEquals(38, usage.getInt("context_percent"))
+            val categories = usage.getJSONObject("context_breakdown").getJSONArray("categories")
+            assertEquals("conversation", categories.getJSONObject(0).getString("id"))
+            assertEquals(384_000L, categories.getJSONObject(0).getLong("tokens"))
+        } finally { f.client.closeNative() }
+    }
+
     @Test fun canonicalFastCommandOmitsTheUnsupportedScopeField() = runBlocking {
         val f = NativeOperationsTest.Fixture(canonical = true)
         try {

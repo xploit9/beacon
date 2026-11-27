@@ -894,7 +894,7 @@ class NativeApprovalMenuUiTest {
                 compose.onNodeWithTag("reasoning-level:high").assert(isSelected())
                 compose.onNodeWithTag("reasoning-level:xhigh").performClick()
                 await { !vm.reasoningSaving.value && vm.chat.value.sessionReasoningEffort == "xhigh" }
-                compose.onNodeWithTag("reasoning-level:xhigh").assert(isSelected())
+                assertTrue("the selected level closes the sheet at once", vm.catalog.value.isBlank())
                 compose.runOnIdle { vm.closeCatalog() }
                 chip("Extra high")
                 assertEquals("max", fixture.reasoningEffort)

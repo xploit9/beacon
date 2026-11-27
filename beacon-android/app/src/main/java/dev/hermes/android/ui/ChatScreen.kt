@@ -155,7 +155,7 @@ internal suspend fun fetchBackgroundActivity(source: BeaconClient, profile: Stri
             val session = json("session_id" to runtimeSessionId, "profile" to profile)
             val roster = async { optionalBackgroundRead { source.nativeRpc("subagent.list", session.copy()) } }
             val processes = async { optionalBackgroundRead { source.nativeRpc("process.list", session.copy()) } }
-            val current = conversationBackgroundActivity(roster.await(), processes.await())
+            val current = conversationBackgroundActivity(roster.await(), processes.await()).copy(runtimeSessionId = runtimeSessionId)
             if (source.scope == scope) current else BackgroundActivitySummary(available = false)
         }
     } ?: BackgroundActivitySummary(available = false)
@@ -171,12 +171,17 @@ internal data class BackgroundStopOutcome(val failure: String = "", val activity
  * Stops one row through the RPC that owns it: `process.kill` for a process this chat owns, or the child's
  * `subagent.interrupt`. The id is the one `process.list` / `subagent.list` gave this chat, never a PID.
  */
-internal suspend fun stopBackgroundActivity(source: BeaconClient, profile: String, storedSessionId: String, item: BackgroundActivityItem): BackgroundStopOutcome {
+internal suspend fun stopBackgroundActivity(
+    source: BeaconClient, profile: String, storedSessionId: String, item: BackgroundActivityItem,
+    activity: BackgroundActivitySummary = BackgroundActivitySummary(),
+): BackgroundStopOutcome {
     if (source.scope.profile != profile || storedSessionId.isBlank()) return BackgroundStopOutcome(backgroundStopFailureMessage(item))
     val scope = source.scope
     return try {
         withTimeoutOrNull(30_000L) {
-            val runtime = backgroundActivityRuntime(optionalBackgroundRead { source.nativeRpc("session.active_list", JSONObject()) }, storedSessionId)
+            // The sheet was listed under one runtime; a fresh listing supplies it, so Stop sends its request at once.
+            val runtime = activity.runtimeSessionId.takeIf(String::isNotBlank)
+                ?: backgroundActivityRuntime(optionalBackgroundRead { source.nativeRpc("session.active_list", JSONObject()) }, storedSessionId)
                 ?: return@withTimeoutOrNull BackgroundStopOutcome(backgroundStopFailureMessage(item))
             val request = backgroundStopRequest(item, runtime, profile)
                 ?: return@withTimeoutOrNull BackgroundStopOutcome("")
@@ -189,8 +194,8 @@ internal suspend fun stopBackgroundActivity(source: BeaconClient, profile: Strin
             }
             if (result != null && !backgroundStopAccepted(request.method, result) && !backgroundStopAlreadyGone(request.method, result))
                 return@withTimeoutOrNull BackgroundStopOutcome(backgroundStopFailureMessage(item))
-            val refreshed = fetchBackgroundActivity(source, profile, storedSessionId)
-            BackgroundStopOutcome(activity = refreshed.takeIf { source.scope == scope })
+            // Hermes' receipt is the row's answer. The next background poll settles any final words; it is not on this path.
+            BackgroundStopOutcome(activity = backgroundActivityAfterStop(activity, item, request.method, result ?: JSONObject()).takeIf { source.scope == scope })
         } ?: BackgroundStopOutcome(backgroundStopFailureMessage(item))
     } catch (error: Exception) {
         if (error is CancellationException) throw error
@@ -1764,7 +1769,7 @@ private enum class ChatStage { Conversation, Call, CallFailure }
     if (activitySheet && ready) ChatActivitySheet(backgroundActivity, stopBackground = { item ->
         val source = vm.client
         if (source == null) backgroundStopFailureMessage(item) else {
-            val outcome = stopBackgroundActivity(source, ui.profile, chat.sessionId, item)
+            val outcome = stopBackgroundActivity(source, ui.profile, chat.sessionId, item, backgroundActivity)
             outcome.activity?.let { current -> backgroundActivity = reconcileBackgroundActivity(backgroundActivity, current) }
             outcome.failure.ifBlank { null }
         }

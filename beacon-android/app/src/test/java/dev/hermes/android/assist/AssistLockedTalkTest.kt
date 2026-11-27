@@ -205,7 +205,8 @@ class AssistLockedTalkTest {
     @Test fun theFullAppEntryStillAsksForTheUnlockFirst() {
         val entry = source("AssistEntryActivity.kt")
         assertTrue(entry.contains("deviceLockedNow(this)"))
-        assertTrue(entry.contains("AssistUnlockActivity.open(this, AssistTarget())"))
+        assertTrue(entry.contains("AssistUnlockActivity.open(this, target)"))
+        assertTrue(entry.contains("assistCallerTrusted(caller, home, packageName)"))
         assertTrue(source("PhoneAssistant.kt").contains("AssistAction.StartCall -> if (dev.hermes.android.phone.deviceLockedNow(context)) AssistUnlockActivity.open(context, target) else vm.callBeacon()"))
     }
 

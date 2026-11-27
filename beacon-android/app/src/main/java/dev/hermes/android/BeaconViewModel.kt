@@ -1202,6 +1202,28 @@ internal fun reloadedEffort(old: ChatState, sessionId: String, row: JSONObject, 
 internal fun chatOnSelection(previous: ChatState, id: String, titleHint: String, previousEffort: String): ChatState =
     if (previous.sessionId == id) previous
     else ChatState(sessionId = id, title = titleHint.ifBlank { "New conversation" }, projectionReady = false, sessionReasoningEffort = previousEffort)
+
+/** The selection the person tapped, before Hermes has answered; the picker and composer read it at once. */
+internal fun chatWithModelSelection(state: ChatState, model: String, provider: String): ChatState =
+    state.copy(raw = state.raw.copy().put("model", model).put("model_provider", provider))
+
+/** A refused model change restores the old pair only while the chat still shows the optimistic one; a newer answer wins. */
+internal fun restoreModelSelection(state: ChatState, model: String, provider: String, previous: JSONObject): ChatState {
+    if (state.raw.string("model") != model || state.raw.string("model_provider") != provider) return state
+    return state.copy(raw = state.raw.copy().apply {
+        if (previous.has("model")) put("model", previous.opt("model")) else remove("model")
+        if (previous.has("model_provider")) put("model_provider", previous.opt("model_provider")) else remove("model_provider")
+    })
+}
+
+internal fun chatWithReasoningSelection(state: ChatState, effort: String): ChatState =
+    state.copy(raw = state.raw.copy().put("reasoning_effort", effort))
+
+/** A refused reasoning change restores the old level only while the chat still shows the optimistic one. */
+internal fun restoreReasoningSelection(state: ChatState, effort: String, previous: Any?): ChatState {
+    if (state.raw.opt("reasoning_effort") != effort) return state
+    return state.copy(raw = state.raw.copy().apply { if (previous == null) remove("reasoning_effort") else put("reasoning_effort", previous) })
+}
 /** After a successful read Hermes is asked for its pending approval and question when a stream is attached, and always after "Refresh question": its answer decides. */
 /** R2C: a turn painted on a cold start ([followed] false) is not asked here: its own look comes next and asks when Hermes waits on a card; asking first held its stream back by two slow reads. */
 internal fun asksPromptsAfterRead(dropQuestion: Boolean, streamId: String, followed: Boolean = true): Boolean = dropQuestion || streamId.isNotBlank() && followed
@@ -3438,6 +3460,13 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
     fun setReasoning(effort: String) {
         if (!admitConversation() || _reasoningSaving.value) return
         if (conversationChanges["${sourceScope?.key}|/api/reasoning"]?.isCompleted == false) return
+        val scope = sourceScope ?: return
+        if (_chat.value.sessionId != scope.session) return
+        val previous = _chat.value.raw.opt("reasoning_effort")
+        // The tapped level is the state Hermes is asked for; a refusal puts the old one back.
+        _chat.update { chatWithReasoningSelection(it, effort) }
+        closeCatalog()
+        notice("Applying…")
         _reasoningSaving.value = true
         val path = reasoningPath()
         val query = reasoningQuery(_chat.value.sessionId, _chat.value.raw)
@@ -3457,18 +3486,33 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             withContext(Dispatchers.Default) { screens.flush(active.scope) }
         }
         reasoningChange = job
-        job.invokeOnCompletion { if (reasoningChange === job) _reasoningSaving.value = false }
+        job.invokeOnCompletion { cause ->
+            if (reasoningChange === job) _reasoningSaving.value = false
+            if (cause != null && sourceScope == scope && _chat.value.sessionId == scope.session) {
+                _chat.update { state -> restoreReasoningSelection(state, effort, previous) }
+            }
+        }
     }
     fun closeCatalog() { _catalog.value = "" }
     fun pickModel(model: String, provider: String) {
         if (!admitConversation() || _modelSaving.value.isNotBlank()) return
         val scope = sourceScope ?: return
         if (conversationChanges["${scope.key}|/api/session/update"]?.isCompleted == false) return
+        if (_chat.value.sessionId != scope.session) return
+        val previous = _chat.value.raw.copy()
+        val shownProvider = provider.ifBlank { previous.string("model_provider") }
+        // Move the checkmark and the composer at the tap; Hermes' answer settles or rolls it back.
+        _chat.update { chatWithModelSelection(it, model, shownProvider) }
         _modelSaving.value = "$provider:$model"
         notice("Applying model…")
         val job = action("/api/session/update", json("session_id" to scope.session, "model" to model, "model_provider" to provider.ifBlank { null }), successNotice = "Model updated for this chat") { _, _ -> saved["model_pick:${scope.key}"] = true; closeCatalog() }
         modelChange = job
-        job.invokeOnCompletion { if (modelChange === job) _modelSaving.value = "" }
+        job.invokeOnCompletion { cause ->
+            if (modelChange === job) _modelSaving.value = ""
+            if (cause != null && sourceScope == scope && _chat.value.sessionId == scope.session) {
+                _chat.update { state -> restoreModelSelection(state, model, shownProvider, previous) }
+            }
+        }
     }
     private suspend fun exportDownload(c: BeaconClient, uri: Uri, path: String, query: Map<String, String>, limit: Long) = withContext(Dispatchers.IO) {
         val temporary = java.io.File.createTempFile("hermes-export-", ".part", app.cacheDir)
@@ -6127,9 +6171,9 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
         projectCallTranscripts()
         if (sourceScope == scope && _chat.value.queued != queuedBefore) checkpoint()
         // A steer Hermes already saved is not shown a second time while the turn still runs.
-        if (_chat.value.queued.any { it.kind == "steer" && it.rowId.isBlank() && it.state in setOf("accepted", "unknown") }) pairSteerCopies(scope, emptyList(), o.rows("messages")) { sourceScope == scope }
+        if (_chat.value.queued.any { it.kind == "steer" && it.rowId.isBlank() && it.state in setOf("accepted", "unknown") }) pairSteerCopies(scope, emptyList(), rows) { sourceScope == scope }
         // The same for a message (a photo) Hermes accepted without naming its row: the saved row replaces the phone's copy instead of showing beside it.
-        if (_chat.value.queued.any { it.kind == "queue" && it.rowId.isBlank() && it.state in setOf("accepted", "settled") }) pairAcceptedCopies(scope, o.rows("messages")) { sourceScope == scope }
+        if (_chat.value.queued.any { it.kind == "queue" && it.rowId.isBlank() && it.state in setOf("accepted", "settled") }) pairAcceptedCopies(scope, rows) { sourceScope == scope }
         // R2C (owner, 22 Nov): a finished copy whose row left the loaded window can never retire by its proof; Hermes holds the row, so the copy goes now.
         // This also heals a queue saved before the fix on its first load.
         for (stale in copiesAboveWindow(_chat.value.queued, _chat.value.messages)) {

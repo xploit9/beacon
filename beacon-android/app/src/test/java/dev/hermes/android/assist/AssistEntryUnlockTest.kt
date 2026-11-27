@@ -20,10 +20,14 @@ class AssistEntryUnlockTest {
         val entry = source("assist/AssistEntryActivity.kt")
         val lock = entry.indexOf("deviceLockedNow(this)")
         assertTrue("The entry reads the lock", lock >= 0)
-        val unlock = entry.indexOf("AssistUnlockActivity.open(this, AssistTarget())")
+        val unlock = entry.indexOf("AssistUnlockActivity.open(this, target)")
         val opened = entry.indexOf("Intent(this, BeaconActivity::class.java)")
         assertTrue("Locked, the entry asks for the unlock, and only then is the token issued", unlock > lock)
         assertTrue("The app opens directly only when the phone is unlocked", opened > unlock)
+        // Any app can open this entry; only the platform's own gesture may start a call.
+        val callerCheck = entry.indexOf("fromSystemAssist()")
+        assertTrue("The caller decides the target", callerCheck >= 0 && callerCheck < unlock)
+        assertTrue("An untrusted caller gets the chat", entry.contains("AssistTarget(AssistPurpose.OpenAssistant)"))
     }
 
     @Test fun theGesturesCallStartReadsTheLockAgainBeforeItStarts() {

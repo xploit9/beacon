@@ -29,6 +29,7 @@ import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -39,6 +40,7 @@ import dev.hermes.android.core.*
 import org.json.JSONObject
 import java.text.NumberFormat
 import java.util.Locale
+import kotlin.math.roundToInt
 
 /** The picker group whose slug, or a name Hermes lists for it (custom providers carry `aliases`), is [name]; blank when none. */
 internal fun pickerGroupNamed(groups: List<JSONObject>, name: String): String =
@@ -370,24 +372,106 @@ internal val ReasoningStrings = (reasoningLevels.map(::reasoningLevelLabel) + re
 }
 
 /** A session's token figures, read from whichever names Hermes uses; the keys it consumed are left out of the Details view. */
-internal data class SessionUsageFigures(val input: Long?, val output: Long?, val window: Long?, val used: Long?, val consumed: Set<String>) {
+internal data class SessionUsageFigures(
+    val input: Long?, val output: Long?, val window: Long?, val used: Long?, val consumed: Set<String>,
+    /** Hermes' own context_percent when it sent one; null falls back to the dashboard's rounding. */
+    val reportedPercent: Int? = null,
+    /** Hermes' context_estimated: the occupancy is an estimate, not a provider reading. */
+    val estimated: Boolean = false,
+) {
     /** Share of the context window in use, 0–100; null without both figures. */
-    val percent: Int? get() = if (used != null && window != null && window > 0) (used * 100 / window).toInt().coerceIn(0, 100) else null
+    val percent: Int? get() = if (used != null && window != null && window > 0)
+        (reportedPercent ?: (used.toDouble() / window * 100).roundToInt()).coerceIn(0, 100) else null
 }
 
 internal fun sessionUsageFigures(usage: JSONObject): SessionUsageFigures {
     val consumed = mutableSetOf<String>()
-    fun number(vararg keys: String): Long? = keys.firstNotNullOfOrNull { key ->
+    fun parse(key: String): Long? {
         val raw = usage.opt(key)
-        (raw as? Number)?.toLong()?.also { consumed += key } ?: (raw as? String)?.toLongOrNull()?.also { consumed += key }
+        return (raw as? Number)?.toLong() ?: (raw as? String)?.toLongOrNull()
+    }
+    fun number(vararg keys: String): Long? = keys.firstNotNullOfOrNull { key -> parse(key)?.also { consumed += key } }
+    // The dashboard's counters are first non-zero: input_tokens is uncached input, prompt_tokens the prompt total.
+    fun counter(vararg keys: String): Long? = keys.firstNotNullOfOrNull { key -> parse(key)?.takeIf { it != 0L }?.also { consumed += key } }
+    val window = listOf("context_max", "context_length", "context_window").firstNotNullOfOrNull { key ->
+        parse(key)?.takeIf { it > 0 }?.also { consumed += key }
+    }
+    // Hermes clamps occupancy to the window before display; an absent occupancy stays absent, so no bar is invented.
+    val used = number("context_used", "context_tokens", "last_prompt_tokens")?.let { value ->
+        if (window != null) value.coerceIn(0, window) else value.coerceAtLeast(0)
     }
     return SessionUsageFigures(
-        input = number("input_tokens", "input", "prompt_tokens", "prompt"),
-        output = number("output_tokens", "output", "completion_tokens", "completion"),
-        window = number("context_window", "context_max", "max_context", "context_length"),
-        used = number("context_usage", "context_used", "total_tokens", "total"),
+        input = counter("input_tokens", "prompt_tokens"),
+        output = counter("output_tokens", "completion_tokens"),
+        window = window,
+        used = used,
         consumed = consumed,
+        reportedPercent = number("context_percent")?.toInt(),
+        // The dashboard derives the flag from context_source when the record carries only that half of the pair.
+        estimated = if (usage.has("context_estimated")) usage.optBoolean("context_estimated")
+        else (usage.opt("context_source") as? String).orEmpty().let { it.isNotBlank() && it != "provider_usage" },
     )
+}
+
+/** The keys [sessionUsageFigures] interprets, so Details shows neither a second copy nor the lifetime totals it refuses as occupancy. */
+internal val sessionUsageContextKeys = setOf(
+    "input_tokens", "prompt_tokens", "output_tokens", "completion_tokens",
+    "context_used", "context_tokens", "last_prompt_tokens",
+    "context_max", "context_length", "context_window",
+    "context_percent", "context_source", "context_estimated", "context_breakdown", "context_files",
+    "total_tokens", "total", "model",
+)
+
+/** One category of Hermes' context breakdown, in the order and with the colour Hermes sent. */
+internal data class ContextUsageCategory(val id: String, val label: String, val tokens: Long, val colorToken: String)
+
+internal data class ContextUsageBreakdown(val categories: List<ContextUsageCategory>, val estimated: Boolean) {
+    val total: Long get() = categories.sumOf { it.tokens }
+}
+
+/** Hermes' session.context_breakdown payload, or the same shape nested in a usage record; null when it has no categories to draw. */
+internal fun contextUsageBreakdown(usage: JSONObject): ContextUsageBreakdown? {
+    val record = usage.optJSONObject("context_breakdown") ?: usage
+    val rows = record.optJSONArray("categories") ?: return null
+    val categories = (0 until rows.length()).mapNotNull { index ->
+        val row = rows.optJSONObject(index) ?: return@mapNotNull null
+        val id = row.optString("id").trim()
+        val label = row.optString("label").trim()
+        val tokens = (row.opt("tokens") as? Number)?.toLong()?.takeIf { it >= 0 } ?: return@mapNotNull null
+        id.takeIf { it.isNotBlank() && label.isNotBlank() }?.let { ContextUsageCategory(it, label, tokens, row.optString("color")) }
+    }
+    if (categories.isEmpty()) return null
+    return ContextUsageBreakdown(categories, record.optBoolean("context_estimated") || usage.optBoolean("context_estimated"))
+}
+
+/** A category's share of the breakdown Hermes returned, rounded as the dashboard rounds a percent. */
+internal fun contextCategoryShare(tokens: Long, total: Long): Int =
+    if (total > 0) ((tokens.toDouble() / total) * 100).roundToInt().coerceIn(0, 100) else 0
+
+/** The CSS colour token Hermes' breakdown sends, mapped to the app's palette; the category id is the fallback for a token we do not know. */
+internal fun contextCategoryBaseColor(category: ContextUsageCategory): Color {
+    val token = category.colorToken.substringAfter("--", category.colorToken).substringBefore(')').trim()
+    return when (token) {
+        "context-usage-system" -> Color(0xFF7C7D81)
+        "context-usage-tools" -> Color(0xFF9E94D5)
+        "context-usage-rules" -> Color(0xFF1F8A65)
+        "context-usage-skills" -> Color(0xFFC08532)
+        "context-usage-mcp" -> Color(0xFFC14A7A)
+        "context-usage-subagents" -> Color(0xFF1760DB)
+        "context-usage-memory" -> Color(0xFFD67446)
+        "context-usage-conversation" -> Color(0xFF4C7F8C)
+        else -> when (category.id) {
+            "system_prompt" -> Color(0xFF7C7D81)
+            "tool_definitions" -> Color(0xFF9E94D5)
+            "rules" -> Color(0xFF1F8A65)
+            "skills" -> Color(0xFFC08532)
+            "mcp" -> Color(0xFFC14A7A)
+            "subagent_definitions" -> Color(0xFF1760DB)
+            "memory" -> Color(0xFFD67446)
+            "conversation" -> Color(0xFF4C7F8C)
+            else -> Color(0xFF7C7D81)
+        }
+    }
 }
 
 /** Hermes sent no token figures for a chat that holds replies: input and output are both zero or missing. */
@@ -512,11 +596,13 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
     val chat by vm.chat.collectAsStateWithLifecycle()
     val usage = data[usageKey]
     val error = recordError(usage)
+    val locale = uiLocale()
     var details by rememberSaveable(usageKey) { mutableStateOf(false) }
     val reload = { vm.load(usageKey, "/api/session/usage", mapOf("session_id" to chat.sessionId)); Unit }
     // REVIEW-FIXCHAT-121 P3: the title follows the chat header's rule, and the model is named as the composer's chip names it (no raw ids).
     val title = if (chat.title == "New conversation") uiText("New chat") else chat.title.ifBlank { uiText("Chat usage") }
-    val modelLine = chatModelTitle(chat.raw.string("model").ifBlank { usage?.string("model").orEmpty() }, data["picker:models"]?.rows("groups").orEmpty())
+    // Hermes' own session.usage model is the live session's; the chat projection is only the fallback before it lands.
+    val modelLine = chatModelTitle(usage?.string("model").orEmpty().ifBlank { chat.raw.string("model") }, data["picker:models"]?.rows("groups").orEmpty())
     SettingsList(refreshing = usage != null && usageKey in refreshing, testTag = "usage-page") {
         when {
             chat.sessionId.isBlank() -> item { SettingsSection { SettingsEmpty(uiText("Open a chat first"), Icons.Rounded.ChatBubbleOutline) } }
@@ -528,6 +614,8 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
             error.isNotBlank() && !sessionUsageReadable(usage) -> item { SettingsSection { SettingsErrorRow(uiText(error), reload, uiText("Retry")) } }
             else -> {
                 val figures = sessionUsageFigures(usage)
+                val breakdown = contextUsageBreakdown(usage)
+                val estimated = figures.estimated || breakdown?.estimated == true
                 item { SettingsStatusHero(null, title, line = modelLine, icon = Icons.Rounded.BarChart, testTag = "usage-hero") }
                 // "0 in, 0 out" under a chat full of replies is Hermes not counting, not the chat using nothing.
                 val unreported = sessionUsageUnreported(figures, chat.messages.any { it.role == "assistant" })
@@ -535,12 +623,12 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
                 val hasContext = figures.window != null || figures.used != null
                 if (unreported || hasTokens || hasContext) item { SettingsSection(testTag = "usage-figures") {
                     val tokens = listOfNotNull(
-                        figures.input?.takeUnless { unreported }?.let { uiText("Tokens in") to formatTokenCount(it) },
-                        figures.output?.takeUnless { unreported }?.let { uiText("Tokens out") to formatTokenCount(it) },
+                        figures.input?.takeUnless { unreported }?.let { uiText("Tokens in") to formatTokenCount(it, locale) },
+                        figures.output?.takeUnless { unreported }?.let { uiText("Tokens out") to formatTokenCount(it, locale) },
                     )
                     val context = listOfNotNull(
-                        figures.window?.let { uiText("Context window") to formatTokenCount(it) },
-                        figures.used?.let { uiText("Context used") to formatTokenCount(it) },
+                        figures.window?.let { uiText("Context window") to formatTokenCount(it, locale) },
+                        figures.used?.let { uiText("Context used") to formatTokenCount(it, locale) },
                     )
                     if (unreported) SettingsValueRow(uiText("Hermes didn't report usage for this chat."), icon = Icons.Rounded.Info, testTag = "usage-unreported")
                     if (tokens.isNotEmpty()) {
@@ -558,7 +646,8 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
                         Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                             LinearProgressIndicator(progress = { percent / 100f }, modifier = Modifier.fillMaxWidth().height(8.dp).clip(RoundedCornerShape(4.dp)).testTag("usage-context-bar"))
                             // Hermes' own used and window figures, never a sum of the two token totals above (they can differ).
-                            Text(uiText("{0} of {1} used").replace("{0}", formatTokenCount(used)).replace("{1}", formatTokenCount(window)),
+                            val estimatedNote = if (estimated) " · " + uiText("estimated") else ""
+                            Text(uiText("{0} of {1} used").replace("{0}", formatTokenCount(used, locale)).replace("{1}", formatTokenCount(window, locale)) + estimatedNote,
                                 style = nativeMetadataStyle(), color = MaterialTheme.colorScheme.onSurfaceVariant)
                             val share = uiText("{0}% of context").replace("{0}", "$percent")
                             val state = usageContextStatus(percent)?.let { uiText(it) }
@@ -566,19 +655,72 @@ internal fun isBuiltInCommand(name: String): Boolean = slashCommandText(name, ""
                         }
                     }
                 } }
-                val extra = usage.keys().asSequence().filter { !it.startsWith('_') && it != "error" && it !in figures.consumed && usage.opt(it).let { v -> v != null && v != JSONObject.NULL && v.toString().isNotBlank() } }.toList()
-                if (extra.isNotEmpty()) item { SettingsSection(testTag = "usage-details") {
+                val extra = usage.keys().asSequence().filter { key ->
+                    !key.startsWith('_') && key != "error" && key !in figures.consumed && key !in sessionUsageContextKeys &&
+                        usage.opt(key).let { value -> value != null && value != JSONObject.NULL && value.toString().isNotBlank() }
+                }.toList()
+                item { SettingsSection(testTag = "usage-details") {
                     val stateText = uiText(if (details) "Expanded" else "Collapsed")
                     SettingsNavRow(uiText("Details"), { details = !details }, Modifier.semantics { stateDescription = stateText }, icon = Icons.Rounded.Info,
                         minHeight = SettingsKit.RowMinHeight, trailingIcon = if (details) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore, testTag = "usage-details-toggle")
                     if (details) {
                         SettingsDivider()
-                        Box(Modifier.fillMaxWidth().padding(16.dp)) { StructuredRead(JSONObject(usage, extra.toTypedArray())) }
+                        if (breakdown != null) ContextBreakdownDetails(breakdown)
+                        else ContextBreakdownUnavailable()
+                        if (extra.isNotEmpty()) {
+                            SettingsDivider()
+                            Box(Modifier.fillMaxWidth().padding(16.dp)) { StructuredRead(JSONObject(usage, extra.toTypedArray())) }
+                        }
                     }
                 } }
                 // A failed refresh keeps the figures already read; its error sits under them.
                 if (error.isNotBlank()) item(key = "refresh-error") { SettingsSection { SettingsErrorRow(uiText(error), reload, uiText("Retry")) } }
             }
         }
+    }
+}
+
+/** Hermes' own context categories as one stacked bar and its rows, in the order and colours Hermes returned. */
+@Composable private fun ContextBreakdownDetails(breakdown: ContextUsageBreakdown) {
+    val locale = uiLocale()
+    val scheme = MaterialTheme.colorScheme
+    val total = breakdown.total
+    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(uiText("Token breakdown"), style = MaterialTheme.typography.titleSmall, color = scheme.onSurfaceVariant)
+        if (total > 0) Row(Modifier.fillMaxWidth().height(10.dp).clip(RoundedCornerShape(5.dp)).background(scheme.surfaceContainerHighest)
+            .testTag("usage-breakdown-bar")) {
+            breakdown.categories.filter { it.tokens > 0 }.forEach { category ->
+                Box(Modifier.weight(category.tokens.toFloat()).fillMaxHeight().background(contextCategoryColor(category)))
+            }
+        }
+        Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            breakdown.categories.forEach { category ->
+                Row(Modifier.fillMaxWidth().semantics(mergeDescendants = true) {}.testTag("usage-breakdown-${category.id}"),
+                    verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Box(Modifier.size(10.dp).clip(RoundedCornerShape(3.dp)).background(contextCategoryColor(category)).clearAndSetSemantics {})
+                    Text(category.label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium.contentDirection(),
+                        color = scheme.onSurface, maxLines = Int.MAX_VALUE, overflow = TextOverflow.Clip)
+                    Text("${formatTokenCount(category.tokens, locale)} · ${formatContextPercent(contextCategoryShare(category.tokens, total), locale)}",
+                        style = nativeMetadataStyle(), color = scheme.onSurfaceVariant, textAlign = TextAlign.End, maxLines = 2)
+                }
+            }
+        }
+    }
+}
+
+/** No breakdown for this chat: the plain figures above stay, and this says why there is no bar rather than drawing an empty one. */
+@Composable private fun ContextBreakdownUnavailable() {
+    Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(uiText("Token breakdown"), style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(uiText("The context breakdown isn't available for this chat."), style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+}
+
+/** The category colour Hermes sent, kept at 3:1 against the theme's own surfaces in light and dark. */
+@Composable private fun contextCategoryColor(category: ContextUsageCategory): Color {
+    val scheme = MaterialTheme.colorScheme
+    return remember(category.id, category.colorToken, scheme.background, scheme.surface) {
+        readableInk(contextCategoryBaseColor(category), min = 3.05f) { listOf(scheme.background, scheme.surface) }
     }
 }

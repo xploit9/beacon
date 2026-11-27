@@ -109,6 +109,8 @@ internal data class BackgroundActivitySummary(
     val processes: Int = 0,
     val available: Boolean = true,
     val items: List<BackgroundActivityItem> = emptyList(),
+    // The runtime this chat's rows were listed under; Stop needs it and a fresh sheet already has it.
+    val runtimeSessionId: String = "",
 ) {
     val active get() = agents > 0 || processes > 0 || items.any { it.status == "Status unknown" }
     val working get() = agents > 0 || processes > 0
@@ -240,7 +242,21 @@ internal fun reconcileBackgroundActivity(previous: BackgroundActivitySummary, cu
     val previousItems = previous.items.filter { it.id !in knownIds }.map { item ->
         if (item.running || item.status == "Status unknown") item.copy(status = if (current.available) "No longer listed" else "Status unknown") else item
     }
-    return current.copy(items = current.items + previousItems.takeLast(20))
+    return current.copy(items = current.items + previousItems.takeLast(20),
+        runtimeSessionId = current.runtimeSessionId.ifBlank { previous.runtimeSessionId })
+}
+
+/** The sheet after Hermes' own stop receipt: the row leaves Running now, and the next background poll settles its final words. */
+internal fun backgroundActivityAfterStop(previous: BackgroundActivitySummary, item: BackgroundActivityItem, method: String, result: JSONObject): BackgroundActivitySummary {
+    val status = when {
+        method == PROCESS_KILL_METHOD && result.string("status") == "killed" -> "Stopped"
+        method == SUBAGENT_INTERRUPT_METHOD && result.optBoolean("found") -> "Cancelled"
+        else -> "No longer listed"
+    }
+    val items = previous.items.map { if (it.id == item.id) it.copy(status = status) else it }
+    return previous.copy(items = items,
+        agents = items.count { (it.id.startsWith("agent:") || it.id.startsWith("delegation:")) && it.running },
+        processes = items.count { it.id.startsWith("process:") && it.running })
 }
 
 internal fun conversationActionLabel(action: String, pinned: Boolean, archived: Boolean): String = when {

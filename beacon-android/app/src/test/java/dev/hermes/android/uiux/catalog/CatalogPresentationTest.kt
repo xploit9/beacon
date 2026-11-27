@@ -41,11 +41,11 @@ class CatalogPresentationTest {
     // Session usage
 
     @Test fun usageFiguresReadTheNamesHermesUses() {
-        val figures = sessionUsageFigures(json("input_tokens" to 100, "output_tokens" to 20, "context_window" to 32000, "total_tokens" to 8000, "model" to "m"))
+        val figures = sessionUsageFigures(json("input_tokens" to 100, "output_tokens" to 20, "context_length" to 32000, "context_tokens" to 8000, "model" to "m"))
         assertEquals(100L, figures.input); assertEquals(20L, figures.output); assertEquals(32000L, figures.window); assertEquals(8000L, figures.used)
         assertEquals(25, figures.percent)
-        assertEquals("What the figures use stays out of Details", setOf("input_tokens", "output_tokens", "context_window", "total_tokens"), figures.consumed)
-        val short = sessionUsageFigures(json("input" to "12", "output" to 3, "context_max" to 1000, "context_used" to 2000))
+        assertEquals("What the figures use stays out of Details", setOf("input_tokens", "output_tokens", "context_length", "context_tokens"), figures.consumed)
+        val short = sessionUsageFigures(json("prompt_tokens" to "12", "completion_tokens" to 3, "context_max" to 1000, "context_used" to 2000))
         assertEquals(12L, short.input); assertEquals(1000L, short.window)
         assertEquals("Over the window reads as full, not beyond", 100, short.percent)
     }
@@ -55,7 +55,7 @@ class CatalogPresentationTest {
         assertNull(noWindow.percent); assertNull(noWindow.window); assertNull(noWindow.used)
         val empty = sessionUsageFigures(JSONObject())
         assertTrue(empty.input == null && empty.output == null && empty.window == null && empty.consumed.isEmpty())
-        assertNull("A zero window cannot be divided by", sessionUsageFigures(json("context_window" to 0, "total_tokens" to 4)).percent)
+        assertNull("A zero window cannot be divided by", sessionUsageFigures(json("context_window" to 0, "context_tokens" to 4)).percent)
     }
 
     @Test fun tokenCountsAreShort() {

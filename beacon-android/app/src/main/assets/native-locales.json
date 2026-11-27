@@ -1,5 +1,7 @@
 {
   "en": {
+    "estimated": "estimated",
+    "the context breakdown isn't available for this chat.": "The context breakdown isn't available for this chat.",
     "you're using the phone": "You're using the phone",
     "do a phone task": "Do a phone task",
     "check the phone": "Check the phone",
@@ -2653,6 +2655,8 @@
     "couldn't stop this agent. it may still be running.": "Couldn't stop this agent. It may still be running."
   },
   "it": {
+    "estimated": "stimato",
+    "the context breakdown isn't available for this chat.": "La ripartizione del contesto non è disponibile per questa chat.",
     "you're using the phone": "Stai usando il telefono",
     "do a phone task": "Svolgi un'attività sul telefono",
     "check the phone": "Controlla il telefono",
@@ -7165,6 +7169,8 @@
     "context full": "Contesto pieno"
   },
   "ja": {
+    "estimated": "推定",
+    "the context breakdown isn't available for this chat.": "このチャットのコンテキスト内訳は利用できません。",
     "you're using the phone": "あなたがスマートフォンを操作中です",
     "do a phone task": "スマホでタスクを実行",
     "check the phone": "スマホを確認",
@@ -11680,6 +11686,8 @@
     "context full": "コンテキスト満杯"
   },
   "ru": {
+    "estimated": "оценка",
+    "the context breakdown isn't available for this chat.": "Разбивка контекста для этого чата недоступна.",
     "you're using the phone": "Вы используете телефон",
     "do a phone task": "Выполнить задачу на телефоне",
     "check the phone": "Проверить телефон",
@@ -16195,6 +16203,8 @@
     "context full": "Контекст заполнен"
   },
   "es": {
+    "estimated": "estimado",
+    "the context breakdown isn't available for this chat.": "El desglose del contexto no está disponible para este chat.",
     "you're using the phone": "Estás usando el teléfono",
     "do a phone task": "Hacer una tarea en el teléfono",
     "check the phone": "Revisar el teléfono",
@@ -20674,6 +20684,8 @@
     "context full": "Contexto lleno"
   },
   "de": {
+    "estimated": "geschätzt",
+    "the context breakdown isn't available for this chat.": "Die Kontextaufteilung ist für diesen Chat nicht verfügbar.",
     "you're using the phone": "Du verwendest das Telefon",
     "do a phone task": "Aufgabe auf dem Telefon erledigen",
     "check the phone": "Telefon prüfen",
@@ -25143,6 +25155,8 @@
     "context full": "Kontext voll"
   },
   "zh": {
+    "estimated": "估算",
+    "the context breakdown isn't available for this chat.": "此对话无法提供上下文明细。",
     "you're using the phone": "你正在使用这部手机",
     "do a phone task": "在手机上执行任务",
     "check the phone": "查看手机",
@@ -29612,6 +29626,8 @@
     "context full": "上下文已满"
   },
   "zh-Hant": {
+    "estimated": "估算",
+    "the context breakdown isn't available for this chat.": "此對話無法提供上下文明細。",
     "you're using the phone": "你正在使用這部手機",
     "do a phone task": "在手機上執行任務",
     "check the phone": "查看手機",
@@ -34127,6 +34143,8 @@
     "context full": "脈絡已滿"
   },
   "pt": {
+    "estimated": "estimado",
+    "the context breakdown isn't available for this chat.": "A divisão do contexto não está disponível para este chat.",
     "you're using the phone": "Você está usando o telefone",
     "do a phone task": "Fazer uma tarefa no telefone",
     "check the phone": "Verificar o telefone",
@@ -38501,6 +38519,8 @@
     "context full": "Contexto cheio"
   },
   "ko": {
+    "estimated": "추정",
+    "the context breakdown isn't available for this chat.": "이 대화의 컨텍스트 분석을 사용할 수 없습니다.",
     "you're using the phone": "휴대전화를 사용 중입니다",
     "do a phone task": "휴대전화에서 작업 수행",
     "check the phone": "휴대전화 확인",
@@ -43016,6 +43036,8 @@
     "context full": "컨텍스트 가득 참"
   },
   "fr": {
+    "estimated": "estimé",
+    "the context breakdown isn't available for this chat.": "La répartition du contexte n'est pas disponible pour cette conversation.",
     "you're using the phone": "Vous utilisez le téléphone",
     "do a phone task": "Faire une tâche sur le téléphone",
     "check the phone": "Vérifier le téléphone",
@@ -47531,6 +47553,8 @@
     "context full": "Contexte plein"
   },
   "cs": {
+    "estimated": "odhad",
+    "the context breakdown isn't available for this chat.": "Rozdělení kontextu pro tento chat není k dispozici.",
     "you're using the phone": "Telefon právě používáte vy",
     "do a phone task": "Udělat úkol v telefonu",
     "check the phone": "Zkontrolovat telefon",
@@ -52046,6 +52070,8 @@
     "context full": "Kontext plný"
   },
   "tr": {
+    "estimated": "tahmini",
+    "the context breakdown isn't available for this chat.": "Bu sohbet için bağlam dağılımı kullanılamıyor.",
     "you're using the phone": "Telefonu siz kullanıyorsunuz",
     "do a phone task": "Telefonda bir görev yap",
     "check the phone": "Telefonu kontrol et",
@@ -56561,6 +56587,8 @@
     "context full": "Bağlam dolu"
   },
   "pl": {
+    "estimated": "szacowane",
+    "the context breakdown isn't available for this chat.": "Podział kontekstu nie jest dostępny dla tego czatu.",
     "you're using the phone": "Korzystasz z telefonu",
     "do a phone task": "Wykonaj zadanie na telefonie",
     "check the phone": "Sprawdź telefon",
@@ -61076,6 +61104,8 @@
     "context full": "Kontekst pełny"
   },
   "vi": {
+    "estimated": "ước tính",
+    "the context breakdown isn't available for this chat.": "Không có phân tích ngữ cảnh cho cuộc trò chuyện này.",
     "you're using the phone": "Bạn đang dùng điện thoại",
     "do a phone task": "Làm một việc trên điện thoại",
     "check the phone": "Kiểm tra điện thoại",
@@ -65591,6 +65621,9 @@
     "context full": "Ngữ cảnh đầy"
   },
   "ar": {
+    "estimated": "مقدّر",
+    "token breakdown": "تفصيل الرموز",
+    "the context breakdown isn't available for this chat.": "تفصيل السياق غير متاح لهذه المحادثة.",
     "you're using the phone": "أنت تستخدم الهاتف",
     "do a phone task": "تنفيذ مهمة على الهاتف",
     "check the phone": "فحص الهاتف",
