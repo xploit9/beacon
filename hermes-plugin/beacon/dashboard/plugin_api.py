@@ -573,11 +573,13 @@ async def calls(request:Request):
         result=safely(mobile.reserve,owner,profile,conversation,selection,principal or '',*binding)
         # The conversation was verified just now: the call's own requests need not verify it again.
         remember_call_authority(result['call_id'],owner,provider,principal or '',profile)
+        safely(note_phone_activity,profile)
         return result
     return await asyncio.to_thread(grant)
 @router.get('/mobile/calls/{call_id}')
 async def get_call(call_id:str,request:Request):
     owner,provider,row,cfg=await call(request,call_id)
+    safely(note_phone_activity,row['profile'])
     await asyncio.to_thread(watch,owner,provider,row['profile'])
     return await asyncio.to_thread(call_status,row,owner)
 @router.delete('/mobile/calls/{call_id}')
@@ -607,6 +609,7 @@ async def close_call(call_id:str,request:Request):
 async def events(call_id:str,request:Request):
     value=await body(request);owner,provider,row,_=await call(request,call_id,True)
     result=await asyncio.to_thread(safely,mobile.events,call_id,owner,value)
+    safely(note_phone_activity,row['profile'])
     warm_memory(owner,provider,row,value)
     return result
 @router.post('/mobile/calls/{call_id}/finalize')
@@ -759,6 +762,17 @@ def watch_pending(job_id,pending,uncertain):
         conn.execute("UPDATE jobs SET status=?,error=CASE WHEN ?<>'' THEN ? WHEN error=? THEN '' ELSE error END,history_updated=? WHERE id=? AND status IN ('watching','needs_input')",('needs_input' if pending else 'watching',marker,marker,_PENDING_JOB_ERROR,time.time(),job_id))
 
 _activity_logged=set()
+
+def note_phone_activity(profile):
+    """Keep the agent phone's idle keeper from stopping it during a live call."""
+    module = sys.modules.get('beacon_agent_phone_api')
+    if module is not None:
+        try:
+            module.touch_call_activity(profile)
+        except Exception:
+            pass
+
+
 def watch(owner,provider,profile):
     sys.modules['beacon_voice_continuation'].sync(mobile,native,owner,provider,profile)
     try: activity.sync(mobile,native,owner,provider,profile)
@@ -1698,6 +1712,7 @@ async def call_updates_feed(call_id:str,request:Request):
     """Call contract v3 updates channel (CALLS-CONTRACT.md section 3): answers at once with new events, else waits for them."""
     try:
         owner,provider,row,_=await call(request,call_id)
+        safely(note_phone_activity,row['profile'])
         try:
             after=int(request.query_params.get('after','0'));wait_ms=int(request.query_params.get('wait_ms',str(UPDATES_WAIT_MS)))
         except ValueError: raise HTTPException(400,'after and wait_ms must be integers') from None

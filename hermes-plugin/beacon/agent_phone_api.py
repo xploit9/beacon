@@ -48,6 +48,28 @@ START_FAILED = "The phone didn't start."
 log = logging.getLogger('beacon.agent_phone.api')
 
 
+def touch_call_activity(profile, home=None):
+    """Touch the agent phone's activity file while a voice call is active.
+
+    The keeper stops the emulator after idle_minutes without this file changing. A call is activity even when the
+    owner has not opened the phone view; without this the keeper can stop the phone mid-call (27 Nov, 13:58).
+    """
+    try:
+        base = Path(home) if home is not None else Path(os.environ.get('HERMES_HOME') or ROOT.parent.parent)
+        pointer = json.loads((base / 'plugin-data' / 'beacon' / 'agent-phone.json').read_text(encoding='utf-8'))
+        if pointer.get('profile') != profile:
+            return False
+        folder = Path(pointer['folder'])
+        if not (folder / 'home' / 'avd' / f'{AVD_NAME}.avd' / 'config.ini').is_file():
+            return False
+        run = folder / 'run'
+        run.mkdir(parents=True, exist_ok=True)
+        (run / 'activity').touch()
+        return True
+    except Exception:
+        return False
+
+
 def sibling(name):
     """A Beacon module beside this one (``beacon_<name>``), or None when its file is not there. A module whose file changed
     since it was loaded (a plugin update) is loaded again, as plugin_api does for its own siblings."""

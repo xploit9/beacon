@@ -1271,7 +1271,9 @@ private enum class ChatStage { Conversation, Call, CallFailure }
         else requestCall(active,pending.conversationId)
     }
     LaunchedEffect(list, search, chat.sessionId) { snapshotFlow { Triple(list.firstVisibleItemIndex, list.firstVisibleItemScrollOffset, list.isScrollInProgress) to ownerScrolling }.collect { (position, byOwner) ->
-        if (byOwner && search.isBlank()) {
+        // Save the owner's place once the scroll stops; an anchor per scrolled frame recomposed the whole transcript.
+        val stopped = !position.third
+        if (stopped && byOwner && search.isBlank()) {
             follow = !list.canScrollForward
             val current = vm.chat.value
             if (follow) { if (current.anchor > 0 || current.anchorOffset > 0 || current.anchorId.isNotBlank()) vm.anchor(0, 0, "") }
@@ -1280,7 +1282,7 @@ private enum class ChatStage { Conversation, Call, CallFailure }
                 if (id != null) vm.anchor(position.first, position.second, id)
             }
         }
-        if (!position.third) ownerScrolling = false
+        if (stopped) ownerScrolling = false
     } }
     LaunchedEffect(list, callHistoryTargetSession, callHistoryTargetId, chat.sessionId, chat.projectionReady, chat.callMessages, chat.messages, chat.raw) {
         if (callHistoryTargetId.isBlank() || callHistoryTargetSession != chat.sessionId || !chat.projectionReady) return@LaunchedEffect

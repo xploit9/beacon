@@ -1212,3 +1212,16 @@ def test_declarations_are_built_once_per_tool_list(harness, monkeypatch):
     assert first['tool_declarations'] == second['tool_declarations'] and built == [1]
     warm(api, 'default', [row('read_file', True, 'hermes'), row('patch', False, 'hermes')])
     assert len(api.call_contract_fields('default', None)['tool_declarations']) == 2 and built == [1, 2]
+
+
+def test_a_call_and_its_events_note_agent_phone_activity(harness, monkeypatch):
+    api, client, _, _, _ = harness
+    seen = []
+    monkeypatch.setattr(api, 'note_phone_activity', lambda profile: seen.append(profile))
+    call_id = reserve(client)
+    assert seen == ['default']
+    response = client.post(f'/api/plugins/beacon/mobile/calls/{call_id}/events', json={'events': [
+        {'event_id': 'media', 'turn_id': 't', 'type': 'media_diagnostic', 'at_ms': 1, 'stage': 'grant_sent',
+         'elapsed_ms': 1, 'attempt': 0, 'provider': 'grok'}]})
+    assert response.status_code == 200, response.text
+    assert seen == ['default', 'default']

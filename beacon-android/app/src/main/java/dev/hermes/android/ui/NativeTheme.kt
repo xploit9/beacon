@@ -7,6 +7,9 @@ import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.luminance
@@ -64,13 +67,37 @@ internal fun beaconEmbers(width: Float, height: Float, spacing: Float, maxRadius
 @Composable fun Modifier.chatBeaconBackground(): Modifier {
     val light = MaterialTheme.colorScheme.primary
     return drawWithCache {
-        val glow = Brush.radialGradient(listOf(light.copy(alpha = .13f), light.copy(alpha = .04f), Color.Transparent),
-            center = Offset(size.width / 2f, -size.height * .04f), radius = maxOf(size.width, size.height) * .72f)
-        val embers = beaconEmbers(size.width, size.height, 34.dp.toPx(), 1.6.dp.toPx())
-        onDrawBehind {
-            drawRect(glow)
-            embers.forEach { drawCircle(light.copy(alpha = it.alpha), it.radius, Offset(it.x, it.y)) }
+        val image = ChatBackdropCache.image(size, light, 34.dp.toPx(), 1.6.dp.toPx())
+        onDrawBehind { drawImage(image) }
+    }
+}
+
+/** One full-screen ARGB_8888 backdrop per size and theme colour; recomposition and streaming reuse it instead of repainting ~100 embers. */
+private object ChatBackdropCache {
+    private var key: String = ""
+    private var cached: ImageBitmap? = null
+
+    @Synchronized fun image(size: androidx.compose.ui.geometry.Size, light: Color, spacing: Float, maxRadius: Float): ImageBitmap {
+        val width = size.width.toInt().coerceAtLeast(1)
+        val height = size.height.toInt().coerceAtLeast(1)
+        val next = "${width}x${height}:${light.toArgb()}:${spacing.toBits()}:${maxRadius.toBits()}"
+        cached?.takeIf { next == key }?.let { return it }
+        val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+        paint.shader = android.graphics.RadialGradient(size.width / 2f, -size.height * .04f, maxOf(size.width, size.height) * .72f,
+            intArrayOf(light.copy(alpha = .13f).toArgb(), light.copy(alpha = .04f).toArgb(), Color.Transparent.toArgb()),
+            floatArrayOf(0f, .5f, 1f), android.graphics.Shader.TileMode.CLAMP)
+        canvas.drawRect(0f, 0f, size.width, size.height, paint)
+        paint.shader = null
+        beaconEmbers(size.width, size.height, spacing, maxRadius).forEach {
+            paint.color = light.copy(alpha = it.alpha).toArgb()
+            canvas.drawCircle(it.x, it.y, it.radius, paint)
         }
+        val image = bitmap.asImageBitmap()
+        key = next
+        cached = image
+        return image
     }
 }
 

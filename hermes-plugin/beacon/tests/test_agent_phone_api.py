@@ -1396,3 +1396,15 @@ def test_capture_capability_needs_the_registered_live_generation(phone_api):
     assert p.stream.frame_directory_for_view(folder) is None
     proof_path.unlink()
     assert p.stream.frame_directory_for_view(folder) is None
+
+
+def test_touch_call_activity_marks_only_the_owning_profiles_phone(phone_api):
+    apimod = sys.modules['beacon_agent_phone_api']
+    activity = phone_api.folder / 'run' / 'activity'
+    activity.unlink(missing_ok=True)
+    assert apimod.touch_call_activity('default', home=phone_api.tmp) is True
+    assert activity.is_file()
+    before = activity.stat().st_mtime_ns
+    time.sleep(0.01)
+    assert apimod.touch_call_activity('other', home=phone_api.tmp) is False
+    assert activity.stat().st_mtime_ns == before
