@@ -5790,6 +5790,11 @@ class BeaconViewModel(application: Application, private val saved: SavedStateHan
             if (owner.profile != wanted) {
                 // The assistant keeps its own profile; switching reopens this tab there, and leaving gives the chats' profile back.
                 _ui.update { it.copy(beaconOpening = true, beaconError = "") }
+                // The chat on screen belongs to the profile being left: never leave it under the assistant profile's name while the
+                // switch is on its way (the selector and the transcript must name the same profile at every moment).
+                try { checkpointVisible() } catch (e: CancellationException) { throw e } catch (_: Throwable) {}
+                clearDetails(); sessionWatch?.cancel(); selectionJob?.cancel(); sourceScope = null; ++sessionGeneration
+                _chat.value = ChatState()
                 switchProfile(wanted, false).join()
                 if (_ui.value.tab == "Beacon" && (client?.scope ?: cachedOwnerScope)?.profile != wanted) _ui.update { it.copy(beaconOpening = false, beaconError = "The $wanted profile could not be opened. Choose another in Settings › Assistant.") }
                 return@launch

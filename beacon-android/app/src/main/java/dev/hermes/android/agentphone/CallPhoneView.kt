@@ -38,6 +38,7 @@ import androidx.compose.ui.window.SecureFlagPolicy
 import androidx.lifecycle.compose.LifecycleStartEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.hermes.android.BeaconTheme
+import dev.hermes.android.BeaconApplication
 import dev.hermes.android.data.BeaconClient
 import dev.hermes.android.ui.LocalAssistantName
 import dev.hermes.android.ui.uiText
@@ -56,6 +57,20 @@ internal suspend fun callHandOffClient(waitMs: Long = 15_000, resolve: suspend (
         found
     }
 
+/**
+ * The account this call's phone view uses. The call service normally hands over the account it froze at call start; if the
+ * screen has no service yet (or that hand-off refuses), the app's own sign-in for the call's profile is the same account, with
+ * the same linked device, so the view still opens instead of sitting on "Opening phone…".
+ */
+internal suspend fun callPhoneClient(app: BeaconApplication, call: CallState, controller: CallController): BeaconClient? {
+    val handed = runCatching { controller.service?.clientForHandoff(call.callId) }.getOrNull()
+    if (handed != null) return handed
+    val scope = call.conversationScope ?: return null
+    val auth = runCatching { app.auth.read(scope.origin) }.getOrNull() ?: return null
+    if (auth.owner.isBlank() || !auth.scope().sameAccount(scope)) return null
+    return BeaconClient(auth.copy(profile = scope.profile), app.auth, persistContext = false)
+}
+
 /** Its own secure window keeps the phone out of recordings, including a screen shared during the call. [client] is asked for this
  *  call's account when the picture first opens (and again on a retry): the call screen's button stays usable while the call's service
  *  is still taking it over, instead of going dead for the rest of the call. */
@@ -63,7 +78,7 @@ internal suspend fun callHandOffClient(waitMs: Long = 15_000, resolve: suspend (
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val decoder = remember { FrameDecoder() }
-    val session = remember { ViewSession(LazyViewTransport(watching = true, client), decoder, scope) }
+    val session = remember { ViewSession(LazyViewTransport(watching = true, client), decoder, scope, preflight = true) }
     DisposableEffect(session) { onDispose { session.dispose(); decoder.close() } }
     LifecycleStartEffect(session) {
         session.open()

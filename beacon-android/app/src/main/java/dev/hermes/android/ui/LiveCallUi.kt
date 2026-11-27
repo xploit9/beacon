@@ -28,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import dev.hermes.android.BeaconApplication
 import dev.hermes.android.agentphone.CallPhoneView
 import dev.hermes.android.agentphone.callHandOffClient
+import dev.hermes.android.agentphone.callPhoneClient
 import androidx.compose.ui.Alignment
 
 import androidx.compose.ui.Modifier
@@ -496,12 +497,13 @@ internal fun shouldAskCallBubble(wasMinimized: Boolean, bubbleWasMissing: Boolea
         }
     }
     val context = LocalContext.current
-    val controller = (context.applicationContext as BeaconApplication).calls
+    val app = context.applicationContext as BeaconApplication
+    val controller = app.calls
     var showPhone by remember(call.callId) { mutableStateOf(false) }
     if (showPhone && call.active) {
         // The view waits for the call's account when it opens: a hand-off a moment away must not leave this button dead for the rest
         // of the call (owner, 25 Nov: the button was there and did nothing).
-        CallPhoneView({ callHandOffClient { runCatching { controller.service?.clientForHandoff(call.callId) }.getOrNull() } }, call,
+        CallPhoneView({ callHandOffClient { callPhoneClient(app, call, controller) } }, call,
             actions = controller, onDismiss = { showPhone = false })
     }
     val name: @Composable (Modifier) -> Unit = { area ->

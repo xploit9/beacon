@@ -380,6 +380,8 @@ internal class ViewSession(
     private val clock: () -> Long = { System.nanoTime() / 1_000_000 },
     /** Whether this phone has a working connection at all; without one a drop is this phone's, never "Back in a moment". */
     private val online: () -> Boolean = { true },
+    /** Ask for the phone's state before the socket: a watch view during a call starts an off phone at once (owner, 27 Nov). */
+    private val preflight: Boolean = false,
     /**
      * Where the hand-back runs when the view closes without a socket: a scope that outlives the view (Closed finishes the activity and
      * cancels [scope] at once, and a cancelled hand-back would leave the phone the owner's for 5 more minutes).
@@ -412,7 +414,23 @@ internal class ViewSession(
         set { it.copy(flash = Flash(kind, line, ++flashes, reason, args)) }
     val phaseNow: ViewPhase get() = state.value.phase
 
-    fun open() { if (phaseNow == ViewPhase.Connecting && connection == null && job == null) connect(ViewPhase.Connecting) }
+    /**
+     * The phone may be off before the socket opens (the keeper stopped it, or the owner did): ask first and start it at once,
+     * instead of waiting for a socket to say "off". A watch view during a call then turns the phone on even when the socket is
+     * slow to point at it; when the answer cannot be read, the socket still decides as before.
+     */
+    fun open() {
+        if (phaseNow != ViewPhase.Connecting || connection != null || job != null) return
+        if (!preflight) { connect(ViewPhase.Connecting); return }
+        val gen = generation
+        job = scope.launch {
+            val phone = try { withTimeoutOrNull(8_000) { transport.phoneNow().phone } }
+                catch (e: CancellationException) { throw e } catch (_: Exception) { null }
+            if (gen != generation || phaseNow != ViewPhase.Connecting || connection != null) return@launch
+            job = null
+            if (phone == "off") startPhone() else connect(ViewPhase.Connecting)
+        }
+    }
 
     // -- input ----------------------------------------------------------------------------------------------------------------------------
     private val live get() = phaseNow == ViewPhase.Live && connection != null && !state.value.background
